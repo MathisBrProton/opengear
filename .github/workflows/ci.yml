@@ -13,15 +13,20 @@ jobs:
   build-test:
     name: Build, test & lint (Windows)
     runs-on: windows-latest
+    env:
+      # rust-toolchain.toml pins a host-qualified channel (1.99.1-x86_64-pc-windows-gnu) for local
+      # builds without MSVC; recent rustup rejects that form, so CI uses the same Rust version on
+      # the runner's default (MSVC) host. The build target stays x86_64-pc-windows-gnullvm.
+      RUSTUP_TOOLCHAIN: "1.99.1"
     steps:
       - uses: actions/checkout@v4
 
-      # rustup reads rust-toolchain.toml (channel + gnullvm target) on first cargo call.
       - name: Install toolchain
         shell: bash
         run: |
-          rustup show active-toolchain || rustup toolchain install
-          rustup component add clippy
+          rustup toolchain install 1.99.1 --profile minimal \
+            --target x86_64-pc-windows-gnullvm --component clippy
+          rustc --version
 
       - uses: Swatinem/rust-cache@v2
 
