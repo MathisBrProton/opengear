@@ -1,0 +1,10 @@
+# Build outputs (workspace + standalone tools such as tools/opengear-setup)
+target/
+**/*.rs.bk
+
+# Release artefacts (rebuilt from source: OpenGear.exe, setup, WebView2Loader.dll)
+/dist/
+
+# Local user data written next to a dev build
+opengear_profiles.toml
+opengear_profiles.toml.*

@@ -1,0 +1,19 @@
+pub mod features;
+pub mod headset;
+pub mod hidpp;
+pub mod keyboard;
+pub mod mouse;
+pub mod onboard;
+
+pub use features::{FeatureEntry, feature_name};
+pub use headset::{EQ_PRESETS, EqPreset, EqualizerInfo, LogitechHeadset, LogitechHeadsetInfo};
+pub use hidpp::{HidppError, HidppTransport};
+pub use keyboard::{KeyboardRgbMode, LogitechKeyboard, LogitechKeyboardInfo};
+pub use mouse::{
+    BatteryInfo, BatteryPowerModel, BatteryState, DpiSensorInfo, LedZoneInfo, LodLevel,
+    LogitechMouse, LogitechMouseInfo, MouseLedMode, OnboardMode, OnboardProfilesSummary,
+    ReportRateInfo,
+};
+pub use onboard::{
+    MouseButtonAction, OnboardMacroStep, OnboardMemoryDesc, OnboardProfile, crc16_ccitt,
+};

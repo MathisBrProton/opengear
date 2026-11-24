@@ -1,0 +1,504 @@
+use hidapi::{HidApi, HidDevice};
+use opengear_core::Rgb;
+use serde::{Deserialize, Serialize};
+use std::ffi::CString;
+use thiserror::Error;
+use tracing::{debug, info};
+
+pub const ASUS_VID: u16 = 0x0B05;
+pub const AURA_MB_PIDS: &[u16] = &[0x18F3, 0x1939, 0x19AF, 0x1AA6, 0x1BED];
+pub const AURA_USAGE_PAGE: u16 = 0xFF72;
+pub const AURA_USAGE: u16 = 0x00A1;
+
+const REPORT_ID: u8 = 0xEC;
+const PACKET_LEN: usize = 65;
+const LEDS_PER_PACKET: usize = 20; // 0x14
+
+const CMD_EFFECT: u8 = 0x35;
+const CMD_EFFECT_COLOR: u8 = 0x36;
+const CMD_COMMIT: u8 = 0x3F;
+const CMD_DIRECT: u8 = 0x40;
+const CMD_FIRMWARE: u8 = 0x82;
+const CMD_CONFIG_TABLE: u8 = 0xB0;
+
+const DIRECT_APPLY_FLAG: u8 = 0x80;
+const DIRECT_OVERFLOW_FLAG: u8 = 0x10;
+
+#[derive(Debug, Error)]
+pub enum AuraError {
+    #[error("Aucun contrôleur ASUS AURA USB détecté (VID 0B05, UsagePage FF72)")]
+    DeviceNotFound,
+    #[error("Erreur HID : {0}")]
+    Hid(#[from] hidapi::HidError),
+    #[error("Impossible de lire la table de configuration Aura (réponse invalide)")]
+    InvalidConfigTable,
+    #[error("Index de canal Aura invalide ({0})")]
+    InvalidChannel(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum AuraHwMode {
+    Off = 0,
+    Static = 1,
+    Breathing = 2,
+    Flashing = 3,
+    SpectrumCycle = 4,
+    Rainbow = 5,
+    SpectrumCycleBreathing = 6,
+    ChaseFade = 7,
+    SpectrumCycleChaseFade = 8,
+    Chase = 9,
+    SpectrumCycleChase = 10,
+    Wave = 11,
+    ChaseRainbowPulse = 12,
+    RandomFlicker = 13,
+    GentleTransition = 16,
+    WavePropagation = 17,
+    RedPulse = 19,
+    Direct = 0xFF,
+}
+
+impl AuraHwMode {
+    pub const HARDWARE_MODES: &'static [Self] = &[
+        Self::Static,
+        Self::Breathing,
+        Self::Rainbow,
+        Self::SpectrumCycle,
+        Self::SpectrumCycleBreathing,
+        Self::Wave,
+        Self::ChaseFade,
+        Self::SpectrumCycleChaseFade,
+        Self::Chase,
+        Self::SpectrumCycleChase,
+        Self::Flashing,
+        Self::RandomFlicker,
+        Self::GentleTransition,
+        Self::WavePropagation,
+        Self::RedPulse,
+        Self::Off,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Éteint",
+            Self::Static => "Statique",
+            Self::Breathing => "Respiration",
+            Self::Flashing => "Flash",
+            Self::SpectrumCycle => "Cycle de spectre",
+            Self::Rainbow => "Arc-en-ciel",
+            Self::SpectrumCycleBreathing => "Respiration Arc-en-ciel",
+            Self::ChaseFade => "Comète (Fondu)",
+            Self::SpectrumCycleChaseFade => "Comète Arc-en-ciel",
+            Self::Chase => "Poursuite",
+            Self::SpectrumCycleChase => "Poursuite Arc-en-ciel",
+            Self::Wave => "Vague",
+            Self::ChaseRainbowPulse => "Pulsation Arc-en-ciel",
+            Self::RandomFlicker => "Scintillement",
+            Self::GentleTransition => "Transition douce",
+            Self::WavePropagation => "Propagation d'onde",
+            Self::RedPulse => "Pulsation ROG",
+            Self::Direct => "Direct (OpenGear Sync)",
+        }
+    }
+
+    pub fn uses_color(self) -> bool {
+        matches!(
+            self,
+            Self::Static | Self::Breathing | Self::Flashing | Self::ChaseFade | Self::Chase
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuraChannelKind {
+    /// Fixed motherboard onboard zones + 12V 4-pin RGB headers
+    MainboardFixed,
+    /// 5V 3-pin Addressable Gen2 RGB header
+    AddressableGen2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuraChannel {
+    pub index: usize,
+    pub name: String,
+    pub kind: AuraChannelKind,
+    pub effect_channel: u8,
+    pub direct_channel: u8,
+    /// Number of fixed LEDs reported by firmware (for Addressable headers, user can customize `led_count`).
+    pub default_led_count: usize,
+    pub led_count: usize,
+    pub rgb_headers_12v: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuraMainboardInfo {
+    pub vid: u16,
+    pub pid: u16,
+    pub product_name: String,
+    pub firmware_version: String,
+    pub config_table_hex: String,
+    pub mainboard_fixed_leds: u8,
+    pub rgb_12v_headers: u8,
+    pub argb_5v_headers: u8,
+    pub channels: Vec<AuraChannel>,
+}
+
+pub struct AuraMainboardController {
+    dev: HidDevice,
+    pub info: AuraMainboardInfo,
+    in_direct_mode: bool,
+}
+
+impl AuraMainboardController {
+    pub fn connect() -> Result<Self, AuraError> {
+        let api = HidApi::new()?;
+
+        // Prefer exact match on Usage Page 0xFF72 / Usage 0x00A1 (used by 0x19AF ROG B650-A),
+        // falling back to any known ASUS Aura motherboard PID on Usage Page 0xFF72.
+        let found = api
+            .device_list()
+            .find(|d| {
+                d.vendor_id() == ASUS_VID
+                    && AURA_MB_PIDS.contains(&d.product_id())
+                    && d.usage_page() == AURA_USAGE_PAGE
+                    && d.usage() == AURA_USAGE
+            })
+            .or_else(|| {
+                api.device_list().find(|d| {
+                    d.vendor_id() == ASUS_VID
+                        && AURA_MB_PIDS.contains(&d.product_id())
+                        && d.usage_page() == AURA_USAGE_PAGE
+                })
+            })
+            .ok_or(AuraError::DeviceNotFound)?;
+
+        let path: CString = found.path().to_owned();
+        let vid = found.vendor_id();
+        let pid = found.product_id();
+        let product_name = found
+            .product_string()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("ASUS AURA LED Controller")
+            .to_string();
+
+        let dev = api.open_path(&path)?;
+
+        let firmware_version = Self::read_firmware_version(&dev)?;
+        let config_table = Self::read_config_table(&dev)?;
+
+        let mainboard_fixed_leds = config_table[0x1B];
+        let mut rgb_12v_headers = config_table[0x1D];
+        let argb_5v_headers = config_table[0x02];
+        if mainboard_fixed_leds < rgb_12v_headers {
+            rgb_12v_headers = 0;
+        }
+
+        let mut channels = Vec::new();
+        let mut effect_channel: u8 = 0;
+        let argb_from_zero = firmware_version.starts_with("AULA3-AR32");
+
+        if mainboard_fixed_leds > 0 {
+            let mb_eff_ch = if argb_from_zero {
+                argb_5v_headers
+            } else {
+                let c = effect_channel;
+                effect_channel += 1;
+                c
+            };
+            channels.push(AuraChannel {
+                index: channels.len(),
+                name: "Carte mère (Zones intégrées & RGB 12V)".to_string(),
+                kind: AuraChannelKind::MainboardFixed,
+                effect_channel: mb_eff_ch,
+                direct_channel: 0x04,
+                default_led_count: mainboard_fixed_leds as usize,
+                led_count: mainboard_fixed_leds as usize,
+                rgb_headers_12v: rgb_12v_headers,
+            });
+        }
+
+        for i in 0..argb_5v_headers {
+            channels.push(AuraChannel {
+                index: channels.len(),
+                name: format!("Header ARGB Gen2 #{}", i + 1),
+                kind: AuraChannelKind::AddressableGen2,
+                effect_channel,
+                direct_channel: i,
+                default_led_count: 20,
+                led_count: 20,
+                rgb_headers_12v: 0,
+            });
+            effect_channel += 1;
+        }
+
+        let config_table_hex = config_table
+            .iter()
+            .take(36)
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let info = AuraMainboardInfo {
+            vid,
+            pid,
+            product_name,
+            firmware_version,
+            config_table_hex,
+            mainboard_fixed_leds,
+            rgb_12v_headers,
+            argb_5v_headers,
+            channels,
+        };
+
+        info!(
+            "ASUS AURA connecté ({:04X}:{:04X}) FW={} — {} LEDs CM, {} headers 12V RGB, {} headers 5V ARGB",
+            info.vid,
+            info.pid,
+            info.firmware_version,
+            info.mainboard_fixed_leds,
+            info.rgb_12v_headers,
+            info.argb_5v_headers
+        );
+
+        let mut ctrl = Self {
+            dev,
+            info,
+            in_direct_mode: false,
+        };
+        // Put ARGB Gen2 headers in Gen1 direct-addressable compatibility mode (matches OpenRGB SetGen1)
+        ctrl.set_gen1()?;
+        Ok(ctrl)
+    }
+
+    fn read_firmware_version(dev: &HidDevice) -> Result<String, AuraError> {
+        let mut buf = [0u8; PACKET_LEN];
+        buf[0] = REPORT_ID;
+        buf[1] = CMD_FIRMWARE;
+        dev.write(&buf)?;
+
+        let mut rx = [0u8; PACKET_LEN];
+        let n = dev.read_timeout(&mut rx, 250)?;
+        debug!("Aura FW RX ({n}B): {:02X?}", &rx[..n.min(20)]);
+        if n >= 18 && rx[1] == 0x02 {
+            let raw = &rx[2..18];
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            Ok(String::from_utf8_lossy(&raw[..end]).trim().to_string())
+        } else {
+            Ok("Unknown".to_string())
+        }
+    }
+
+    fn read_config_table(dev: &HidDevice) -> Result<[u8; 60], AuraError> {
+        let mut buf = [0u8; PACKET_LEN];
+        buf[0] = REPORT_ID;
+        buf[1] = CMD_CONFIG_TABLE;
+        dev.write(&buf)?;
+
+        let mut rx = [0u8; PACKET_LEN];
+        let n = dev.read_timeout(&mut rx, 250)?;
+        debug!("Aura Config RX ({n}B): {:02X?}", &rx[..n.min(24)]);
+        if n >= 64 && rx[1] == 0x30 {
+            let mut table = [0u8; 60];
+            table.copy_from_slice(&rx[4..64]);
+            Ok(table)
+        } else {
+            Err(AuraError::InvalidConfigTable)
+        }
+    }
+
+    /// Enable Gen1 addressing compatibility on ARGB headers (matches OpenRGB `SetGen1()`).
+    pub fn set_gen1(&mut self) -> Result<(), AuraError> {
+        let mut buf = [0u8; PACKET_LEN];
+        buf[0] = REPORT_ID;
+        buf[1] = 0x52;
+        buf[2] = 0x53;
+        buf[3] = 0x00;
+        buf[4] = 0x01;
+        self.dev.write(&buf)?;
+        Ok(())
+    }
+
+    pub fn set_channel_led_count(&mut self, channel_idx: usize, count: usize) {
+        if let Some(ch) = self.info.channels.get_mut(channel_idx) {
+            if ch.kind == AuraChannelKind::AddressableGen2 {
+                ch.led_count = count.clamp(1, 120);
+            }
+        }
+    }
+
+    fn send_effect_cmd(&self, effect_channel: u8, mode: AuraHwMode, shutdown_effect: bool) -> Result<(), AuraError> {
+        let mut buf = [0u8; PACKET_LEN];
+        buf[0] = REPORT_ID;
+        buf[1] = CMD_EFFECT;
+        buf[2] = effect_channel;
+        buf[3] = 0x00;
+        buf[4] = if shutdown_effect { 0x01 } else { 0x00 };
+        buf[5] = mode as u8;
+        self.dev.write(&buf)?;
+        Ok(())
+    }
+
+    fn send_effect_color(&self, start_led: usize, led_count: usize, color: Rgb, shutdown_effect: bool) -> Result<(), AuraError> {
+        if led_count == 0 || start_led + led_count > 16 {
+            return Ok(());
+        }
+        let mask: u16 = (((1u32 << led_count) - 1) << start_led) as u16;
+        let mut buf = [0u8; PACKET_LEN];
+        buf[0] = REPORT_ID;
+        buf[1] = CMD_EFFECT_COLOR;
+        buf[2] = (mask >> 8) as u8;
+        buf[3] = (mask & 0xFF) as u8;
+        buf[4] = if shutdown_effect { 0x01 } else { 0x00 };
+
+        for i in 0..led_count {
+            let off = 5 + 3 * (start_led + i);
+            if off + 2 < PACKET_LEN {
+                buf[off] = color.r;
+                buf[off + 1] = color.g;
+                buf[off + 2] = color.b;
+            }
+        }
+        self.dev.write(&buf)?;
+        Ok(())
+    }
+
+    /// Apply a built-in Aura hardware effect (e.g. Static, Breathing, Rainbow, Off) to a channel.
+    pub fn set_channel_hw_mode(
+        &mut self,
+        channel_idx: usize,
+        mode: AuraHwMode,
+        color: Rgb,
+        shutdown_effect: bool,
+    ) -> Result<(), AuraError> {
+        let ch = self
+            .info
+            .channels
+            .get(channel_idx)
+            .ok_or(AuraError::InvalidChannel(channel_idx))?
+            .clone();
+
+        self.send_effect_cmd(ch.effect_channel, mode, shutdown_effect)?;
+
+        if mode == AuraHwMode::Direct {
+            self.in_direct_mode = true;
+            return Ok(());
+        }
+        self.in_direct_mode = false;
+
+        // Compute LED offset for hardware color mask (matches OpenRGB AuraMainboardController::SetMode)
+        let mut start_led = 0usize;
+        for c in self.info.channels.iter().take(channel_idx) {
+            start_led += match c.kind {
+                AuraChannelKind::MainboardFixed => c.default_led_count,
+                AuraChannelKind::AddressableGen2 => 1,
+            };
+        }
+        let hw_led_count = match ch.kind {
+            AuraChannelKind::MainboardFixed => ch.default_led_count,
+            AuraChannelKind::AddressableGen2 => 1,
+        };
+        self.send_effect_color(start_led, hw_led_count, color, shutdown_effect)?;
+        Ok(())
+    }
+
+    /// Apply a hardware mode across ALL channels (mainboard + all ARGB headers).
+    pub fn set_all_hw_mode(
+        &mut self,
+        mode: AuraHwMode,
+        color: Rgb,
+        shutdown_effect: bool,
+    ) -> Result<(), AuraError> {
+        let count = self.info.channels.len();
+        for idx in 0..count {
+            self.set_channel_hw_mode(idx, mode, color, shutdown_effect)?;
+        }
+        Ok(())
+    }
+
+    /// Persist current hardware effect & shutdown effect into the motherboard's Aura flash memory.
+    pub fn commit(&mut self) -> Result<(), AuraError> {
+        let mut buf = [0u8; PACKET_LEN];
+        buf[0] = REPORT_ID;
+        buf[1] = CMD_COMMIT;
+        buf[2] = 0x55;
+        self.dev.write(&buf)?;
+        info!("Configuration ASUS AURA sauvegardée en mémoire flash (Commit 0x3F 0x55)");
+        Ok(())
+    }
+
+    /// Switch all channels into Direct mode for real-time per-LED streaming / Aura+Corsair Sync.
+    /// True while the controller is streaming software (Direct) colors instead of a hardware effect.
+    pub fn is_in_direct_mode(&self) -> bool {
+        self.in_direct_mode
+    }
+
+    pub fn enter_direct_mode(&mut self) -> Result<(), AuraError> {
+        if self.in_direct_mode {
+            return Ok(());
+        }
+        for i in 0..self.info.channels.len() {
+            let eff_ch = self.info.channels[i].effect_channel;
+            self.send_effect_cmd(eff_ch, AuraHwMode::Direct, false)?;
+        }
+        self.in_direct_mode = true;
+        Ok(())
+    }
+
+    /// Stream direct per-LED RGB colors to a specific channel (Mainboard or ARGB header).
+    pub fn send_channel_direct(&mut self, channel_idx: usize, colors: &[Rgb]) -> Result<(), AuraError> {
+        let ch = self
+            .info
+            .channels
+            .get(channel_idx)
+            .ok_or(AuraError::InvalidChannel(channel_idx))?
+            .clone();
+
+        if !self.in_direct_mode {
+            self.enter_direct_mode()?;
+        }
+
+        let total = colors.len();
+        if total == 0 {
+            return Ok(());
+        }
+
+        let mut command = ch.direct_channel;
+        let mut offset: usize = 0;
+        let mut configured: usize = 0;
+
+        while configured < total {
+            let remaining = total - configured;
+            let in_pkt = if remaining > LEDS_PER_PACKET {
+                LEDS_PER_PACKET
+            } else {
+                command |= DIRECT_APPLY_FLAG;
+                remaining
+            };
+
+            let mut buf = [0u8; PACKET_LEN];
+            buf[0] = REPORT_ID;
+            buf[1] = CMD_DIRECT;
+            buf[2] = command;
+            buf[3] = (offset & 0xFF) as u8;
+            buf[4] = in_pkt as u8;
+
+            for i in 0..in_pkt {
+                let c = colors[configured + i];
+                buf[5 + i * 3] = c.r;
+                buf[6 + i * 3] = c.g;
+                buf[7 + i * 3] = c.b;
+            }
+
+            self.dev.write(&buf)?;
+
+            configured += in_pkt;
+            offset += in_pkt;
+            if configured > 255 {
+                command |= DIRECT_OVERFLOW_FLAG;
+                offset = configured - 256;
+            }
+        }
+        Ok(())
+    }
+}

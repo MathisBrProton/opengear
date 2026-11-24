@@ -1,0 +1,461 @@
+use crate::proto::*;
+use hidapi::{HidApi, HidDevice};
+use std::ffi::CString;
+use std::time::Duration;
+use tracing::{debug, trace, warn};
+
+const READ_TIMEOUT_MS: i32 = 150;
+const SHORT_TIMEOUT_MS: i32 = 15;
+
+#[derive(Debug, Clone)]
+pub struct HidCapsInfo {
+    pub out_report_len: usize,
+    pub in_report_len: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct BragiHidCandidate {
+    pub vid: u16,
+    pub pid: u16,
+    pub product_name: String,
+    pub serial: String,
+    pub path: String,
+    pub path_cstr: CString,
+}
+
+/// Query exact Windows HID Input/Output report byte lengths so we match 65-byte vs 1025-byte firmwares.
+#[cfg(windows)]
+fn query_windows_hid_caps(path: &str) -> Option<HidCapsInfo> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Devices::HumanInterfaceDevice::{
+        HIDP_CAPS, HidD_FreePreparsedData, HidD_GetPreparsedData, HidP_GetCaps,
+    };
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            return None;
+        }
+        let mut preparsed = 0isize;
+        let ok = HidD_GetPreparsedData(handle, &mut preparsed);
+        if ok == 0 || preparsed == 0 {
+            CloseHandle(handle);
+            return None;
+        }
+        let mut caps: HIDP_CAPS = std::mem::zeroed();
+        let status = HidP_GetCaps(preparsed, &mut caps);
+        HidD_FreePreparsedData(preparsed);
+        CloseHandle(handle);
+
+        if status == 0x0011_0000 {
+            Some(HidCapsInfo {
+                out_report_len: caps.OutputReportByteLength as usize,
+                in_report_len: caps.InputReportByteLength as usize,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn query_windows_hid_caps(_path: &str) -> Option<HidCapsInfo> {
+    None
+}
+
+pub struct BragiTransport {
+    dev: HidDevice,
+    pub vid: u16,
+    pub pid: u16,
+    /// `0` = host / wired device (`0x08`); `1..=7` = wireless Slipstream subdevice (`0x08 | id`).
+    pub subdevice_id: u8,
+    pub product_name: String,
+    pub serial: String,
+    pub path: String,
+    /// Full HID write report length including Report ID byte 0 (usually 65 or 1025).
+    pub out_report_len: usize,
+    /// Full HID read report length including Report ID byte 0 (usually 65 or 1025).
+    pub in_report_len: usize,
+}
+
+impl BragiTransport {
+    /// Enumerate ALL Corsair Bragi command HID interfaces (`VID 1B1C`, `UsagePage 0xFF42`, `Usage 0x0001`).
+    pub fn enumerate_candidates() -> Result<Vec<BragiHidCandidate>, BragiError> {
+        let api = HidApi::new()?;
+        let mut out = Vec::new();
+        for d in api.device_list() {
+            if d.vendor_id() == CORSAIR_VID
+                && d.usage_page() == BRAGI_USAGE_PAGE
+                && d.usage() == BRAGI_USAGE_CMD
+            {
+                let path_cstr = d.path().to_owned();
+                let path = path_cstr.to_string_lossy().into_owned();
+                if out.iter().any(|c: &BragiHidCandidate| c.path == path) {
+                    continue;
+                }
+                out.push(BragiHidCandidate {
+                    vid: d.vendor_id(),
+                    pid: d.product_id(),
+                    product_name: d
+                        .product_string()
+                        .unwrap_or("Corsair Bragi Device")
+                        .to_string(),
+                    serial: d.serial_number().unwrap_or("").to_string(),
+                    path,
+                    path_cstr,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Open a specific Corsair Bragi candidate for a given subdevice slot (`0` = direct/wired, `1..=7` = Slipstream subdevice).
+    pub fn open_candidate(
+        cand: &BragiHidCandidate,
+        subdevice_id: u8,
+    ) -> Result<Self, BragiError> {
+        let api = HidApi::new()?;
+        let caps = query_windows_hid_caps(&cand.path);
+        let (out_report_len, in_report_len) = match caps {
+            Some(c) if c.out_report_len >= 65 => {
+                debug!(
+                    "Detected HID report lengths for {:04X}:{:04X}: out={}, in={}",
+                    cand.vid, cand.pid, c.out_report_len, c.in_report_len
+                );
+                (c.out_report_len, c.in_report_len.max(65))
+            }
+            _ => {
+                warn!("Could not query HIDP_CAPS, defaulting to 65-byte reports");
+                (65, 65)
+            }
+        };
+
+        let dev = api.open_path(&cand.path_cstr)?;
+
+        let mut transport = Self {
+            dev,
+            vid: cand.vid,
+            pid: cand.pid,
+            subdevice_id: subdevice_id & 0x07,
+            product_name: cand.product_name.clone(),
+            serial: cand.serial.clone(),
+            path: cand.path.clone(),
+            out_report_len,
+            in_report_len,
+        };
+        transport.drain_input();
+        Ok(transport)
+    }
+
+    /// Open the first Corsair Bragi command HID interface (optionally filtered by PID).
+    pub fn open_first(target_pid: Option<u16>) -> Result<Self, BragiError> {
+        let cands = Self::enumerate_candidates()?;
+        let chosen = cands
+            .into_iter()
+            .find(|c| target_pid.map_or(true, |p| c.pid == p))
+            .ok_or(BragiError::DeviceNotFound)?;
+        Self::open_candidate(&chosen, 0)
+    }
+
+    #[inline]
+    pub fn magic(&self) -> u8 {
+        BRAGI_MAGIC | (self.subdevice_id & 0x07)
+    }
+
+    /// Payload length excluding the Windows HID Report ID byte (e.g. 64 or 1024).
+    pub fn payload_len(&self) -> usize {
+        self.out_report_len.saturating_sub(1)
+    }
+
+    pub fn drain_input(&mut self) {
+        let mut buf = vec![0u8; self.in_report_len];
+        for _ in 0..8 {
+            match self.dev.read_timeout(&mut buf, 2) {
+                Ok(n) if n > 0 => continue,
+                _ => break,
+            }
+        }
+    }
+
+    /// Send a Bragi packet and read the matching response.
+    pub fn exchange(&mut self, payload: &[u8]) -> Result<Vec<u8>, BragiError> {
+        let mut tx = vec![0u8; self.out_report_len];
+        let copy_n = payload.len().min(self.payload_len());
+        tx[0] = 0x00; // Report ID 0
+        tx[1..1 + copy_n].copy_from_slice(&payload[..copy_n]);
+
+        trace!("TX ({} bytes): {:02X?}", tx.len(), &tx[..tx.len().min(16)]);
+        self.dev.write(&tx)?;
+
+        let expected_cmd = payload.get(1).copied().unwrap_or(0);
+        let mut rx = vec![0u8; self.in_report_len];
+
+        for _ in 0..4 {
+            let n = self.dev.read_timeout(&mut rx, READ_TIMEOUT_MS)?;
+            if n == 0 {
+                return Err(BragiError::Timeout);
+            }
+            trace!("RX ({} bytes): {:02X?}", n, &rx[..n.min(16)]);
+
+            if rx.len() >= 3 && rx[1] == expected_cmd {
+                return Ok(rx);
+            }
+            if rx.len() >= 4 && rx[0] == 0x00 && rx[2] == expected_cmd {
+                return Ok(rx[1..].to_vec());
+            }
+        }
+        Ok(rx)
+    }
+
+    /// Fire-and-forget write with short optional response read (used for high-speed RGB chunks).
+    pub fn write_chunk(&mut self, payload: &[u8], wait_reply: bool) -> Result<(), BragiError> {
+        let mut tx = vec![0u8; self.out_report_len];
+        let copy_n = payload.len().min(self.payload_len());
+        tx[0] = 0x00;
+        tx[1..1 + copy_n].copy_from_slice(&payload[..copy_n]);
+
+        self.dev.write(&tx)?;
+
+        if wait_reply {
+            let mut rx = vec![0u8; self.in_report_len];
+            let n = self.dev.read_timeout(&mut rx, SHORT_TIMEOUT_MS)?;
+            if n == 0 {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
+    pub fn get_property(&mut self, prop: u8) -> Result<u32, BragiError> {
+        self.get_property_ext(prop as u16)
+    }
+
+    pub fn get_property_ext(&mut self, prop: u16) -> Result<u32, BragiError> {
+        let p = prop.to_le_bytes();
+        let rx = self.exchange(&[self.magic(), CMD_GET, p[0], p[1]])?;
+        let err = rx[2];
+        if err == ERR_NOT_SUPPORTED {
+            return Err(BragiError::UnsupportedProperty(prop));
+        }
+        if err != ERR_OK {
+            return Err(BragiError::from_code(err));
+        }
+        let val = u32::from_le_bytes([
+            rx.get(3).copied().unwrap_or(0),
+            rx.get(4).copied().unwrap_or(0),
+            rx.get(5).copied().unwrap_or(0),
+            rx.get(6).copied().unwrap_or(0),
+        ]);
+        Ok(val)
+    }
+
+    pub fn set_property(&mut self, prop: u8, val: u16) -> Result<(), BragiError> {
+        self.set_property_ext(prop as u16, val as u32)
+    }
+
+    pub fn set_property_u32(&mut self, prop: u8, val: u32) -> Result<(), BragiError> {
+        self.set_property_ext(prop as u16, val)
+    }
+
+    pub fn set_property_ext(&mut self, prop: u16, val: u32) -> Result<(), BragiError> {
+        let p = prop.to_le_bytes();
+        let b = val.to_le_bytes();
+        let rx = self.exchange(&[self.magic(), CMD_SET, p[0], p[1], b[0], b[1], b[2], b[3]])?;
+        let err = rx[2];
+        if err == ERR_NOT_SUPPORTED {
+            return Err(BragiError::UnsupportedProperty(prop));
+        }
+        if err != ERR_OK {
+            return Err(BragiError::from_code(err));
+        }
+        Ok(())
+    }
+
+    pub fn open_handle(&mut self, handle: u8, resource: u16) -> Result<u8, BragiError> {
+        let lo = (resource & 0xFF) as u8;
+        let hi = (resource >> 8) as u8;
+        let rx = self.exchange(&[self.magic(), CMD_OPEN_HANDLE, handle, lo, hi])?;
+        let err = rx[2];
+        if err == ERR_FAILED_OR_OPEN {
+            let _ = self.close_handle(handle);
+            let rx2 = self.exchange(&[self.magic(), CMD_OPEN_HANDLE, handle, lo, hi])?;
+            return Ok(rx2[2]);
+        }
+        Ok(err)
+    }
+
+    pub fn close_handle(&mut self, handle: u8) -> Result<(), BragiError> {
+        let _ = self.exchange(&[self.magic(), CMD_CLOSE_HANDLE, 0x01, handle])?;
+        Ok(())
+    }
+
+    /// Write an arbitrary byte buffer to an opened Bragi handle using WRITE_DATA + CONTINUE_WRITE.
+    pub fn write_handle_data(&mut self, handle: u8, data: &[u8]) -> Result<(), BragiError> {
+        let max_payload = self.payload_len();
+        let data_len = data.len() as u32;
+        let len_bytes = data_len.to_le_bytes();
+
+        let first_hdr = 7usize;
+        let first_cap = max_payload.saturating_sub(first_hdr);
+        let first_chunk = data.len().min(first_cap);
+
+        let mut pkt = vec![0u8; max_payload];
+        pkt[0] = self.magic();
+        pkt[1] = CMD_WRITE_DATA;
+        pkt[2] = handle;
+        pkt[3..7].copy_from_slice(&len_bytes);
+        pkt[first_hdr..first_hdr + first_chunk].copy_from_slice(&data[..first_chunk]);
+
+        self.write_chunk(&pkt, true)?;
+
+        let mut offset = first_chunk;
+        let cont_hdr = 3usize;
+        let cont_cap = max_payload.saturating_sub(cont_hdr);
+        while offset < data.len() {
+            let take = (data.len() - offset).min(cont_cap);
+            let mut cont = vec![0u8; max_payload];
+            cont[0] = self.magic();
+            cont[1] = CMD_CONTINUE_WRITE;
+            cont[2] = handle;
+            cont[cont_hdr..cont_hdr + take].copy_from_slice(&data[offset..offset + take]);
+            self.write_chunk(&cont, false)?;
+            offset += take;
+        }
+        Ok(())
+    }
+
+    /// Send Bragi keepalive ping (every ~45s in Software mode).
+    pub fn send_keepalive(&mut self) -> Result<(), BragiError> {
+        let _ = self.exchange(&[self.magic(), CMD_KEEPALIVE])?;
+        Ok(())
+    }
+
+    /// Query the byte size of an opened Bragi file handle (`CMD_PROBE_HANDLE` / `DescribeBuffer = 0x09`).
+    /// Verified live on K70 RGB TKL: `[00, 09, err, flags, mode, size_u32_le[4], ...]`
+    pub fn describe_handle(&mut self, handle: u8) -> Result<usize, BragiError> {
+        let rx = self.exchange(&[self.magic(), CMD_PROBE_HANDLE, handle])?;
+        debug!("DescribeBuffer(h={handle}) RX: {:02X?}", &rx[..rx.len().min(16)]);
+        let err = rx[2];
+        if err != ERR_OK {
+            return Err(BragiError::from_code(err));
+        }
+        let sz = u32::from_le_bytes([
+            rx.get(5).copied().unwrap_or(0),
+            rx.get(6).copied().unwrap_or(0),
+            rx.get(7).copied().unwrap_or(0),
+            rx.get(8).copied().unwrap_or(0),
+        ]) as usize;
+        Ok(sz)
+    }
+
+    /// Read raw file contents from an opened handle (`CMD_READ_DATA` / `ReadBuffer = 0x08`).
+    pub fn read_handle_data(&mut self, handle: u8, expected_len: usize) -> Result<Vec<u8>, BragiError> {
+        let mut out = Vec::with_capacity(expected_len);
+        let max_iters = (expected_len / 32).max(1) + 8;
+        for iter in 0..max_iters {
+            if expected_len > 0 && out.len() >= expected_len {
+                break;
+            }
+            let rx = self.exchange(&[self.magic(), CMD_READ_DATA, handle])?;
+            if iter == 0 {
+                debug!("ReadBuffer(h={handle}) RX[0..24]: {:02X?}", &rx[..rx.len().min(24)]);
+            }
+            let err = rx[2];
+            if err != ERR_OK {
+                if out.is_empty() {
+                    return Err(BragiError::from_code(err));
+                }
+                break;
+            }
+            // Payload starts at rx[3..] (up to payload_len - 3 bytes per USB packet)
+            let max_chunk = self.in_report_len.saturating_sub(1).saturating_sub(3);
+            let avail = rx.len().saturating_sub(3).min(max_chunk);
+            if avail == 0 {
+                break;
+            }
+            let take = if expected_len > 0 {
+                (expected_len - out.len()).min(avail)
+            } else {
+                avail
+            };
+            out.extend_from_slice(&rx[3..3 + take]);
+            if expected_len == 0 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Open, describe, read, and cleanly close a Bragi onboard flash file by `FileId`.
+    pub fn read_file(&mut self, file_id: u16) -> Result<Vec<u8>, BragiError> {
+        let handle = 0x00u8;
+        let _ = self.close_handle(handle);
+        let code = self.open_handle(handle, file_id)?;
+        if code != ERR_OK {
+            return Err(BragiError::from_code(code));
+        }
+        let res = (|| -> Result<Vec<u8>, BragiError> {
+            let sz = self.describe_handle(handle)?;
+            if sz == 0 {
+                return Ok(Vec::new());
+            }
+            if sz > 65536 {
+                return Err(BragiError::Protocol(0x01, "Taille fichier Bragi anormale"));
+            }
+            self.read_handle_data(handle, sz)
+        })();
+        let _ = self.close_handle(handle);
+        res
+    }
+
+    /// Create a new free-use Bragi flash file (`0x6D60..=0x7FFF`) via `CMD_CREATE_FILE (0x0B)`.
+    pub fn create_file(&mut self, file_id: u16) -> Result<(), BragiError> {
+        let b = file_id.to_le_bytes();
+        let rx = self.exchange(&[self.magic(), CMD_CREATE_FILE, b[0], b[1]])?;
+        let err = rx[2];
+        if err != ERR_OK {
+            return Err(BragiError::from_code(err));
+        }
+        Ok(())
+    }
+
+    /// Remove a free-use Bragi flash file (`0x6D60..=0x7FFF`) via `CMD_REMOVE_FILE (0x0C)`.
+    pub fn remove_file(&mut self, file_id: u16) -> Result<(), BragiError> {
+        let b = file_id.to_le_bytes();
+        let rx = self.exchange(&[self.magic(), CMD_REMOVE_FILE, b[0], b[1]])?;
+        let err = rx[2];
+        if err != ERR_OK {
+            return Err(BragiError::from_code(err));
+        }
+        Ok(())
+    }
+
+    /// Write raw bytes to an existing Bragi flash file by `FileId` (with full open/write/close).
+    pub fn write_file(&mut self, file_id: u16, data: &[u8]) -> Result<(), BragiError> {
+        let handle = 0x00u8;
+        let _ = self.close_handle(handle);
+        let code = self.open_handle(handle, file_id)?;
+        if code != ERR_OK {
+            return Err(BragiError::from_code(code));
+        }
+        let res = self.write_handle_data(handle, data);
+        let _ = self.close_handle(handle);
+        res
+    }
+}

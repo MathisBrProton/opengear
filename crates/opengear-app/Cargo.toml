@@ -1,0 +1,26 @@
+[package]
+name = "opengear-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "opengear"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+flate2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tao.workspace = true
+wry.workspace = true
+windows-sys.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+opengear-core.workspace = true
+opengear-corsair.workspace = true
+opengear-asus.workspace = true
+opengear-logitech.workspace = true
+opengear-input.workspace = true

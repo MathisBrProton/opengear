@@ -1,0 +1,11 @@
+[package]
+name = "opengear-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+opengear-core.workspace = true
+windows-sys.workspace = true

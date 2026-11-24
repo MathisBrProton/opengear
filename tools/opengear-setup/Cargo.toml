@@ -1,0 +1,12 @@
+[workspace]
+
+[package]
+name = "opengear-setup"
+version = "0.6.0"
+edition = "2024"
+
+[build-dependencies]
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+
+[dependencies]
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
