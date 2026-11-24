@@ -1805,8 +1805,6 @@
 
   // ---- Opposing-keys tester: shows what Windows actually receives (after hardware / software SOCD) ----
   const SOCD_PADS = [["KeyA", "Gauche", "Q (AZERTY) / A (QWERTY)"], ["KeyD", "Droite", "D"], ["KeyW", "Avant", "Z (AZERTY) / W (QWERTY)"], ["KeyS", "Arrière", "S"]];
-  const heldCodes = new Set();
-  const keyLog = [];
   // Pads reflect what APPLICATIONS receive, as tracked by the keyboard hook (polled while visible).
   const PAD_LIVE_KEYS = { KeyA: "left", KeyD: "right", KeyW: "forward", KeyS: "back" };
   let socdLive = null;
@@ -1835,44 +1833,8 @@
       el.classList.toggle("on", on);
       el.setAttribute("aria-pressed", String(on));
     });
-    const logEl = document.getElementById("socd-keylog");
-    if (logEl) logEl.textContent = keyLog.join("\n") || "—";
-  }
-  function logKey(e, kind) {
-    if (e.repeat) return;
-    keyLog.unshift(`${kind === "down" ? "↓ appui   " : "↑ relâché "} code=${e.code || "(vide)"}  touche=${e.key}`);
-    keyLog.length = Math.min(keyLog.length, 8);
-  }
-  // Live engine counters while the tester is on screen (stops by itself when it is not).
-  let engineDebugBusy = false;
-  async function refreshEngineDebug() {
-    const el = document.getElementById("socd-engine");
-    if (!el || engineDebugBusy) return;
-    engineDebugBusy = true;
-    try {
-      const res = await rpc("input_debug", {});
-      const c = (res && res.counters) || {};
-      el.textContent = Object.entries(c)
-        .map(([k, v]) => (k === "evenements_recents" ? `\nÉvénements bruts vus par le hook (récent en haut) :\n${String(v).split(" ; ").join("\n") || "—"}` : `${k.padEnd(28)} ${v}`))
-        .join("\n");
-    } catch (e) {
-      el.textContent = `Indisponible : ${(e && e.message) || e}`;
-    } finally {
-      engineDebugBusy = false;
-    }
-  }
-  setInterval(() => { if (document.getElementById("socd-engine")) refreshEngineDebug(); }, 700);
-
-  let socdTesterBound = false;
-  function bindSocdTester() {
-    if (socdTesterBound) return;
-    socdTesterBound = true;
-    document.addEventListener("keydown", (e) => { logKey(e, "down"); if (SOCD_PADS.some(([c]) => c === e.code)) heldCodes.add(e.code); refreshSocdPads(); });
-    document.addEventListener("keyup", (e) => { logKey(e, "up"); heldCodes.delete(e.code); refreshSocdPads(); });
-    window.addEventListener("blur", () => { heldCodes.clear(); refreshSocdPads(); });
   }
   function socdTesterCard() {
-    bindSocdTester();
     return `
       <div class="card mb-16">
         <div class="card-head">
@@ -1886,13 +1848,6 @@
           ${SOCD_PADS.map(([code, label, hint]) => `<div class="socd-pad" data-socd-pad="${code}" aria-pressed="false"><strong>${label}</strong><span class="muted">${hint}</span></div>`).join("")}
         </div>
         <div id="socd-live-note" class="muted mt-16">Les frappes faites dans la fenêtre d'OpenGear elle-même ne passent pas par le moteur clavier : teste dans une autre fenêtre.</div>
-        <details class="mt-16">
-          <summary class="muted">Journal des touches reçues et état du moteur clavier (diagnostic)</summary>
-          <div class="grid-2" style="margin-top:8px">
-            <pre id="socd-keylog" class="mono" style="font-size:11px;white-space:pre-wrap">${esc(keyLog.join("\n") || "—")}</pre>
-            <pre id="socd-engine" class="mono" style="font-size:11px;white-space:pre-wrap">Chargement…</pre>
-          </div>
-        </details>
       </div>`;
   }
 
