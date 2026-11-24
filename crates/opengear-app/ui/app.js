@@ -1779,7 +1779,12 @@
   // ---- FlashTap (hardware SOCD inside Corsair keyboards) ----
   function flashtapCard() {
     const kbs = arr(S.corsair_devices).filter((d) => d.flashtap_supported);
-    if (!kbs.length) return "";
+    if (!kbs.length) {
+      const corsairKb = arr(S.corsair_devices).find((d) => d.kind === "Keyboard");
+      return corsairKb
+        ? `<div class="card mb-16"><div class="muted">FlashTap matériel non détecté sur ${esc(corsairKb.product_name)} : ce firmware n'expose pas de réglage FlashTap reconnu. Le Snap Tap logiciel ci-dessous reste disponible.</div></div>`
+        : "";
+    }
     return `
       <div class="card accent-purple mb-16">
         <div class="card-head">

@@ -94,6 +94,8 @@ pub struct CorsairDeviceInfo {
     pub flashtap_supported: bool,
     /// Current FlashTap (hardware SOCD) state, when the firmware exposes it as a 0/1 switch.
     pub flashtap_enabled: Option<bool>,
+    /// Raw answer to the FlashTap property probe (value or error), for diagnostics.
+    pub flashtap_probe: String,
     pub rapid_trigger_supported: bool,
     // Onboard Flash HWP profiles decoded from Bragi filesystem (0x000F -> 0xF11E -> 0x6C69)
     pub hwp_profiles: Vec<crate::hwp::HwpProfileInfo>,
@@ -226,10 +228,16 @@ impl CorsairDevice {
         let storage_total_kb = transport.get_property(PROP_TOTAL_STORAGE_SIZE).ok().map(|v| v / 1024);
         let storage_free_kb = transport.get_property(PROP_FREE_STORAGE_SIZE).ok().map(|v| v / 1024);
         // Only treat 0xF5 as FlashTap if it really behaves like an on/off switch.
-        let flashtap_enabled = transport
-            .get_property(PROP_FLASHTAP_ENABLED)
-            .ok()
-            .and_then(flashtap_state_from_raw);
+        let flashtap_raw = transport.get_property(PROP_FLASHTAP_ENABLED);
+        let flashtap_probe = match &flashtap_raw {
+            Ok(v) => format!("0x{v:X}"),
+            Err(e) => e.to_string(),
+        };
+        info!(
+            "{} : propriété FlashTap 0x{:02X} -> {}",
+            transport.product_name, PROP_FLASHTAP_ENABLED, flashtap_probe
+        );
+        let flashtap_enabled = flashtap_raw.ok().and_then(flashtap_state_from_raw);
         let flashtap_supported = flashtap_enabled.is_some();
         let rapid_trigger_supported = transport.get_property(PROP_RAPID_TRIGGER_ENABLED).is_ok();
 
@@ -371,6 +379,7 @@ impl CorsairDevice {
             storage_free_kb,
             flashtap_supported,
             flashtap_enabled,
+            flashtap_probe,
             rapid_trigger_supported,
             hwp_profiles: Vec::new(),
             mouse,

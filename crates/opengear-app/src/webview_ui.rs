@@ -1770,9 +1770,9 @@ impl BackendEngine {
         for d in &self.corsair_devices {
             let _ = writeln!(
                 r,
-                "Corsair {} ({:04X}:{:04X}, {}) FW {} | mode {:?} | report {} o",
+                "Corsair {} ({:04X}:{:04X}, {}) FW {} | mode {:?} | report {} o | FlashTap 0xF5 = {}",
                 d.info.product_name, d.info.vid, d.info.pid, d.info.kind.label(),
-                d.info.firmware_version, d.info.mode, d.info.out_report_len
+                d.info.firmware_version, d.info.mode, d.info.out_report_len, d.info.flashtap_probe
             );
         }
         for m in &self.logi_mice {

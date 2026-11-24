@@ -14,7 +14,7 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, SendInput,
+    KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -230,12 +230,16 @@ fn send_vk(vk: u16, down: bool) -> bool {
     if is_extended_vk(vk) {
         flags |= KEYEVENTF_EXTENDEDKEY;
     }
+    // Fill the hardware scan code too: apps that read physical keys (Chromium/WebView2 `code`,
+    // Raw Input / DirectInput games) ignore a key event whose scan code is 0 — a Snap Tap
+    // release or a remapped key would then never reach them.
+    let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
     let input = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: vk,
-                wScan: 0,
+                wScan: scan,
                 dwFlags: flags,
                 time: 0,
                 dwExtraInfo: OPENGEAR_INJECTED_TAG,
