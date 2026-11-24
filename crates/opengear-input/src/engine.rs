@@ -14,7 +14,8 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
-    GetKeyboardLayout, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyExW, SendInput,
+    GetKeyboardLayout, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyExW,
+    SendInput,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -173,6 +174,98 @@ fn sleep_unless_cancelled(total: Duration, generation: u32) -> bool {
 struct SocdPairRuntime {
     vk_a: u16,
     vk_b: u16,
+    /// Physical keys (scan codes) of the pair. Snap Tap is about physical positions
+    /// (left/right, forward/back): matching on scan codes works whatever the keyboard layout
+    /// and whatever virtual-key code Windows reports to the hook.
+    scan_a: u16,
+    scan_b: u16,
+}
+
+impl SocdPairRuntime {
+    /// Which side of the pair a key event belongs to: `Some(true)` = A, `Some(false)` = B.
+    /// Scan code first (physical position), virtual-key code as a fallback.
+    fn side_of(&self, vk: u16, scan: u16) -> Option<bool> {
+        if scan != 0 {
+            if scan == self.scan_a {
+                return Some(true);
+            }
+            if scan == self.scan_b {
+                return Some(false);
+            }
+        }
+        if vk == self.vk_a {
+            Some(true)
+        } else if vk == self.vk_b {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
+/// Physical scan code for a Snap Tap key name.
+///
+/// The Snap Tap presets always target the movement cluster (the WASD positions), named by
+/// their AZERTY (Q D Z S) or QWERTY (A D W S) letters: those map to fixed set-1 scan codes,
+/// independent of the layout Windows applies. Other keys use the active layout.
+pub(crate) fn scan_for_name(name: &str, vk: u16) -> u16 {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "Q" | "A" => 0x1E, // left
+        "D" => 0x20,       // right
+        "Z" | "W" => 0x11, // forward
+        "S" => 0x1F,       // back
+        _ => layout_scan(vk),
+    }
+}
+
+#[cfg(windows)]
+fn layout_scan(vk: u16) -> u16 {
+    scan_for_foreground_layout(vk)
+}
+
+#[cfg(not(windows))]
+fn layout_scan(_vk: u16) -> u16 {
+    0
+}
+
+/// Lock-free ring of the last raw keyboard events seen by the hook (diagnostics).
+/// Packed: vk (8 bits) | scan (12 bits) | injected (1) | pair match (1).
+const DBG_RING_LEN: usize = 12;
+static DBG_RING: [AtomicU32; DBG_RING_LEN] = [const { AtomicU32::new(0) }; DBG_RING_LEN];
+static DBG_RING_POS: AtomicU32 = AtomicU32::new(0);
+
+fn dbg_record_event(vk: u32, scan: u32, injected: bool, pair: bool, down: bool) {
+    let packed = (vk & 0xFF)
+        | ((scan & 0xFFF) << 8)
+        | (u32::from(injected) << 20)
+        | (u32::from(pair) << 21)
+        | (u32::from(down) << 22)
+        | (1 << 31);
+    let i = DBG_RING_POS.fetch_add(1, Ordering::Relaxed) as usize % DBG_RING_LEN;
+    DBG_RING[i].store(packed, Ordering::Relaxed);
+}
+
+/// Last raw events, newest first, human readable.
+fn dbg_recent_events() -> String {
+    let pos = DBG_RING_POS.load(Ordering::Relaxed) as usize;
+    (0..DBG_RING_LEN)
+        .filter_map(|k| {
+            let i = (pos + DBG_RING_LEN - 1 - k) % DBG_RING_LEN;
+            let v = DBG_RING[i].load(Ordering::Relaxed);
+            (v & (1 << 31) != 0).then(|| {
+                format!(
+                    "{} vk=0x{:02X}({}) sc=0x{:02X}{}{}",
+                    if v & (1 << 22) != 0 { "↓" } else { "↑" },
+                    v & 0xFF,
+                    vk_to_key_name((v & 0xFF) as u16).unwrap_or("?"),
+                    (v >> 8) & 0xFFF,
+                    if v & (1 << 20) != 0 { " injecté" } else { "" },
+                    if v & (1 << 21) != 0 { " PAIRE" } else { "" }
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ; ")
 }
 
 #[derive(Debug, Default, Clone)]
@@ -282,6 +375,39 @@ fn send_vk(vk: u16, down: bool) -> bool {
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: vk,
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: OPENGEAR_INJECTED_TAG,
+            },
+        },
+    };
+    let ok = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 1 };
+    if ok {
+        INJECTED_OK_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        INJECTED_FAILED_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    ok
+}
+
+/// Inject a Snap Tap key by its physical scan code (`KEYEVENTF_SCANCODE`): Windows derives the
+/// virtual key with the receiving window's layout, games reading scan codes see the right key.
+/// Falls back to the virtual key when no scan code is known.
+#[cfg(windows)]
+fn send_pair_key(scan: u16, vk: u16, down: bool) -> bool {
+    if scan == 0 {
+        return send_vk(vk, down);
+    }
+    let mut flags = KEYEVENTF_SCANCODE;
+    if !down {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: 0,
                 wScan: scan,
                 dwFlags: flags,
                 time: 0,
@@ -421,6 +547,13 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         DBG_HOOK_EVENTS.fetch_add(1, Ordering::Relaxed);
         DBG_LAST_VK.store(info.vkCode, Ordering::Relaxed);
         if is_injected {
+            dbg_record_event(
+                info.vkCode,
+                info.scanCode,
+                true,
+                false,
+                wparam == WM_KEYDOWN as usize || wparam == WM_SYSKEYDOWN as usize,
+            );
             DBG_INJECTED_SKIPPED.fetch_add(1, Ordering::Relaxed);
             if info.dwExtraInfo != OPENGEAR_INJECTED_TAG {
                 // Injected by ANOTHER program (macro tool, keyboard remapper...)
@@ -514,7 +647,10 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     }
 
                     // 5. SOCD / Snap Tap (Last-Input Priority) — automatically bypassed if suspended (e.g. cs2.exe)
-                    let pair_hit = rules.socd_pairs.iter().any(|p| p.vk_a == vk || p.vk_b == vk);
+                    //    Keys are matched by PHYSICAL position (scan code), VK as a fallback.
+                    let scan = info.scanCode as u16;
+                    let pair_hit = rules.socd_pairs.iter().any(|p| p.side_of(vk, scan).is_some());
+                    dbg_record_event(info.vkCode, info.scanCode, false, pair_hit, is_down);
                     if pair_hit {
                         DBG_SOCD_PAIR_KEYS.fetch_add(1, Ordering::Relaxed);
                         if !rules.socd_enabled {
@@ -524,14 +660,18 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                         }
                     }
                     if rules.socd_enabled && !SOCD_SUSPENDED.load(Ordering::Relaxed) {
-                        if let Some(pair) = rules
+                        if let Some((pair, is_a)) = rules
                             .socd_pairs
                             .iter()
-                            .find(|p| p.vk_a == vk || p.vk_b == vk)
+                            .find_map(|p| p.side_of(vk, scan).map(|side| (p, side)))
                         {
                             let key = (pair.vk_a, pair.vk_b);
-                            let is_a = vk == pair.vk_a;
+                            // The opposing key is re-injected by its physical scan code.
+                            let opp_scan = if is_a { pair.scan_b } else { pair.scan_a };
                             let opp_vk = if is_a { pair.vk_b } else { pair.vk_a };
+                            // Identify sides by the pair's own VKs, not by the VK the hook
+                            // reported (which may differ from the configured one).
+                            let self_vk = if is_a { pair.vk_a } else { pair.vk_b };
 
                             if let Ok(mut st) = state_store().try_lock() {
                                 let entry = st.pair_state.entry(key).or_insert((false, false, None));
@@ -546,11 +686,11 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                                     if !was_held {
                                         if entry.2 == Some(opp_vk) {
                                             // Release opposing key before letting new key pass
-                                            send_vk(opp_vk, false);
+                                            send_pair_key(opp_scan, opp_vk, false);
                                             SOCD_RESOLVED_COUNT.fetch_add(1, Ordering::Relaxed);
                                         }
-                                        entry.2 = Some(vk);
-                                    } else if entry.2 != Some(vk) {
+                                        entry.2 = Some(self_vk);
+                                    } else if entry.2 != Some(self_vk) {
                                         // Suppress OS auto-repeat of suppressed key while opponent owns priority
                                         return 1;
                                     }
@@ -561,7 +701,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                                         entry.1 = false;
                                     }
                                     let opp_held = if is_a { entry.1 } else { entry.0 };
-                                    if entry.2 == Some(vk) {
+                                    if entry.2 == Some(self_vk) {
                                         if opp_held {
                                             // Re-engage held opposing key immediately!
                                             entry.2 = Some(opp_vk);
@@ -574,7 +714,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                                                     lparam,
                                                 )
                                             };
-                                            send_vk(opp_vk, true);
+                                            send_pair_key(opp_scan, opp_vk, true);
                                             return res;
                                         } else {
                                             entry.2 = None;
@@ -729,9 +869,11 @@ impl InputEngine {
                         .iter()
                         .map(|p| {
                             format!(
-                                "{}+{}",
+                                "{}+{}(sc {:02X}/{:02X})",
                                 vk_to_key_name(p.vk_a).unwrap_or("?"),
-                                vk_to_key_name(p.vk_b).unwrap_or("?")
+                                vk_to_key_name(p.vk_b).unwrap_or("?"),
+                                p.scan_a,
+                                p.scan_b
                             )
                         })
                         .collect::<Vec<_>>()
@@ -760,6 +902,7 @@ impl InputEngine {
             ("snaptap_resolutions", c(&SOCD_RESOLVED_COUNT)),
             ("injections_ok", c(&INJECTED_OK_COUNT)),
             ("injections_refusees", c(&INJECTED_FAILED_COUNT)),
+            ("evenements_recents", dbg_recent_events()),
         ]
     }
 
@@ -797,7 +940,14 @@ impl InputEngine {
         for p in &socd.pairs {
             if let (Some(va), Some(vb)) = (key_name_to_vk(&p.key_a), key_name_to_vk(&p.key_b)) {
                 if va != vb {
-                    socd_pairs.push(SocdPairRuntime { vk_a: va, vk_b: vb });
+                    // Physical positions of the named keys in the user's active layout
+                    // (AZERTY "Q" = the key at scan 0x1E, QWERTY "A" = same physical key).
+                    socd_pairs.push(SocdPairRuntime {
+                        vk_a: va,
+                        vk_b: vb,
+                        scan_a: scan_for_name(&p.key_a, va),
+                        scan_b: scan_for_name(&p.key_b, vb),
+                    });
                 }
             }
         }
@@ -1046,6 +1196,24 @@ impl Drop for InputEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snap_tap_pairs_match_physical_keys_whatever_the_layout() {
+        // AZERTY preset "Q+D" and QWERTY preset "A+D" are the same physical keys.
+        assert_eq!(scan_for_name("Q", 0x51), 0x1E);
+        assert_eq!(scan_for_name("A", 0x41), 0x1E);
+        assert_eq!(scan_for_name("d", 0x44), 0x20);
+        assert_eq!(scan_for_name("Z", 0x5A), 0x11);
+        assert_eq!(scan_for_name("W", 0x57), 0x11);
+        let pair = SocdPairRuntime { vk_a: 0x51, vk_b: 0x44, scan_a: 0x1E, scan_b: 0x20 };
+        // Physical left key reported with an unexpected VK (e.g. 0x41) is still "A side"
+        assert_eq!(pair.side_of(0x41, 0x1E), Some(true));
+        assert_eq!(pair.side_of(0x00, 0x20), Some(false));
+        // VK fallback when no scan code
+        assert_eq!(pair.side_of(0x51, 0), Some(true));
+        // Unrelated key
+        assert_eq!(pair.side_of(0x45, 0x12), None);
+    }
 
     #[test]
     fn observed_scan_code_is_reused_with_its_extended_flag() {

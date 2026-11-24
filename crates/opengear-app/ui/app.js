@@ -1830,7 +1830,9 @@
     try {
       const res = await rpc("input_debug", {});
       const c = (res && res.counters) || {};
-      el.textContent = Object.entries(c).map(([k, v]) => `${k.padEnd(28)} ${v}`).join("\n");
+      el.textContent = Object.entries(c)
+        .map(([k, v]) => (k === "evenements_recents" ? `\nÉvénements bruts vus par le hook (récent en haut) :\n${String(v).split(" ; ").join("\n") || "—"}` : `${k.padEnd(28)} ${v}`))
+        .join("\n");
     } catch (e) {
       el.textContent = `Indisponible : ${(e && e.message) || e}`;
     } finally {
