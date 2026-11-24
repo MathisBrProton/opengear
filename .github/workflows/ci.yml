@@ -26,6 +26,9 @@ jobs:
         run: |
           rustup toolchain install 1.99.1 --profile minimal \
             --target x86_64-pc-windows-gnullvm --component clippy
+          # Self-contained MinGW import libraries (kernel32, msvcrt, unwind...) that rust-lld
+          # links against for the gnullvm target, as on the developer machine.
+          rustup component add rust-mingw --target x86_64-pc-windows-gnullvm --toolchain 1.99.1
           rustc --version
 
       - uses: Swatinem/rust-cache@v2
