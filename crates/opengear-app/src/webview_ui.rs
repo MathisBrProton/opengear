@@ -1797,15 +1797,13 @@ impl BackendEngine {
                 let _ = writeln!(r, "ASUS Aura : {}", self.asus_err.as_deref().unwrap_or("absent"));
             }
         }
-        let (socd_n, inj_ok, inj_fail) = self.input_engine.injection_stats();
-        let _ = writeln!(
-            r,
-            "Moteur clavier : actif={} | Snap Tap résolutions={} | injections OK={} refusées={}",
-            self.input_engine.is_running(),
-            socd_n,
-            inj_ok,
-            inj_fail
-        );
+        let counters: Vec<String> = self
+            .input_engine
+            .debug_counters()
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        let _ = writeln!(r, "Moteur clavier : {}", counters.join(" | "));
         let _ = writeln!(r, "\n--- Diagnostic ---");
         if let Some(checks) = self.diagnostics_json()["checks"].as_array() {
             for c in checks {
@@ -1891,6 +1889,15 @@ impl BackendEngine {
                 Ok(self.full_state_json())
             }
             "get_diagnostics" => Ok(self.diagnostics_json()),
+            "input_debug" => {
+                let counters: serde_json::Map<String, Value> = self
+                    .input_engine
+                    .debug_counters()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), json!(v)))
+                    .collect();
+                Ok(json!({ "counters": counters }))
+            }
             "get_diagnostic_report" => Ok(json!({ "text": self.diagnostic_report() })),
             "list_backups" => Ok(json!({ "backups": list_sector_backups() })),
             "logi_restore_backup" => {

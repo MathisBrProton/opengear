@@ -212,6 +212,17 @@ static SOCD_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static CHATTER_BLOCKED_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Diagnostics: Snap Tap resolutions performed, and key injections accepted / refused by Windows.
 static SOCD_RESOLVED_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Hook pipeline diagnostics (see `InputEngine::debug_counters`).
+static DBG_HOOK_EVENTS: AtomicU32 = AtomicU32::new(0);
+static DBG_INJECTED_SKIPPED: AtomicU32 = AtomicU32::new(0);
+static DBG_FOREIGN_INJECTED: AtomicU32 = AtomicU32::new(0);
+static DBG_RECORDER_BYPASS: AtomicU32 = AtomicU32::new(0);
+static DBG_RULES_BUSY: AtomicU32 = AtomicU32::new(0);
+static DBG_SOCD_PAIR_KEYS: AtomicU32 = AtomicU32::new(0);
+static DBG_SOCD_DISABLED: AtomicU32 = AtomicU32::new(0);
+static DBG_SOCD_SUSPENDED: AtomicU32 = AtomicU32::new(0);
+static DBG_SOCD_STATE_BUSY: AtomicU32 = AtomicU32::new(0);
+static DBG_LAST_VK: AtomicU32 = AtomicU32::new(0);
 static INJECTED_OK_COUNT: AtomicU32 = AtomicU32::new(0);
 static INJECTED_FAILED_COUNT: AtomicU32 = AtomicU32::new(0);
 static MOUSE_DBLCLICK_BLOCKED_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -407,6 +418,15 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         let info = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
         let is_injected =
             (info.flags & LLKHF_INJECTED) != 0 || info.dwExtraInfo == OPENGEAR_INJECTED_TAG;
+        DBG_HOOK_EVENTS.fetch_add(1, Ordering::Relaxed);
+        DBG_LAST_VK.store(info.vkCode, Ordering::Relaxed);
+        if is_injected {
+            DBG_INJECTED_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            if info.dwExtraInfo != OPENGEAR_INJECTED_TAG {
+                // Injected by ANOTHER program (macro tool, keyboard remapper...)
+                DBG_FOREIGN_INJECTED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
         if !is_injected {
             let vk = info.vkCode as u16;
@@ -464,6 +484,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                             rec.last_event = Some(now);
                         }
                         // While recording, don't execute conflicting remaps
+                        DBG_RECORDER_BYPASS.fetch_add(1, Ordering::Relaxed);
                         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
                     }
                 }
@@ -493,6 +514,15 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     }
 
                     // 5. SOCD / Snap Tap (Last-Input Priority) — automatically bypassed if suspended (e.g. cs2.exe)
+                    let pair_hit = rules.socd_pairs.iter().any(|p| p.vk_a == vk || p.vk_b == vk);
+                    if pair_hit {
+                        DBG_SOCD_PAIR_KEYS.fetch_add(1, Ordering::Relaxed);
+                        if !rules.socd_enabled {
+                            DBG_SOCD_DISABLED.fetch_add(1, Ordering::Relaxed);
+                        } else if SOCD_SUSPENDED.load(Ordering::Relaxed) {
+                            DBG_SOCD_SUSPENDED.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     if rules.socd_enabled && !SOCD_SUSPENDED.load(Ordering::Relaxed) {
                         if let Some(pair) = rules
                             .socd_pairs
@@ -551,6 +581,8 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                                         }
                                     }
                                 }
+                            } else {
+                                DBG_SOCD_STATE_BUSY.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -589,6 +621,8 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                             }
                         }
                     }
+                } else {
+                    DBG_RULES_BUSY.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -679,6 +713,54 @@ impl InputEngine {
                 st.pair_state.clear();
             }
         }
+    }
+
+    /// Step-by-step counters of the keyboard hook pipeline, plus the runtime SOCD rules, to tell
+    /// exactly why Snap Tap does or does not act (hook not called, keys seen as injected by another
+    /// program, rules not synced, suspended, state busy...).
+    pub fn debug_counters(&self) -> Vec<(&'static str, String)> {
+        let rules = rules_store().read().ok();
+        let (socd_on, pairs) = rules
+            .as_ref()
+            .map(|r| {
+                (
+                    r.socd_enabled,
+                    r.socd_pairs
+                        .iter()
+                        .map(|p| {
+                            format!(
+                                "{}+{}",
+                                vk_to_key_name(p.vk_a).unwrap_or("?"),
+                                vk_to_key_name(p.vk_b).unwrap_or("?")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            })
+            .unwrap_or((false, String::from("(règles illisibles)")));
+        let recording = recorder_store().lock().map(|r| r.recording).unwrap_or(false);
+        let c = |a: &AtomicU32| a.load(Ordering::Relaxed).to_string();
+        vec![
+            ("hook_actif", self.is_running().to_string()),
+            ("evenements_vus", c(&DBG_HOOK_EVENTS)),
+            ("injectes_ignores", c(&DBG_INJECTED_SKIPPED)),
+            ("injectes_par_autre_logiciel", c(&DBG_FOREIGN_INJECTED)),
+            ("derniere_touche_vk", format!("0x{:02X}", DBG_LAST_VK.load(Ordering::Relaxed))),
+            ("enregistreur_macro", recording.to_string()),
+            ("ignores_enregistreur", c(&DBG_RECORDER_BYPASS)),
+            ("regles_occupees", c(&DBG_RULES_BUSY)),
+            ("snaptap_regle_active", socd_on.to_string()),
+            ("snaptap_paires", pairs),
+            ("snaptap_en_pause", SOCD_SUSPENDED.load(Ordering::Relaxed).to_string()),
+            ("touches_de_paire_vues", c(&DBG_SOCD_PAIR_KEYS)),
+            ("paire_mais_desactive", c(&DBG_SOCD_DISABLED)),
+            ("paire_mais_en_pause", c(&DBG_SOCD_SUSPENDED)),
+            ("etat_occupe", c(&DBG_SOCD_STATE_BUSY)),
+            ("snaptap_resolutions", c(&SOCD_RESOLVED_COUNT)),
+            ("injections_ok", c(&INJECTED_OK_COUNT)),
+            ("injections_refusees", c(&INJECTED_FAILED_COUNT)),
+        ]
     }
 
     /// (Snap Tap resolutions, injections accepted, injections refused by Windows).

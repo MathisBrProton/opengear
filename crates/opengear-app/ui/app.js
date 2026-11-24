@@ -1821,6 +1821,24 @@
     keyLog.unshift(`${kind === "down" ? "↓ appui   " : "↑ relâché "} code=${e.code || "(vide)"}  touche=${e.key}`);
     keyLog.length = Math.min(keyLog.length, 8);
   }
+  // Live engine counters while the tester is on screen (stops by itself when it is not).
+  let engineDebugBusy = false;
+  async function refreshEngineDebug() {
+    const el = document.getElementById("socd-engine");
+    if (!el || engineDebugBusy) return;
+    engineDebugBusy = true;
+    try {
+      const res = await rpc("input_debug", {});
+      const c = (res && res.counters) || {};
+      el.textContent = Object.entries(c).map(([k, v]) => `${k.padEnd(28)} ${v}`).join("\n");
+    } catch (e) {
+      el.textContent = `Indisponible : ${(e && e.message) || e}`;
+    } finally {
+      engineDebugBusy = false;
+    }
+  }
+  setInterval(() => { if (document.getElementById("socd-engine")) refreshEngineDebug(); }, 700);
+
   let socdTesterBound = false;
   function bindSocdTester() {
     if (socdTesterBound) return;
@@ -1842,9 +1860,12 @@
         <div class="socd-pads" role="group" aria-label="Touches reçues par Windows">
           ${SOCD_PADS.map(([code, label, hint]) => `<div class="socd-pad ${heldCodes.has(code) ? "on" : ""}" data-socd-pad="${code}" aria-pressed="${heldCodes.has(code)}"><strong>${label}</strong><span class="muted">${hint}</span></div>`).join("")}
         </div>
-        <details class="mt-16">
-          <summary class="muted">Journal des touches reçues (diagnostic)</summary>
-          <pre id="socd-keylog" class="mono" style="margin-top:8px;font-size:11px;white-space:pre-wrap">${esc(keyLog.join("\n") || "—")}</pre>
+        <details class="mt-16" open>
+          <summary class="muted">Journal des touches reçues et état du moteur clavier (diagnostic)</summary>
+          <div class="grid-2" style="margin-top:8px">
+            <pre id="socd-keylog" class="mono" style="font-size:11px;white-space:pre-wrap">${esc(keyLog.join("\n") || "—")}</pre>
+            <pre id="socd-engine" class="mono" style="font-size:11px;white-space:pre-wrap">Chargement…</pre>
+          </div>
         </details>
       </div>`;
   }
