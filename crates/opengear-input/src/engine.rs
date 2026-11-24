@@ -14,11 +14,12 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput,
+    GetKeyboardLayout, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyExW, SendInput,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG,
+    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
+    HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG,
     MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
     TranslateMessage, UnhookWindowsHookEx,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
@@ -47,6 +48,10 @@ pub(crate) struct KeyTracker {
     held: [AtomicBool; 256],
     /// For a source key currently remapped: the target VK OpenGear pressed (0 = none).
     remapped_to: [AtomicU16; 256],
+    /// Last hardware scan code seen for each VK (bit 15 = extended key), 0 = never seen.
+    /// Re-injecting a key with the scan code the user's keyboard really produced keeps the
+    /// physical key identity right whatever the keyboard layout (AZERTY vs QWERTY...).
+    scan: [AtomicU16; 256],
 }
 
 impl KeyTracker {
@@ -54,7 +59,25 @@ impl KeyTracker {
         Self {
             held: [const { AtomicBool::new(false) }; 256],
             remapped_to: [const { AtomicU16::new(0) }; 256],
+            scan: [const { AtomicU16::new(0) }; 256],
         }
+    }
+
+    /// Remember the scan code a physical key event carried (`extended` = LLKHF_EXTENDED).
+    pub(crate) fn note_scan(&self, vk: u16, scan_code: u32, extended: bool) {
+        if let Some(i) = Self::slot(vk) {
+            let packed = (scan_code as u16 & 0x7FFF) | if extended { 0x8000 } else { 0 };
+            if scan_code != 0 {
+                self.scan[i].store(packed, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Scan code (without the extended bit) and extended flag last observed for `vk`.
+    pub(crate) fn observed_scan(&self, vk: u16) -> Option<(u16, bool)> {
+        let i = Self::slot(vk)?;
+        let packed = self.scan[i].load(Ordering::Relaxed);
+        (packed != 0).then_some((packed & 0x7FFF, packed & 0x8000 != 0))
     }
 
     fn slot(vk: u16) -> Option<usize> {
@@ -187,6 +210,10 @@ static REACTIVE_RIPPLES: OnceLock<Mutex<VecDeque<(String, Instant)>>> = OnceLock
 static HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SOCD_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static CHATTER_BLOCKED_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Diagnostics: Snap Tap resolutions performed, and key injections accepted / refused by Windows.
+static SOCD_RESOLVED_COUNT: AtomicU32 = AtomicU32::new(0);
+static INJECTED_OK_COUNT: AtomicU32 = AtomicU32::new(0);
+static INJECTED_FAILED_COUNT: AtomicU32 = AtomicU32::new(0);
 static MOUSE_DBLCLICK_BLOCKED_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn rules_store() -> &'static RwLock<RuntimeRules> {
@@ -227,13 +254,18 @@ fn is_extended_vk(vk: u16) -> bool {
 #[cfg(windows)]
 fn send_vk(vk: u16, down: bool) -> bool {
     let mut flags = if down { 0 } else { KEYEVENTF_KEYUP };
-    if is_extended_vk(vk) {
+    // Fill the hardware scan code too: apps that read physical keys (Chromium/WebView2 `code`,
+    // Raw Input / DirectInput games) identify a key by its scan code. Prefer the scan code the
+    // user's keyboard actually produced for this VK (always known for Snap Tap: the opposing key
+    // was physically pressed); otherwise translate with the FOREGROUND window's layout — the
+    // hook thread's own layout may differ (e.g. US on an AZERTY desktop) and give the wrong key.
+    let (scan, extended) = match KEYS.observed_scan(vk) {
+        Some(s) => s,
+        None => (scan_for_foreground_layout(vk), is_extended_vk(vk)),
+    };
+    if extended {
         flags |= KEYEVENTF_EXTENDEDKEY;
     }
-    // Fill the hardware scan code too: apps that read physical keys (Chromium/WebView2 `code`,
-    // Raw Input / DirectInput games) ignore a key event whose scan code is 0 — a Snap Tap
-    // release or a remapped key would then never reach them.
-    let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
     let input = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
@@ -246,7 +278,28 @@ fn send_vk(vk: u16, down: bool) -> bool {
             },
         },
     };
-    unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 1 }
+    let ok = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 1 };
+    if ok {
+        INJECTED_OK_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        INJECTED_FAILED_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    ok
+}
+
+/// VK -> scan code using the keyboard layout of the window that will receive the key.
+#[cfg(windows)]
+fn scan_for_foreground_layout(vk: u16) -> u16 {
+    unsafe {
+        let fg = GetForegroundWindow();
+        let tid = if fg.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(fg, std::ptr::null_mut())
+        };
+        let hkl = GetKeyboardLayout(tid);
+        MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, hkl) as u16
+    }
 }
 
 #[cfg(windows)]
@@ -363,6 +416,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             if is_down || is_up {
                 let now = Instant::now();
                 let is_repeat = KEYS.note_physical(vk, is_down);
+                KEYS.note_scan(vk, info.scanCode, (info.flags & LLKHF_EXTENDED) != 0);
 
                 // 0. Active remap: undo / repeat exactly what was pressed on key-down, whatever the
                 //    rules are now (they may have changed mid-press, or be write-locked right now).
@@ -463,6 +517,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                                         if entry.2 == Some(opp_vk) {
                                             // Release opposing key before letting new key pass
                                             send_vk(opp_vk, false);
+                                            SOCD_RESOLVED_COUNT.fetch_add(1, Ordering::Relaxed);
                                         }
                                         entry.2 = Some(vk);
                                     } else if entry.2 != Some(vk) {
@@ -624,6 +679,15 @@ impl InputEngine {
                 st.pair_state.clear();
             }
         }
+    }
+
+    /// (Snap Tap resolutions, injections accepted, injections refused by Windows).
+    pub fn injection_stats(&self) -> (u32, u32, u32) {
+        (
+            SOCD_RESOLVED_COUNT.load(Ordering::Relaxed),
+            INJECTED_OK_COUNT.load(Ordering::Relaxed),
+            INJECTED_FAILED_COUNT.load(Ordering::Relaxed),
+        )
     }
 
     pub fn stats(&self) -> (u32, u32) {
@@ -900,6 +964,20 @@ impl Drop for InputEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observed_scan_code_is_reused_with_its_extended_flag() {
+        let k = KeyTracker::new();
+        assert_eq!(k.observed_scan(0x51), None);
+        // AZERTY: VK_Q is produced by the physical key at scan 0x1E
+        k.note_scan(0x51, 0x1E, false);
+        assert_eq!(k.observed_scan(0x51), Some((0x1E, false)));
+        // A zero scan code never overwrites a real one
+        k.note_scan(0x51, 0, false);
+        assert_eq!(k.observed_scan(0x51), Some((0x1E, false)));
+        k.note_scan(0x25, 0x4B, true); // left arrow (extended)
+        assert_eq!(k.observed_scan(0x25), Some((0x4B, true)));
+    }
 
     #[test]
     fn auto_repeat_is_detected_only_while_held() {

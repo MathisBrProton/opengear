@@ -1797,6 +1797,15 @@ impl BackendEngine {
                 let _ = writeln!(r, "ASUS Aura : {}", self.asus_err.as_deref().unwrap_or("absent"));
             }
         }
+        let (socd_n, inj_ok, inj_fail) = self.input_engine.injection_stats();
+        let _ = writeln!(
+            r,
+            "Moteur clavier : actif={} | Snap Tap résolutions={} | injections OK={} refusées={}",
+            self.input_engine.is_running(),
+            socd_n,
+            inj_ok,
+            inj_fail
+        );
         let _ = writeln!(r, "\n--- Diagnostic ---");
         if let Some(checks) = self.diagnostics_json()["checks"].as_array() {
             for c in checks {

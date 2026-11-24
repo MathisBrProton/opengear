@@ -1806,19 +1806,27 @@
   // ---- Opposing-keys tester: shows what Windows actually receives (after hardware / software SOCD) ----
   const SOCD_PADS = [["KeyA", "Gauche", "Q (AZERTY) / A (QWERTY)"], ["KeyD", "Droite", "D"], ["KeyW", "Avant", "Z (AZERTY) / W (QWERTY)"], ["KeyS", "Arrière", "S"]];
   const heldCodes = new Set();
+  const keyLog = [];
   function refreshSocdPads() {
     document.querySelectorAll("[data-socd-pad]").forEach((el) => {
       const on = heldCodes.has(el.dataset.socdPad);
       el.classList.toggle("on", on);
       el.setAttribute("aria-pressed", String(on));
     });
+    const logEl = document.getElementById("socd-keylog");
+    if (logEl) logEl.textContent = keyLog.join("\n") || "—";
+  }
+  function logKey(e, kind) {
+    if (e.repeat) return;
+    keyLog.unshift(`${kind === "down" ? "↓ appui   " : "↑ relâché "} code=${e.code || "(vide)"}  touche=${e.key}`);
+    keyLog.length = Math.min(keyLog.length, 8);
   }
   let socdTesterBound = false;
   function bindSocdTester() {
     if (socdTesterBound) return;
     socdTesterBound = true;
-    document.addEventListener("keydown", (e) => { if (SOCD_PADS.some(([c]) => c === e.code)) { heldCodes.add(e.code); refreshSocdPads(); } });
-    document.addEventListener("keyup", (e) => { if (heldCodes.delete(e.code)) refreshSocdPads(); });
+    document.addEventListener("keydown", (e) => { logKey(e, "down"); if (SOCD_PADS.some(([c]) => c === e.code)) heldCodes.add(e.code); refreshSocdPads(); });
+    document.addEventListener("keyup", (e) => { logKey(e, "up"); heldCodes.delete(e.code); refreshSocdPads(); });
     window.addEventListener("blur", () => { heldCodes.clear(); refreshSocdPads(); });
   }
   function socdTesterCard() {
@@ -1834,6 +1842,10 @@
         <div class="socd-pads" role="group" aria-label="Touches reçues par Windows">
           ${SOCD_PADS.map(([code, label, hint]) => `<div class="socd-pad ${heldCodes.has(code) ? "on" : ""}" data-socd-pad="${code}" aria-pressed="${heldCodes.has(code)}"><strong>${label}</strong><span class="muted">${hint}</span></div>`).join("")}
         </div>
+        <details class="mt-16">
+          <summary class="muted">Journal des touches reçues (diagnostic)</summary>
+          <pre id="socd-keylog" class="mono" style="margin-top:8px;font-size:11px;white-space:pre-wrap">${esc(keyLog.join("\n") || "—")}</pre>
+        </details>
       </div>`;
   }
 
