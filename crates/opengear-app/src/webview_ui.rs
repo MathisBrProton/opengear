@@ -1889,6 +1889,22 @@ impl BackendEngine {
                 Ok(self.full_state_json())
             }
             "get_diagnostics" => Ok(self.diagnostics_json()),
+            // Live Snap Tap view: what applications receive for left / right / forward / back.
+            "input_socd_live" => {
+                let k = opengear_input::movement_keys_effective();
+                Ok(json!({
+                    "engine_running": self.input_engine.is_running(),
+                    "left": k[0], "right": k[1], "forward": k[2], "back": k[3],
+                }))
+            }
+            // Opens Notepad so the user can type OUTSIDE OpenGear: keystrokes typed in OpenGear's
+            // own window do not go through the keyboard engine (observed with the hook counters).
+            "open_test_window" => {
+                std::process::Command::new("notepad.exe")
+                    .spawn()
+                    .map_err(|e| format!("Impossible d'ouvrir le Bloc-notes : {e}"))?;
+                Ok(json!({ "message": "Bloc-notes ouvert : tapes-y Q puis D en gardant OpenGear visible" }))
+            }
             "input_debug" => {
                 let counters: serde_json::Map<String, Value> = self
                     .input_engine

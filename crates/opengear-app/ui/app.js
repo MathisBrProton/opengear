@@ -1807,9 +1807,31 @@
   const SOCD_PADS = [["KeyA", "Gauche", "Q (AZERTY) / A (QWERTY)"], ["KeyD", "Droite", "D"], ["KeyW", "Avant", "Z (AZERTY) / W (QWERTY)"], ["KeyS", "Arrière", "S"]];
   const heldCodes = new Set();
   const keyLog = [];
+  // Pads reflect what APPLICATIONS receive, as tracked by the keyboard hook (polled while visible).
+  const PAD_LIVE_KEYS = { KeyA: "left", KeyD: "right", KeyW: "forward", KeyS: "back" };
+  let socdLive = null;
+  let socdLiveBusy = false;
+  async function pollSocdLive() {
+    if (socdLiveBusy || !document.querySelector("[data-socd-pad]")) return;
+    socdLiveBusy = true;
+    try {
+      socdLive = await rpc("input_socd_live", {});
+      const note = document.getElementById("socd-live-note");
+      if (note && socdLive && socdLive.engine_running === false) {
+        note.textContent = "Moteur clavier arrêté : active « Moteur d'entrée actif » en haut de la page.";
+      }
+      refreshSocdPads();
+    } catch (_) {
+      socdLive = null;
+    } finally {
+      socdLiveBusy = false;
+    }
+  }
+  setInterval(pollSocdLive, 100);
+
   function refreshSocdPads() {
     document.querySelectorAll("[data-socd-pad]").forEach((el) => {
-      const on = heldCodes.has(el.dataset.socdPad);
+      const on = !!(socdLive && socdLive[PAD_LIVE_KEYS[el.dataset.socdPad]]);
       el.classList.toggle("on", on);
       el.setAttribute("aria-pressed", String(on));
     });
@@ -1856,13 +1878,15 @@
         <div class="card-head">
           <div>
             <h2 class="card-title">Testeur de touches opposées</h2>
-            <div class="card-desc">Maintiens la touche Gauche, puis appuie sur Droite sans relâcher. Avec FlashTap ou Snap Tap actif, <strong>seule la dernière touche doit rester allumée</strong> ; relâche-la et la première doit se rallumer.</div>
+            <div class="card-desc">Les pastilles montrent ce que <strong>tes jeux et applications reçoivent</strong>, vu par le moteur clavier. Ouvre le Bloc-notes de test, garde OpenGear visible à côté, puis tape <strong>dans le Bloc-notes</strong> : maintiens Gauche, appuie sur Droite. Avec le Snap Tap actif, seule la dernière doit rester allumée ; relâche-la et la première doit se rallumer.</div>
           </div>
+          <button type="button" class="btn btn-sm btn-primary" data-act="open-test-window">Ouvrir le Bloc-notes de test</button>
         </div>
-        <div class="socd-pads" role="group" aria-label="Touches reçues par Windows">
-          ${SOCD_PADS.map(([code, label, hint]) => `<div class="socd-pad ${heldCodes.has(code) ? "on" : ""}" data-socd-pad="${code}" aria-pressed="${heldCodes.has(code)}"><strong>${label}</strong><span class="muted">${hint}</span></div>`).join("")}
+        <div class="socd-pads" role="group" aria-label="Touches reçues par les applications">
+          ${SOCD_PADS.map(([code, label, hint]) => `<div class="socd-pad" data-socd-pad="${code}" aria-pressed="false"><strong>${label}</strong><span class="muted">${hint}</span></div>`).join("")}
         </div>
-        <details class="mt-16" open>
+        <div id="socd-live-note" class="muted mt-16">Les frappes faites dans la fenêtre d'OpenGear elle-même ne passent pas par le moteur clavier : teste dans une autre fenêtre.</div>
+        <details class="mt-16">
           <summary class="muted">Journal des touches reçues et état du moteur clavier (diagnostic)</summary>
           <div class="grid-2" style="margin-top:8px">
             <pre id="socd-keylog" class="mono" style="font-size:11px;white-space:pre-wrap">${esc(keyLog.join("\n") || "—")}</pre>
@@ -3185,6 +3209,7 @@
     // Système
     shortcuts: (el) => call("sys_create_shortcuts", {}, { btn: el }),
     "diag-refresh": () => loadDiagnostics(),
+    "open-test-window": (el) => call("open_test_window", {}, { btn: el, rerender: false }),
     "diag-report": async (el) => {
       el.disabled = true;
       try {

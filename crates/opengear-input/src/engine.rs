@@ -234,7 +234,26 @@ const DBG_RING_LEN: usize = 12;
 static DBG_RING: [AtomicU32; DBG_RING_LEN] = [const { AtomicU32::new(0) }; DBG_RING_LEN];
 static DBG_RING_POS: AtomicU32 = AtomicU32::new(0);
 
+/// Movement-cluster physical keys tracked for the live Snap Tap view: left, right, forward, back.
+pub const MOVEMENT_SCANS: [u16; 4] = [0x1E, 0x20, 0x11, 0x1F];
+/// Key state as delivered DOWNSTREAM to applications (after OpenGear's Snap Tap): updated from
+/// every event that leaves the hook chain at our level — physical ones we let through and the
+/// releases / presses Snap Tap injects.
+static EFFECTIVE_DOWN: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
+
+fn note_effective(scan: u32, down: bool) {
+    if let Some(i) = MOVEMENT_SCANS.iter().position(|&s| s as u32 == scan) {
+        EFFECTIVE_DOWN[i].store(down, Ordering::Relaxed);
+    }
+}
+
+/// What applications currently receive for [`MOVEMENT_SCANS`] (left, right, forward, back).
+pub fn movement_keys_effective() -> [bool; 4] {
+    [0, 1, 2, 3].map(|i| EFFECTIVE_DOWN[i].load(Ordering::Relaxed))
+}
+
 fn dbg_record_event(vk: u32, scan: u32, injected: bool, pair: bool, down: bool) {
+    note_effective(scan, down);
     let packed = (vk & 0xFF)
         | ((scan & 0xFFF) << 8)
         | (u32::from(injected) << 20)
@@ -1196,6 +1215,17 @@ impl Drop for InputEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_state_tracks_movement_keys_only() {
+        note_effective(0x1E, true);
+        note_effective(0x20, true);
+        note_effective(0x1E, false); // Snap Tap released "left"
+        note_effective(0x10, true); // unrelated key ignored
+        let k = movement_keys_effective();
+        assert!(!k[0] && k[1] && !k[2] && !k[3]);
+        note_effective(0x20, false);
+    }
 
     #[test]
     fn snap_tap_pairs_match_physical_keys_whatever_the_layout() {
