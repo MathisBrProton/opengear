@@ -2048,6 +2048,29 @@ impl BackendEngine {
                 dev.set_hw_winlock(on).map_err(|e| e.to_string())?;
                 Ok(self.full_state_json())
             }
+            "corsair_set_flashtap" => {
+                let on = p["enabled"].as_bool().ok_or("enabled manquant")?;
+                let dev = self.corsair_mut(p)?;
+                if !dev.info.flashtap_supported {
+                    return Err("Ce périphérique ne propose pas le FlashTap matériel".into());
+                }
+                dev.set_flashtap(on).map_err(|e| e.to_string())?;
+                // Hardware SOCD and the software SOCD hook must not both act on the same keys.
+                let mut msg = if on {
+                    "FlashTap matériel activé : le clavier gère lui-même la priorité des touches opposées".to_string()
+                } else {
+                    "FlashTap matériel désactivé".to_string()
+                };
+                if on && self.config.active_profile_mut().socd.enabled {
+                    self.config.active_profile_mut().socd.enabled = false;
+                    self.sync_input_rules();
+                    self.persist_config();
+                    msg.push_str(" — SOCD logiciel désactivé pour éviter un double traitement");
+                }
+                let mut st = self.full_state_json();
+                st["last_action_msg"] = json!(msg);
+                Ok(st)
+            }
             "corsair_set_winlock_shortcuts" => {
                 let mask = p["mask"].as_u64().unwrap_or(1) as u8;
                 let dev = self.corsair_mut(p)?;
@@ -2924,6 +2947,7 @@ impl BackendEngine {
             "storage_total_kb": i.storage_total_kb,
             "storage_free_kb": i.storage_free_kb,
             "flashtap_supported": i.flashtap_supported,
+            "flashtap_enabled": i.flashtap_enabled,
             "rapid_trigger_supported": i.rapid_trigger_supported,
             "hwp_profiles": hwp_profiles,
             "mouse": i.mouse,

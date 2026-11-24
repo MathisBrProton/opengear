@@ -461,3 +461,9 @@ input[type="range"].eq-vslider:focus-visible { outline: 2px solid var(--focus); 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+/* Opposing-keys (SOCD / FlashTap) tester */
+.socd-pads { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.socd-pad { display: flex; flex-direction: column; gap: 4px; padding: 14px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border-strong); background: var(--bg-elevated); transition: background 0.08s ease, border-color 0.08s ease, box-shadow 0.08s ease; }
+.socd-pad span { font-size: 11px; }
+.socd-pad.on { border-color: var(--cyan); background: rgba(0, 212, 255, 0.16); box-shadow: 0 0 0 1px var(--cyan) inset; }

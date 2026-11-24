@@ -1776,6 +1776,62 @@
       </div>`;
   }
 
+  // ---- FlashTap (hardware SOCD inside Corsair keyboards) ----
+  function flashtapCard() {
+    const kbs = arr(S.corsair_devices).filter((d) => d.flashtap_supported);
+    if (!kbs.length) return "";
+    return `
+      <div class="card accent-purple mb-16">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">FlashTap matériel <span class="pill amber">Expérimental</span></h2>
+            <div class="card-desc">La priorité entre touches opposées est gérée <strong>dans le clavier</strong> : rien n'est injecté dans Windows, donc invisible pour les anti-triche (contrairement au Snap Tap logiciel ci-dessous). Les touches concernées sont celles définies par le firmware du clavier.</div>
+          </div>
+        </div>
+        <div class="stack" style="gap:10px">
+          ${kbs.map((d) => `
+            <div class="row-between">
+              ${sw(!!d.flashtap_enabled, `${esc(d.product_name)} — FlashTap ${d.flashtap_enabled ? "actif" : "inactif"}`, "cs-flashtap", { dev: d.index })}
+            </div>`).join("")}
+          <div class="muted">Activer le FlashTap coupe automatiquement le Snap Tap logiciel. Vérifie le résultat avec le testeur juste en dessous.</div>
+        </div>
+      </div>`;
+  }
+
+  // ---- Opposing-keys tester: shows what Windows actually receives (after hardware / software SOCD) ----
+  const SOCD_PADS = [["KeyA", "Gauche", "Q (AZERTY) / A (QWERTY)"], ["KeyD", "Droite", "D"], ["KeyW", "Avant", "Z (AZERTY) / W (QWERTY)"], ["KeyS", "Arrière", "S"]];
+  const heldCodes = new Set();
+  function refreshSocdPads() {
+    document.querySelectorAll("[data-socd-pad]").forEach((el) => {
+      const on = heldCodes.has(el.dataset.socdPad);
+      el.classList.toggle("on", on);
+      el.setAttribute("aria-pressed", String(on));
+    });
+  }
+  let socdTesterBound = false;
+  function bindSocdTester() {
+    if (socdTesterBound) return;
+    socdTesterBound = true;
+    document.addEventListener("keydown", (e) => { if (SOCD_PADS.some(([c]) => c === e.code)) { heldCodes.add(e.code); refreshSocdPads(); } });
+    document.addEventListener("keyup", (e) => { if (heldCodes.delete(e.code)) refreshSocdPads(); });
+    window.addEventListener("blur", () => { heldCodes.clear(); refreshSocdPads(); });
+  }
+  function socdTesterCard() {
+    bindSocdTester();
+    return `
+      <div class="card mb-16">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">Testeur de touches opposées</h2>
+            <div class="card-desc">Maintiens la touche Gauche, puis appuie sur Droite sans relâcher. Avec FlashTap ou Snap Tap actif, <strong>seule la dernière touche doit rester allumée</strong> ; relâche-la et la première doit se rallumer.</div>
+          </div>
+        </div>
+        <div class="socd-pads" role="group" aria-label="Touches reçues par Windows">
+          ${SOCD_PADS.map(([code, label, hint]) => `<div class="socd-pad ${heldCodes.has(code) ? "on" : ""}" data-socd-pad="${code}" aria-pressed="${heldCodes.has(code)}"><strong>${label}</strong><span class="muted">${hint}</span></div>`).join("")}
+        </div>
+      </div>`;
+  }
+
   function inputEsports() {
     const prof = S.config.profile;
     const sp = S.system_prefs;
@@ -1786,6 +1842,8 @@
     const chatter = num(prof.key_chatter_ms);
     const mdeb = num(prof.mouse_debounce_ms);
     return `
+      ${flashtapCard()}
+      ${socdTesterCard()}
       <div class="grid-2">
         <div class="card accent-purple">
           <div class="card-head">
@@ -3174,6 +3232,7 @@
     "input-engine": (el) => call("input_set_enabled", { enabled: el.checked }, { ok: el.checked ? "Moteur d'entrée démarré" : "Moteur d'entrée arrêté" }),
     "input-winlock": (el) => call("input_set_winlock", { enabled: el.checked }, { ok: el.checked ? "Touche Windows bloquée" : "Touche Windows débloquée" }),
     azerty: (el) => call("set_azerty", { enabled: el.checked }, { ok: el.checked ? "Disposition AZERTY" : "Disposition QWERTY" }),
+    "cs-flashtap": (el) => call("corsair_set_flashtap", { device_index: Number(el.dataset.dev), enabled: el.checked }),
     "socd-en": (el) => call("input_set_esports", { socd_enabled: el.checked }, { ok: el.checked ? "Snap Tap activé" : "Snap Tap désactivé" }),
     "socd-preset": (el) => call("input_set_esports", { socd_preset: el.value }, { ok: "Touches Snap Tap mises à jour" }),
     "es-chatter": (el) => call("input_set_esports", { key_chatter_ms: Number(el.value) }, { ok: `Anti-rebond clavier : ${LABEL_FMT.ms(el.value)}` }),
