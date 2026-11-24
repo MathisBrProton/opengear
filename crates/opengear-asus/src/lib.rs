@@ -28,6 +28,7 @@ pub use superio::{
 pub use power::{PowerPlan, list_power_plans, set_active_power_plan};
 pub use ram_rgb::{
     EneRamMode, EneRamModule, PhysicalDimmInfo, RamRgbStatus, apply_ram_rgb, probe_ram_rgb,
+    set_ram_modes_only,
     read_physical_dimms,
 };
 pub use sensors::{FanRpmReading, HardwareSensorsSnapshot, read_hardware_sensors};

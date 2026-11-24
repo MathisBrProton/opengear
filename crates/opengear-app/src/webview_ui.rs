@@ -20,7 +20,8 @@ use opengear_asus::{
     install_official_pawnio, is_elevated, list_power_plans, pawnio_availability,
     probe_asus_wmi_cooling, probe_ram_rgb, read_asus_wmi_channel,
     read_hardware_sensors, read_superio_snapshot, relaunch_as_admin, restore_all_superio_fans_auto,
-    restore_superio_fan_auto, saved_superio_states, set_active_power_plan, set_superio_fan_pwm,
+    restore_superio_fan_auto, saved_superio_states, set_active_power_plan, set_ram_modes_only,
+    set_superio_fan_pwm,
 };
 use crate::fan_watchdog;
 use opengear_core::{
@@ -422,6 +423,24 @@ struct BackendEngine {
     blackout_applied: bool,
     /// Last low-battery level notified per device (15 or 5), reset when charging.
     battery_alerted: std::collections::HashMap<String, u8>,
+    /// RAM modules switched off by a blackout: (SMBus address, mode to restore).
+    ram_restore_modes: Option<Vec<(u8, u8)>>,
+}
+
+/// Highest LED count an ASUS ARGB Gen2 header accepts (see `set_channel_led_count`).
+const ARGB_MAX_LEDS: usize = 120;
+
+/// Vendor IDs whose set of HID interfaces differs between two signatures (sorted, unique).
+pub(crate) fn changed_vendors(old: &[(u16, u16, u16)], new: &[(u16, u16, u16)]) -> Vec<u16> {
+    let mut v: Vec<u16> = old
+        .iter()
+        .filter(|e| !new.contains(e))
+        .chain(new.iter().filter(|e| !old.contains(e)))
+        .map(|e| e.0)
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 /// Low-battery notification state machine. Returns `(new_last_alerted, level_to_notify)`:
@@ -605,6 +624,7 @@ impl BackendEngine {
             blackout_idle: false,
             blackout_applied: false,
             battery_alerted: std::collections::HashMap::new(),
+            ram_restore_modes: None,
         };
         eng.manual_profile_name = eng.config.active_profile.clone();
         eng.sync_input_rules();
@@ -1250,11 +1270,41 @@ impl BackendEngine {
         if sig == self.last_hid_sig {
             return false;
         }
-        info!("Changement USB/HID détecté — reconnexion Plug & Play automatique…");
+        let vendors = changed_vendors(&self.last_hid_sig, &sig);
+        info!("Changement USB/HID détecté ({vendors:04X?}) — reconnexion ciblée…");
         self.last_hid_sig = sig;
-        self.reconnect_all();
+        self.reconnect_vendors(&vendors);
         self.reapply_runtime_state();
         true
+    }
+
+    /// Reconnect only the brands whose USB devices changed. Unlike `reconnect_all`, this skips
+    /// the slow system probes (WMI fan interface, power plans) that a USB event cannot affect,
+    /// and leaves untouched brands connected.
+    fn reconnect_vendors(&mut self, vendors: &[u16]) {
+        if vendors.contains(&0x1B1C) {
+            self.corsair_devices.clear();
+            self.corsair_devices = CorsairDevice::connect_all();
+        }
+        if vendors.contains(&0x046D) {
+            self.logi_mice.clear();
+            self.logi_keyboards.clear();
+            self.logi_headsets.clear();
+            self.logi_mice = LogitechMouse::connect_all();
+            self.logi_keyboards = LogitechKeyboard::connect_all();
+            self.logi_headsets = LogitechHeadset::connect_all();
+        }
+        if vendors.contains(&0x0B05) {
+            self.asus_aura = None;
+            match AuraMainboardController::connect() {
+                Ok(a) => {
+                    self.asus_aura = Some(a);
+                    self.asus_err = None;
+                }
+                Err(e) => self.asus_err = Some(e.to_string()),
+            }
+        }
+        self.scanned_devices = scan_hid_devices(false).unwrap_or_default();
     }
 
     fn profile_needs_input_engine(&mut self) -> bool {
@@ -1293,7 +1343,8 @@ impl BackendEngine {
         }
     }
 
-    /// One black frame on every software-controllable light (Corsair keyboards, ASUS Aura).
+    /// One black frame on every software-controllable light (Corsair keyboards, ASUS Aura), and
+    /// the first time, RAM lighting switched off (mode only: colors are kept for the restore).
     fn push_blackout_frame(&mut self) {
         for dev in &mut self.corsair_devices {
             if dev.info.kind == CorsairDeviceKind::Keyboard {
@@ -1302,15 +1353,77 @@ impl BackendEngine {
         }
         if let Some(aura) = self.asus_aura.as_mut() {
             let _ = aura.enter_direct_mode();
-            let counts: Vec<usize> = aura.info.channels.iter().map(|c| c.led_count).collect();
+            // ARGB strips may be longer than the configured LED count (default 20, e.g. a Lian Li
+            // O11 case strip): black out the whole addressable range so nothing stays lit.
+            let counts: Vec<usize> = aura
+                .info
+                .channels
+                .iter()
+                .map(|c| match c.kind {
+                    AuraChannelKind::AddressableGen2 => c.led_count.max(ARGB_MAX_LEDS),
+                    _ => c.led_count,
+                })
+                .collect();
             for (ch, n) in counts.into_iter().enumerate() {
                 let _ = aura.send_channel_direct(ch, &vec![Rgb::BLACK; n]);
             }
         }
         if !self.blackout_applied {
+            self.ram_blackout();
             info!("Éclairage coupé (session verrouillée ou inactivité)");
         }
         self.blackout_applied = true;
+    }
+
+    /// Switch RAM lighting off, remembering each module's mode so `ram_restore` brings back the
+    /// exact previous effect (colors live in separate registers and are not touched).
+    fn ram_blackout(&mut self) {
+        if self.ram_restore_modes.is_some() || self.ram_rgb.ene_modules.is_empty() || !is_elevated() {
+            return;
+        }
+        // `current_mode` is read from the module at scan time and updated on every RAM change
+        // made through OpenGear, so it is the effect actually running right now.
+        let restore: Vec<(u8, u8)> = self
+            .ram_rgb
+            .ene_modules
+            .iter()
+            .map(|m| (m.address_7bit, m.current_mode))
+            .filter(|&(_, mode)| mode != EneRamMode::Off as u8)
+            .collect();
+        if restore.is_empty() {
+            return; // already off
+        }
+        let targets: Vec<(&opengear_asus::EneRamModule, u8)> = self
+            .ram_rgb
+            .ene_modules
+            .iter()
+            .filter(|m| restore.iter().any(|(a, _)| *a == m.address_7bit))
+            .map(|m| (m, EneRamMode::Off as u8))
+            .collect();
+        match set_ram_modes_only(&targets) {
+            Ok(n) if n > 0 => self.ram_restore_modes = Some(restore),
+            Ok(_) => {}
+            Err(e) => error!("Extinction RAM impossible : {e}"),
+        }
+    }
+
+    fn ram_restore(&mut self) {
+        let Some(restore) = self.ram_restore_modes.take() else {
+            return;
+        };
+        let targets: Vec<(&opengear_asus::EneRamModule, u8)> = restore
+            .iter()
+            .filter_map(|(addr, mode)| {
+                self.ram_rgb
+                    .ene_modules
+                    .iter()
+                    .find(|m| m.address_7bit == *addr)
+                    .map(|m| (m, *mode))
+            })
+            .collect();
+        if let Err(e) = set_ram_modes_only(&targets) {
+            error!("Rallumage RAM impossible : {e}");
+        }
     }
 
     /// Give the lights back: live effects resume by themselves; hardware effects are re-enabled.
@@ -1333,6 +1446,7 @@ impl BackendEngine {
                 let _ = aura.set_all_hw_mode(self.aura_hw_mode, self.aura_hw_color, false);
             }
         }
+        self.ram_restore();
         self.blackout_applied = false;
         info!("Éclairage rétabli");
     }
@@ -2118,6 +2232,13 @@ impl BackendEngine {
                 self.ram_rgb.last_mode = mode.id().to_string();
                 self.ram_rgb.last_color = color.to_hex();
                 self.ram_rgb.last_speed = speed;
+                // Keep the per-module mode in sync with what the hardware now runs
+                // (used to restore the exact effect after a lights-off).
+                for m in self.ram_rgb.ene_modules.iter_mut() {
+                    if target_addr.map_or(true, |a| a == m.address_7bit) {
+                        m.current_mode = mode as u8;
+                    }
+                }
                 Ok(self.full_state_json())
             }
             // ================= LOGITECH G MULTI-DEVICE (MICE + KEYBOARDS + HEADSETS) =================
@@ -3370,5 +3491,21 @@ mod tests {
             assert!(!masked.contains(&home));
             assert!(masked.contains("%USERPROFILE%"));
         }
+    }
+}
+
+#[cfg(test)]
+mod hotplug_tests {
+    use super::changed_vendors;
+
+    #[test]
+    fn only_the_brand_that_changed_is_reconnected() {
+        let before = [(0x046D, 0xC547, 0xFF00), (0x0B05, 0x19AF, 0xFF72), (0x1B1C, 0x1B73, 0xFF42)];
+        // Logitech receiver unplugged
+        let after = [(0x0B05, 0x19AF, 0xFF72), (0x1B1C, 0x1B73, 0xFF42)];
+        assert_eq!(changed_vendors(&before, &after), vec![0x046D]);
+        // Corsair keyboard plugged back
+        assert_eq!(changed_vendors(&after[..1], &after), vec![0x1B1C]);
+        assert!(changed_vendors(&before, &before).is_empty());
     }
 }
