@@ -14,22 +14,22 @@ jobs:
     name: Build, test & lint (Windows)
     runs-on: windows-latest
     env:
-      # rust-toolchain.toml pins a host-qualified channel (1.99.1-x86_64-pc-windows-gnu) for local
-      # builds without MSVC; recent rustup rejects that form, so CI uses the same Rust version on
-      # the runner's default (MSVC) host. The build target stays x86_64-pc-windows-gnullvm.
-      RUSTUP_TOOLCHAIN: "1.99.1"
+      # Same toolchain as the developer machine (GNU host, no MSVC needed). Recent rustup rejects
+      # this host-qualified name inside rust-toolchain.toml, but accepts it as an explicit override.
+      RUSTUP_TOOLCHAIN: "1.99.1-x86_64-pc-windows-gnu"
     steps:
       - uses: actions/checkout@v4
 
       - name: Install toolchain
         shell: bash
         run: |
-          rustup toolchain install 1.99.1 --profile minimal \
+          rustup toolchain install 1.99.1-x86_64-pc-windows-gnu --profile minimal \
             --target x86_64-pc-windows-gnullvm --component clippy
-          # Self-contained MinGW import libraries (kernel32, msvcrt, unwind...) that rust-lld
-          # links against for the gnullvm target, as on the developer machine.
-          rustup component add rust-mingw --target x86_64-pc-windows-gnullvm --toolchain 1.99.1
-          rustc --version
+          # Self-contained MinGW import libraries (kernel32, msvcrt, unwind...) that rust-lld links
+          # against for the gnullvm target. Only offered by GNU-host toolchains.
+          rustup component add rust-mingw --target x86_64-pc-windows-gnullvm \
+            --toolchain 1.99.1-x86_64-pc-windows-gnu
+          rustc --version --verbose
 
       - uses: Swatinem/rust-cache@v2
 
