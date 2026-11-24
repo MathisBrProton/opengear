@@ -153,7 +153,17 @@ pub struct AppConfig {
     pub start_minimized: bool,
     #[serde(default = "default_true")]
     pub auto_profile_switch: bool,
+    /// Interface mode: "simple" (risky / advanced settings hidden) or "expert".
+    #[serde(default = "default_ui_mode")]
+    pub ui_mode: String,
+    /// First-run assistant completed (or skipped).
+    #[serde(default)]
+    pub onboarding_done: bool,
     pub profiles: Vec<KeyboardProfile>,
+}
+
+fn default_ui_mode() -> String {
+    "simple".to_string()
 }
 
 impl Default for AppConfig {
@@ -164,6 +174,8 @@ impl Default for AppConfig {
             minimize_to_tray: true,
             start_minimized: false,
             auto_profile_switch: true,
+            ui_mode: default_ui_mode(),
+            onboarding_done: false,
             profiles: vec![KeyboardProfile::default()],
         }
     }

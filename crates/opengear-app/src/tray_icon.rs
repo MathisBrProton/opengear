@@ -798,7 +798,7 @@ pub fn install_to_windows() -> Result<()> {
         if rc == 0 && !hkey.is_null() {
             let entries = [
                 ("DisplayName", "OpenGear — Command Center".to_string()),
-                ("DisplayVersion", "0.8.0".to_string()),
+                ("DisplayVersion", env!("CARGO_PKG_VERSION").to_string()),
                 ("Publisher", "OpenGear".to_string()),
                 ("InstallLocation", install_dir.display().to_string()),
                 ("DisplayIcon", dst_ico.display().to_string()),

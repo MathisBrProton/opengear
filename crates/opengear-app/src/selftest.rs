@@ -290,6 +290,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs real hardware (audio endpoint, HID, WMI); run with `cargo test -- --ignored`"]
     fn test_live_non_admin_hardware_selftest() {
         let rep = run_full_selftest();
         assert!(!rep.checks.is_empty());

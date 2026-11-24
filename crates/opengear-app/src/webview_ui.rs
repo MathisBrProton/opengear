@@ -14,11 +14,13 @@ use opengear_asus::{
     AsusWmiCoolingStatus, AuraChannelKind, AuraHwMode, AuraMainboardController, CurvePoint,
     EneRamMode, FanChannelConfig, FanHeaderKind, FanPolicyMode, FanTempSource,
     HardwareSensorsSnapshot, PowerPlan, RamRgbStatus, SuperIoSnapshot, SystemTelemetry,
-    TelemetryCollector, apply_asus_wmi_curve, apply_ram_rgb, install_official_pawnio,
-    list_power_plans, probe_asus_wmi_cooling, probe_ram_rgb, read_asus_wmi_channel,
+    PawnIoAvailability, TelemetryCollector, apply_asus_wmi_curve, apply_ram_rgb,
+    install_official_pawnio, is_elevated, list_power_plans, pawnio_availability,
+    probe_asus_wmi_cooling, probe_ram_rgb, read_asus_wmi_channel,
     read_hardware_sensors, read_superio_snapshot, relaunch_as_admin, restore_all_superio_fans_auto,
-    restore_superio_fan_auto, set_active_power_plan, set_superio_fan_pwm,
+    restore_superio_fan_auto, saved_superio_states, set_active_power_plan, set_superio_fan_pwm,
 };
+use crate::fan_watchdog;
 use opengear_core::{
     AppConfig, DetectedDevice, EffectKind, KeyAction, KeyboardProfile, MacroStep, OperatingMode,
     PollingRate, Rgb, SocdPair, scan_hid_devices,
@@ -34,6 +36,7 @@ use opengear_input::{ALL_BINDABLE_KEYS, InputEngine};
 use opengear_logitech::{
     BatteryPowerModel, EQ_PRESETS, KeyboardRgbMode, LodLevel, LogitechHeadset, LogitechKeyboard,
     LogitechMouse, MouseButtonAction, MouseLedMode, OnboardMacroStep, OnboardMode,
+    backup_path_for, list_sector_backups,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -148,6 +151,10 @@ pub fn run_gui(cli_minimized: bool) -> Result<()> {
         info!("OpenGear est déjà en cours d'exécution — réveil de la fenêtre existante.");
         return Ok(());
     }
+
+    // We hold the single-instance lock: any fan override marker left behind belongs to a dead
+    // session (crash / forced kill) and must be handed back to the BIOS now.
+    fan_watchdog::recover_stale_marker();
 
     let _ = ensure_ico_beside_exe();
     let initial_cfg = AppConfig::load(&AppConfig::default_config_path()).unwrap_or_default();
@@ -387,7 +394,69 @@ struct BackendEngine {
     smart_fan_ref_temp: [f32; 5],
     superio: SuperIoSnapshot,
     last_selftest: Option<SelfTestReport>,
+    /// Config snapshots taken before each undoable change (label, config), newest last.
+    undo_stack: Vec<(String, AppConfig)>,
+    /// `list_visible_apps()` enumerates every window: cached for a few seconds because the full
+    /// state is rebuilt after every UI action.
+    visible_apps_cache: Option<(Instant, Vec<String>)>,
+    /// The fan watchdog process has been started for this session.
+    watchdog_spawned: bool,
 }
+
+/// Maximum number of undo steps kept in memory.
+const UNDO_DEPTH: usize = 20;
+
+/// Commands whose effect is a configuration change that `undo_last` can revert, with the label
+/// shown in the UI. Hardware-only writes (DPI, flash, EEPROM…) are not in this list.
+fn undo_label_for(cmd: &str) -> Option<&'static str> {
+    Some(match cmd {
+        "set_rgb_config" => "Réglage de l'éclairage",
+        "set_per_key_color" => "Couleur de touche",
+        "clear_per_key" => "Effacement des couleurs par touche",
+        "set_sync_all" | "tray_toggle_sync" => "Synchronisation de l'éclairage",
+        "switch_profile" => "Changement de profil",
+        "create_profile" => "Création de profil",
+        "set_azerty" => "Disposition du clavier",
+        "input_set_winlock" => "Verrou de la touche Windows",
+        "input_set_binding" => "Assignation de touche",
+        "input_remove_binding" => "Suppression d'assignation",
+        "input_set_esports" | "tray_toggle_socd" => "Réglages e-sport",
+        "profile_set_linked_apps" => "Applications liées au profil",
+        "profile_import_json" => "Import de profil",
+        "apply_preset" => "Préréglage",
+        "asus_set_led_count" => "Nombre de LED",
+        "cooling_sl3_argb" => "Éclairage du waterblock",
+        _ => return None,
+    })
+}
+
+/// One-click presets shown on the home screen.
+const PRESETS: &[(&str, &str, &str)] = &[
+    (
+        "silent",
+        "Silencieux",
+        "Ventilateurs en profil silencieux, éclairage doux et tamisé, plan d'alimentation équilibré.",
+    ),
+    (
+        "gaming",
+        "Jeu",
+        "Ventilateurs en profil turbo, éclairage arc-en-ciel, plan d'alimentation hautes performances.",
+    ),
+    (
+        "office",
+        "Bureau",
+        "Ventilateurs en profil standard, éclairage blanc statique, plan d'alimentation équilibré.",
+    ),
+    (
+        "lights_off",
+        "Tout éteint",
+        "Coupe l'éclairage de tous les appareils sans toucher aux ventilateurs.",
+    ),
+];
+
+const POWER_PLAN_BALANCED: &str = "381b4222-f694-41f0-9685-ff5bb260df2e";
+const POWER_PLAN_HIGH_PERF: &str = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
+const POWER_PLAN_ULTIMATE: &str = "e9a42b02-d5df-448d-aa00-03f14749eb61";
 
 impl BackendEngine {
     fn new(
@@ -485,6 +554,9 @@ impl BackendEngine {
             smart_fan_ref_temp: [40.0; 5],
             superio: read_superio_snapshot(),
             last_selftest: None,
+            undo_stack: Vec::new(),
+            visible_apps_cache: None,
+            watchdog_spawned: false,
         };
         eng.manual_profile_name = eng.config.active_profile.clone();
         eng.sync_input_rules();
@@ -531,27 +603,53 @@ impl BackendEngine {
     /// Runs on the backend thread (which owns all handles): Corsair keyboards back to Hardware
     /// mode, Aura out of Direct streaming, Smart Cooling flat curves replaced by the original BIOS
     /// configuration, and SuperIO channels returned to their saved BIOS mode.
+    /// BIOS configuration to re-apply for Smart Cooling channel `idx` (the curve read at startup,
+    /// else the BIOS automatic "Standard" profile).
+    fn wmi_restore_config(&self, idx: usize) -> Option<FanChannelConfig> {
+        let header = FanHeaderKind::ALL.get(idx).copied()?;
+        Some(match self.initial_cooling_channels.get(idx).cloned().flatten() {
+            Some(original) => original,
+            None => {
+                let mut auto = FanChannelConfig::default_for(header);
+                auto.policy = FanPolicyMode::Standard;
+                auto
+            }
+        })
+    }
+
+    /// Keep the crash-recovery marker in sync with the fans currently overridden, and make sure
+    /// the watchdog process is running while any override is active.
+    fn sync_fan_marker(&mut self) {
+        let marker = fan_watchdog::FanOverrideMarker {
+            pid: std::process::id(),
+            wmi_restore: (0..self.smart_fan_last_duty.len())
+                .filter(|&i| self.smart_fan_last_duty[i].is_some())
+                .filter_map(|i| self.wmi_restore_config(i))
+                .collect(),
+            superio_restore: saved_superio_states(),
+        };
+        let active = !marker.is_empty();
+        fan_watchdog::write_marker(&marker);
+        if active && !self.watchdog_spawned {
+            match fan_watchdog::spawn_watchdog() {
+                Ok(()) => self.watchdog_spawned = true,
+                Err(e) => error!("Watchdog ventilateurs non démarré : {e}"),
+            }
+        }
+    }
+
     fn restore_hardware_on_exit(&mut self) {
         // 1. Smart Cooling: undo the flat manual curves written to the BIOS.
         for idx in 0..self.smart_fan_last_duty.len() {
             if self.smart_fan_last_duty[idx].is_none() {
                 continue;
             }
-            let Some(header) = FanHeaderKind::ALL.get(idx).copied() else {
+            let Some(restore) = self.wmi_restore_config(idx) else {
                 continue;
-            };
-            let restore = match self.initial_cooling_channels.get(idx).cloned().flatten() {
-                Some(original) => original,
-                None => {
-                    // Original BIOS curve unknown: hand control back to the BIOS automatic profile.
-                    let mut auto = FanChannelConfig::default_for(header);
-                    auto.policy = FanPolicyMode::Standard;
-                    auto
-                }
             };
             match apply_asus_wmi_curve(&restore) {
                 Ok(_) => self.smart_fan_last_duty[idx] = None,
-                Err(e) => error!("Restauration ventilateur {:?} échouée : {e}", header),
+                Err(e) => error!("Restauration ventilateur {:?} échouée : {e}", restore.header),
             }
         }
 
@@ -559,6 +657,8 @@ impl BackendEngine {
         for msg in restore_all_superio_fans_auto() {
             info!("{msg}");
         }
+        // Whatever could not be restored stays in the marker: the watchdog retries after exit.
+        self.sync_fan_marker();
 
         // 3. ASUS Aura: leave Direct streaming for the hardware effect.
         if let Some(aura) = self.asus_aura.as_mut() {
@@ -747,6 +847,7 @@ impl BackendEngine {
 
             // 1b. FanControl-style Smart Cooling (GPU / Mix max(CPU,GPU) with Hysteresis anti-yoyo)
             if smart_fan_active && last_smart_fan.elapsed() >= Duration::from_secs(3) {
+                let mut marker_dirty = false;
                 let sensors = self.latest_sensors();
                 // Never guess a reassuring temperature: a missing sensor must make fans spin UP.
                 let gpu_t: Option<f32> = self
@@ -793,9 +894,16 @@ impl BackendEngine {
                             pt.duty_pct = target_duty;
                         }
                         if apply_asus_wmi_curve(&flat).is_ok() {
+                            let newly_overridden = self.smart_fan_last_duty[idx].is_none();
                             self.smart_fan_last_duty[idx] = Some(target_duty);
+                            if newly_overridden {
+                                marker_dirty = true;
+                            }
                         }
                     }
+                }
+                if marker_dirty {
+                    self.sync_fan_marker();
                 }
                 last_smart_fan = Instant::now();
             }
@@ -1027,9 +1135,345 @@ impl BackendEngine {
             .ok_or_else(|| "Clavier Logitech non connecté".to_string())
     }
 
+    /// Run an IPC command, recording an undo snapshot when it changes the configuration.
     fn handle_cmd(&mut self, cmd: &str, p: &Value) -> std::result::Result<Value, String> {
+        let Some(label) = undo_label_for(cmd) else {
+            return self.handle_cmd_inner(cmd, p);
+        };
+        let before = self.config.clone();
+        let before_json = serde_json::to_string(&before).unwrap_or_default();
+        let mut res = self.handle_cmd_inner(cmd, p)?;
+        let after_json = serde_json::to_string(&self.config).unwrap_or_default();
+        if before_json != after_json {
+            self.undo_stack.push((label.to_string(), before));
+            if self.undo_stack.len() > UNDO_DEPTH {
+                self.undo_stack.remove(0);
+            }
+            // The state was serialized before the snapshot was pushed: refresh the undo info.
+            if let Some(ui) = res.get_mut("ui") {
+                ui["can_undo"] = json!(true);
+                ui["undo_label"] = json!(label);
+            } else if let Some(ui) = res.get_mut("state").and_then(|s| s.get_mut("ui")) {
+                ui["can_undo"] = json!(true);
+                ui["undo_label"] = json!(label);
+            }
+        }
+        Ok(res)
+    }
+
+    /// Re-apply the hardware side effects of a configuration restored by `undo_last`.
+    fn apply_restored_config(&mut self) {
+        self.sync_input_rules();
+        let (enable_rgb, sync_aura, thermal) = {
+            let p = self.config.active_profile_mut();
+            (p.enable_rgb, p.sync_asus_aura, p.silent_loop3_thermal_rgb)
+        };
+        if !enable_rgb {
+            for dev in &mut self.corsair_devices {
+                if dev.info.kind == CorsairDeviceKind::Keyboard
+                    && dev.info.mode == OperatingMode::Software
+                {
+                    let _ = dev.set_mode(OperatingMode::Hardware);
+                }
+            }
+        }
+        if let Some(aura) = self.asus_aura.as_mut() {
+            if sync_aura || thermal {
+                let _ = aura.enter_direct_mode();
+            } else if aura.is_in_direct_mode() {
+                let _ = aura.set_all_hw_mode(self.aura_hw_mode, self.aura_hw_color, false);
+            }
+        }
+        self.persist_config();
+    }
+
+    fn visible_apps_cached(&mut self) -> Vec<String> {
+        if let Some((at, apps)) = &self.visible_apps_cache {
+            if at.elapsed() < Duration::from_secs(5) {
+                return apps.clone();
+            }
+        }
+        let apps = list_visible_apps();
+        self.visible_apps_cache = Some((Instant::now(), apps.clone()));
+        apps
+    }
+
+    /// Apply a one-click preset. Never writes flash/EEPROM: lighting is a profile setting, fans use
+    /// the BIOS policies (only on channels not driven by Smart Cooling), power plan if present.
+    fn apply_preset(&mut self, preset: &str) -> std::result::Result<Vec<String>, String> {
+        let (kind, primary, brightness, fan_policy, plans): (
+            EffectKind,
+            Rgb,
+            f32,
+            Option<FanPolicyMode>,
+            &[&str],
+        ) = match preset {
+            "silent" => (
+                EffectKind::Breathing,
+                Rgb::new(40, 90, 255),
+                0.35,
+                Some(FanPolicyMode::Silent),
+                &[POWER_PLAN_BALANCED],
+            ),
+            "gaming" => (
+                EffectKind::RainbowWave,
+                Rgb::CYAN,
+                1.0,
+                Some(FanPolicyMode::Turbo),
+                &[POWER_PLAN_HIGH_PERF, POWER_PLAN_ULTIMATE],
+            ),
+            "office" => (
+                EffectKind::Static,
+                Rgb::new(235, 240, 255),
+                0.6,
+                Some(FanPolicyMode::Standard),
+                &[POWER_PLAN_BALANCED],
+            ),
+            "lights_off" => (EffectKind::Off, Rgb::BLACK, 0.0, None, &[]),
+            _ => return Err(format!("Préréglage inconnu : {preset}")),
+        };
+        let mut summary = Vec::new();
+
+        {
+            let p = self.config.active_profile_mut();
+            p.enable_rgb = true;
+            p.sync_asus_aura = true;
+            p.rgb.kind = kind;
+            p.rgb.primary = primary;
+            p.rgb.brightness = brightness;
+        }
+        if let Some(aura) = self.asus_aura.as_mut() {
+            let _ = aura.enter_direct_mode();
+        }
+        summary.push(format!("Éclairage : {}", kind.label()));
+
+        if let Some(policy) = fan_policy {
+            if self.cooling_status.wmi_available && is_elevated() {
+                let mut applied = 0usize;
+                let mut failed = 0usize;
+                for ch in self.cooling_channels.iter_mut() {
+                    if ch.source != FanTempSource::CpuBios {
+                        continue; // Smart Cooling owns this channel
+                    }
+                    let mut cfg = ch.clone();
+                    cfg.policy = policy;
+                    match apply_asus_wmi_curve(&cfg) {
+                        Ok(_) => {
+                            ch.policy = policy;
+                            applied += 1;
+                        }
+                        Err(_) => failed += 1,
+                    }
+                }
+                summary.push(format!(
+                    "Ventilateurs : profil {} sur {applied} canal(aux){}",
+                    policy.asus_profile_str(),
+                    if failed > 0 { format!(", {failed} refusé(s) par le BIOS") } else { String::new() }
+                ));
+            } else {
+                summary.push("Ventilateurs inchangés (droits administrateur + ASUS WMI requis)".into());
+            }
+        }
+
+        if !plans.is_empty() {
+            let target = plans.iter().find_map(|g| {
+                self.power_plans
+                    .iter()
+                    .find(|p| p.guid.eq_ignore_ascii_case(g))
+                    .map(|p| (p.guid.clone(), p.name.clone()))
+            });
+            match target {
+                Some((guid, name)) => match set_active_power_plan(&guid) {
+                    Ok(_) => {
+                        self.power_plans = list_power_plans();
+                        summary.push(format!("Alimentation : {name}"));
+                    }
+                    Err(e) => summary.push(format!("Alimentation inchangée ({e})")),
+                },
+                None => summary.push("Alimentation inchangée (plan absent de ce PC)".into()),
+            }
+        }
+        self.persist_config();
+        Ok(summary)
+    }
+
+    /// Human-readable health checks for the Diagnostic page.
+    fn diagnostics_json(&mut self) -> Value {
+        let mut checks: Vec<Value> = Vec::new();
+        let mut push = |id: &str, label: &str, status: &str, detail: String, action: Value| {
+            checks.push(json!({ "id": id, "label": label, "status": status, "detail": detail, "action": action }));
+        };
+
+        let admin = is_elevated();
+        push(
+            "admin",
+            "Droits administrateur",
+            if admin { "ok" } else { "warn" },
+            if admin {
+                "OpenGear tourne en administrateur : ventilateurs, RGB de la RAM et capteurs avancés sont disponibles.".into()
+            } else {
+                "Sans droits administrateur, le contrôle des ventilateurs, le RGB de la RAM et certains capteurs sont désactivés.".into()
+            },
+            if admin {
+                Value::Null
+            } else {
+                json!({ "label": "Relancer en administrateur", "cmd": "cooling_relaunch_admin", "payload": {} })
+            },
+        );
+
+        let (st, detail, action) = match pawnio_availability() {
+            PawnIoAvailability::Ready => ("ok", "Pilote signé PawnIO actif (capteurs CPU, SMBus, SuperIO).".to_string(), Value::Null),
+            PawnIoAvailability::NeedsAdmin => (
+                "warn",
+                "Le pilote PawnIO est installé mais nécessite les droits administrateur.".to_string(),
+                Value::Null,
+            ),
+            PawnIoAvailability::NotInstalled => (
+                "warn",
+                "Le pilote signé PawnIO n'est pas installé : température CPU native, RAM RGB et ventilateurs directs indisponibles.".to_string(),
+                json!({ "label": "Installer PawnIO", "cmd": "pawnio_install", "payload": {} }),
+            ),
+        };
+        push("pawnio", "Pilote matériel PawnIO", st, detail, action);
+
+        push(
+            "asus_wmi",
+            "Interface ventilateurs ASUS (WMI)",
+            if self.cooling_status.wmi_available { "ok" } else { "warn" },
+            self.cooling_status.message.clone(),
+            Value::Null,
+        );
+
+        let sensors = self.latest_sensors();
+        push(
+            "sensors",
+            "Capteurs de température",
+            if sensors.available { "ok" } else { "warn" },
+            if sensors.available {
+                format!("Source : {}", sensors.source)
+            } else {
+                "Aucune source de capteurs : installe LibreHardwareMonitor ou PawnIO pour les températures.".into()
+            },
+            Value::Null,
+        );
+
+        let n_dev = self.corsair_devices.len()
+            + self.logi_mice.len()
+            + self.logi_keyboards.len()
+            + self.logi_headsets.len()
+            + usize::from(self.asus_aura.is_some());
+        push(
+            "devices",
+            "Appareils compatibles",
+            if n_dev > 0 { "ok" } else { "warn" },
+            if n_dev > 0 {
+                format!("{n_dev} appareil(s) piloté(s).")
+            } else {
+                "Aucun appareil compatible détecté. Vérifie les branchements et ferme iCUE / G HUB / Armoury Crate.".into()
+            },
+            json!({ "label": "Relancer la détection", "cmd": "reconnect_all", "payload": {} }),
+        );
+
+        if let Some(err) = &self.asus_err {
+            push(
+                "aura",
+                "Contrôleur ASUS Aura",
+                "warn",
+                format!("Non connecté : {err}"),
+                Value::Null,
+            );
+        }
+
+        let needs_engine = {
+            let p = self.config.active_profile_mut();
+            p.socd.enabled
+                || p.key_chatter_ms > 0
+                || p.mouse_debounce_ms > 0
+                || p.win_lock
+                || !p.bindings.is_empty()
+        };
+        let engine_ok = self.input_engine.is_running();
+        push(
+            "input",
+            "Moteur clavier (remaps, macros, SOCD)",
+            if !needs_engine || engine_ok { "ok" } else { "error" },
+            if engine_ok {
+                "Actif.".into()
+            } else if needs_engine {
+                "Des assignations sont configurées mais le moteur clavier ne tourne pas.".into()
+            } else {
+                "Inactif (aucune assignation configurée).".into()
+            },
+            if needs_engine && !engine_ok {
+                json!({ "label": "Démarrer le moteur", "cmd": "input_set_enabled", "payload": { "enabled": true } })
+            } else {
+                Value::Null
+            },
+        );
+
+        match &self.config_warning {
+            Some(w) => push("config", "Fichier de profils", "error", w.clone(), Value::Null),
+            None => push(
+                "config",
+                "Fichier de profils",
+                "ok",
+                format!("Profils enregistrés dans {}", self.config_path.display()),
+                Value::Null,
+            ),
+        }
+
+        json!({ "checks": checks })
+    }
+
+    fn handle_cmd_inner(&mut self, cmd: &str, p: &Value) -> std::result::Result<Value, String> {
         match cmd {
             "get_state" => Ok(self.full_state_json()),
+            // ================= UX: PREFERENCES, PRESETS, UNDO, DIAGNOSTICS, BACKUPS =================
+            "set_ui_prefs" => {
+                if let Some(mode) = p["ui_mode"].as_str() {
+                    if mode != "simple" && mode != "expert" {
+                        return Err(format!("Mode d'interface inconnu : {mode}"));
+                    }
+                    self.config.ui_mode = mode.to_string();
+                }
+                if let Some(done) = p["onboarding_done"].as_bool() {
+                    self.config.onboarding_done = done;
+                }
+                self.persist_config();
+                Ok(self.full_state_json())
+            }
+            "apply_preset" => {
+                let preset = p["preset"].as_str().ok_or("Préréglage manquant")?;
+                let summary = self.apply_preset(preset)?;
+                let label = PRESETS
+                    .iter()
+                    .find(|(id, _, _)| *id == preset)
+                    .map(|(_, l, _)| *l)
+                    .unwrap_or(preset);
+                let mut st = self.full_state_json();
+                st["last_action_msg"] = json!(format!("Préréglage « {label} » appliqué — {}", summary.join(" • ")));
+                Ok(st)
+            }
+            "undo_last" => {
+                let (label, snapshot) = self.undo_stack.pop().ok_or("Rien à annuler")?;
+                self.config = snapshot;
+                self.apply_restored_config();
+                let mut st = self.full_state_json();
+                st["last_action_msg"] = json!(format!("Annulé : {label}"));
+                Ok(st)
+            }
+            "get_diagnostics" => Ok(self.diagnostics_json()),
+            "list_backups" => Ok(json!({ "backups": list_sector_backups() })),
+            "logi_restore_backup" => {
+                let file = p["file"].as_str().ok_or("Fichier de sauvegarde manquant")?;
+                let path = backup_path_for(file).ok_or("Sauvegarde introuvable ou nom invalide")?;
+                let m = self.logi_mouse_mut(p)?;
+                m.restore_onboard_backup(&path).map_err(|e| e.to_string())?;
+                m.refresh_telemetry();
+                let mut st = self.full_state_json();
+                st["last_action_msg"] = json!(format!("Sauvegarde {file} restaurée et vérifiée"));
+                Ok(st)
+            }
             "reconnect_all" => {
                 self.reconnect_all();
                 Ok(self.full_state_json())
@@ -1837,6 +2281,7 @@ impl BackendEngine {
                 let ch = p["channel"].as_u64().ok_or("channel manquant")? as usize;
                 let duty = p["duty_pct"].as_u64().ok_or("duty_pct manquant")?.min(100) as u8;
                 let msg = set_superio_fan_pwm(ch, duty).map_err(|e| e.to_string())?;
+                self.sync_fan_marker();
                 self.superio = read_superio_snapshot();
                 let mut st = self.full_state_json();
                 st["last_action_msg"] = json!(msg);
@@ -1845,6 +2290,7 @@ impl BackendEngine {
             "superio_restore_auto" => {
                 let ch = p["channel"].as_u64().ok_or("channel manquant")? as usize;
                 let msg = restore_superio_fan_auto(ch).map_err(|e| e.to_string())?;
+                self.sync_fan_marker();
                 self.superio = read_superio_snapshot();
                 let mut st = self.full_state_json();
                 st["last_action_msg"] = json!(msg);
@@ -2319,7 +2765,7 @@ impl BackendEngine {
             .collect();
 
         let (chatter_blocked, mouse_dblclick_blocked) = self.input_engine.stats();
-        let visible_apps = list_visible_apps();
+        let visible_apps = self.visible_apps_cached();
 
         let mut fw_inventory: Vec<Value> = vec![json!({
             "device": self.telemetry.static_info.motherboard,
@@ -2373,6 +2819,17 @@ impl BackendEngine {
                 "gpu_name": self.telemetry.static_info.gpu_name,
             },
             "config_warning": self.config_warning,
+            "ui": {
+                "mode": self.config.ui_mode,
+                "onboarding_done": self.config.onboarding_done,
+                "can_undo": !self.undo_stack.is_empty(),
+                "undo_label": self.undo_stack.last().map(|(l, _)| l.clone()),
+            },
+            "presets": PRESETS.iter().map(|(id, label, description)| json!({
+                "id": id,
+                "label": label,
+                "description": description,
+            })).collect::<Vec<_>>(),
             "system_prefs": {
                 "autostart": is_autostart_enabled(),
                 "minimize_to_tray": self.config.minimize_to_tray,

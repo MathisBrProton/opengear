@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod audio_ext;
+mod fan_watchdog;
 mod local_assets;
 mod selftest;
 mod system_ext;
@@ -36,6 +37,9 @@ struct Cli {
     /// Désinstaller OpenGear proprement de Windows
     #[arg(long)]
     uninstall: bool,
+    /// (interne) Surveille le processus <PID> et rend les ventilateurs au BIOS s'il meurt.
+    #[arg(long, hide = true, value_name = "PID")]
+    fan_watchdog: Option<u32>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -184,6 +188,9 @@ fn attach_parent_console_for_cli() {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if let Some(parent_pid) = cli.fan_watchdog {
+        return fan_watchdog::run_watchdog(parent_pid);
+    }
     if cli.install {
         tray_icon::install_to_windows()?;
         return Ok(());

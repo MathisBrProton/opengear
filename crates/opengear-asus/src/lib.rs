@@ -21,9 +21,9 @@ pub use pawnio::{
     read_native_cpu_temp,
 };
 pub use superio::{
-    SUPERIO_MIN_PWM_PCT, SuperIoFanChannel, SuperIoSnapshot, read_superio_snapshot,
-    restore_all_superio_fans_auto, restore_superio_fan_auto, safe_superio_duty,
-    set_superio_fan_pwm,
+    SUPERIO_MIN_PWM_PCT, SuperIoFanChannel, SuperIoSavedState, SuperIoSnapshot,
+    read_superio_snapshot, restore_all_superio_fans_auto, restore_superio_fan_auto,
+    restore_superio_saved_states, safe_superio_duty, saved_superio_states, set_superio_fan_pwm,
 };
 pub use power::{PowerPlan, list_power_plans, set_active_power_plan};
 pub use ram_rgb::{
