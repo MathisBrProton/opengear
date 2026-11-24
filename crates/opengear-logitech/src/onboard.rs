@@ -931,8 +931,68 @@ pub(crate) fn write_and_verify(
     Ok(())
 }
 
+/// One sector backup file written before a flash (see [`save_sector_backup`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct SectorBackup {
+    pub file: String,
+    pub sector_hex: String,
+    pub tag: String,
+    pub created_ms: u64,
+    pub size: u64,
+}
+
+/// Parse `sec<SSSS>_<tag>_<unix_ms>.bin` into (sector, tag, unix_ms).
+pub(crate) fn parse_backup_file_name(name: &str) -> Option<(u16, String, u64)> {
+    let sector = parse_backup_sector(name)?;
+    let rest = name.get(8..)?.strip_suffix(".bin")?; // after "secSSSS_"
+    if name.as_bytes().get(7) != Some(&b'_') {
+        return None;
+    }
+    let (tag, ms) = rest.rsplit_once('_')?;
+    let ms: u64 = ms.parse().ok()?;
+    if tag.is_empty() || !tag.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some((sector, tag.to_string(), ms))
+}
+
+/// Every sector backup OpenGear has written, newest first.
+pub fn list_sector_backups() -> Vec<SectorBackup> {
+    let Ok(rd) = std::fs::read_dir(backup_dir()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SectorBackup> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let (sector, tag, ms) = parse_backup_file_name(&name)?;
+            let size = e.metadata().ok()?.len();
+            Some(SectorBackup {
+                file: name,
+                sector_hex: format!("0x{sector:04X}"),
+                tag,
+                created_ms: ms,
+                size,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+    out
+}
+
+/// Resolve a backup file name (as listed by [`list_sector_backups`]) to its path, refusing
+/// anything that is not a plain, well-formed backup name inside the backup folder.
+pub fn backup_path_for(file_name: &str) -> Option<std::path::PathBuf> {
+    if file_name.contains(['/', '\\', ':']) || file_name.contains("..") {
+        return None;
+    }
+    parse_backup_file_name(file_name)?;
+    let path = backup_dir().join(file_name);
+    path.is_file().then_some(path)
+}
+
 /// Durable backup folder: `%APPDATA%\OpenGear\backups\logitech` (temp dir as a last resort).
-fn backup_dir() -> std::path::PathBuf {
+pub fn backup_dir() -> std::path::PathBuf {
     std::env::var_os("APPDATA")
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)

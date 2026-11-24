@@ -12,6 +12,7 @@
 use crate::cooling::is_elevated;
 use crate::pawnio::{
     PawnIoAvailability, apply_pawnio_ene_ram, pawnio_availability, probe_pawnio_ene_ram,
+    set_pawnio_ene_modes,
 };
 use anyhow::{Context, Result};
 use opengear_core::Rgb;
@@ -466,6 +467,94 @@ foreach ($line in $found) { Write-Output $line }
 ///
 /// Color byte order on ENE SMBus is verified `[Red, Blue, Green]` (RBG) per OpenRGB `ENESMBusController`.
 /// When `save_eeprom` is true, writes `0xAA` to `ENE_REG_APPLY (0x80A0)` so the effect persists across power cycles.
+/// Switch RAM lighting off / back on by writing ONLY the ENE effect-mode register of each module
+/// (colors, speed and EEPROM untouched), so restoring the previous mode restores the exact look.
+/// `modes`: (module, raw mode byte). Supports PawnIO and ASUSManagement WMI backends; modules
+/// driven through the OpenRGB SDK are skipped. Returns the number of modules updated.
+pub fn set_ram_modes_only(modes: &[(&EneRamModule, u8)]) -> Result<usize> {
+    let pawnio: Vec<(&EneRamModule, u8)> = modes
+        .iter()
+        .filter(|(m, _)| m.backend == "pawnio_piix4" || m.backend == "pawnio_i801")
+        .copied()
+        .collect();
+    let wmi: Vec<(&EneRamModule, u8)> = modes
+        .iter()
+        .filter(|(m, _)| !m.backend.starts_with("pawnio") && m.backend != "openrgb_sdk")
+        .copied()
+        .collect();
+    let mut applied = 0usize;
+    if !pawnio.is_empty() {
+        applied += set_pawnio_ene_modes(&pawnio)?;
+    }
+    if wmi.is_empty() {
+        return Ok(applied);
+    }
+    if !is_elevated() {
+        anyhow::bail!("Droits administrateur requis pour piloter la RAM via ASUSManagement WMI");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut targets = String::new();
+        for (m, mode) in &wmi {
+            targets.push_str(&format!(
+                "@{{ slave = [uint32]{}; mode = [uint32]{} }},\n",
+                m.wmi_slave_arg, mode
+            ));
+        }
+        let script = format!(
+            r#"
+$inst = Get-CimInstance -Namespace root\wmi -ClassName ASUSManagement -ErrorAction Stop | Select-Object -First 1
+if (-not $inst) {{ throw 'ASUSManagement WMI introuvable' }}
+function Write-EneReg([uint32]$slave, [uint16]$reg, [uint32]$val) {{
+    $swapped = [uint32]((($reg -shl 8) -band 0xFF00) -bor (($reg -shr 8) -band 0x00FF))
+    $w1 = Invoke-CimMethod -InputObject $inst -MethodName write_smbus_word -Arguments @{{ slave = $slave; cmd = [uint32]0x00; data = $swapped }} -ErrorAction Stop
+    if ($w1.Result -ne 0) {{ throw "SMBus write_word failed (slave=$slave reg=$reg)" }}
+    $w2 = Invoke-CimMethod -InputObject $inst -MethodName write_smbus_byte -Arguments @{{ slave = $slave; cmd = [uint32]0x01; data = $val }} -ErrorAction Stop
+    if ($w2.Result -ne 0) {{ throw "SMBus write_byte failed (slave=$slave reg=$reg)" }}
+}}
+function Test-EneFingerprint([uint32]$slave) {{
+    for ($i = 0; $i -lt 16; $i++) {{
+        $r = Invoke-CimMethod -InputObject $inst -MethodName read_smbus_byte -Arguments @{{ slave = $slave; cmd = [uint32](0xA0 + $i) }} -ErrorAction SilentlyContinue
+        if ($null -eq $r -or ($r.Result -ne 0 -and $r.Result -ne 1)) {{ return $false }}
+        if ((([int]$r.data) -band 0xFF) -ne $i) {{ return $false }}
+    }}
+    return $true
+}}
+$targets = @(
+{targets}
+)
+$applied = 0
+foreach ($t in $targets) {{
+    if (-not (Test-EneFingerprint $t.slave)) {{ continue }}
+    Write-EneReg $t.slave 0x8020 0
+    Write-EneReg $t.slave 0x8021 $t.mode
+    Write-EneReg $t.slave 0x80A0 1
+    $applied++
+}}
+"$applied"
+"#
+        );
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .context("Échec exécution PowerShell WMI SMBus")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "Erreur SMBus ENE RAM : {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        applied += String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(0);
+    }
+    Ok(applied)
+}
+
 pub fn apply_ram_rgb(
     modules: &[EneRamModule],
     target_addr_7bit: Option<u8>,

@@ -76,6 +76,33 @@ struct SavedFanState {
     cmd: u8,
 }
 
+/// Serializable copy of a channel's original BIOS state, so another process (the fan watchdog)
+/// can restore it if OpenGear dies while the channel is in manual mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuperIoSavedState {
+    pub index: usize,
+    pub mode: u8,
+    pub cmd: u8,
+}
+
+/// Original BIOS states of every channel currently overridden by OpenGear.
+pub fn saved_superio_states() -> Vec<SuperIoSavedState> {
+    saved_states()
+        .lock()
+        .map(|g| {
+            (0..7)
+                .filter_map(|i| {
+                    g[i].map(|s| SuperIoSavedState {
+                        index: i,
+                        mode: s.mode,
+                        cmd: s.cmd,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 static SAVED_INITIAL_STATES: OnceLock<Mutex<[Option<SavedFanState>; 7]>> = OnceLock::new();
 
 fn saved_states() -> &'static Mutex<[Option<SavedFanState>; 7]> {
@@ -382,6 +409,33 @@ mod win_sio {
         ))
     }
 
+    /// Write explicit saved BIOS states back (used by the fan watchdog / crash recovery).
+    pub fn restore_saved_states(states: &[SuperIoSavedState]) -> Vec<String> {
+        if states.is_empty() {
+            return Vec::new();
+        }
+        let Some(_lock) = NamedMutexGuard::acquire(r"Global\Access_ISABUS.HTP.Method", 3000) else {
+            return vec!["SuperIO : bus ISA occupé, restauration impossible".into()];
+        };
+        let (sess, chip) = match detect_and_prepare() {
+            Ok(v) => v,
+            Err(e) => return vec![format!("SuperIO : {e}")],
+        };
+        states
+            .iter()
+            .filter(|s| s.index < chip.fan_count)
+            .map(|s| {
+                let r = hwm_write(&sess, chip.hwm_base, FAN_PWM_CMD_REGS[s.index], s.cmd).and_then(
+                    |_| hwm_write(&sess, chip.hwm_base, FAN_CTRL_MODE_REGS[s.index], s.mode),
+                );
+                match r {
+                    Ok(()) => format!("SuperIO ch#{} restauré (mode=0x{:02X})", s.index + 1, s.mode),
+                    Err(e) => format!("SuperIO ch#{} : restauration échouée : {e}", s.index + 1),
+                }
+            })
+            .collect()
+    }
+
     /// Restore every channel OpenGear switched to manual back to its original BIOS state.
     pub fn restore_all_fans_auto() -> Vec<String> {
         let touched: Vec<usize> = saved_states()
@@ -416,6 +470,19 @@ pub fn set_superio_fan_pwm(channel_idx: usize, duty_pct: u8) -> Result<String> {
     {
         let _ = (channel_idx, duty_pct);
         anyhow::bail!("Non supporté hors Windows")
+    }
+}
+
+/// Restore explicit saved states (fan watchdog / crash recovery in another process).
+pub fn restore_superio_saved_states(states: &[SuperIoSavedState]) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        win_sio::restore_saved_states(states)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = states;
+        Vec::new()
     }
 }
 

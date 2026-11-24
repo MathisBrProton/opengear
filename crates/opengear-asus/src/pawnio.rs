@@ -605,6 +605,58 @@ mod win_pio {
             if save_eeprom { ", EEPROM sauvée" } else { "" }
         ))
     }
+    /// Write ONLY the effect mode register of each module (no color / speed / EEPROM writes), so
+    /// the stored colors survive: used to switch RAM lighting off and back on exactly.
+    pub fn set_pawnio_ene_modes(targets: &[(&EneRamModule, u8)]) -> Result<usize> {
+        if !is_elevated() {
+            anyhow::bail!("Droits Administrateur requis pour PawnIO SMBus");
+        }
+        let Some(first) = targets.first() else {
+            return Ok(0);
+        };
+        let _lock = NamedMutexGuard::acquire(r"Global\Access_SMBUS.HTP.Method", 1500)
+            .context("Bus SMBus occupé par un autre logiciel")?;
+        let is_intel = first.0.backend == "pawnio_i801";
+        let sess = if is_intel {
+            PawnIoSession::load(MOD_SMBUS_I801)?
+        } else {
+            PawnIoSession::load(MOD_SMBUS_PIIX4)?
+        };
+        let prev_port = if !is_intel {
+            sess.execute("ioctl_piix4_port_sel", &[-1], 1)
+                .ok()
+                .and_then(|v| v.first().copied())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let mut applied = 0usize;
+        let res = (|| -> Result<()> {
+            for (m, mode) in targets {
+                if !is_intel
+                    && sess
+                        .execute("ioctl_piix4_port_sel", &[m.wmi_slave_arg as i64], 1)
+                        .is_err()
+                {
+                    continue;
+                }
+                if !test_ene_fingerprint(&sess, m.address_7bit) {
+                    continue;
+                }
+                ene_write_reg(&sess, m.address_7bit, 0x8020, 0)?;
+                ene_write_reg(&sess, m.address_7bit, 0x8021, *mode)?;
+                ene_write_reg(&sess, m.address_7bit, 0x80A0, 0x01)?;
+                applied += 1;
+            }
+            Ok(())
+        })();
+        if !is_intel {
+            let _ = sess.execute("ioctl_piix4_port_sel", &[prev_port], 1);
+        }
+        res?;
+        Ok(applied)
+    }
+
     /// Diagnostic scan of PawnIO SMBus controllers (lists every responding 7-bit I2C address).
     ///
     /// Uses SMBus read transactions only (the "read byte data" command phase sets a register
@@ -721,6 +773,19 @@ pub fn read_native_cpu_temp() -> Option<(f32, &'static str)> {
     }
     #[cfg(not(windows))]
     None
+}
+
+/// Set only the effect mode of ENE RAM modules over PawnIO (colors and EEPROM untouched).
+pub fn set_pawnio_ene_modes(targets: &[(&EneRamModule, u8)]) -> Result<usize> {
+    #[cfg(windows)]
+    {
+        win_pio::set_pawnio_ene_modes(targets)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = targets;
+        anyhow::bail!("Non supporté hors Windows")
+    }
 }
 
 pub fn probe_pawnio_ene_ram() -> Vec<EneRamModule> {

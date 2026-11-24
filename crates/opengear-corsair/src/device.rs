@@ -92,6 +92,10 @@ pub struct CorsairDeviceInfo {
     pub storage_total_kb: Option<u32>,
     pub storage_free_kb: Option<u32>,
     pub flashtap_supported: bool,
+    /// Current FlashTap (hardware SOCD) state, when the firmware exposes it as a 0/1 switch.
+    pub flashtap_enabled: Option<bool>,
+    /// Raw answer to the FlashTap property probe (value or error), for diagnostics.
+    pub flashtap_probe: String,
     pub rapid_trigger_supported: bool,
     // Onboard Flash HWP profiles decoded from Bragi filesystem (0x000F -> 0xF11E -> 0x6C69)
     pub hwp_profiles: Vec<crate::hwp::HwpProfileInfo>,
@@ -223,7 +227,18 @@ impl CorsairDevice {
         let active_hw_profile = transport.get_property(PROP_ACTIVE_HW_PROFILE).ok().map(|v| v as u8);
         let storage_total_kb = transport.get_property(PROP_TOTAL_STORAGE_SIZE).ok().map(|v| v / 1024);
         let storage_free_kb = transport.get_property(PROP_FREE_STORAGE_SIZE).ok().map(|v| v / 1024);
-        let flashtap_supported = transport.get_property(PROP_FLASHTAP_ENABLED).is_ok();
+        // Only treat 0xF5 as FlashTap if it really behaves like an on/off switch.
+        let flashtap_raw = transport.get_property(PROP_FLASHTAP_ENABLED);
+        let flashtap_probe = match &flashtap_raw {
+            Ok(v) => format!("0x{v:X}"),
+            Err(e) => e.to_string(),
+        };
+        info!(
+            "{} : propriété FlashTap 0x{:02X} -> {}",
+            transport.product_name, PROP_FLASHTAP_ENABLED, flashtap_probe
+        );
+        let flashtap_enabled = flashtap_raw.ok().and_then(flashtap_state_from_raw);
+        let flashtap_supported = flashtap_enabled.is_some();
         let rapid_trigger_supported = transport.get_property(PROP_RAPID_TRIGGER_ENABLED).is_ok();
 
         // Mouse probes
@@ -363,6 +378,8 @@ impl CorsairDevice {
             storage_total_kb,
             storage_free_kb,
             flashtap_supported,
+            flashtap_enabled,
+            flashtap_probe,
             rapid_trigger_supported,
             hwp_profiles: Vec::new(),
             mouse,
@@ -546,6 +563,32 @@ impl CorsairDevice {
         Ok(())
     }
 
+    /// Enable / disable FlashTap (hardware SOCD: the most recent of the two opposing keys wins,
+    /// resolved inside the keyboard, invisible to anti-cheats).
+    ///
+    /// Defensive: the property must currently hold 0 or 1 (anything else means it is not a plain
+    /// switch on this firmware and nothing is written), and the new value is read back.
+    pub fn set_flashtap(&mut self, enabled: bool) -> Result<(), BragiError> {
+        let current = self.transport.get_property(PROP_FLASHTAP_ENABLED)?;
+        if flashtap_state_from_raw(current).is_none() {
+            return Err(BragiError::Protocol(
+                ERR_INVALID_VALUE,
+                "Valeur FlashTap inattendue sur ce firmware : écriture refusée",
+            ));
+        }
+        self.transport
+            .set_property(PROP_FLASHTAP_ENABLED, u16::from(enabled))?;
+        let readback = self.transport.get_property(PROP_FLASHTAP_ENABLED)?;
+        if flashtap_state_from_raw(readback) != Some(enabled) {
+            return Err(BragiError::Protocol(
+                ERR_INVALID_VALUE,
+                "Le clavier n'a pas confirmé le changement FlashTap",
+            ));
+        }
+        self.info.flashtap_enabled = Some(enabled);
+        Ok(())
+    }
+
     pub fn set_winlock_shortcuts(&mut self, mask: u8) -> Result<(), BragiError> {
         self.transport
             .set_property(PROP_WINLOCK_DISABLED_SHORTCUTS, mask as u16)?;
@@ -582,6 +625,9 @@ impl CorsairDevice {
     /// Low-level read of any Bragi onboard flash file by `FileId` (e.g. `0x0011` FileListing, `0x000F` ProfilesList).
     /// Temporarily ensures Software mode (required by Bragi v2 MCU to open flash handles) and restores Hardware mode cleanly.
     pub fn read_flash_file(&mut self, file_id: u16) -> Result<Vec<u8>, BragiError> {
+        // File access reuses handle 0 (= the lighting handle) and closes it afterwards:
+        // forget it so the next frame re-opens it instead of writing to a closed handle.
+        self.lighting_handle_open = false;
         let was_hw = self.info.mode == OperatingMode::Hardware;
         if was_hw {
             let _ = self.transport.set_property(PROP_MODE, MODE_SOFTWARE);
@@ -624,6 +670,8 @@ impl CorsairDevice {
     }
 
     pub fn write_flash_file(&mut self, file_id: u16, data: &[u8]) -> Result<(), BragiError> {
+        // Same handle-0 reuse as read_flash_file: the lighting handle must be re-opened afterwards.
+        self.lighting_handle_open = false;
         self.transport.write_file(file_id, data)
     }
 
@@ -753,5 +801,27 @@ impl Drop for CorsairDevice {
         if self.restore_hw_on_drop && self.info.mode == OperatingMode::Software {
             let _ = self.set_mode(OperatingMode::Hardware);
         }
+    }
+}
+
+/// FlashTap state from the raw `0xF5` property: only 0 / 1 are accepted as a valid switch.
+pub(crate) fn flashtap_state_from_raw(raw: u32) -> Option<bool> {
+    match raw {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod flashtap_tests {
+    use super::flashtap_state_from_raw;
+
+    #[test]
+    fn only_boolean_values_are_a_flashtap_switch() {
+        assert_eq!(flashtap_state_from_raw(0), Some(false));
+        assert_eq!(flashtap_state_from_raw(1), Some(true));
+        assert_eq!(flashtap_state_from_raw(2), None);
+        assert_eq!(flashtap_state_from_raw(0x0101), None);
     }
 }

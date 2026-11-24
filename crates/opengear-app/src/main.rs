@@ -1,8 +1,11 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod app_log;
 mod audio_ext;
+mod fan_watchdog;
 mod local_assets;
 mod selftest;
+mod system_events;
 mod system_ext;
 mod tray_icon;
 mod webview_ui;
@@ -36,6 +39,9 @@ struct Cli {
     /// Désinstaller OpenGear proprement de Windows
     #[arg(long)]
     uninstall: bool,
+    /// (interne) Surveille le processus <PID> et rend les ventilateurs au BIOS s'il meurt.
+    #[arg(long, hide = true, value_name = "PID")]
+    fan_watchdog: Option<u32>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -184,6 +190,10 @@ fn attach_parent_console_for_cli() {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if let Some(parent_pid) = cli.fan_watchdog {
+        app_log::init(true, false);
+        return fan_watchdog::run_watchdog(parent_pid);
+    }
     if cli.install {
         tray_icon::install_to_windows()?;
         return Ok(());
@@ -198,12 +208,11 @@ fn main() -> Result<()> {
         attach_parent_console_for_cli();
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // GUI has no console: log to %LOCALAPPDATA%\OpenGear\logs. CLI logs to the terminal.
+    app_log::init(is_gui, is_gui);
+    if is_gui {
+        tracing::info!("OpenGear {} démarré", env!("CARGO_PKG_VERSION"));
+    }
 
     match cli.command.unwrap_or(Commands::Gui) {
         Commands::Gui => webview_ui::run_gui(cli.minimized),

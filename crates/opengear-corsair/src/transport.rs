@@ -6,6 +6,21 @@ use tracing::{debug, trace, warn};
 
 const READ_TIMEOUT_MS: i32 = 150;
 const SHORT_TIMEOUT_MS: i32 = 15;
+/// Total time `exchange` waits for the matching reply while skipping unrelated reports.
+const EXCHANGE_DEADLINE_MS: u64 = 300;
+
+/// Locate the Bragi reply to `expected_cmd` in a raw input report: `[magic, cmd, err, ...]`, or
+/// the same prefixed by a `0x00` report ID. Returns the reply starting at its first byte, or
+/// `None` for any unrelated report (stale reply, notification, other command).
+pub(crate) fn match_reply(rx: &[u8], expected_cmd: u8) -> Option<&[u8]> {
+    if rx.len() >= 3 && rx[1] == expected_cmd {
+        return Some(rx);
+    }
+    if rx.len() >= 4 && rx[0] == 0x00 && rx[2] == expected_cmd {
+        return Some(&rx[1..]);
+    }
+    None
+}
 
 #[derive(Debug, Clone)]
 pub struct HidCapsInfo {
@@ -191,34 +206,56 @@ impl BragiTransport {
         }
     }
 
-    /// Send a Bragi packet and read the matching response.
+    /// Discard every input report already queued (late replies of a previous command, ACKs of
+    /// fire-and-forget RGB chunks, device notifications) without waiting.
+    pub fn drain_pending(&mut self) {
+        let mut buf = vec![0u8; self.in_report_len];
+        for _ in 0..64 {
+            match self.dev.read_timeout(&mut buf, 0) {
+                Ok(n) if n > 0 => continue,
+                _ => break,
+            }
+        }
+    }
+
+    /// Send a Bragi packet and read **its** response.
+    ///
+    /// Stale reports are drained before sending, and any report that does not echo the command
+    /// byte is skipped until the deadline: a foreign packet is never returned as the answer
+    /// (it used to be after 4 mismatches, making callers decode garbage).
     pub fn exchange(&mut self, payload: &[u8]) -> Result<Vec<u8>, BragiError> {
         let mut tx = vec![0u8; self.out_report_len];
         let copy_n = payload.len().min(self.payload_len());
         tx[0] = 0x00; // Report ID 0
         tx[1..1 + copy_n].copy_from_slice(&payload[..copy_n]);
 
+        self.drain_pending();
         trace!("TX ({} bytes): {:02X?}", tx.len(), &tx[..tx.len().min(16)]);
         self.dev.write(&tx)?;
 
         let expected_cmd = payload.get(1).copied().unwrap_or(0);
         let mut rx = vec![0u8; self.in_report_len];
+        let deadline = std::time::Instant::now() + Duration::from_millis(EXCHANGE_DEADLINE_MS);
 
-        for _ in 0..4 {
-            let n = self.dev.read_timeout(&mut rx, READ_TIMEOUT_MS)?;
-            if n == 0 {
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
                 return Err(BragiError::Timeout);
             }
+            let wait = (remaining.as_millis() as i32).clamp(1, READ_TIMEOUT_MS);
+            let n = self.dev.read_timeout(&mut rx, wait)?;
+            if n == 0 {
+                continue;
+            }
             trace!("RX ({} bytes): {:02X?}", n, &rx[..n.min(16)]);
-
-            if rx.len() >= 3 && rx[1] == expected_cmd {
-                return Ok(rx);
+            if let Some(reply) = match_reply(&rx[..n.max(3).min(rx.len())], expected_cmd) {
+                let mut out = reply.to_vec();
+                // Callers index fixed offsets: keep the historical full-report length.
+                out.resize(self.in_report_len.max(out.len()), 0);
+                return Ok(out);
             }
-            if rx.len() >= 4 && rx[0] == 0x00 && rx[2] == expected_cmd {
-                return Ok(rx[1..].to_vec());
-            }
+            trace!("RX ignoré (commande 0x{:02X} attendue)", expected_cmd);
         }
-        Ok(rx)
     }
 
     /// Fire-and-forget write with short optional response read (used for high-speed RGB chunks).
@@ -231,10 +268,18 @@ impl BragiTransport {
         self.dev.write(&tx)?;
 
         if wait_reply {
+            // Short wait for the ACK of the first chunk: a missing ACK is tolerated (fast path),
+            // but an explicit error code from the device is reported instead of ignored.
+            let expected_cmd = payload.get(1).copied().unwrap_or(0);
             let mut rx = vec![0u8; self.in_report_len];
             let n = self.dev.read_timeout(&mut rx, SHORT_TIMEOUT_MS)?;
             if n == 0 {
                 std::thread::sleep(Duration::from_millis(2));
+            } else if let Some(reply) = match_reply(&rx[..n.max(3).min(rx.len())], expected_cmd) {
+                let err = reply[2];
+                if err != ERR_OK {
+                    return Err(BragiError::from_code(err));
+                }
             }
         } else {
             std::thread::sleep(Duration::from_millis(1));
@@ -307,6 +352,8 @@ impl BragiTransport {
 
     /// Write an arbitrary byte buffer to an opened Bragi handle using WRITE_DATA + CONTINUE_WRITE.
     pub fn write_handle_data(&mut self, handle: u8, data: &[u8]) -> Result<(), BragiError> {
+        // ACKs of the previous frame's continuation packets must not be read as this frame's ACK.
+        self.drain_pending();
         let max_payload = self.payload_len();
         let data_len = data.len() as u32;
         let len_bytes = data_len.to_le_bytes();
@@ -457,5 +504,30 @@ impl BragiTransport {
         let res = self.write_handle_data(handle, data);
         let _ = self.close_handle(handle);
         res
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::match_reply;
+
+    #[test]
+    fn reply_matches_command_byte() {
+        let rx = [0x00, 0x09, 0x00, 0x01, 0x02];
+        assert_eq!(match_reply(&rx, 0x09), Some(&rx[..]));
+    }
+
+    #[test]
+    fn reply_with_report_id_prefix_is_unwrapped() {
+        let rx = [0x00, 0x08, 0x02, 0x00, 0x55];
+        assert_eq!(match_reply(&rx, 0x02), Some(&rx[1..]));
+    }
+
+    #[test]
+    fn foreign_reports_are_rejected() {
+        // Late reply of a previous GET (0x02) while waiting for OPEN_HANDLE (0x0D)
+        assert_eq!(match_reply(&[0x00, 0x02, 0x00, 0x10], 0x0D), None);
+        // Too short to be a reply
+        assert_eq!(match_reply(&[0x00, 0x0D], 0x0D), None);
     }
 }

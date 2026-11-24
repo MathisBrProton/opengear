@@ -15,5 +15,6 @@ pub use mouse::{
     ReportRateInfo,
 };
 pub use onboard::{
-    MouseButtonAction, OnboardMacroStep, OnboardMemoryDesc, OnboardProfile, crc16_ccitt,
+    MouseButtonAction, OnboardMacroStep, OnboardMemoryDesc, OnboardProfile, SectorBackup,
+    backup_dir, backup_path_for, crc16_ccitt, list_sector_backups,
 };

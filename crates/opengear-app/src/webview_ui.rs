@@ -2,23 +2,28 @@ use crate::audio_ext::{read_audio_state, read_output_peak, set_endpoint_mute, se
 use crate::local_assets::LocalAssetCatalog;
 use crate::selftest::{SelfTestReport, run_full_selftest};
 use crate::system_ext::{
-    AmbilightFrame, get_foreground_exe_name, list_visible_apps, sample_ambilight_screen,
+    AmbilightFrame, get_foreground_exe_name, idle_duration, list_visible_apps,
+    sample_ambilight_screen,
 };
+use crate::system_events;
 use crate::tray_icon::{
     TrayAction, acquire_single_instance, build_window_icon, create_windows_shortcuts,
     ensure_ico_beside_exe, is_autostart_enabled, release_single_instance, set_autostart_enabled,
-    start_system_tray, stop_system_tray, trim_working_set,
+    start_system_tray, stop_system_tray, tray_notify, trim_working_set,
 };
 use anyhow::Result;
 use opengear_asus::{
     AsusWmiCoolingStatus, AuraChannelKind, AuraHwMode, AuraMainboardController, CurvePoint,
     EneRamMode, FanChannelConfig, FanHeaderKind, FanPolicyMode, FanTempSource,
     HardwareSensorsSnapshot, PowerPlan, RamRgbStatus, SuperIoSnapshot, SystemTelemetry,
-    TelemetryCollector, apply_asus_wmi_curve, apply_ram_rgb, install_official_pawnio,
-    list_power_plans, probe_asus_wmi_cooling, probe_ram_rgb, read_asus_wmi_channel,
+    PawnIoAvailability, TelemetryCollector, apply_asus_wmi_curve, apply_ram_rgb,
+    install_official_pawnio, is_elevated, list_power_plans, pawnio_availability,
+    probe_asus_wmi_cooling, probe_ram_rgb, read_asus_wmi_channel,
     read_hardware_sensors, read_superio_snapshot, relaunch_as_admin, restore_all_superio_fans_auto,
-    restore_superio_fan_auto, set_active_power_plan, set_superio_fan_pwm,
+    restore_superio_fan_auto, saved_superio_states, set_active_power_plan, set_ram_modes_only,
+    set_superio_fan_pwm,
 };
+use crate::fan_watchdog;
 use opengear_core::{
     AppConfig, DetectedDevice, EffectKind, KeyAction, KeyboardProfile, MacroStep, OperatingMode,
     PollingRate, Rgb, SocdPair, scan_hid_devices,
@@ -32,8 +37,9 @@ use opengear_corsair::{
 };
 use opengear_input::{ALL_BINDABLE_KEYS, InputEngine};
 use opengear_logitech::{
-    BatteryPowerModel, EQ_PRESETS, KeyboardRgbMode, LodLevel, LogitechHeadset, LogitechKeyboard,
+    BatteryPowerModel, BatteryState, EQ_PRESETS, KeyboardRgbMode, LodLevel, LogitechHeadset, LogitechKeyboard,
     LogitechMouse, MouseButtonAction, MouseLedMode, OnboardMacroStep, OnboardMode,
+    backup_path_for, list_sector_backups,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -149,6 +155,10 @@ pub fn run_gui(cli_minimized: bool) -> Result<()> {
         return Ok(());
     }
 
+    // We hold the single-instance lock: any fan override marker left behind belongs to a dead
+    // session (crash / forced kill) and must be handed back to the BIOS now.
+    fan_watchdog::recover_stale_marker();
+
     let _ = ensure_ico_beside_exe();
     let initial_cfg = AppConfig::load(&AppConfig::default_config_path()).unwrap_or_default();
     MINIMIZE_TO_TRAY.store(initial_cfg.minimize_to_tray, Ordering::Relaxed);
@@ -232,6 +242,16 @@ pub fn run_gui(cli_minimized: bool) -> Result<()> {
         info!("OpenGear WebView2 natif démarré.");
         Some(wv)
     };
+
+    // Sleep / resume, session lock and device plug events -> backend (as internal commands).
+    let sys_tx = tx_cmd.clone();
+    system_events::start(move |ev| {
+        let _ = sys_tx.send(IpcRequest {
+            id: 0,
+            cmd: "__sys_event".into(),
+            payload: json!({ "event": ev.id() }),
+        });
+    });
 
     let tray_tx = tx_cmd.clone();
     let ui_assets = Arc::clone(&local_assets);
@@ -387,7 +407,118 @@ struct BackendEngine {
     smart_fan_ref_temp: [f32; 5],
     superio: SuperIoSnapshot,
     last_selftest: Option<SelfTestReport>,
+    /// Config snapshots taken before each undoable change (label, config), newest last.
+    undo_stack: Vec<(String, AppConfig)>,
+    /// `list_visible_apps()` enumerates every window: cached for a few seconds because the full
+    /// state is rebuilt after every UI action.
+    visible_apps_cache: Option<(Instant, Vec<String>)>,
+    /// The fan watchdog process has been started for this session.
+    watchdog_spawned: bool,
+    /// System is going to sleep: no device I/O until resume.
+    suspended: bool,
+    /// Lights forced off because the session is locked / the user is inactive.
+    blackout_lock: bool,
+    blackout_idle: bool,
+    /// A black frame has been pushed to the devices (so lights must be restored afterwards).
+    blackout_applied: bool,
+    /// Last low-battery level notified per device (15 or 5), reset when charging.
+    battery_alerted: std::collections::HashMap<String, u8>,
+    /// RAM modules switched off by a blackout: (SMBus address, mode to restore).
+    ram_restore_modes: Option<Vec<(u8, u8)>>,
 }
+
+/// Highest LED count an ASUS ARGB Gen2 header accepts (see `set_channel_led_count`).
+const ARGB_MAX_LEDS: usize = 120;
+
+/// Vendor IDs whose set of HID interfaces differs between two signatures (sorted, unique).
+pub(crate) fn changed_vendors(old: &[(u16, u16, u16)], new: &[(u16, u16, u16)]) -> Vec<u16> {
+    let mut v: Vec<u16> = old
+        .iter()
+        .filter(|e| !new.contains(e))
+        .chain(new.iter().filter(|e| !old.contains(e)))
+        .map(|e| e.0)
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Low-battery notification state machine. Returns `(new_last_alerted, level_to_notify)`:
+/// notify once at <= 15 %, once more at <= 5 %, and re-arm when charging or back above 20 %.
+pub(crate) fn battery_alert_step(last: Option<u8>, pct: u8, charging: bool) -> (Option<u8>, Option<u8>) {
+    if charging || pct > 20 {
+        return (None, None);
+    }
+    if pct <= 5 && last != Some(5) {
+        return (Some(5), Some(5));
+    }
+    if pct <= 15 && last.is_none() {
+        return (Some(15), Some(15));
+    }
+    (last, None)
+}
+
+fn battery_is_charging(state: BatteryState) -> bool {
+    matches!(
+        state,
+        BatteryState::Charging | BatteryState::SlowCharging | BatteryState::AlmostFull | BatteryState::Full
+    )
+}
+
+/// Maximum number of undo steps kept in memory.
+const UNDO_DEPTH: usize = 20;
+
+/// Commands whose effect is a configuration change that `undo_last` can revert, with the label
+/// shown in the UI. Hardware-only writes (DPI, flash, EEPROM…) are not in this list.
+fn undo_label_for(cmd: &str) -> Option<&'static str> {
+    Some(match cmd {
+        "set_rgb_config" => "Réglage de l'éclairage",
+        "set_per_key_color" => "Couleur de touche",
+        "clear_per_key" => "Effacement des couleurs par touche",
+        "set_sync_all" | "tray_toggle_sync" => "Synchronisation de l'éclairage",
+        "switch_profile" => "Changement de profil",
+        "create_profile" => "Création de profil",
+        "set_azerty" => "Disposition du clavier",
+        "input_set_winlock" => "Verrou de la touche Windows",
+        "input_set_binding" => "Assignation de touche",
+        "input_remove_binding" => "Suppression d'assignation",
+        "input_set_esports" | "tray_toggle_socd" => "Réglages e-sport",
+        "profile_set_linked_apps" => "Applications liées au profil",
+        "profile_import_json" => "Import de profil",
+        "apply_preset" => "Préréglage",
+        "asus_set_led_count" => "Nombre de LED",
+        "cooling_sl3_argb" => "Éclairage du waterblock",
+        _ => return None,
+    })
+}
+
+/// One-click presets shown on the home screen.
+const PRESETS: &[(&str, &str, &str)] = &[
+    (
+        "silent",
+        "Silencieux",
+        "Ventilateurs en profil silencieux, éclairage doux et tamisé, plan d'alimentation équilibré.",
+    ),
+    (
+        "gaming",
+        "Jeu",
+        "Ventilateurs en profil turbo, éclairage arc-en-ciel, plan d'alimentation hautes performances.",
+    ),
+    (
+        "office",
+        "Bureau",
+        "Ventilateurs en profil standard, éclairage blanc statique, plan d'alimentation équilibré.",
+    ),
+    (
+        "lights_off",
+        "Tout éteint",
+        "Coupe l'éclairage de tous les appareils sans toucher aux ventilateurs.",
+    ),
+];
+
+const POWER_PLAN_BALANCED: &str = "381b4222-f694-41f0-9685-ff5bb260df2e";
+const POWER_PLAN_HIGH_PERF: &str = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
+const POWER_PLAN_ULTIMATE: &str = "e9a42b02-d5df-448d-aa00-03f14749eb61";
 
 impl BackendEngine {
     fn new(
@@ -485,6 +616,15 @@ impl BackendEngine {
             smart_fan_ref_temp: [40.0; 5],
             superio: read_superio_snapshot(),
             last_selftest: None,
+            undo_stack: Vec::new(),
+            visible_apps_cache: None,
+            watchdog_spawned: false,
+            suspended: false,
+            blackout_lock: false,
+            blackout_idle: false,
+            blackout_applied: false,
+            battery_alerted: std::collections::HashMap::new(),
+            ram_restore_modes: None,
         };
         eng.manual_profile_name = eng.config.active_profile.clone();
         eng.sync_input_rules();
@@ -531,27 +671,53 @@ impl BackendEngine {
     /// Runs on the backend thread (which owns all handles): Corsair keyboards back to Hardware
     /// mode, Aura out of Direct streaming, Smart Cooling flat curves replaced by the original BIOS
     /// configuration, and SuperIO channels returned to their saved BIOS mode.
+    /// BIOS configuration to re-apply for Smart Cooling channel `idx` (the curve read at startup,
+    /// else the BIOS automatic "Standard" profile).
+    fn wmi_restore_config(&self, idx: usize) -> Option<FanChannelConfig> {
+        let header = FanHeaderKind::ALL.get(idx).copied()?;
+        Some(match self.initial_cooling_channels.get(idx).cloned().flatten() {
+            Some(original) => original,
+            None => {
+                let mut auto = FanChannelConfig::default_for(header);
+                auto.policy = FanPolicyMode::Standard;
+                auto
+            }
+        })
+    }
+
+    /// Keep the crash-recovery marker in sync with the fans currently overridden, and make sure
+    /// the watchdog process is running while any override is active.
+    fn sync_fan_marker(&mut self) {
+        let marker = fan_watchdog::FanOverrideMarker {
+            pid: std::process::id(),
+            wmi_restore: (0..self.smart_fan_last_duty.len())
+                .filter(|&i| self.smart_fan_last_duty[i].is_some())
+                .filter_map(|i| self.wmi_restore_config(i))
+                .collect(),
+            superio_restore: saved_superio_states(),
+        };
+        let active = !marker.is_empty();
+        fan_watchdog::write_marker(&marker);
+        if active && !self.watchdog_spawned {
+            match fan_watchdog::spawn_watchdog() {
+                Ok(()) => self.watchdog_spawned = true,
+                Err(e) => error!("Watchdog ventilateurs non démarré : {e}"),
+            }
+        }
+    }
+
     fn restore_hardware_on_exit(&mut self) {
         // 1. Smart Cooling: undo the flat manual curves written to the BIOS.
         for idx in 0..self.smart_fan_last_duty.len() {
             if self.smart_fan_last_duty[idx].is_none() {
                 continue;
             }
-            let Some(header) = FanHeaderKind::ALL.get(idx).copied() else {
+            let Some(restore) = self.wmi_restore_config(idx) else {
                 continue;
-            };
-            let restore = match self.initial_cooling_channels.get(idx).cloned().flatten() {
-                Some(original) => original,
-                None => {
-                    // Original BIOS curve unknown: hand control back to the BIOS automatic profile.
-                    let mut auto = FanChannelConfig::default_for(header);
-                    auto.policy = FanPolicyMode::Standard;
-                    auto
-                }
             };
             match apply_asus_wmi_curve(&restore) {
                 Ok(_) => self.smart_fan_last_duty[idx] = None,
-                Err(e) => error!("Restauration ventilateur {:?} échouée : {e}", header),
+                Err(e) => error!("Restauration ventilateur {:?} échouée : {e}", restore.header),
             }
         }
 
@@ -559,6 +725,8 @@ impl BackendEngine {
         for msg in restore_all_superio_fans_auto() {
             info!("{msg}");
         }
+        // Whatever could not be restored stays in the marker: the watchdog retries after exit.
+        self.sync_fan_marker();
 
         // 3. ASUS Aura: leave Direct streaming for the hardware effect.
         if let Some(aura) = self.asus_aura.as_mut() {
@@ -592,12 +760,19 @@ impl BackendEngine {
         let mut last_hotplug_check = Instant::now();
         let mut last_fg_check = Instant::now();
         let mut last_smart_fan = Instant::now();
+        let mut last_idle_check = Instant::now();
+        let mut last_blackout_push = Instant::now();
 
         loop {
             let ui_open = UI_VISIBLE.load(Ordering::Relaxed);
+            let blackout = self.blackout_lock || self.blackout_idle;
             let (live_rgb_active, thermal_rgb_active) = {
                 let p = self.config.active_profile_mut();
-                (p.enable_rgb || p.sync_asus_aura, p.silent_loop3_thermal_rgb)
+                let lights_owned = !self.suspended && !blackout;
+                (
+                    lights_owned && (p.enable_rgb || p.sync_asus_aura),
+                    lights_owned && p.silent_loop3_thermal_rgb,
+                )
             };
             let smart_fan_active = self.cooling_status.wmi_available
                 && self
@@ -607,7 +782,9 @@ impl BackendEngine {
             THERMAL_RGB_ACTIVE.store(thermal_rgb_active || smart_fan_active, Ordering::Relaxed);
 
             // Adaptive wake interval: 33ms ONLY during active live RGB streaming; 250ms UI open; 500ms in Ultra-Light Tray!
-            let wait_ms = if live_rgb_active {
+            let wait_ms = if self.suspended {
+                1000
+            } else if live_rgb_active {
                 33
             } else if ui_open {
                 250
@@ -747,6 +924,7 @@ impl BackendEngine {
 
             // 1b. FanControl-style Smart Cooling (GPU / Mix max(CPU,GPU) with Hysteresis anti-yoyo)
             if smart_fan_active && last_smart_fan.elapsed() >= Duration::from_secs(3) {
+                let mut marker_dirty = false;
                 let sensors = self.latest_sensors();
                 // Never guess a reassuring temperature: a missing sensor must make fans spin UP.
                 let gpu_t: Option<f32> = self
@@ -793,41 +971,74 @@ impl BackendEngine {
                             pt.duty_pct = target_duty;
                         }
                         if apply_asus_wmi_curve(&flat).is_ok() {
+                            let newly_overridden = self.smart_fan_last_duty[idx].is_none();
                             self.smart_fan_last_duty[idx] = Some(target_duty);
+                            if newly_overridden {
+                                marker_dirty = true;
+                            }
                         }
                     }
+                }
+                if marker_dirty {
+                    self.sync_fan_marker();
                 }
                 last_smart_fan = Instant::now();
             }
 
-            // 2. Automatic USB/HID Hot-Plug Watcher (3.5s when UI open, 12s in Ultra-Light Tray)
+            // 2. USB/HID hot-plug. Instant path: WM_DEVICECHANGE (system_events) -> `__sys_event`.
+            //    This slow poll is only a safety net in case an event was missed.
             let hotplug_interval = if ui_open {
-                Duration::from_millis(3500)
+                Duration::from_secs(30)
             } else {
-                Duration::from_secs(12)
+                Duration::from_secs(60)
             };
-            if last_hotplug_check.elapsed() >= hotplug_interval {
-                let sig = compute_hid_signature();
-                if sig != self.last_hid_sig {
-                    info!("Changement USB/HID détecté — reconnexion Plug & Play automatique…");
-                    self.last_hid_sig = sig;
-                    self.reconnect_all();
-                    if ui_open {
-                        let st = self.full_state_json();
-                        let _ = proxy.send_event(UserEvent::EvalJs(format!(
-                            "window.__ogHotplug && window.__ogHotplug({st});"
-                        )));
-                    }
+            if !self.suspended && last_hotplug_check.elapsed() >= hotplug_interval {
+                if self.check_hotplug() && ui_open {
+                    let st = self.full_state_json();
+                    let _ = proxy.send_event(UserEvent::EvalJs(format!(
+                        "window.__ogHotplug && window.__ogHotplug({st});"
+                    )));
                 }
                 last_hotplug_check = Instant::now();
             }
 
-            // 3. Logitech battery refresh every 30s ONLY when UI is visible
-            if ui_open && last_logi_poll.elapsed() >= Duration::from_secs(30) {
+            // 3. Battery refresh (30 s with the UI open, 5 min in the tray) + low-battery alerts
+            let logi_interval = if ui_open {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_secs(300)
+            };
+            if !self.suspended && last_logi_poll.elapsed() >= logi_interval {
                 for m in &mut self.logi_mice {
                     m.refresh_telemetry();
                 }
+                self.check_battery_alerts();
                 last_logi_poll = Instant::now();
+            }
+
+            // 3b. Inactivity lights-off
+            if last_idle_check.elapsed() >= Duration::from_secs(5) {
+                let min = self.config.idle_lights_off_min;
+                self.blackout_idle = min > 0
+                    && idle_duration()
+                        .map(|d| d >= Duration::from_secs(min as u64 * 60))
+                        .unwrap_or(false);
+                last_idle_check = Instant::now();
+            }
+
+            // 3c. Lights-off (session locked / inactivity): hold every controlled light black,
+            //     then give the lights back exactly as they were.
+            if !self.suspended {
+                if blackout {
+                    if !self.blackout_applied
+                        || last_blackout_push.elapsed() >= Duration::from_secs(1)
+                    {
+                        self.push_blackout_frame();
+                        last_blackout_push = Instant::now();
+                    }
+                } else if self.blackout_applied {
+                    self.end_blackout();
+                }
             }
 
             // 4. Live ~28 FPS RGB streaming ONLY when live RGB or Thermal RGB is actually enabled!
@@ -1027,9 +1238,687 @@ impl BackendEngine {
             .ok_or_else(|| "Clavier Logitech non connecté".to_string())
     }
 
+    /// Run an IPC command, recording an undo snapshot when it changes the configuration.
     fn handle_cmd(&mut self, cmd: &str, p: &Value) -> std::result::Result<Value, String> {
+        let Some(label) = undo_label_for(cmd) else {
+            return self.handle_cmd_inner(cmd, p);
+        };
+        let before = self.config.clone();
+        let before_json = serde_json::to_string(&before).unwrap_or_default();
+        let mut res = self.handle_cmd_inner(cmd, p)?;
+        let after_json = serde_json::to_string(&self.config).unwrap_or_default();
+        if before_json != after_json {
+            self.undo_stack.push((label.to_string(), before));
+            if self.undo_stack.len() > UNDO_DEPTH {
+                self.undo_stack.remove(0);
+            }
+            // The state was serialized before the snapshot was pushed: refresh the undo info.
+            if let Some(ui) = res.get_mut("ui") {
+                ui["can_undo"] = json!(true);
+                ui["undo_label"] = json!(label);
+            } else if let Some(ui) = res.get_mut("state").and_then(|s| s.get_mut("ui")) {
+                ui["can_undo"] = json!(true);
+                ui["undo_label"] = json!(label);
+            }
+        }
+        Ok(res)
+    }
+
+    /// Reconnect everything if the set of HID devices changed. Returns `true` if it did.
+    fn check_hotplug(&mut self) -> bool {
+        let sig = compute_hid_signature();
+        if sig == self.last_hid_sig {
+            return false;
+        }
+        let vendors = changed_vendors(&self.last_hid_sig, &sig);
+        info!("Changement USB/HID détecté ({vendors:04X?}) — reconnexion ciblée…");
+        self.last_hid_sig = sig;
+        self.reconnect_vendors(&vendors);
+        self.reapply_runtime_state();
+        true
+    }
+
+    /// Reconnect only the brands whose USB devices changed. Unlike `reconnect_all`, this skips
+    /// the slow system probes (WMI fan interface, power plans) that a USB event cannot affect,
+    /// and leaves untouched brands connected.
+    fn reconnect_vendors(&mut self, vendors: &[u16]) {
+        if vendors.contains(&0x1B1C) {
+            self.corsair_devices.clear();
+            self.corsair_devices = CorsairDevice::connect_all();
+        }
+        if vendors.contains(&0x046D) {
+            self.logi_mice.clear();
+            self.logi_keyboards.clear();
+            self.logi_headsets.clear();
+            self.logi_mice = LogitechMouse::connect_all();
+            self.logi_keyboards = LogitechKeyboard::connect_all();
+            self.logi_headsets = LogitechHeadset::connect_all();
+        }
+        if vendors.contains(&0x0B05) {
+            self.asus_aura = None;
+            match AuraMainboardController::connect() {
+                Ok(a) => {
+                    self.asus_aura = Some(a);
+                    self.asus_err = None;
+                }
+                Err(e) => self.asus_err = Some(e.to_string()),
+            }
+        }
+        self.scanned_devices = scan_hid_devices(false).unwrap_or_default();
+    }
+
+    fn profile_needs_input_engine(&mut self) -> bool {
+        let p = self.config.active_profile_mut();
+        p.socd.enabled
+            || p.key_chatter_ms > 0
+            || p.mouse_debounce_ms > 0
+            || p.win_lock
+            || !p.bindings.is_empty()
+            || p.rgb.kind == EffectKind::ReactiveTyping
+    }
+
+    /// After a reconnection (hot-plug, resume from sleep), freshly opened devices know nothing of
+    /// the current session: push back the runtime state they need.
+    fn reapply_runtime_state(&mut self) {
+        let (sync, thermal, counts) = {
+            let p = self.config.active_profile_mut();
+            (p.sync_asus_aura, p.silent_loop3_thermal_rgb, p.asus_argb_led_counts.clone())
+        };
+        let blackout = self.blackout_lock || self.blackout_idle;
+        if let Some(aura) = self.asus_aura.as_mut() {
+            for (ch, n) in counts {
+                aura.set_channel_led_count(ch, n);
+            }
+            if sync || thermal || blackout {
+                let _ = aura.enter_direct_mode();
+            }
+        }
+        // New handles: the blackout frame (if any) must be pushed again.
+        self.blackout_applied = false;
+        // Windows may silently drop low-level hooks (sleep, hook timeout): restart if needed.
+        if self.profile_needs_input_engine() && !self.input_engine.is_running() {
+            if let Err(e) = self.input_engine.start() {
+                error!("Moteur clavier non redémarré : {e}");
+            }
+        }
+    }
+
+    /// One black frame on every software-controllable light (Corsair keyboards, ASUS Aura), and
+    /// the first time, RAM lighting switched off (mode only: colors are kept for the restore).
+    fn push_blackout_frame(&mut self) {
+        for dev in &mut self.corsair_devices {
+            if dev.info.kind == CorsairDeviceKind::Keyboard {
+                let _ = dev.render_custom_frame(|_, _, _, _| Rgb::BLACK);
+            }
+        }
+        if let Some(aura) = self.asus_aura.as_mut() {
+            let _ = aura.enter_direct_mode();
+            // ARGB strips may be longer than the configured LED count (default 20, e.g. a Lian Li
+            // O11 case strip): black out the whole addressable range so nothing stays lit.
+            let counts: Vec<usize> = aura
+                .info
+                .channels
+                .iter()
+                .map(|c| match c.kind {
+                    AuraChannelKind::AddressableGen2 => c.led_count.max(ARGB_MAX_LEDS),
+                    _ => c.led_count,
+                })
+                .collect();
+            for (ch, n) in counts.into_iter().enumerate() {
+                let _ = aura.send_channel_direct(ch, &vec![Rgb::BLACK; n]);
+            }
+        }
+        if !self.blackout_applied {
+            self.ram_blackout();
+            info!("Éclairage coupé (session verrouillée ou inactivité)");
+        }
+        self.blackout_applied = true;
+    }
+
+    /// Switch RAM lighting off, remembering each module's mode so `ram_restore` brings back the
+    /// exact previous effect (colors live in separate registers and are not touched).
+    fn ram_blackout(&mut self) {
+        if self.ram_restore_modes.is_some() || self.ram_rgb.ene_modules.is_empty() || !is_elevated() {
+            return;
+        }
+        // `current_mode` is read from the module at scan time and updated on every RAM change
+        // made through OpenGear, so it is the effect actually running right now.
+        let restore: Vec<(u8, u8)> = self
+            .ram_rgb
+            .ene_modules
+            .iter()
+            .map(|m| (m.address_7bit, m.current_mode))
+            .filter(|&(_, mode)| mode != EneRamMode::Off as u8)
+            .collect();
+        if restore.is_empty() {
+            return; // already off
+        }
+        let targets: Vec<(&opengear_asus::EneRamModule, u8)> = self
+            .ram_rgb
+            .ene_modules
+            .iter()
+            .filter(|m| restore.iter().any(|(a, _)| *a == m.address_7bit))
+            .map(|m| (m, EneRamMode::Off as u8))
+            .collect();
+        match set_ram_modes_only(&targets) {
+            Ok(n) if n > 0 => self.ram_restore_modes = Some(restore),
+            Ok(_) => {}
+            Err(e) => error!("Extinction RAM impossible : {e}"),
+        }
+    }
+
+    fn ram_restore(&mut self) {
+        let Some(restore) = self.ram_restore_modes.take() else {
+            return;
+        };
+        let targets: Vec<(&opengear_asus::EneRamModule, u8)> = restore
+            .iter()
+            .filter_map(|(addr, mode)| {
+                self.ram_rgb
+                    .ene_modules
+                    .iter()
+                    .find(|m| m.address_7bit == *addr)
+                    .map(|m| (m, *mode))
+            })
+            .collect();
+        if let Err(e) = set_ram_modes_only(&targets) {
+            error!("Rallumage RAM impossible : {e}");
+        }
+    }
+
+    /// Give the lights back: live effects resume by themselves; hardware effects are re-enabled.
+    fn end_blackout(&mut self) {
+        let (enable_rgb, sync, thermal) = {
+            let p = self.config.active_profile_mut();
+            (p.enable_rgb, p.sync_asus_aura, p.silent_loop3_thermal_rgb)
+        };
+        if !enable_rgb {
+            for dev in &mut self.corsair_devices {
+                if dev.info.kind == CorsairDeviceKind::Keyboard
+                    && dev.info.mode == OperatingMode::Software
+                {
+                    let _ = dev.set_mode(OperatingMode::Hardware);
+                }
+            }
+        }
+        if !(sync || thermal) {
+            if let Some(aura) = self.asus_aura.as_mut() {
+                let _ = aura.set_all_hw_mode(self.aura_hw_mode, self.aura_hw_color, false);
+            }
+        }
+        self.ram_restore();
+        self.blackout_applied = false;
+        info!("Éclairage rétabli");
+    }
+
+    /// Windows notification when a wireless device crosses 15 % then 5 % (once per discharge).
+    fn check_battery_alerts(&mut self) {
+        if !self.config.battery_alerts {
+            return;
+        }
+        let mut readings: Vec<(String, String, u8, bool)> = Vec::new();
+        for m in &self.logi_mice {
+            if let Some(b) = &m.info.battery {
+                if let Some(pct) = b.percent {
+                    readings.push((format!("mouse-{:04X}-{}", m.info.pid, m.info.device_index), m.info.name.clone(), pct, battery_is_charging(b.state)));
+                }
+            }
+        }
+        for k in &self.logi_keyboards {
+            if let Some(b) = &k.info.battery {
+                if let Some(pct) = b.percent {
+                    readings.push((format!("kb-{:04X}-{}", k.info.pid, k.info.device_index), k.info.name.clone(), pct, battery_is_charging(b.state)));
+                }
+            }
+        }
+        for (key, name, pct, charging) in readings {
+            let last = self.battery_alerted.get(&key).copied();
+            let (next, notify) = battery_alert_step(last, pct, charging);
+            match next {
+                Some(level) => {
+                    self.battery_alerted.insert(key, level);
+                }
+                None => {
+                    self.battery_alerted.remove(&key);
+                }
+            }
+            if let Some(level) = notify {
+                let body = format!("{name} : {pct} % restants — pense à la recharger.");
+                let title = if level <= 5 { "Batterie presque vide" } else { "Batterie faible" };
+                if !tray_notify(title, &body) {
+                    info!("{title} — {body}");
+                }
+            }
+        }
+    }
+
+    /// Re-apply the hardware side effects of a configuration restored by `undo_last`.
+    fn apply_restored_config(&mut self) {
+        self.sync_input_rules();
+        let (enable_rgb, sync_aura, thermal) = {
+            let p = self.config.active_profile_mut();
+            (p.enable_rgb, p.sync_asus_aura, p.silent_loop3_thermal_rgb)
+        };
+        if !enable_rgb {
+            for dev in &mut self.corsair_devices {
+                if dev.info.kind == CorsairDeviceKind::Keyboard
+                    && dev.info.mode == OperatingMode::Software
+                {
+                    let _ = dev.set_mode(OperatingMode::Hardware);
+                }
+            }
+        }
+        if let Some(aura) = self.asus_aura.as_mut() {
+            if sync_aura || thermal {
+                let _ = aura.enter_direct_mode();
+            } else if aura.is_in_direct_mode() {
+                let _ = aura.set_all_hw_mode(self.aura_hw_mode, self.aura_hw_color, false);
+            }
+        }
+        self.persist_config();
+    }
+
+    fn visible_apps_cached(&mut self) -> Vec<String> {
+        if let Some((at, apps)) = &self.visible_apps_cache {
+            if at.elapsed() < Duration::from_secs(5) {
+                return apps.clone();
+            }
+        }
+        let apps = list_visible_apps();
+        self.visible_apps_cache = Some((Instant::now(), apps.clone()));
+        apps
+    }
+
+    /// Apply a one-click preset. Never writes flash/EEPROM: lighting is a profile setting, fans use
+    /// the BIOS policies (only on channels not driven by Smart Cooling), power plan if present.
+    fn apply_preset(&mut self, preset: &str) -> std::result::Result<Vec<String>, String> {
+        let (kind, primary, brightness, fan_policy, plans): (
+            EffectKind,
+            Rgb,
+            f32,
+            Option<FanPolicyMode>,
+            &[&str],
+        ) = match preset {
+            "silent" => (
+                EffectKind::Breathing,
+                Rgb::new(40, 90, 255),
+                0.35,
+                Some(FanPolicyMode::Silent),
+                &[POWER_PLAN_BALANCED],
+            ),
+            "gaming" => (
+                EffectKind::RainbowWave,
+                Rgb::CYAN,
+                1.0,
+                Some(FanPolicyMode::Turbo),
+                &[POWER_PLAN_HIGH_PERF, POWER_PLAN_ULTIMATE],
+            ),
+            "office" => (
+                EffectKind::Static,
+                Rgb::new(235, 240, 255),
+                0.6,
+                Some(FanPolicyMode::Standard),
+                &[POWER_PLAN_BALANCED],
+            ),
+            "lights_off" => (EffectKind::Off, Rgb::BLACK, 0.0, None, &[]),
+            _ => return Err(format!("Préréglage inconnu : {preset}")),
+        };
+        let mut summary = Vec::new();
+
+        {
+            let p = self.config.active_profile_mut();
+            p.enable_rgb = true;
+            p.sync_asus_aura = true;
+            p.rgb.kind = kind;
+            p.rgb.primary = primary;
+            p.rgb.brightness = brightness;
+        }
+        if let Some(aura) = self.asus_aura.as_mut() {
+            let _ = aura.enter_direct_mode();
+        }
+        summary.push(format!("Éclairage : {}", kind.label()));
+
+        if let Some(policy) = fan_policy {
+            if self.cooling_status.wmi_available && is_elevated() {
+                let mut applied = 0usize;
+                let mut failed = 0usize;
+                for ch in self.cooling_channels.iter_mut() {
+                    if ch.source != FanTempSource::CpuBios {
+                        continue; // Smart Cooling owns this channel
+                    }
+                    let mut cfg = ch.clone();
+                    cfg.policy = policy;
+                    match apply_asus_wmi_curve(&cfg) {
+                        Ok(_) => {
+                            ch.policy = policy;
+                            applied += 1;
+                        }
+                        Err(_) => failed += 1,
+                    }
+                }
+                summary.push(format!(
+                    "Ventilateurs : profil {} sur {applied} canal(aux){}",
+                    policy.asus_profile_str(),
+                    if failed > 0 { format!(", {failed} refusé(s) par le BIOS") } else { String::new() }
+                ));
+            } else {
+                summary.push("Ventilateurs inchangés (droits administrateur + ASUS WMI requis)".into());
+            }
+        }
+
+        if !plans.is_empty() {
+            let target = plans.iter().find_map(|g| {
+                self.power_plans
+                    .iter()
+                    .find(|p| p.guid.eq_ignore_ascii_case(g))
+                    .map(|p| (p.guid.clone(), p.name.clone()))
+            });
+            match target {
+                Some((guid, name)) => match set_active_power_plan(&guid) {
+                    Ok(_) => {
+                        self.power_plans = list_power_plans();
+                        summary.push(format!("Alimentation : {name}"));
+                    }
+                    Err(e) => summary.push(format!("Alimentation inchangée ({e})")),
+                },
+                None => summary.push("Alimentation inchangée (plan absent de ce PC)".into()),
+            }
+        }
+        self.persist_config();
+        Ok(summary)
+    }
+
+    /// Human-readable health checks for the Diagnostic page.
+    fn diagnostics_json(&mut self) -> Value {
+        let mut checks: Vec<Value> = Vec::new();
+        let mut push = |id: &str, label: &str, status: &str, detail: String, action: Value| {
+            checks.push(json!({ "id": id, "label": label, "status": status, "detail": detail, "action": action }));
+        };
+
+        let admin = is_elevated();
+        push(
+            "admin",
+            "Droits administrateur",
+            if admin { "ok" } else { "warn" },
+            if admin {
+                "OpenGear tourne en administrateur : ventilateurs, RGB de la RAM et capteurs avancés sont disponibles.".into()
+            } else {
+                "Sans droits administrateur, le contrôle des ventilateurs, le RGB de la RAM et certains capteurs sont désactivés.".into()
+            },
+            if admin {
+                Value::Null
+            } else {
+                json!({ "label": "Relancer en administrateur", "cmd": "cooling_relaunch_admin", "payload": {} })
+            },
+        );
+
+        let (st, detail, action) = match pawnio_availability() {
+            PawnIoAvailability::Ready => ("ok", "Pilote signé PawnIO actif (capteurs CPU, SMBus, SuperIO).".to_string(), Value::Null),
+            PawnIoAvailability::NeedsAdmin => (
+                "warn",
+                "Le pilote PawnIO est installé mais nécessite les droits administrateur.".to_string(),
+                Value::Null,
+            ),
+            PawnIoAvailability::NotInstalled => (
+                "warn",
+                "Le pilote signé PawnIO n'est pas installé : température CPU native, RAM RGB et ventilateurs directs indisponibles.".to_string(),
+                json!({ "label": "Installer PawnIO", "cmd": "pawnio_install", "payload": {} }),
+            ),
+        };
+        push("pawnio", "Pilote matériel PawnIO", st, detail, action);
+
+        push(
+            "asus_wmi",
+            "Interface ventilateurs ASUS (WMI)",
+            if self.cooling_status.wmi_available { "ok" } else { "warn" },
+            self.cooling_status.message.clone(),
+            Value::Null,
+        );
+
+        let sensors = self.latest_sensors();
+        push(
+            "sensors",
+            "Capteurs de température",
+            if sensors.available { "ok" } else { "warn" },
+            if sensors.available {
+                format!("Source : {}", sensors.source)
+            } else {
+                "Aucune source de capteurs : installe LibreHardwareMonitor ou PawnIO pour les températures.".into()
+            },
+            Value::Null,
+        );
+
+        let n_dev = self.corsair_devices.len()
+            + self.logi_mice.len()
+            + self.logi_keyboards.len()
+            + self.logi_headsets.len()
+            + usize::from(self.asus_aura.is_some());
+        push(
+            "devices",
+            "Appareils compatibles",
+            if n_dev > 0 { "ok" } else { "warn" },
+            if n_dev > 0 {
+                format!("{n_dev} appareil(s) piloté(s).")
+            } else {
+                "Aucun appareil compatible détecté. Vérifie les branchements et ferme iCUE / G HUB / Armoury Crate.".into()
+            },
+            json!({ "label": "Relancer la détection", "cmd": "reconnect_all", "payload": {} }),
+        );
+
+        if let Some(err) = &self.asus_err {
+            push(
+                "aura",
+                "Contrôleur ASUS Aura",
+                "warn",
+                format!("Non connecté : {err}"),
+                Value::Null,
+            );
+        }
+
+        let needs_engine = {
+            let p = self.config.active_profile_mut();
+            p.socd.enabled
+                || p.key_chatter_ms > 0
+                || p.mouse_debounce_ms > 0
+                || p.win_lock
+                || !p.bindings.is_empty()
+        };
+        let engine_ok = self.input_engine.is_running();
+        push(
+            "input",
+            "Moteur clavier (remaps, macros, SOCD)",
+            if !needs_engine || engine_ok { "ok" } else { "error" },
+            if engine_ok {
+                "Actif.".into()
+            } else if needs_engine {
+                "Des assignations sont configurées mais le moteur clavier ne tourne pas.".into()
+            } else {
+                "Inactif (aucune assignation configurée).".into()
+            },
+            if needs_engine && !engine_ok {
+                json!({ "label": "Démarrer le moteur", "cmd": "input_set_enabled", "payload": { "enabled": true } })
+            } else {
+                Value::Null
+            },
+        );
+
+        match &self.config_warning {
+            Some(w) => push("config", "Fichier de profils", "error", w.clone(), Value::Null),
+            None => push(
+                "config",
+                "Fichier de profils",
+                "ok",
+                format!("Profils enregistrés dans {}", self.config_path.display()),
+                Value::Null,
+            ),
+        }
+
+        json!({ "checks": checks })
+    }
+
+    /// Plain-text report to paste in a bug report: versions, machine, devices (no serial numbers),
+    /// health checks and the end of the log. The user profile path is masked.
+    fn diagnostic_report(&mut self) -> String {
+        use std::fmt::Write as _;
+        let mut r = String::new();
+        let s = &self.telemetry.static_info;
+        let _ = writeln!(r, "=== Rapport de diagnostic OpenGear {} ===", env!("CARGO_PKG_VERSION"));
+        let _ = writeln!(r, "Carte mère : {} (BIOS {})", s.motherboard, s.bios_version);
+        let _ = writeln!(r, "CPU : {} | GPU : {} | RAM : {:.0} Go", s.cpu_name, s.gpu_name, s.ram_total_gb);
+        let _ = writeln!(r, "Administrateur : {} | Mode UI : {}", is_elevated(), self.config.ui_mode);
+        let _ = writeln!(r, "\n--- Appareils pilotés ---");
+        for d in &self.corsair_devices {
+            let _ = writeln!(
+                r,
+                "Corsair {} ({:04X}:{:04X}, {}) FW {} | mode {:?} | report {} o | FlashTap 0xF5 = {}",
+                d.info.product_name, d.info.vid, d.info.pid, d.info.kind.label(),
+                d.info.firmware_version, d.info.mode, d.info.out_report_len, d.info.flashtap_probe
+            );
+        }
+        for m in &self.logi_mice {
+            let _ = writeln!(
+                r,
+                "Logitech souris {} ({:04X}:{:04X}, slot 0x{:02X}) HID++ v{} FW {}",
+                m.info.name, m.info.vid, m.info.pid, m.info.device_index,
+                m.info.proto_version, m.info.firmware.join(" / ")
+            );
+        }
+        for k in &self.logi_keyboards {
+            let _ = writeln!(r, "Logitech clavier {} ({:04X}:{:04X})", k.info.name, k.info.vid, k.info.pid);
+        }
+        for h in &self.logi_headsets {
+            let _ = writeln!(r, "Logitech casque {} ({:04X}:{:04X})", h.info.name, h.info.vid, h.info.pid);
+        }
+        match &self.asus_aura {
+            Some(a) => {
+                let _ = writeln!(r, "ASUS Aura {} FW {} | {} canaux", a.info.product_name, a.info.firmware_version, a.info.channels.len());
+            }
+            None => {
+                let _ = writeln!(r, "ASUS Aura : {}", self.asus_err.as_deref().unwrap_or("absent"));
+            }
+        }
+        let (socd_n, inj_ok, inj_fail) = self.input_engine.injection_stats();
+        let _ = writeln!(
+            r,
+            "Moteur clavier : actif={} | Snap Tap résolutions={} | injections OK={} refusées={}",
+            self.input_engine.is_running(),
+            socd_n,
+            inj_ok,
+            inj_fail
+        );
+        let _ = writeln!(r, "\n--- Diagnostic ---");
+        if let Some(checks) = self.diagnostics_json()["checks"].as_array() {
+            for c in checks {
+                let _ = writeln!(
+                    r,
+                    "[{}] {} — {}",
+                    c["status"].as_str().unwrap_or("?").to_uppercase(),
+                    c["label"].as_str().unwrap_or(""),
+                    c["detail"].as_str().unwrap_or("")
+                );
+            }
+        }
+        let _ = writeln!(r, "\n--- Journal (200 dernières lignes) ---");
+        r.push_str(&crate::app_log::tail(200));
+        mask_user_profile(&r)
+    }
+
+    fn handle_cmd_inner(&mut self, cmd: &str, p: &Value) -> std::result::Result<Value, String> {
         match cmd {
             "get_state" => Ok(self.full_state_json()),
+            // ================= UX: PREFERENCES, PRESETS, UNDO, DIAGNOSTICS, BACKUPS =================
+            "set_ui_prefs" => {
+                if let Some(mode) = p["ui_mode"].as_str() {
+                    if mode != "simple" && mode != "expert" {
+                        return Err(format!("Mode d'interface inconnu : {mode}"));
+                    }
+                    self.config.ui_mode = mode.to_string();
+                }
+                if let Some(done) = p["onboarding_done"].as_bool() {
+                    self.config.onboarding_done = done;
+                }
+                self.persist_config();
+                Ok(self.full_state_json())
+            }
+            "apply_preset" => {
+                let preset = p["preset"].as_str().ok_or("Préréglage manquant")?;
+                let summary = self.apply_preset(preset)?;
+                let label = PRESETS
+                    .iter()
+                    .find(|(id, _, _)| *id == preset)
+                    .map(|(_, l, _)| *l)
+                    .unwrap_or(preset);
+                let mut st = self.full_state_json();
+                st["last_action_msg"] = json!(format!("Préréglage « {label} » appliqué — {}", summary.join(" • ")));
+                Ok(st)
+            }
+            "undo_last" => {
+                let (label, snapshot) = self.undo_stack.pop().ok_or("Rien à annuler")?;
+                self.config = snapshot;
+                self.apply_restored_config();
+                let mut st = self.full_state_json();
+                st["last_action_msg"] = json!(format!("Annulé : {label}"));
+                Ok(st)
+            }
+            // ================= WINDOWS SYSTEM EVENTS (system_events.rs) =================
+            "__sys_event" => {
+                match p["event"].as_str().unwrap_or("") {
+                    "suspend" => {
+                        info!("Mise en veille : pilotage des appareils suspendu");
+                        self.suspended = true;
+                    }
+                    "resume" => {
+                        info!("Sortie de veille : reconnexion des appareils…");
+                        self.suspended = false;
+                        // USB devices re-enumerate for a moment after wake-up.
+                        std::thread::sleep(Duration::from_millis(1500));
+                        self.reconnect_all();
+                        self.reapply_runtime_state();
+                    }
+                    "lock" => {
+                        if self.config.lights_off_on_lock {
+                            self.blackout_lock = true;
+                        }
+                    }
+                    "unlock" => self.blackout_lock = false,
+                    "devices_changed" => {
+                        if !self.suspended {
+                            self.check_hotplug();
+                        }
+                    }
+                    other => return Err(format!("Événement système inconnu : {other}")),
+                }
+                Ok(self.full_state_json())
+            }
+            "get_diagnostics" => Ok(self.diagnostics_json()),
+            // Live Snap Tap view: what applications receive for left / right / forward / back.
+            "input_socd_live" => {
+                let k = opengear_input::movement_keys_effective();
+                Ok(json!({
+                    "engine_running": self.input_engine.is_running(),
+                    "left": k[0], "right": k[1], "forward": k[2], "back": k[3],
+                }))
+            }
+            // Opens Notepad so the user can type OUTSIDE OpenGear: keystrokes typed in OpenGear's
+            // own window do not go through the keyboard engine (observed with the hook counters).
+            "open_test_window" => {
+                std::process::Command::new("notepad.exe")
+                    .spawn()
+                    .map_err(|e| format!("Impossible d'ouvrir le Bloc-notes : {e}"))?;
+                Ok(json!({ "message": "Bloc-notes ouvert : tapes-y Q puis D en gardant OpenGear visible" }))
+            }
+            "get_diagnostic_report" => Ok(json!({ "text": self.diagnostic_report() })),
+            "list_backups" => Ok(json!({ "backups": list_sector_backups() })),
+            "logi_restore_backup" => {
+                let file = p["file"].as_str().ok_or("Fichier de sauvegarde manquant")?;
+                let path = backup_path_for(file).ok_or("Sauvegarde introuvable ou nom invalide")?;
+                let m = self.logi_mouse_mut(p)?;
+                m.restore_onboard_backup(&path).map_err(|e| e.to_string())?;
+                m.refresh_telemetry();
+                let mut st = self.full_state_json();
+                st["last_action_msg"] = json!(format!("Sauvegarde {file} restaurée et vérifiée"));
+                Ok(st)
+            }
             "reconnect_all" => {
                 self.reconnect_all();
                 Ok(self.full_state_json())
@@ -1183,6 +2072,29 @@ impl BackendEngine {
                 let dev = self.corsair_mut(p)?;
                 dev.set_hw_winlock(on).map_err(|e| e.to_string())?;
                 Ok(self.full_state_json())
+            }
+            "corsair_set_flashtap" => {
+                let on = p["enabled"].as_bool().ok_or("enabled manquant")?;
+                let dev = self.corsair_mut(p)?;
+                if !dev.info.flashtap_supported {
+                    return Err("Ce périphérique ne propose pas le FlashTap matériel".into());
+                }
+                dev.set_flashtap(on).map_err(|e| e.to_string())?;
+                // Hardware SOCD and the software SOCD hook must not both act on the same keys.
+                let mut msg = if on {
+                    "FlashTap matériel activé : le clavier gère lui-même la priorité des touches opposées".to_string()
+                } else {
+                    "FlashTap matériel désactivé".to_string()
+                };
+                if on && self.config.active_profile_mut().socd.enabled {
+                    self.config.active_profile_mut().socd.enabled = false;
+                    self.sync_input_rules();
+                    self.persist_config();
+                    msg.push_str(" — SOCD logiciel désactivé pour éviter un double traitement");
+                }
+                let mut st = self.full_state_json();
+                st["last_action_msg"] = json!(msg);
+                Ok(st)
             }
             "corsair_set_winlock_shortcuts" => {
                 let mask = p["mask"].as_u64().unwrap_or(1) as u8;
@@ -1368,6 +2280,13 @@ impl BackendEngine {
                 self.ram_rgb.last_mode = mode.id().to_string();
                 self.ram_rgb.last_color = color.to_hex();
                 self.ram_rgb.last_speed = speed;
+                // Keep the per-module mode in sync with what the hardware now runs
+                // (used to restore the exact effect after a lights-off).
+                for m in self.ram_rgb.ene_modules.iter_mut() {
+                    if target_addr.map_or(true, |a| a == m.address_7bit) {
+                        m.current_mode = mode as u8;
+                    }
+                }
                 Ok(self.full_state_json())
             }
             // ================= LOGITECH G MULTI-DEVICE (MICE + KEYBOARDS + HEADSETS) =================
@@ -1755,6 +2674,18 @@ impl BackendEngine {
             }
             // ================= SYSTEM TRAY, AUTOSTART, SHORTCUTS & AUTO-PROFILE SWITCH =================
             "sys_set_prefs" => {
+                if let Some(v) = p["lights_off_on_lock"].as_bool() {
+                    self.config.lights_off_on_lock = v;
+                    if !v {
+                        self.blackout_lock = false;
+                    }
+                }
+                if let Some(v) = p["idle_lights_off_min"].as_u64() {
+                    self.config.idle_lights_off_min = v.min(240) as u16;
+                }
+                if let Some(v) = p["battery_alerts"].as_bool() {
+                    self.config.battery_alerts = v;
+                }
                 if let Some(v) = p["minimize_to_tray"].as_bool() {
                     self.config.minimize_to_tray = v;
                     MINIMIZE_TO_TRAY.store(v, Ordering::Relaxed);
@@ -1837,6 +2768,7 @@ impl BackendEngine {
                 let ch = p["channel"].as_u64().ok_or("channel manquant")? as usize;
                 let duty = p["duty_pct"].as_u64().ok_or("duty_pct manquant")?.min(100) as u8;
                 let msg = set_superio_fan_pwm(ch, duty).map_err(|e| e.to_string())?;
+                self.sync_fan_marker();
                 self.superio = read_superio_snapshot();
                 let mut st = self.full_state_json();
                 st["last_action_msg"] = json!(msg);
@@ -1845,6 +2777,7 @@ impl BackendEngine {
             "superio_restore_auto" => {
                 let ch = p["channel"].as_u64().ok_or("channel manquant")? as usize;
                 let msg = restore_superio_fan_auto(ch).map_err(|e| e.to_string())?;
+                self.sync_fan_marker();
                 self.superio = read_superio_snapshot();
                 let mut st = self.full_state_json();
                 st["last_action_msg"] = json!(msg);
@@ -2039,6 +2972,7 @@ impl BackendEngine {
             "storage_total_kb": i.storage_total_kb,
             "storage_free_kb": i.storage_free_kb,
             "flashtap_supported": i.flashtap_supported,
+            "flashtap_enabled": i.flashtap_enabled,
             "rapid_trigger_supported": i.rapid_trigger_supported,
             "hwp_profiles": hwp_profiles,
             "mouse": i.mouse,
@@ -2319,7 +3253,7 @@ impl BackendEngine {
             .collect();
 
         let (chatter_blocked, mouse_dblclick_blocked) = self.input_engine.stats();
-        let visible_apps = list_visible_apps();
+        let visible_apps = self.visible_apps_cached();
 
         let mut fw_inventory: Vec<Value> = vec![json!({
             "device": self.telemetry.static_info.motherboard,
@@ -2372,12 +3306,28 @@ impl BackendEngine {
                 "cpu_name": self.telemetry.static_info.cpu_name,
                 "gpu_name": self.telemetry.static_info.gpu_name,
             },
+            "app_version": env!("CARGO_PKG_VERSION"),
             "config_warning": self.config_warning,
+            "ui": {
+                "mode": self.config.ui_mode,
+                "onboarding_done": self.config.onboarding_done,
+                "can_undo": !self.undo_stack.is_empty(),
+                "undo_label": self.undo_stack.last().map(|(l, _)| l.clone()),
+            },
+            "presets": PRESETS.iter().map(|(id, label, description)| json!({
+                "id": id,
+                "label": label,
+                "description": description,
+            })).collect::<Vec<_>>(),
             "system_prefs": {
                 "autostart": is_autostart_enabled(),
                 "minimize_to_tray": self.config.minimize_to_tray,
                 "start_minimized": self.config.start_minimized,
                 "auto_profile_switch": self.config.auto_profile_switch,
+                "lights_off_on_lock": self.config.lights_off_on_lock,
+                "idle_lights_off_min": self.config.idle_lights_off_min,
+                "battery_alerts": self.config.battery_alerts,
+                "lights_blackout": self.blackout_lock || self.blackout_idle,
                 "foreground_app": self.foreground_app,
                 "auto_switched": self.auto_switched,
                 "socd_suspended": self.input_engine.is_socd_suspended(),
@@ -2536,5 +3486,75 @@ fn thermal_rgb(temp_c: f32) -> Rgb {
             (185.0 - f * 155.0) as u8,
             (30.0 + f * 40.0) as u8,
         )
+    }
+}
+
+/// Replace the user profile folder (which contains the Windows user name) by `%USERPROFILE%`.
+fn mask_user_profile(text: &str) -> String {
+    match std::env::var("USERPROFILE") {
+        Ok(home) if home.len() > 3 => {
+            let masked = text.replace(&home, "%USERPROFILE%");
+            masked.replace(&home.replace('\\', "/"), "%USERPROFILE%")
+        }
+        _ => text.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{battery_alert_step, mask_user_profile};
+
+    #[test]
+    fn battery_alerts_fire_once_at_15_then_once_at_5() {
+        let mut last = None;
+        let mut fired = Vec::new();
+        for pct in [40, 21, 16, 15, 14, 12, 6, 5, 4, 3] {
+            let (next, notify) = battery_alert_step(last, pct, false);
+            last = next;
+            if let Some(level) = notify {
+                fired.push((pct, level));
+            }
+        }
+        assert_eq!(fired, vec![(15, 15), (5, 5)]);
+    }
+
+    #[test]
+    fn battery_alert_starts_at_5_when_first_seen_very_low() {
+        assert_eq!(battery_alert_step(None, 3, false), (Some(5), Some(5)));
+        // ...and does not then fire the 15 % alert
+        assert_eq!(battery_alert_step(Some(5), 3, false), (Some(5), None));
+    }
+
+    #[test]
+    fn charging_or_recharged_rearms_alerts() {
+        assert_eq!(battery_alert_step(Some(5), 4, true), (None, None));
+        assert_eq!(battery_alert_step(Some(15), 25, false), (None, None));
+        assert_eq!(battery_alert_step(None, 14, false), (Some(15), Some(15)));
+    }
+
+    #[test]
+    fn user_profile_is_masked_in_reports() {
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            let text = format!(r"cfg: {home}\AppData\Roaming\OpenGear\x.toml");
+            let masked = mask_user_profile(&text);
+            assert!(!masked.contains(&home));
+            assert!(masked.contains("%USERPROFILE%"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod hotplug_tests {
+    use super::changed_vendors;
+
+    #[test]
+    fn only_the_brand_that_changed_is_reconnected() {
+        let before = [(0x046D, 0xC547, 0xFF00), (0x0B05, 0x19AF, 0xFF72), (0x1B1C, 0x1B73, 0xFF42)];
+        // Logitech receiver unplugged
+        let after = [(0x0B05, 0x19AF, 0xFF72), (0x1B1C, 0x1B73, 0xFF42)];
+        assert_eq!(changed_vendors(&before, &after), vec![0x046D]);
+        // Corsair keyboard plugged back
+        assert_eq!(changed_vendors(&after[..1], &after), vec![0x1B1C]);
+        assert!(changed_vendors(&before, &before).is_empty());
     }
 }

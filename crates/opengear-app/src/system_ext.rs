@@ -6,6 +6,27 @@
 use opengear_core::Rgb;
 
 /// Return the lowercase `.exe` filename of the currently focused Windows application (e.g. `cs2.exe`).
+/// Time since the last keyboard / mouse input in this session (`GetLastInputInfo`).
+pub fn idle_duration() -> Option<std::time::Duration> {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::SystemInformation::GetTickCount;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+        let mut info = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        if GetLastInputInfo(&mut info) == 0 {
+            return None;
+        }
+        // Both are 32-bit tick counts: wrapping_sub handles the 49.7-day rollover.
+        let idle_ms = GetTickCount().wrapping_sub(info.dwTime);
+        Some(std::time::Duration::from_millis(idle_ms as u64))
+    }
+    #[cfg(not(windows))]
+    None
+}
+
 pub fn get_foreground_exe_name() -> Option<String> {
     #[cfg(windows)]
     unsafe {

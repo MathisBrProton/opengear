@@ -1481,7 +1481,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "opengear-app"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1502,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "opengear-asus"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "hidapi",
@@ -1516,7 +1516,7 @@ dependencies = [
 
 [[package]]
 name = "opengear-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "hidapi",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "opengear-corsair"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "hidapi",
@@ -1542,7 +1542,7 @@ dependencies = [
 
 [[package]]
 name = "opengear-input"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "opengear-core",
@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "opengear-logitech"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "hidapi",
