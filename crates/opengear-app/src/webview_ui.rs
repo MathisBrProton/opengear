@@ -2,12 +2,14 @@ use crate::audio_ext::{read_audio_state, read_output_peak, set_endpoint_mute, se
 use crate::local_assets::LocalAssetCatalog;
 use crate::selftest::{SelfTestReport, run_full_selftest};
 use crate::system_ext::{
-    AmbilightFrame, get_foreground_exe_name, list_visible_apps, sample_ambilight_screen,
+    AmbilightFrame, get_foreground_exe_name, idle_duration, list_visible_apps,
+    sample_ambilight_screen,
 };
+use crate::system_events;
 use crate::tray_icon::{
     TrayAction, acquire_single_instance, build_window_icon, create_windows_shortcuts,
     ensure_ico_beside_exe, is_autostart_enabled, release_single_instance, set_autostart_enabled,
-    start_system_tray, stop_system_tray, trim_working_set,
+    start_system_tray, stop_system_tray, tray_notify, trim_working_set,
 };
 use anyhow::Result;
 use opengear_asus::{
@@ -34,7 +36,7 @@ use opengear_corsair::{
 };
 use opengear_input::{ALL_BINDABLE_KEYS, InputEngine};
 use opengear_logitech::{
-    BatteryPowerModel, EQ_PRESETS, KeyboardRgbMode, LodLevel, LogitechHeadset, LogitechKeyboard,
+    BatteryPowerModel, BatteryState, EQ_PRESETS, KeyboardRgbMode, LodLevel, LogitechHeadset, LogitechKeyboard,
     LogitechMouse, MouseButtonAction, MouseLedMode, OnboardMacroStep, OnboardMode,
     backup_path_for, list_sector_backups,
 };
@@ -240,6 +242,16 @@ pub fn run_gui(cli_minimized: bool) -> Result<()> {
         Some(wv)
     };
 
+    // Sleep / resume, session lock and device plug events -> backend (as internal commands).
+    let sys_tx = tx_cmd.clone();
+    system_events::start(move |ev| {
+        let _ = sys_tx.send(IpcRequest {
+            id: 0,
+            cmd: "__sys_event".into(),
+            payload: json!({ "event": ev.id() }),
+        });
+    });
+
     let tray_tx = tx_cmd.clone();
     let ui_assets = Arc::clone(&local_assets);
     event_loop.run(move |event, _, control_flow| {
@@ -401,6 +413,37 @@ struct BackendEngine {
     visible_apps_cache: Option<(Instant, Vec<String>)>,
     /// The fan watchdog process has been started for this session.
     watchdog_spawned: bool,
+    /// System is going to sleep: no device I/O until resume.
+    suspended: bool,
+    /// Lights forced off because the session is locked / the user is inactive.
+    blackout_lock: bool,
+    blackout_idle: bool,
+    /// A black frame has been pushed to the devices (so lights must be restored afterwards).
+    blackout_applied: bool,
+    /// Last low-battery level notified per device (15 or 5), reset when charging.
+    battery_alerted: std::collections::HashMap<String, u8>,
+}
+
+/// Low-battery notification state machine. Returns `(new_last_alerted, level_to_notify)`:
+/// notify once at <= 15 %, once more at <= 5 %, and re-arm when charging or back above 20 %.
+pub(crate) fn battery_alert_step(last: Option<u8>, pct: u8, charging: bool) -> (Option<u8>, Option<u8>) {
+    if charging || pct > 20 {
+        return (None, None);
+    }
+    if pct <= 5 && last != Some(5) {
+        return (Some(5), Some(5));
+    }
+    if pct <= 15 && last.is_none() {
+        return (Some(15), Some(15));
+    }
+    (last, None)
+}
+
+fn battery_is_charging(state: BatteryState) -> bool {
+    matches!(
+        state,
+        BatteryState::Charging | BatteryState::SlowCharging | BatteryState::AlmostFull | BatteryState::Full
+    )
 }
 
 /// Maximum number of undo steps kept in memory.
@@ -557,6 +600,11 @@ impl BackendEngine {
             undo_stack: Vec::new(),
             visible_apps_cache: None,
             watchdog_spawned: false,
+            suspended: false,
+            blackout_lock: false,
+            blackout_idle: false,
+            blackout_applied: false,
+            battery_alerted: std::collections::HashMap::new(),
         };
         eng.manual_profile_name = eng.config.active_profile.clone();
         eng.sync_input_rules();
@@ -692,12 +740,19 @@ impl BackendEngine {
         let mut last_hotplug_check = Instant::now();
         let mut last_fg_check = Instant::now();
         let mut last_smart_fan = Instant::now();
+        let mut last_idle_check = Instant::now();
+        let mut last_blackout_push = Instant::now();
 
         loop {
             let ui_open = UI_VISIBLE.load(Ordering::Relaxed);
+            let blackout = self.blackout_lock || self.blackout_idle;
             let (live_rgb_active, thermal_rgb_active) = {
                 let p = self.config.active_profile_mut();
-                (p.enable_rgb || p.sync_asus_aura, p.silent_loop3_thermal_rgb)
+                let lights_owned = !self.suspended && !blackout;
+                (
+                    lights_owned && (p.enable_rgb || p.sync_asus_aura),
+                    lights_owned && p.silent_loop3_thermal_rgb,
+                )
             };
             let smart_fan_active = self.cooling_status.wmi_available
                 && self
@@ -707,7 +762,9 @@ impl BackendEngine {
             THERMAL_RGB_ACTIVE.store(thermal_rgb_active || smart_fan_active, Ordering::Relaxed);
 
             // Adaptive wake interval: 33ms ONLY during active live RGB streaming; 250ms UI open; 500ms in Ultra-Light Tray!
-            let wait_ms = if live_rgb_active {
+            let wait_ms = if self.suspended {
+                1000
+            } else if live_rgb_active {
                 33
             } else if ui_open {
                 250
@@ -908,34 +965,60 @@ impl BackendEngine {
                 last_smart_fan = Instant::now();
             }
 
-            // 2. Automatic USB/HID Hot-Plug Watcher (3.5s when UI open, 12s in Ultra-Light Tray)
+            // 2. USB/HID hot-plug. Instant path: WM_DEVICECHANGE (system_events) -> `__sys_event`.
+            //    This slow poll is only a safety net in case an event was missed.
             let hotplug_interval = if ui_open {
-                Duration::from_millis(3500)
+                Duration::from_secs(30)
             } else {
-                Duration::from_secs(12)
+                Duration::from_secs(60)
             };
-            if last_hotplug_check.elapsed() >= hotplug_interval {
-                let sig = compute_hid_signature();
-                if sig != self.last_hid_sig {
-                    info!("Changement USB/HID détecté — reconnexion Plug & Play automatique…");
-                    self.last_hid_sig = sig;
-                    self.reconnect_all();
-                    if ui_open {
-                        let st = self.full_state_json();
-                        let _ = proxy.send_event(UserEvent::EvalJs(format!(
-                            "window.__ogHotplug && window.__ogHotplug({st});"
-                        )));
-                    }
+            if !self.suspended && last_hotplug_check.elapsed() >= hotplug_interval {
+                if self.check_hotplug() && ui_open {
+                    let st = self.full_state_json();
+                    let _ = proxy.send_event(UserEvent::EvalJs(format!(
+                        "window.__ogHotplug && window.__ogHotplug({st});"
+                    )));
                 }
                 last_hotplug_check = Instant::now();
             }
 
-            // 3. Logitech battery refresh every 30s ONLY when UI is visible
-            if ui_open && last_logi_poll.elapsed() >= Duration::from_secs(30) {
+            // 3. Battery refresh (30 s with the UI open, 5 min in the tray) + low-battery alerts
+            let logi_interval = if ui_open {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_secs(300)
+            };
+            if !self.suspended && last_logi_poll.elapsed() >= logi_interval {
                 for m in &mut self.logi_mice {
                     m.refresh_telemetry();
                 }
+                self.check_battery_alerts();
                 last_logi_poll = Instant::now();
+            }
+
+            // 3b. Inactivity lights-off
+            if last_idle_check.elapsed() >= Duration::from_secs(5) {
+                let min = self.config.idle_lights_off_min;
+                self.blackout_idle = min > 0
+                    && idle_duration()
+                        .map(|d| d >= Duration::from_secs(min as u64 * 60))
+                        .unwrap_or(false);
+                last_idle_check = Instant::now();
+            }
+
+            // 3c. Lights-off (session locked / inactivity): hold every controlled light black,
+            //     then give the lights back exactly as they were.
+            if !self.suspended {
+                if blackout {
+                    if !self.blackout_applied
+                        || last_blackout_push.elapsed() >= Duration::from_secs(1)
+                    {
+                        self.push_blackout_frame();
+                        last_blackout_push = Instant::now();
+                    }
+                } else if self.blackout_applied {
+                    self.end_blackout();
+                }
             }
 
             // 4. Live ~28 FPS RGB streaming ONLY when live RGB or Thermal RGB is actually enabled!
@@ -1159,6 +1242,140 @@ impl BackendEngine {
             }
         }
         Ok(res)
+    }
+
+    /// Reconnect everything if the set of HID devices changed. Returns `true` if it did.
+    fn check_hotplug(&mut self) -> bool {
+        let sig = compute_hid_signature();
+        if sig == self.last_hid_sig {
+            return false;
+        }
+        info!("Changement USB/HID détecté — reconnexion Plug & Play automatique…");
+        self.last_hid_sig = sig;
+        self.reconnect_all();
+        self.reapply_runtime_state();
+        true
+    }
+
+    fn profile_needs_input_engine(&mut self) -> bool {
+        let p = self.config.active_profile_mut();
+        p.socd.enabled
+            || p.key_chatter_ms > 0
+            || p.mouse_debounce_ms > 0
+            || p.win_lock
+            || !p.bindings.is_empty()
+            || p.rgb.kind == EffectKind::ReactiveTyping
+    }
+
+    /// After a reconnection (hot-plug, resume from sleep), freshly opened devices know nothing of
+    /// the current session: push back the runtime state they need.
+    fn reapply_runtime_state(&mut self) {
+        let (sync, thermal, counts) = {
+            let p = self.config.active_profile_mut();
+            (p.sync_asus_aura, p.silent_loop3_thermal_rgb, p.asus_argb_led_counts.clone())
+        };
+        let blackout = self.blackout_lock || self.blackout_idle;
+        if let Some(aura) = self.asus_aura.as_mut() {
+            for (ch, n) in counts {
+                aura.set_channel_led_count(ch, n);
+            }
+            if sync || thermal || blackout {
+                let _ = aura.enter_direct_mode();
+            }
+        }
+        // New handles: the blackout frame (if any) must be pushed again.
+        self.blackout_applied = false;
+        // Windows may silently drop low-level hooks (sleep, hook timeout): restart if needed.
+        if self.profile_needs_input_engine() && !self.input_engine.is_running() {
+            if let Err(e) = self.input_engine.start() {
+                error!("Moteur clavier non redémarré : {e}");
+            }
+        }
+    }
+
+    /// One black frame on every software-controllable light (Corsair keyboards, ASUS Aura).
+    fn push_blackout_frame(&mut self) {
+        for dev in &mut self.corsair_devices {
+            if dev.info.kind == CorsairDeviceKind::Keyboard {
+                let _ = dev.render_custom_frame(|_, _, _, _| Rgb::BLACK);
+            }
+        }
+        if let Some(aura) = self.asus_aura.as_mut() {
+            let _ = aura.enter_direct_mode();
+            let counts: Vec<usize> = aura.info.channels.iter().map(|c| c.led_count).collect();
+            for (ch, n) in counts.into_iter().enumerate() {
+                let _ = aura.send_channel_direct(ch, &vec![Rgb::BLACK; n]);
+            }
+        }
+        if !self.blackout_applied {
+            info!("Éclairage coupé (session verrouillée ou inactivité)");
+        }
+        self.blackout_applied = true;
+    }
+
+    /// Give the lights back: live effects resume by themselves; hardware effects are re-enabled.
+    fn end_blackout(&mut self) {
+        let (enable_rgb, sync, thermal) = {
+            let p = self.config.active_profile_mut();
+            (p.enable_rgb, p.sync_asus_aura, p.silent_loop3_thermal_rgb)
+        };
+        if !enable_rgb {
+            for dev in &mut self.corsair_devices {
+                if dev.info.kind == CorsairDeviceKind::Keyboard
+                    && dev.info.mode == OperatingMode::Software
+                {
+                    let _ = dev.set_mode(OperatingMode::Hardware);
+                }
+            }
+        }
+        if !(sync || thermal) {
+            if let Some(aura) = self.asus_aura.as_mut() {
+                let _ = aura.set_all_hw_mode(self.aura_hw_mode, self.aura_hw_color, false);
+            }
+        }
+        self.blackout_applied = false;
+        info!("Éclairage rétabli");
+    }
+
+    /// Windows notification when a wireless device crosses 15 % then 5 % (once per discharge).
+    fn check_battery_alerts(&mut self) {
+        if !self.config.battery_alerts {
+            return;
+        }
+        let mut readings: Vec<(String, String, u8, bool)> = Vec::new();
+        for m in &self.logi_mice {
+            if let Some(b) = &m.info.battery {
+                if let Some(pct) = b.percent {
+                    readings.push((format!("mouse-{:04X}-{}", m.info.pid, m.info.device_index), m.info.name.clone(), pct, battery_is_charging(b.state)));
+                }
+            }
+        }
+        for k in &self.logi_keyboards {
+            if let Some(b) = &k.info.battery {
+                if let Some(pct) = b.percent {
+                    readings.push((format!("kb-{:04X}-{}", k.info.pid, k.info.device_index), k.info.name.clone(), pct, battery_is_charging(b.state)));
+                }
+            }
+        }
+        for (key, name, pct, charging) in readings {
+            let last = self.battery_alerted.get(&key).copied();
+            let (next, notify) = battery_alert_step(last, pct, charging);
+            match next {
+                Some(level) => {
+                    self.battery_alerted.insert(key, level);
+                }
+                None => {
+                    self.battery_alerted.remove(&key);
+                }
+            }
+            if let Some(level) = notify {
+                let body = format!("{name} : {pct} % restants — pense à la recharger.");
+                let title = if level <= 5 { "Batterie presque vide" } else { "Batterie faible" };
+                if !tray_notify(title, &body) {
+                    info!("{title} — {body}");
+                }
+            }
+        }
     }
 
     /// Re-apply the hardware side effects of a configuration restored by `undo_last`.
@@ -1425,6 +1642,64 @@ impl BackendEngine {
         json!({ "checks": checks })
     }
 
+    /// Plain-text report to paste in a bug report: versions, machine, devices (no serial numbers),
+    /// health checks and the end of the log. The user profile path is masked.
+    fn diagnostic_report(&mut self) -> String {
+        use std::fmt::Write as _;
+        let mut r = String::new();
+        let s = &self.telemetry.static_info;
+        let _ = writeln!(r, "=== Rapport de diagnostic OpenGear {} ===", env!("CARGO_PKG_VERSION"));
+        let _ = writeln!(r, "Carte mère : {} (BIOS {})", s.motherboard, s.bios_version);
+        let _ = writeln!(r, "CPU : {} | GPU : {} | RAM : {:.0} Go", s.cpu_name, s.gpu_name, s.ram_total_gb);
+        let _ = writeln!(r, "Administrateur : {} | Mode UI : {}", is_elevated(), self.config.ui_mode);
+        let _ = writeln!(r, "\n--- Appareils pilotés ---");
+        for d in &self.corsair_devices {
+            let _ = writeln!(
+                r,
+                "Corsair {} ({:04X}:{:04X}, {}) FW {} | mode {:?} | report {} o",
+                d.info.product_name, d.info.vid, d.info.pid, d.info.kind.label(),
+                d.info.firmware_version, d.info.mode, d.info.out_report_len
+            );
+        }
+        for m in &self.logi_mice {
+            let _ = writeln!(
+                r,
+                "Logitech souris {} ({:04X}:{:04X}, slot 0x{:02X}) HID++ v{} FW {}",
+                m.info.name, m.info.vid, m.info.pid, m.info.device_index,
+                m.info.proto_version, m.info.firmware.join(" / ")
+            );
+        }
+        for k in &self.logi_keyboards {
+            let _ = writeln!(r, "Logitech clavier {} ({:04X}:{:04X})", k.info.name, k.info.vid, k.info.pid);
+        }
+        for h in &self.logi_headsets {
+            let _ = writeln!(r, "Logitech casque {} ({:04X}:{:04X})", h.info.name, h.info.vid, h.info.pid);
+        }
+        match &self.asus_aura {
+            Some(a) => {
+                let _ = writeln!(r, "ASUS Aura {} FW {} | {} canaux", a.info.product_name, a.info.firmware_version, a.info.channels.len());
+            }
+            None => {
+                let _ = writeln!(r, "ASUS Aura : {}", self.asus_err.as_deref().unwrap_or("absent"));
+            }
+        }
+        let _ = writeln!(r, "\n--- Diagnostic ---");
+        if let Some(checks) = self.diagnostics_json()["checks"].as_array() {
+            for c in checks {
+                let _ = writeln!(
+                    r,
+                    "[{}] {} — {}",
+                    c["status"].as_str().unwrap_or("?").to_uppercase(),
+                    c["label"].as_str().unwrap_or(""),
+                    c["detail"].as_str().unwrap_or("")
+                );
+            }
+        }
+        let _ = writeln!(r, "\n--- Journal (200 dernières lignes) ---");
+        r.push_str(&crate::app_log::tail(200));
+        mask_user_profile(&r)
+    }
+
     fn handle_cmd_inner(&mut self, cmd: &str, p: &Value) -> std::result::Result<Value, String> {
         match cmd {
             "get_state" => Ok(self.full_state_json()),
@@ -1462,7 +1737,38 @@ impl BackendEngine {
                 st["last_action_msg"] = json!(format!("Annulé : {label}"));
                 Ok(st)
             }
+            // ================= WINDOWS SYSTEM EVENTS (system_events.rs) =================
+            "__sys_event" => {
+                match p["event"].as_str().unwrap_or("") {
+                    "suspend" => {
+                        info!("Mise en veille : pilotage des appareils suspendu");
+                        self.suspended = true;
+                    }
+                    "resume" => {
+                        info!("Sortie de veille : reconnexion des appareils…");
+                        self.suspended = false;
+                        // USB devices re-enumerate for a moment after wake-up.
+                        std::thread::sleep(Duration::from_millis(1500));
+                        self.reconnect_all();
+                        self.reapply_runtime_state();
+                    }
+                    "lock" => {
+                        if self.config.lights_off_on_lock {
+                            self.blackout_lock = true;
+                        }
+                    }
+                    "unlock" => self.blackout_lock = false,
+                    "devices_changed" => {
+                        if !self.suspended {
+                            self.check_hotplug();
+                        }
+                    }
+                    other => return Err(format!("Événement système inconnu : {other}")),
+                }
+                Ok(self.full_state_json())
+            }
             "get_diagnostics" => Ok(self.diagnostics_json()),
+            "get_diagnostic_report" => Ok(json!({ "text": self.diagnostic_report() })),
             "list_backups" => Ok(json!({ "backups": list_sector_backups() })),
             "logi_restore_backup" => {
                 let file = p["file"].as_str().ok_or("Fichier de sauvegarde manquant")?;
@@ -2199,6 +2505,18 @@ impl BackendEngine {
             }
             // ================= SYSTEM TRAY, AUTOSTART, SHORTCUTS & AUTO-PROFILE SWITCH =================
             "sys_set_prefs" => {
+                if let Some(v) = p["lights_off_on_lock"].as_bool() {
+                    self.config.lights_off_on_lock = v;
+                    if !v {
+                        self.blackout_lock = false;
+                    }
+                }
+                if let Some(v) = p["idle_lights_off_min"].as_u64() {
+                    self.config.idle_lights_off_min = v.min(240) as u16;
+                }
+                if let Some(v) = p["battery_alerts"].as_bool() {
+                    self.config.battery_alerts = v;
+                }
                 if let Some(v) = p["minimize_to_tray"].as_bool() {
                     self.config.minimize_to_tray = v;
                     MINIMIZE_TO_TRAY.store(v, Ordering::Relaxed);
@@ -2818,6 +3136,7 @@ impl BackendEngine {
                 "cpu_name": self.telemetry.static_info.cpu_name,
                 "gpu_name": self.telemetry.static_info.gpu_name,
             },
+            "app_version": env!("CARGO_PKG_VERSION"),
             "config_warning": self.config_warning,
             "ui": {
                 "mode": self.config.ui_mode,
@@ -2835,6 +3154,10 @@ impl BackendEngine {
                 "minimize_to_tray": self.config.minimize_to_tray,
                 "start_minimized": self.config.start_minimized,
                 "auto_profile_switch": self.config.auto_profile_switch,
+                "lights_off_on_lock": self.config.lights_off_on_lock,
+                "idle_lights_off_min": self.config.idle_lights_off_min,
+                "battery_alerts": self.config.battery_alerts,
+                "lights_blackout": self.blackout_lock || self.blackout_idle,
                 "foreground_app": self.foreground_app,
                 "auto_switched": self.auto_switched,
                 "socd_suspended": self.input_engine.is_socd_suspended(),
@@ -2993,5 +3316,59 @@ fn thermal_rgb(temp_c: f32) -> Rgb {
             (185.0 - f * 155.0) as u8,
             (30.0 + f * 40.0) as u8,
         )
+    }
+}
+
+/// Replace the user profile folder (which contains the Windows user name) by `%USERPROFILE%`.
+fn mask_user_profile(text: &str) -> String {
+    match std::env::var("USERPROFILE") {
+        Ok(home) if home.len() > 3 => {
+            let masked = text.replace(&home, "%USERPROFILE%");
+            masked.replace(&home.replace('\\', "/"), "%USERPROFILE%")
+        }
+        _ => text.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{battery_alert_step, mask_user_profile};
+
+    #[test]
+    fn battery_alerts_fire_once_at_15_then_once_at_5() {
+        let mut last = None;
+        let mut fired = Vec::new();
+        for pct in [40, 21, 16, 15, 14, 12, 6, 5, 4, 3] {
+            let (next, notify) = battery_alert_step(last, pct, false);
+            last = next;
+            if let Some(level) = notify {
+                fired.push((pct, level));
+            }
+        }
+        assert_eq!(fired, vec![(15, 15), (5, 5)]);
+    }
+
+    #[test]
+    fn battery_alert_starts_at_5_when_first_seen_very_low() {
+        assert_eq!(battery_alert_step(None, 3, false), (Some(5), Some(5)));
+        // ...and does not then fire the 15 % alert
+        assert_eq!(battery_alert_step(Some(5), 3, false), (Some(5), None));
+    }
+
+    #[test]
+    fn charging_or_recharged_rearms_alerts() {
+        assert_eq!(battery_alert_step(Some(5), 4, true), (None, None));
+        assert_eq!(battery_alert_step(Some(15), 25, false), (None, None));
+        assert_eq!(battery_alert_step(None, 14, false), (Some(15), Some(15)));
+    }
+
+    #[test]
+    fn user_profile_is_masked_in_reports() {
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            let text = format!(r"cfg: {home}\AppData\Roaming\OpenGear\x.toml");
+            let masked = mask_user_profile(&text);
+            assert!(!masked.contains(&home));
+            assert!(masked.contains("%USERPROFILE%"));
+        }
     }
 }

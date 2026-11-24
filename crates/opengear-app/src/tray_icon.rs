@@ -481,6 +481,30 @@ mod win_tray {
             .ok();
     }
 
+    /// Show a Windows notification (tray balloon, rendered as a toast on Windows 10/11).
+    pub fn notify(title: &str, body: &str) -> bool {
+        use windows_sys::Win32::UI::Shell::{NIF_INFO, NIIF_WARNING, NIM_MODIFY};
+        let raw = TRAY_HWND.load(Ordering::SeqCst);
+        if raw == 0 {
+            return false;
+        }
+        unsafe {
+            let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = raw as HWND;
+            nid.uID = TRAY_UID;
+            nid.uFlags = NIF_INFO;
+            nid.dwInfoFlags = NIIF_WARNING;
+            let t = to_wide(title);
+            let n = t.len().min(nid.szInfoTitle.len() - 1);
+            nid.szInfoTitle[..n].copy_from_slice(&t[..n]);
+            let b = to_wide(body);
+            let n = b.len().min(nid.szInfo.len() - 1);
+            nid.szInfo[..n].copy_from_slice(&b[..n]);
+            Shell_NotifyIconW(NIM_MODIFY, &nid) != 0
+        }
+    }
+
     pub fn stop() {
         let raw = TRAY_HWND.load(Ordering::SeqCst);
         if raw != 0 {
@@ -507,6 +531,19 @@ where
 pub fn stop_system_tray() {
     #[cfg(windows)]
     win_tray::stop();
+}
+
+/// Windows notification from the tray icon. Returns `false` if the tray is not running.
+pub fn tray_notify(title: &str, body: &str) -> bool {
+    #[cfg(windows)]
+    {
+        win_tray::notify(title, body)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (title, body);
+        false
+    }
 }
 
 #[cfg(windows)]

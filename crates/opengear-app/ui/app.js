@@ -708,6 +708,8 @@
   // ==================== CHROME (BARRE LATÉRALE, STATUT) ====================
   function updateChrome() {
     if (!S) return;
+    const verEl = document.getElementById("app-version");
+    if (verEl && S.app_version) verEl.textContent = `OpenGear v${S.app_version} · aucune télémétrie`;
     document.querySelectorAll(".nav-item").forEach((b) => {
       const on = b.dataset.tab === tab;
       b.classList.toggle("active", on);
@@ -2386,6 +2388,21 @@
             <button type="button" class="btn btn-sm btn-secondary" data-act="rescan">Reconnecter tous les appareils</button>
           </div>
         </div>
+        <div class="card">
+          <div class="card-head"><div><h2 class="card-title">Éclairage automatique et alertes</h2><div class="card-desc">OpenGear coupe la lumière quand tu n'es pas là et la rallume exactement comme elle était.</div></div></div>
+          <div class="stack" style="gap:12px">
+            ${sw(sp.lights_off_on_lock !== false, "Éteindre l'éclairage quand la session Windows est verrouillée", "sys-pref", { key: "lights_off_on_lock" })}
+            <div class="row-between">
+              <label for="idle-off" style="font-weight:600">Éteindre après une période d'inactivité</label>
+              <select id="idle-off" class="og-select auto" data-change="sys-pref-num" data-key="idle_lights_off_min">
+                ${[[0, "Jamais"], [5, "5 minutes"], [10, "10 minutes"], [15, "15 minutes"], [30, "30 minutes"], [60, "1 heure"]]
+                  .map(([v, l]) => `<option value="${v}" ${num(sp.idle_lights_off_min) === v ? "selected" : ""}>${l}</option>`).join("")}
+              </select>
+            </div>
+            ${sw(sp.battery_alerts !== false, "Prévenir quand la batterie d'une souris ou d'un clavier sans fil passe sous 15 % puis 5 %", "sys-pref", { key: "battery_alerts" })}
+            ${sp.lights_blackout ? `<div class="muted">Éclairage actuellement coupé (verrouillage ou inactivité).</div>` : ""}
+          </div>
+        </div>
       </div>`;
   }
 
@@ -2417,6 +2434,7 @@
           <div class="row">
             ${checks.length ? `<div class="diag-summary"><span class="pill emerald">${count("ok")} OK</span>${count("warn") ? `<span class="pill amber">${count("warn")} à vérifier</span>` : ""}${count("error") ? `<span class="pill rog">${plural(count("error"), "problème", "problèmes")}</span>` : ""}</div>` : ""}
             <button type="button" class="btn btn-sm btn-secondary" data-act="diag-refresh" ${diag.loading ? "disabled" : ""}>${ICONS.refresh}Relancer l'analyse</button>
+            <button type="button" class="btn btn-sm btn-secondary" data-act="diag-report" title="Version, appareils, état et fin du journal — ton dossier utilisateur est masqué">Copier le rapport</button>
           </div>
         </div>
         ${list}
@@ -3069,6 +3087,34 @@
     // Système
     shortcuts: (el) => call("sys_create_shortcuts", {}, { btn: el }),
     "diag-refresh": () => loadDiagnostics(),
+    "diag-report": async (el) => {
+      el.disabled = true;
+      try {
+        const res = await rpc("get_diagnostic_report", {});
+        const text = (res && res.text) || "";
+        let copied = false;
+        try {
+          await navigator.clipboard.writeText(text);
+          copied = true;
+        } catch (_) {
+          // Fallback for contexts without the async clipboard API
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.setAttribute("readonly", "");
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          copied = document.execCommand("copy");
+          ta.remove();
+        }
+        toast(copied ? "Rapport de diagnostic copié : colle-le dans ton signalement." : "Copie impossible : le presse-papiers est indisponible.", copied ? "info" : "error");
+      } catch (e) {
+        toast(String((e && e.message) || e), "error");
+      } finally {
+        el.disabled = false;
+      }
+    },
     "diag-action": async (el) => {
       const c = diagSorted[Number(el.dataset.idx)];
       if (!c || !c.action || !c.action.cmd) return;
@@ -3171,6 +3217,7 @@
     "logi-side": (el) => call("logi_set_sidetone", { device_index: dev(el), percent: Number(el.value) }, { ok: `Retour micro : ${el.value} %` }),
     "wa-vol": (el) => call("audio_set_volume", { is_mic: el.dataset.mic === "1", percent: Number(el.value) }, { rerender: false, ok: `${el.dataset.mic === "1" ? "Micro" : "Volume"} : ${el.value} %` }),
     "sys-pref": (el) => call("sys_set_prefs", { [el.dataset.key]: el.checked }, { ok: "Préférence enregistrée" }),
+    "sys-pref-num": (el) => call("sys_set_prefs", { [el.dataset.key]: Number(el.value) }, { ok: "Préférence enregistrée" }),
     "bk-mouse": (el) => { backups.mouse = Number(el.value); },
   };
 

@@ -582,6 +582,9 @@ impl CorsairDevice {
     /// Low-level read of any Bragi onboard flash file by `FileId` (e.g. `0x0011` FileListing, `0x000F` ProfilesList).
     /// Temporarily ensures Software mode (required by Bragi v2 MCU to open flash handles) and restores Hardware mode cleanly.
     pub fn read_flash_file(&mut self, file_id: u16) -> Result<Vec<u8>, BragiError> {
+        // File access reuses handle 0 (= the lighting handle) and closes it afterwards:
+        // forget it so the next frame re-opens it instead of writing to a closed handle.
+        self.lighting_handle_open = false;
         let was_hw = self.info.mode == OperatingMode::Hardware;
         if was_hw {
             let _ = self.transport.set_property(PROP_MODE, MODE_SOFTWARE);
@@ -624,6 +627,8 @@ impl CorsairDevice {
     }
 
     pub fn write_flash_file(&mut self, file_id: u16, data: &[u8]) -> Result<(), BragiError> {
+        // Same handle-0 reuse as read_flash_file: the lighting handle must be re-opened afterwards.
+        self.lighting_handle_open = false;
         self.transport.write_file(file_id, data)
     }
 

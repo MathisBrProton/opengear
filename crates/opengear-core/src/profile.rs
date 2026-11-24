@@ -159,6 +159,15 @@ pub struct AppConfig {
     /// First-run assistant completed (or skipped).
     #[serde(default)]
     pub onboarding_done: bool,
+    /// Turn every OpenGear-controlled light off while the Windows session is locked.
+    #[serde(default = "default_true")]
+    pub lights_off_on_lock: bool,
+    /// Turn the lights off after this many minutes without keyboard/mouse input (0 = never).
+    #[serde(default)]
+    pub idle_lights_off_min: u16,
+    /// Windows notification when a wireless device battery drops to 15 % and 5 %.
+    #[serde(default = "default_true")]
+    pub battery_alerts: bool,
     pub profiles: Vec<KeyboardProfile>,
 }
 
@@ -176,6 +185,9 @@ impl Default for AppConfig {
             auto_profile_switch: true,
             ui_mode: default_ui_mode(),
             onboarding_done: false,
+            lights_off_on_lock: true,
+            idle_lights_off_min: 0,
+            battery_alerts: true,
             profiles: vec![KeyboardProfile::default()],
         }
     }

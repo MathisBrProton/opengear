@@ -41,7 +41,8 @@ Démarrer et l'entrée « Applications installées ». Désinstallation : `OpenG
 | **Performances** | Fréquence de polling, DPI et paliers, hauteur de levée, ventilateurs et pompe (courbes BIOS, pilotage intelligent CPU/GPU avec hystérésis), plans d'alimentation Windows |
 | **Touches & macros** | Remappage, désactivation, macros multi-étapes et texte, enregistreur, SOCD / Snap Tap, anti-rebond clavier et souris, verrou touche Windows |
 | **Profils** | Profils multiples, bascule automatique selon le jeu au premier plan, import / export, profils embarqués dans la souris et le clavier |
-| **Système** | Zone de notification ultra-légère (WebView2 libérée quand la fenêtre est fermée), démarrage automatique, diagnostic, sauvegardes de la mémoire flash |
+| **Système** | Zone de notification ultra-légère (WebView2 libérée quand la fenêtre est fermée), démarrage automatique, diagnostic + rapport copiable, sauvegardes de la mémoire flash |
+| **Au quotidien** | Reprise propre après la mise en veille, détection instantanée des branchements USB, extinction de l'éclairage au verrouillage de session ou après inactivité, alertes batterie faible (15 % / 5 %) |
 
 Interface **simple par défaut, puissante à la demande** : le mode Simple masque les réglages
 avancés ; le mode Expert donne accès à tout. Chaque changement de configuration peut être
@@ -121,6 +122,7 @@ embarquée dans l'exécutable et reliée au backend Rust par IPC.
 | Profils | `%APPDATA%\OpenGear\opengear_profiles.toml` |
 | Sauvegardes flash | `%APPDATA%\OpenGear\backups\logitech\` |
 | Marqueur ventilateurs (temporaire) | `%APPDATA%\OpenGear\fan_override.json` |
+| Journaux | `%LOCALAPPDATA%\OpenGear\logs\opengear.log` (rotation, 3 fichiers max) |
 
 ## Licence
 
