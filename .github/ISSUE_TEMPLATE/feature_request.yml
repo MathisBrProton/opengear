@@ -1,0 +1,25 @@
+name: Demande de fonctionnalité
+description: Proposer une fonctionnalité ou une amélioration
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Besoin
+      description: Quel problème veux-tu résoudre ? Qu'est-ce que tu fais aujourd'hui ?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Solution envisagée
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considérées
+  - type: checkboxes
+    id: hardware
+    attributes:
+      label: Matériel
+      options:
+        - label: Cette demande dépend d'un appareil précis (précise-le ci-dessus)

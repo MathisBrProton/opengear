@@ -1,0 +1,53 @@
+name: Bug
+description: Signaler un bug de l'application (pas un appareil précis)
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Pour un appareil qui ne fonctionne pas comme prévu, utilise plutôt le modèle **« Support d'appareil »**.
+  - type: input
+    id: version
+    attributes:
+      label: Version d'OpenGear
+      placeholder: "0.4.0"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Version de Windows
+      placeholder: "Windows 11 (version 24H2)"
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Ce qui se passe
+      description: Comportement observé, et comportement attendu.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Étapes pour reproduire
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Rapport de diagnostic (facultatif)
+      description: |
+        Système → Diagnostic → « Copier le rapport ». Relis le texte avant de le coller :
+        retire ton nom d'utilisateur, tes chemins de dossiers et tout identifiant.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Vérifications
+      options:
+        - label: J'ai relancé OpenGear en administrateur si le problème concerne les ventilateurs ou la RAM RGB
+        - label: Je n'ai collé aucune donnée personnelle ni aucun secret dans ce message

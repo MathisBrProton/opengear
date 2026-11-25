@@ -1,0 +1,57 @@
+name: Support d'appareil
+description: Signaler un appareil détecté, testé ou à ajouter (la contribution la plus utile)
+labels: ["device-support", "hardware-needed", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Merci de tester. Ce modèle sert à compléter la **matrice de compatibilité**.
+        Tous les essais doivent être **en lecture seule** : n'écris jamais dans la mémoire de l'appareil
+        pour un test.
+  - type: input
+    id: device
+    attributes:
+      label: Marque et modèle exact
+      placeholder: "Logitech G PRO X Superlight 2"
+    validations:
+      required: true
+  - type: input
+    id: ids
+    attributes:
+      label: Identifiants USB (VID:PID)
+      description: Affiché par `opengear scan`.
+      placeholder: "046D:C547"
+  - type: dropdown
+    id: result
+    attributes:
+      label: Résultat
+      options:
+        - Détecté et piloté correctement
+        - Détecté, mais des réglages ne fonctionnent pas
+        - Détecté, pilote non disponible
+        - Non détecté
+    validations:
+      required: true
+  - type: textarea
+    id: scan
+    attributes:
+      label: Sortie de `opengear scan` (ou de la commande de la marque)
+      description: Relis le texte et retire tout ce qui est personnel (nom d'utilisateur, chemins).
+      render: text
+  - type: input
+    id: firmware
+    attributes:
+      label: Version du firmware (si connue)
+  - type: textarea
+    id: notes
+    attributes:
+      label: Ce qui marche, ce qui ne marche pas
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Vérifications
+      options:
+        - label: Mes essais sont en lecture seule (aucune écriture dans la mémoire de l'appareil)
+          required: true
+        - label: Je n'ai collé aucune donnée personnelle ni aucun secret dans ce message
+          required: true
