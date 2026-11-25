@@ -25,5 +25,7 @@ opengear-corsair.workspace = true
 opengear-asus.workspace = true
 opengear-platform.workspace = true
 opengear-hp.workspace = true
+opengear-mainboard.workspace = true
+opengear-openrgb.workspace = true
 opengear-logitech.workspace = true
 opengear-input.workspace = true

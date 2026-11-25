@@ -8,13 +8,10 @@ use crate::system_ext::idle_duration;
 use crate::tray_icon::{
     create_windows_shortcuts, is_autostart_enabled, release_single_instance, set_autostart_enabled,
 };
-use opengear_asus::{
-    AuraHwMode, CurvePoint, EneRamMode, FanPolicyMode, FanTempSource, apply_asus_wmi_curve,
-    apply_ram_rgb, install_official_pawnio, probe_ram_rgb, read_asus_wmi_channel,
-    read_superio_snapshot, restore_superio_fan_auto, set_superio_fan_pwm,
-};
+use opengear_asus::{AuraHwMode, apply_asus_wmi_curve, read_asus_wmi_channel};
+use opengear_core::cooling::{CurvePoint, FanPolicyMode, FanTempSource};
 use opengear_core::{
-    EffectKind, KeyAction, KeyboardProfile, MacroStep, OperatingMode, PollingRate, Rgb, SocdPair,
+    EffectKind, KeyAction, KeyboardProfile, MacroStep, OperatingMode, Rgb, SocdPair,
     scan_hid_devices,
 };
 use opengear_corsair::proto::{
@@ -32,8 +29,12 @@ use opengear_hp::{
 use opengear_input::movement_keys_effective;
 use opengear_logitech::{
     KeyboardRgbMode, LodLevel, LogitechHeadset, LogitechMouse, MouseButtonAction, MouseLedMode,
-    OnboardMacroStep, OnboardMode, backup_path_for, list_sector_backups,
+    OnboardMacroStep, backup_path_for, list_sector_backups,
 };
+use opengear_mainboard::{
+    EneRamMode, read_superio_snapshot, restore_superio_fan_auto, set_superio_fan_pwm,
+};
+use opengear_platform::pawnio::install_official_pawnio;
 use opengear_platform::{
     is_elevated, list_power_plans, read_display_info, read_laptop_battery, relaunch_as_admin,
     set_active_power_plan, set_display_brightness, set_display_refresh_rate,
@@ -338,7 +339,7 @@ impl BackendEngine {
                 }
                 summary.push(format!(
                     "Ventilateurs : profil {} sur {applied} canal(aux){}",
-                    policy.asus_profile_str(),
+                    policy.label(),
                     if failed > 0 {
                         format!(", {failed} refusé(s) par le BIOS")
                     } else {
@@ -404,14 +405,14 @@ impl BackendEngine {
             },
         );
 
-        let (st, detail, action) = match opengear_asus::pawnio_availability() {
-            opengear_asus::PawnIoAvailability::Ready => ("ok", "Pilote signé PawnIO actif (capteurs CPU, SMBus, SuperIO).".to_string(), Value::Null),
-            opengear_asus::PawnIoAvailability::NeedsAdmin => (
+        let (st, detail, action) = match opengear_platform::pawnio::pawnio_availability() {
+            opengear_platform::PawnIoAvailability::Ready => ("ok", "Pilote signé PawnIO actif (capteurs CPU, SMBus, SuperIO).".to_string(), Value::Null),
+            opengear_platform::PawnIoAvailability::NeedsAdmin => (
                 "warn",
                 "Le pilote PawnIO est installé mais nécessite les droits administrateur.".to_string(),
                 Value::Null,
             ),
-            opengear_asus::PawnIoAvailability::NotInstalled => (
+            opengear_platform::PawnIoAvailability::NotInstalled => (
                 "warn",
                 "Le pilote signé PawnIO n'est pas installé : température CPU native, RAM RGB et ventilateurs directs indisponibles.".to_string(),
                 json!({ "label": "Installer PawnIO", "cmd": "pawnio_install", "payload": {} }),
@@ -802,6 +803,18 @@ impl BackendEngine {
                 ));
                 Ok(st)
             }
+            "device_set" => {
+                let device = p["device"].as_str().ok_or("device manquant")?;
+                let setting = p["setting"].as_str().ok_or("setting manquant")?;
+                let value: opengear_core::driver::Value =
+                    serde_json::from_value(p["value"].clone()).map_err(|_| "valeur invalide")?;
+                let msg = self.set_device_setting(device, setting, &value)?;
+                let mut st = self.full_state_json();
+                if let Some(m) = msg {
+                    st["last_action_msg"] = json!(m);
+                }
+                Ok(st)
+            }
             "reconnect_all" => {
                 self.reconnect_all();
                 Ok(self.full_state_json())
@@ -944,23 +957,6 @@ impl BackendEngine {
                 self.persist_config();
                 Ok(self.full_state_json())
             }
-            "corsair_set_pollrate" => {
-                let hz = p["hz"].as_u64().ok_or("hz manquant")? as u16;
-                let rate = PollingRate::from_hz(hz).ok_or("Fréquence invalide")?;
-                let dev = self.corsair_mut(p)?;
-                dev.set_pollrate(rate).map_err(|e| e.to_string())?;
-                self.config.active_profile_mut().polling_rate = rate;
-                self.persist_config();
-                Ok(self.full_state_json())
-            }
-            "corsair_set_brightness" => {
-                let pct = p["percent"].as_u64().ok_or("percent manquant")? as u8;
-                let dev = self.corsair_mut(p)?;
-                dev.set_hw_brightness_pct(pct).map_err(|e| e.to_string())?;
-                self.config.active_profile_mut().hw_brightness_pct = pct.min(100);
-                self.persist_config();
-                Ok(self.full_state_json())
-            }
             "corsair_set_mode" => {
                 let m = match p["mode"].as_str().unwrap_or("hw") {
                     "sw" => OperatingMode::Software,
@@ -972,53 +968,6 @@ impl BackendEngine {
                     self.config.active_profile_mut().enable_rgb = false;
                 }
                 self.persist_config();
-                Ok(self.full_state_json())
-            }
-            "corsair_set_hw_winlock" => {
-                let on = p["enabled"].as_bool().unwrap_or(false);
-                let dev = self.corsair_mut(p)?;
-                dev.set_hw_winlock(on).map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
-            "corsair_set_flashtap" => {
-                let on = p["enabled"].as_bool().ok_or("enabled manquant")?;
-                let dev = self.corsair_mut(p)?;
-                if !dev.info.flashtap_supported {
-                    return Err("Ce périphérique ne propose pas le FlashTap matériel".into());
-                }
-                dev.set_flashtap(on).map_err(|e| e.to_string())?;
-                let mut msg = if on {
-                    "FlashTap matériel activé : le clavier gère lui-même la priorité des touches opposées".to_string()
-                } else {
-                    "FlashTap matériel désactivé".to_string()
-                };
-                if on && self.config.active_profile_mut().socd.enabled {
-                    self.config.active_profile_mut().socd.enabled = false;
-                    self.sync_input_rules();
-                    self.persist_config();
-                    msg.push_str(" — SOCD logiciel désactivé pour éviter un double traitement");
-                }
-                let mut st = self.full_state_json();
-                st["last_action_msg"] = json!(msg);
-                Ok(st)
-            }
-            "corsair_set_winlock_shortcuts" => {
-                let mask = p["mask"].as_u64().unwrap_or(1) as u8;
-                let dev = self.corsair_mut(p)?;
-                dev.set_winlock_shortcuts(mask).map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
-            "corsair_set_debounce" => {
-                let en = p["enabled"].as_bool().unwrap_or(true);
-                let ms = p["timeout_ms"].as_u64().unwrap_or(30) as u8;
-                let dev = self.corsair_mut(p)?;
-                dev.set_hw_debounce(en, ms).map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
-            "corsair_set_hw_profile" => {
-                let idx = p["index"].as_u64().unwrap_or(0) as u8;
-                let dev = self.corsair_mut(p)?;
-                dev.set_active_hw_profile(idx).map_err(|e| e.to_string())?;
                 Ok(self.full_state_json())
             }
             "corsair_set_indicator_color" => {
@@ -1049,21 +998,6 @@ impl BackendEngine {
                 let stage = p["stage"].as_u64().unwrap_or(0) as u8;
                 let dev = self.corsair_mut(p)?;
                 dev.set_mouse_active_stage(stage)
-                    .map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
-            "corsair_mouse_set_lift_height" => {
-                let level = p["level"].as_u64().unwrap_or(1) as u8;
-                let dev = self.corsair_mut(p)?;
-                dev.set_mouse_lift_height(level)
-                    .map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
-            "corsair_headset_set_sidetone" => {
-                let pct = p["percent"].as_u64().unwrap_or(0) as u8;
-                let muted = p["muted"].as_bool().unwrap_or(pct == 0);
-                let dev = self.corsair_mut(p)?;
-                dev.set_headset_sidetone(pct, muted)
                     .map_err(|e| e.to_string())?;
                 Ok(self.full_state_json())
             }
@@ -1164,7 +1098,7 @@ impl BackendEngine {
                 Ok(self.full_state_json())
             }
             "ram_scan" => {
-                self.ram_rgb = probe_ram_rgb();
+                self.ram_rgb = crate::drivers::ram_rgb().probe();
                 Ok(self.full_state_json())
             }
             "ram_apply_rgb" => {
@@ -1177,18 +1111,18 @@ impl BackendEngine {
                 let target_addr = p["address"].as_u64().map(|v| v as u8);
                 let mode = EneRamMode::from_str_id(mode_str);
                 if self.ram_rgb.ene_modules.is_empty() && self.ram_rgb.is_admin {
-                    self.ram_rgb = probe_ram_rgb();
+                    self.ram_rgb = crate::drivers::ram_rgb().probe();
                 }
-                apply_ram_rgb(
-                    &self.ram_rgb.ene_modules,
-                    target_addr,
+                let effect = opengear_mainboard::RamEffect {
                     mode,
                     color,
                     speed,
                     reverse,
                     save_eeprom,
-                )
-                .map_err(|e| e.to_string())?;
+                };
+                crate::drivers::ram_rgb()
+                    .apply(&self.ram_rgb.ene_modules, target_addr, &effect)
+                    .map_err(|e| e.to_string())?;
                 self.ram_rgb.last_mode = mode.id().to_string();
                 self.ram_rgb.last_color = color.to_hex();
                 self.ram_rgb.last_speed = speed;
@@ -1209,22 +1143,6 @@ impl BackendEngine {
                 });
                 let m = self.logi_mouse_mut(p)?;
                 m.set_dpi(x, y, lod).map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
-            "logi_set_pollrate" => {
-                let hz = p["hz"].as_u64().ok_or("Hz manquant")? as u16;
-                let m = self.logi_mouse_mut(p)?;
-                m.set_report_rate_hz(hz).map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
-            "logi_set_mode" => {
-                let om = match p["mode"].as_str().unwrap_or("Onboard") {
-                    "Host" => OnboardMode::Host,
-                    _ => OnboardMode::Onboard,
-                };
-                let m = self.logi_mouse_mut(p)?;
-                m.set_onboard_mode(om).map_err(|e| e.to_string())?;
-                m.refresh_telemetry();
                 Ok(self.full_state_json())
             }
             "logi_set_active_profile" => {
@@ -1304,12 +1222,6 @@ impl BackendEngine {
                     .map_err(|e| e.to_string())?;
                 Ok(self.full_state_json())
             }
-            "logi_set_angle_snapping" => {
-                let on = p["enabled"].as_bool().unwrap_or(false);
-                let m = self.logi_mouse_mut(p)?;
-                m.set_angle_snapping(on).map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
             "logi_set_led" => {
                 let mode = match p["mode"].as_str().unwrap_or("Fixed") {
                     "Off" => MouseLedMode::Off,
@@ -1346,18 +1258,6 @@ impl BackendEngine {
                     .map_err(|e| e.to_string())?;
                 Ok(self.full_state_json())
             }
-            "logi_kb_set_brightness" => {
-                let pct = p["percent"].as_u64().unwrap_or(100) as u8;
-                let kb = self.logi_kb_mut(p)?;
-                kb.set_brightness_pct(pct).map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
-            "logi_set_sidetone" => {
-                let pct = p["percent"].as_u64().unwrap_or(0) as u8;
-                let h = self.logi_headset_mut(p)?;
-                h.set_sidetone(pct).map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
             "logi_set_eq" => {
                 let arr = p["gains"].as_array().ok_or("gains manquants")?;
                 let gains: Vec<i8> = arr
@@ -1375,11 +1275,12 @@ impl BackendEngine {
                             .into(),
                     );
                 }
-                self.cooling_channels = opengear_asus::FanHeaderKind::ALL
+                self.cooling_channels = opengear_core::cooling::FanHeaderKind::ALL
                     .iter()
                     .map(|&h| {
-                        read_asus_wmi_channel(h)
-                            .unwrap_or_else(|| opengear_asus::FanChannelConfig::default_for(h))
+                        read_asus_wmi_channel(h).unwrap_or_else(|| {
+                            opengear_core::cooling::FanChannelConfig::default_for(h)
+                        })
                     })
                     .collect();
                 Ok(self.full_state_json())
@@ -1429,7 +1330,8 @@ impl BackendEngine {
                 let preset = p["preset"].as_str().unwrap_or("default");
                 if let Some(ch) = self.cooling_channels.get_mut(0) {
                     ch.policy = FanPolicyMode::Manual;
-                    ch.curve = opengear_asus::FanChannelConfig::silent_loop3_preset(preset);
+                    ch.curve =
+                        opengear_core::cooling::FanChannelConfig::silent_loop3_preset(preset);
                     if self.cooling_status.is_admin {
                         let _ = apply_asus_wmi_curve(ch);
                     }
@@ -1899,7 +1801,7 @@ mod tests {
         battery_alert_step, changed_vendors, check_import_size, is_valid_power_guid,
         mask_user_profile, parse_temp_source,
     };
-    use opengear_asus::FanTempSource;
+    use opengear_core::cooling::FanTempSource;
 
     #[test]
     fn battery_alerts_fire_once_at_15_then_once_at_5() {

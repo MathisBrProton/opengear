@@ -2,6 +2,7 @@ pub mod features;
 pub mod headset;
 pub mod hidpp;
 pub mod keyboard;
+pub mod model;
 pub mod mouse;
 pub mod onboard;
 

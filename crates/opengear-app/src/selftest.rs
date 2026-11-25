@@ -3,13 +3,13 @@
 //! Automatically saves a detailed report to `%TEMP%\opengear_selftest.txt`.
 
 use crate::audio_ext::read_audio_state;
-use opengear_asus::{
-    AuraMainboardController, FanHeaderKind, diagnose_smbus_readonly, pawnio_availability,
-    probe_ram_rgb, read_asus_wmi_channel, read_native_cpu_temp, read_superio_snapshot,
-};
+use opengear_asus::{AuraMainboardController, read_asus_wmi_channel};
+use opengear_core::cooling::FanHeaderKind;
 use opengear_corsair::CorsairDevice;
 use opengear_hp::probe_hp_omen;
 use opengear_logitech::{LogitechHeadset, LogitechMouse};
+use opengear_mainboard::{diagnose_smbus_readonly, read_native_cpu_temp, read_superio_snapshot};
+use opengear_platform::pawnio::pawnio_availability;
 use opengear_platform::{
     TelemetryCollector, is_elevated, is_laptop_chassis, read_display_info, read_laptop_battery,
 };
@@ -306,7 +306,7 @@ pub fn run_full_selftest() -> SelfTestReport {
 
         // 7. PawnIO SMBus Full Read-Only Discovery + RAM RGB
         let smbus_diag = diagnose_smbus_readonly();
-        let ram = probe_ram_rgb();
+        let ram = crate::drivers::ram_rgb().probe();
         checks.push(SelfTestCheck {
             name: "PawnIO SMBus & RAM DDR RGB".into(),
             status: if !ram.ene_modules.is_empty() {
@@ -367,7 +367,7 @@ fn save_report_file(is_admin: bool, checks: &[SelfTestCheck]) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opengear_asus::{FanChannelConfig, FanHeaderKind};
+    use opengear_core::cooling::{FanChannelConfig, FanHeaderKind};
 
     #[test]
     fn test_fan_curve_interpolation_and_pump_safety() {

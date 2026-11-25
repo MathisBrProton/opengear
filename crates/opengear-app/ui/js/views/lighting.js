@@ -1,7 +1,7 @@
 import { arr, clamp, esc, num, plural, safeHex } from "../utils.js";
 import { S, isExpert, local } from "../state.js";
 import {
-  advancedHint, batteryBadge, emptyState, expertTag, pageHeader, renderKeyboard, sliderRow,
+  advancedHint, batteryBadge, deviceSettings, emptyState, expertTag, pageHeader, renderKeyboard, sliderRow,
   subtabs, sw, swatches,
 } from "../components.js";
 
@@ -134,7 +134,7 @@ function lightingGlobal() {
         </div>
         ${renderKeyboard("paint", d)}
         <div class="stack mt-16" style="gap:10px">
-          ${sliderRow("Luminosité matérielle", { id: `cs-bright-${i}`, min: 0, max: 100, value: num(d.hw_brightness_pct, 100), input: "label", change: "cs-bright", data: { dev: i, fmt: "pct100" }, display: `${num(d.hw_brightness_pct, 100)} %` })}
+          ${deviceSettings(d.device_id, { sections: ["lighting"], bare: true })}
         </div>
       </div>`).join("") : ""}`;
 }
@@ -324,7 +324,7 @@ export function cardLogiKbLighting(kb, i) {
         <input type="color" id="lkb-col-${i}" class="og-color" value="#00D4FF" aria-label="Couleur" />
         <button type="button" class="btn btn-primary btn-sm" data-act="lkb-apply" data-dev="${i}">Appliquer</button>
       </div>
-      ${kb.supports_brightness ? `<div class="stack mt-12">${sliderRow("Luminosité", { id: `lkb-br-${i}`, min: 0, max: 100, value: num(kb.brightness_pct, 100), input: "label", change: "lkb-bright", data: { dev: i, fmt: "pct100" }, display: `${num(kb.brightness_pct, 100)} %` })}</div>` : ""}
+      <div class="mt-12">${deviceSettings(kb.device_id, { sections: ["lighting"], bare: true })}</div>
     </div>`;
 }
 

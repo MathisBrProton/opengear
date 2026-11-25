@@ -1,0 +1,12 @@
+[package]
+name = "opengear-mainboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vendor-neutral motherboard chips: SMBus, ENE DRAM RGB, Nuvoton SuperIO, CPU temperature, sensors"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+opengear-core.workspace = true
+opengear-platform.workspace = true

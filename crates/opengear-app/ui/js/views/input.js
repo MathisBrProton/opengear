@@ -1,7 +1,7 @@
 import { BTN_NAMES, ICONS, MACRO_PRESETS, arr, esc, fmtHz, num, plural } from "../utils.js";
 import { rpc } from "../ipc.js";
 import { S, codeLabel, getDraft, isExpert, keyLabel, local, mouseImage } from "../state.js";
-import { advancedHint, emptyState, expertTag, keyboardSetup, pageHeader, renderKeyboard, seg, sliderRow, subtabs, sw } from "../components.js";
+import { advancedHint, emptyState, expertTag, keyboardSetup, pageHeader, renderKeyboard, seg, settingInline, sliderRow, subtabs, sw } from "../components.js";
 
 // Physical positions; the hint shows what the key types on the active Windows layout.
 const SOCD_PADS = [
@@ -153,7 +153,7 @@ function flashtapCard() {
       <div class="stack" style="gap:10px">
         ${kbs.map((d) => `
           <div class="row-between">
-            ${sw(!!d.flashtap_enabled, `${esc(d.product_name)} — FlashTap ${d.flashtap_enabled ? "actif" : "inactif"}`, "cs-flashtap", { dev: d.index })}
+            ${settingInline(d.device_id, "hw_socd", { label: `${d.product_name} — FlashTap ${d.flashtap_enabled ? "actif" : "inactif"}` })}
           </div>`).join("")}
         <div class="muted">Activer le FlashTap coupe automatiquement le Snap Tap logiciel. Vérifie le résultat avec le testeur juste en dessous.</div>
       </div>
@@ -313,7 +313,7 @@ export function cardLogiOnboard(m, i) {
     <div class="card expert-card">
       <div class="card-head">
         <div><h2 class="card-title">${esc(m.name)} — mémoire embarquée ${expertTag()}</h2><div class="card-desc">Les modifications restent en brouillon tant que tu ne les écris pas dans la souris.${d.dirty ? " <strong style='color:var(--amber)'>Brouillon modifié.</strong>" : ""}</div></div>
-        ${seg([["Onboard", "Profils de la souris"], ["Host", "Piloté par OpenGear"]], ob.mode, "logi-mode", { dev: i })}
+        ${settingInline(m.device_id, "logitech.onboard_mode", { label: "Mode" })}
       </div>
       <div class="grid-stage">
         ${mouseStage(m, i, btns, btnCount)}

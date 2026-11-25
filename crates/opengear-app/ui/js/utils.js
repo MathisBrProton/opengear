@@ -156,7 +156,7 @@ export function updateLabel(el) {
   const lbl = el.dataset.label && document.getElementById(el.dataset.label);
   if (!lbl) return;
   const f = LABEL_FMT[el.dataset.fmt];
-  lbl.textContent = f ? f(el.value) : el.value;
+  lbl.textContent = f ? f(el.value) : el.dataset.unit ? `${el.value} ${el.dataset.unit}` : el.value;
 }
 
 const throttles = {};

@@ -1,6 +1,7 @@
 use super::backend::BackendEngine;
 use crate::tray_icon::is_autostart_enabled;
-use opengear_asus::{AuraChannelKind, AuraHwMode, EneRamMode, FanHeaderKind, FanRpmReading};
+use opengear_asus::{AuraChannelKind, AuraHwMode};
+use opengear_core::cooling::FanHeaderKind;
 use opengear_core::{EffectKind, OperatingMode};
 use opengear_corsair::HwpLightingKind;
 use opengear_input::ALL_BINDABLE_KEYS;
@@ -8,6 +9,7 @@ use opengear_logitech::{
     BatteryPowerModel, BatteryState, EQ_PRESETS, LogitechHeadset, LogitechMouse, MouseButtonAction,
     OnboardMode,
 };
+use opengear_mainboard::{EneRamMode, FanRpmReading};
 use serde_json::{Value, json};
 
 pub(crate) fn fan_short_label(h: FanHeaderKind) -> &'static str {
@@ -206,6 +208,7 @@ impl BackendEngine {
             .collect();
         json!({
             "index": idx,
+            "device_id": opengear_core::driver::Device::info(dev).id,
             "id": i.id,
             "product_name": i.product_name,
             "kind": format!("{:?}", i.kind),
@@ -275,6 +278,7 @@ impl BackendEngine {
             .collect();
         json!({
             "index": idx,
+            "device_id": opengear_core::driver::Device::info(m).id,
             "name": i.name,
             "vid": format!("{:04X}", i.vid),
             "pid": format!("{:04X}", i.pid),
@@ -313,6 +317,7 @@ impl BackendEngine {
         let i = &h.info;
         json!({
             "index": idx,
+            "device_id": opengear_core::driver::Device::info(h).id,
             "name": i.name,
             "vid": format!("{:04X}", i.vid),
             "pid": format!("{:04X}", i.pid),
@@ -456,6 +461,7 @@ impl BackendEngine {
                 let i = &k.info;
                 json!({
                     "index": idx,
+                    "device_id": opengear_core::driver::Device::info(k).id,
                     "id": i.id,
                     "name": i.name,
                     "vid": format!("{:04X}", i.vid),
@@ -682,6 +688,7 @@ impl BackendEngine {
             },
             "selftest": self.last_selftest,
             "devices": devices,
+            "device_list": self.device_list_json(),
         });
         root["is_laptop"] = json!(self.is_laptop);
         root["laptop_battery"] = json!(&self.laptop_battery);

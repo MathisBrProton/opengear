@@ -1,11 +1,14 @@
 //! Universal Nuvoton SuperIO (`NCT6791D`..`NCT6799D`) live Fan RPM & PWM
 //! controller via Microsoft WHQL-signed **PawnIO** (`LpcIO.bin`).
 
-use crate::pawnio::{
-    NamedMutexGuard, PawnIoAvailability, PawnIoSession, load_pawnio_module, pawnio_availability,
-};
 use anyhow::{Context, Result};
+#[cfg(windows)]
+use opengear_platform::PawnIoAvailability;
 use opengear_platform::is_elevated;
+#[cfg(windows)]
+use opengear_platform::named_mutex::{EC_MUTEX, ISA_MUTEX, NamedMutexGuard};
+#[cfg(windows)]
+use opengear_platform::pawnio::{PawnIoSession, load_pawnio_module, pawnio_availability};
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
 
@@ -214,7 +217,7 @@ mod win_sio {
 
                 if hwm_base >= 0x100 && hwm_base != 0xFFFF {
                     if !verify_nuvoton_vendor(&sess, hwm_base)
-                        && let Some(_ec_lock) = NamedMutexGuard::acquire(r"Global\Access_EC", 500)
+                        && let Some(_ec_lock) = NamedMutexGuard::acquire(EC_MUTEX, 500)
                         && enter_nuvoton(&sess, reg_port).is_ok()
                     {
                         let _ = sio_outb(&sess, 0x07, 0x0B);
@@ -265,7 +268,7 @@ mod win_sio {
             };
         }
 
-        let Some(_lock) = NamedMutexGuard::acquire(r"Global\Access_ISABUS.HTP.Method", 1000) else {
+        let Some(_lock) = NamedMutexGuard::acquire(ISA_MUTEX, 1000) else {
             return SuperIoSnapshot {
                 diagnostic: "Bus SuperIO ISA occupé par un autre outil — lecture annulée.".into(),
                 ..Default::default()
@@ -372,8 +375,8 @@ mod win_sio {
         }
 
         let (sess, chip, cur_mode, cur_cmd, target_raw, mode_reg, cmd_reg, pwm_out_reg) = {
-            let _lock = NamedMutexGuard::acquire(r"Global\Access_ISABUS.HTP.Method", 1500)
-                .context("Bus SuperIO ISA occupé")?;
+            let _lock =
+                NamedMutexGuard::acquire(ISA_MUTEX, 1500).context("Bus SuperIO ISA occupé")?;
             let (sess, chip) = detect_and_prepare()?;
             if channel_idx >= chip.fan_count {
                 anyhow::bail!("Canal #{channel_idx} hors plage pour {}", chip.chip_name);
@@ -420,7 +423,7 @@ mod win_sio {
         // Release ISA mutex while waiting for the SuperIO PWM output to settle.
         std::thread::sleep(std::time::Duration::from_millis(25));
 
-        let _lock = NamedMutexGuard::acquire(r"Global\Access_ISABUS.HTP.Method", 1500)
+        let _lock = NamedMutexGuard::acquire(ISA_MUTEX, 1500)
             .context("Bus SuperIO ISA occupé lors de la vérification")?;
         let rb_mode = hwm_read(&sess, chip.hwm_base, mode_reg)?;
         let rb_cmd = hwm_read(&sess, chip.hwm_base, cmd_reg)?;
@@ -451,8 +454,7 @@ mod win_sio {
         if channel_idx >= 7 {
             anyhow::bail!("Canal SuperIO invalide ({channel_idx})");
         }
-        let _lock = NamedMutexGuard::acquire(r"Global\Access_ISABUS.HTP.Method", 1500)
-            .context("Bus SuperIO ISA occupé")?;
+        let _lock = NamedMutexGuard::acquire(ISA_MUTEX, 1500).context("Bus SuperIO ISA occupé")?;
         let saved = saved_states().lock().ok().and_then(|g| g[channel_idx]);
         let Some(saved) = saved else {
             return Ok(format!(
@@ -489,7 +491,7 @@ mod win_sio {
         if states.is_empty() {
             return Vec::new();
         }
-        let Some(_lock) = NamedMutexGuard::acquire(r"Global\Access_ISABUS.HTP.Method", 3000) else {
+        let Some(_lock) = NamedMutexGuard::acquire(ISA_MUTEX, 3000) else {
             return vec!["SuperIO : bus ISA occupé, restauration impossible".into()];
         };
         let (sess, chip) = match detect_and_prepare() {

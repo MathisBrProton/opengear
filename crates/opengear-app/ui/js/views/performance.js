@@ -1,6 +1,6 @@
 import { ICONS, POLICIES, arr, clamp, esc, fmtHz, num } from "../utils.js";
 import { S, isExpert, local } from "../state.js";
-import { advancedHint, emptyState, expertTag, pageHeader, seg, sensorChips, sliderRow, subtabs, sw } from "../components.js";
+import { advancedHint, deviceSettings, emptyState, expertTag, pageHeader, seg, sensorChips, sliderRow, subtabs, sw } from "../components.js";
 
 export function viewPerformance() {
   const items = [
@@ -59,12 +59,7 @@ export function cardLogiDpi(m, i) {
             <span class="field-label">Distance de décrochage</span>
             ${seg([["Low", "Basse"], ["Medium", "Moyenne"], ["High", "Haute"]], dpi.lod, "logi-lod", { dev: i })}
           </div>` : ""}` : ""}
-      ${rr && arr(rr.supported_hz).length ? `
-        <div class="row-between mt-12">
-          <span class="field-label">Fréquence d'envoi</span>
-          ${seg(arr(rr.supported_hz).map((hz) => [hz, fmtHz(hz)]), rr.current_hz, "logi-hz", { dev: i })}
-        </div>` : ""}
-      ${ex && m.angle_snapping != null ? `<div class="mt-12">${sw(!!m.angle_snapping, `Correction d'angle (angle snapping) ${expertTag()}`, "logi-asnap", { dev: i })}</div>` : ""}
+      <div class="mt-12">${deviceSettings(m.device_id, { sections: ["performance"], bare: true })}</div>
     </div>`;
 }
 
@@ -86,8 +81,7 @@ export function cardCorsairMouse(dev, i) {
             <button type="button" class="btn btn-sm btn-secondary" data-act="cm-dpi-save" data-dev="${i}" data-stage="${s}">Enregistrer</button>
           </div>`).join("")}
       </div>
-      ${dev.pollrate_hz ? `<div class="row-between mt-12"><span class="field-label">Fréquence d'envoi</span>${seg([125, 250, 500, 1000, 2000].map((hz) => [hz, fmtHz(hz)]), dev.pollrate_hz, "cs-hz", { dev: i })}</div>` : ""}
-      ${m.lift_height != null ? `<div class="row-between mt-12"><span class="field-label">Distance de décrochage</span>${seg([[0, "Basse"], [1, "Moyenne"], [2, "Haute"]], m.lift_height, "cm-lod", { dev: i })}</div>` : ""}
+      <div class="mt-12">${deviceSettings(dev.device_id, { sections: ["performance"], bare: true })}</div>
     </div>`;
 }
 
@@ -100,7 +94,7 @@ function cardCorsairPoll(dev, i) {
         <div><h2 class="card-title">${esc(dev.product_name)}</h2><div class="card-desc">Fréquence d'envoi du clavier : plus elle est haute, plus la latence est faible (consommation CPU légèrement supérieure).</div></div>
         <span class="pill emerald">${fmtHz(dev.pollrate_hz)}</span>
       </div>
-      ${seg(rates.map((hz) => [hz, fmtHz(hz)]), dev.pollrate_hz, "cs-hz", { dev: i })}
+      ${deviceSettings(dev.device_id, { sections: ["performance"], bare: true })}
     </div>`;
 }
 

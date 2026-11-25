@@ -35,7 +35,7 @@ pub fn read_hardware_sensors() -> HardwareSensorsSnapshot {
     let mut snap = HardwareSensorsSnapshot::default();
 
     // 1. Instant native CPU temperature via WHQL-signed PawnIO
-    if let Some((cpu_t, src)) = crate::pawnio::read_native_cpu_temp() {
+    if let Some((cpu_t, src)) = crate::cpu_temp::read_native_cpu_temp() {
         snap.cpu_temp_c = Some((cpu_t * 10.0).round() / 10.0);
         snap.available = true;
         snap.source = src.to_string();
@@ -145,14 +145,14 @@ pub fn read_hardware_sensors() -> HardwareSensorsSnapshot {
         return snap;
     }
 
-    let hint = match crate::pawnio::pawnio_availability() {
-        crate::pawnio::PawnIoAvailability::NeedsAdmin => {
+    let hint = match opengear_platform::pawnio::pawnio_availability() {
+        opengear_platform::PawnIoAvailability::NeedsAdmin => {
             "PawnIO détecté — relance en Administrateur (UAC) pour la température CPU AMD/Intel native (zéro LHM requis)"
         }
-        crate::pawnio::PawnIoAvailability::Ready => {
+        opengear_platform::PawnIoAvailability::Ready => {
             "PawnIO actif (plateforme CPU non reconnue) — LHM optionnel pour RPM"
         }
-        crate::pawnio::PawnIoAvailability::NotInstalled => {
+        opengear_platform::PawnIoAvailability::NotInstalled => {
             "Installe le pilote signé PawnIO pour la temp CPU AMD/Intel native (ou LibreHardwareMonitor pour RPM)"
         }
     };

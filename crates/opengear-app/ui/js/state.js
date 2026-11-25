@@ -60,7 +60,7 @@ export function normalizeState() {
   if (!S) return;
   [
     "corsair_devices", "logi_mice", "logi_keyboards", "logi_headsets", "power_plans", "effects",
-    "aura_modes", "ram_rgb_modes", "button_presets", "bindable_keys", "devices",
+    "aura_modes", "ram_rgb_modes", "button_presets", "bindable_keys", "devices", "device_list",
     "firmware_inventory", "hwp_lighting_kinds",
   ].forEach((k) => {
     if (!Array.isArray(S[k])) S[k] = [];
@@ -162,6 +162,24 @@ export function codeLabel(code) {
   return k ? k.label : code.replace(/^Key/, "");
 }
 
+/** Device of the shared model (`S.device_list`) by id. */
+export function deviceById(id) {
+  return arr(S && S.device_list).find((d) => d.info.id === id) || null;
+}
+
+/** Current value of one setting of a device (`undefined` when the device does not offer it). */
+export function settingOf(id, settingId) {
+  const d = deviceById(id);
+  const s = d && d.settings.find((x) => x.id === settingId);
+  return s ? s.value : undefined;
+}
+
+const KIND_LABEL = {
+  keyboard: "Clavier", mouse: "Souris", headset: "Casque", mousepad: "Tapis", controller: "Manette", motherboard: "Carte mère",
+  memory: "Mémoire", cooler: "Refroidissement", led_controller: "Contrôleur LED", laptop: "PC portable", other: "Appareil",
+};
+const KIND_ICON = { keyboard: "keyboard", mouse: "mouse", headset: "headset", cooler: "fan", motherboard: "board" };
+
 export function k70Image() {
   const imgs = arr(S && S.local_assets.k70_images);
   if (imgs.length) {
@@ -181,7 +199,7 @@ export function devicesList() {
   const prof = S.config.profile;
   S.corsair_devices.forEach((d, i) => {
     const kind = d.kind;
-    const base = { key: `corsair:${i}`, vendor: "Corsair", kind, name: d.product_name || "Appareil Corsair", type: d.kind_label || "Corsair", battery: d.battery_pct, status: { label: "Connecté", cls: "emerald" }, quick: [] };
+    const base = { key: `corsair:${i}`, deviceId: d.device_id, vendor: "Corsair", kind, name: d.product_name || "Appareil Corsair", type: d.kind_label || "Corsair", battery: d.battery_pct, status: { label: "Connecté", cls: "emerald" }, quick: [] };
     if (kind === "Mouse") {
       Object.assign(base, { img: mouseImage().url, icon: "mouse" });
       if (d.mouse) {
@@ -193,7 +211,7 @@ export function devicesList() {
     } else if (kind === "Headset") {
       Object.assign(base, { img: headsetImage().url, icon: "headset" });
       const side = num(d.headset && d.headset.sidetone_pct);
-      base.quick.push(qa(side > 0 ? "Couper le retour micro" : "Activer le retour micro", "chs-side-quick", { dev: i, pct: side > 0 ? 0 : 50 }));
+      base.quick.push(qa(side > 0 ? "Couper le retour micro" : "Activer le retour micro", "dev-set", { device: d.device_id, setting: "sidetone", json: side > 0 ? 0 : 50 }));
     } else if (kind === "CoolerHub") {
       Object.assign(base, { img: "/assets/aio.svg", icon: "fan" });
     } else if (kind === "Keyboard") {
@@ -203,8 +221,8 @@ export function devicesList() {
       base.quick.push(qa(prof.enable_rgb ? "Couper l'éclairage" : "Allumer l'éclairage", "rgb-enable", { on: prof.enable_rgb ? "0" : "1" }));
       const br = num(d.hw_brightness_pct, 100);
       const next = br >= 100 ? 50 : br >= 50 ? 0 : 100;
-      base.quick.push(qa(`Luminosité ${next} %`, "cs-bright-quick", { dev: i, pct: next }));
-      if (d.hw_winlock != null) base.quick.push(qa(d.hw_winlock ? "Débloquer Windows" : "Bloquer Windows", "cs-winlock-quick", { dev: i, on: d.hw_winlock ? "0" : "1" }, "Bloque la touche Windows pendant le jeu"));
+      base.quick.push(qa(`Luminosité ${next} %`, "dev-set", { device: d.device_id, setting: "hw_brightness", json: next }));
+      if (d.hw_winlock != null) base.quick.push(qa(d.hw_winlock ? "Débloquer Windows" : "Bloquer Windows", "dev-set", { device: d.device_id, setting: "win_lock", json: !d.hw_winlock }, "Bloque la touche Windows pendant le jeu"));
     } else {
       Object.assign(base, { img: "/assets/generic_device.svg", icon: "chip" });
     }
@@ -215,7 +233,7 @@ export function devicesList() {
     const bat = m.battery || null;
     const dpi = m.dpi;
     const item = {
-      key: `logi-mouse:${i}`, vendor: "Logitech", kind: "Mouse", name: m.name || "Souris Logitech", type: "Souris Logitech G",
+      key: `logi-mouse:${i}`, deviceId: m.device_id, vendor: "Logitech", kind: "Mouse", name: m.name || "Souris Logitech", type: "Souris Logitech G",
       img: mi.url, imgCls: mi.official ? "cutout" : "", icon: "mouse",
       battery: bat ? bat.percent : null, charging: !!(bat && bat.is_charging),
       status: { label: dpi ? `${dpi.dpi_x} DPI` : "Connectée", cls: "cyan" }, quick: [],
@@ -228,7 +246,7 @@ export function devicesList() {
   S.logi_keyboards.forEach((k, i) => {
     const bat = k.battery || null;
     out.push({
-      key: `logi-kb:${i}`, vendor: "Logitech", kind: "Keyboard", name: k.name || "Clavier Logitech", type: "Clavier Logitech G",
+      key: `logi-kb:${i}`, deviceId: k.device_id, vendor: "Logitech", kind: "Keyboard", name: k.name || "Clavier Logitech", type: "Clavier Logitech G",
       img: "/assets/keyboard.svg", icon: "keyboard",
       battery: bat ? bat.percent : null, charging: !!(bat && bat.is_charging), status: { label: "Connecté", cls: "emerald" },
       quick: [qa("Couleur fixe", "lkb-quick", { dev: i, mode: "Fixed" }), qa("Vague", "lkb-quick", { dev: i, mode: "Wave" }), qa("Éteindre", "lkb-quick", { dev: i, mode: "Off" })],
@@ -243,9 +261,9 @@ export function devicesList() {
     const quick = [];
     if (h.equalizer && flatIdx >= 0) quick.push(qa("Son neutre", "eq-preset", { dev: i, idx: flatIdx }));
     if (h.equalizer && fpsIdx >= 0) quick.push(qa("Son FPS", "eq-preset", { dev: i, idx: fpsIdx }));
-    quick.push(qa(num(h.sidetone_pct) > 0 ? "Couper le retour micro" : "Retour micro 50 %", "logi-side-quick", { dev: i, pct: num(h.sidetone_pct) > 0 ? 0 : 50 }));
+    quick.push(qa(num(h.sidetone_pct) > 0 ? "Couper le retour micro" : "Retour micro 50 %", "dev-set", { device: h.device_id, setting: "sidetone", json: num(h.sidetone_pct) > 0 ? 0 : 50 }));
     out.push({
-      key: `logi-hs:${i}`, vendor: "Logitech", kind: "Headset", name: h.name || "Casque Logitech", type: "Casque Logitech G",
+      key: `logi-hs:${i}`, deviceId: h.device_id, vendor: "Logitech", kind: "Headset", name: h.name || "Casque Logitech", type: "Casque Logitech G",
       img: hi.url, imgCls: hi.official ? "cutout" : "", icon: "headset",
       battery: bat ? bat.percent : null, charging: !!(bat && bat.is_charging),
       status: { label: "Connecté", cls: "purple" }, quick,
@@ -309,6 +327,17 @@ export function devicesList() {
       quick: ene ? [qa("Couleur de la carte mère", "ram-sync-aura", {}), qa("Éteindre", "ram-off", {})] : [],
     });
   }
+  // Devices of drivers registered through the shared model appear automatically.
+  const known = new Set(out.map((x) => x.deviceId).filter(Boolean));
+  arr(S.device_list).filter((d) => !known.has(d.info.id)).forEach((d) => {
+    const bat = d.status.battery_pct;
+    out.push({
+      key: `dev:${d.info.id}`, deviceId: d.info.id, vendor: d.info.vendor, kind: d.info.kind, name: d.info.model,
+      type: KIND_LABEL[d.info.kind] || "Appareil", icon: KIND_ICON[d.info.kind] || "chip",
+      battery: bat != null ? bat : null, charging: !!d.status.charging,
+      status: { label: "Connecté", cls: "emerald" }, quick: [],
+    });
+  });
   return out;
 }
 

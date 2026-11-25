@@ -1,6 +1,6 @@
 import { ICONS, arr, esc, fmtHz, num, plural, safeHex } from "../utils.js";
-import { S, devicesList, getEq, headsetImage, isExpert, local } from "../state.js";
-import { advancedHint, batteryBadge, deviceVisual, emptyState, expertTag, pageHeader, seg, sensorChips, sliderRow, sw } from "../components.js";
+import { S, deviceById, devicesList, getEq, headsetImage, isExpert, local } from "../state.js";
+import { advancedHint, batteryBadge, deviceSettings, deviceVisual, emptyState, expertTag, pageHeader, seg, sensorChips, sliderRow, sw } from "../components.js";
 import { cardLogiKbLighting, cardRam } from "./lighting.js";
 import { cardCorsairMouse, cardLogiDpi } from "./performance.js";
 import { cardLogiOnboard } from "./input.js";
@@ -53,6 +53,7 @@ function fiche(d) {
   const [kind, idxStr] = d.key.split(":");
   const i = Number(idxStr || 0);
   const ex = isExpert();
+  if (kind === "dev") return ficheGeneric(d);
   if (kind === "corsair") return ficheCorsair(d, S.corsair_devices[i], i);
   if (kind === "logi-mouse") {
     const m = S.logi_mice[i];
@@ -148,6 +149,19 @@ function fiche(d) {
   return ficheHead(d);
 }
 
+/** Page of a device known only through the shared model: identity, status and its settings. */
+function ficheGeneric(d) {
+  const dev = deviceById(d.deviceId);
+  if (!dev) return ficheHead(d);
+  const conn = { usb: "USB", wireless: "Sans fil", bluetooth: "Bluetooth", internal: "Interne" }[dev.info.connection];
+  return `
+    ${ficheHead(d)}
+    ${deviceSettings(d.deviceId)}
+    <div class="card"><div class="card-head"><h2 class="card-title">Informations</h2></div>${infoTable([
+      ["Fabricant", dev.info.vendor], ["Connexion", conn], ["Firmware", dev.info.firmware, true], isExpert() ? ["Identifiant", dev.info.id, true] : null,
+    ])}</div>`;
+}
+
 function ficheCorsair(d, dev, i) {
   const ex = isExpert();
   const info = `
@@ -165,11 +179,7 @@ function ficheCorsair(d, dev, i) {
     const h = dev.headset;
     return `
       ${ficheHead(d)}
-      <div class="card accent-purple">
-        <div class="card-head"><div><h2 class="card-title">Retour micro (sidetone)</h2><div class="card-desc">T'entendre dans le casque quand tu parles.</div></div></div>
-        ${sliderRow("Niveau", { id: `chs-side-${i}`, min: 0, max: 100, value: num(h.sidetone_pct), input: "label", change: "chs-side", data: { dev: i, fmt: "pct100" }, display: `${num(h.sidetone_pct)} %` })}
-        <div class="row mt-12"><button type="button" class="btn btn-sm btn-secondary" data-act="chs-side-quick" data-dev="${i}" data-pct="0">Couper</button></div>
-      </div>
+      ${deviceSettings(dev.device_id, { title: "Réglages du casque" })}
       ${cardWasapi()}${info}`;
   }
   if (dev.kind === "CoolerHub" && dev.cooler) {
@@ -179,8 +189,6 @@ function ficheCorsair(d, dev, i) {
   }
   if (dev.kind !== "Keyboard") return `${ficheHead(d)}${info}`;
 
-  const mask = dev.winlock_shortcuts_mask != null ? num(dev.winlock_shortcuts_mask) : 3;
-  const deb = num(dev.debounce_timeout_ms, 30);
   const hwpList = arr(dev.hwp_profiles);
   const hwpIdx = clamp(num(local.hwpProfSel[i], 0), 0, Math.max(0, hwpList.length - 1));
   const hp = hwpList[hwpIdx];
@@ -191,30 +199,13 @@ function ficheCorsair(d, dev, i) {
     ${linkCard("Effets, couleurs et peinture par touche se règlent dans Éclairage.", "lighting", "global", "Éclairage")}
     <div class="card accent-cyan">
       <div class="card-head"><h2 class="card-title">Réglages du clavier</h2></div>
-      ${dev.pollrate_hz ? `<div class="row-between"><span class="field-label">Fréquence d'envoi</span>${seg([125, 250, 500, 1000, 2000, 4000, 8000].filter((hz) => hz <= (num(dev.max_pollrate_hz, 8000) || 8000)).map((hz) => [hz, fmtHz(hz)]), dev.pollrate_hz, "cs-hz", { dev: i })}</div>` : ""}
-      <div class="stack mt-12">${sliderRow("Luminosité matérielle", { id: `cs-bright-${i}`, min: 0, max: 100, value: num(dev.hw_brightness_pct, 100), input: "label", change: "cs-bright", data: { dev: i, fmt: "pct100" }, display: `${num(dev.hw_brightness_pct, 100)} %` })}</div>
+      ${deviceSettings(dev.device_id, { bare: true })}
       <div class="row-between mt-12">
         <span class="field-label">Qui contrôle l'éclairage</span>
         ${seg([["hw", "Le clavier (autonome)"], ["sw", "OpenGear (en direct)"]], dev.mode, "cs-mode", { dev: i })}
       </div>
-      ${dev.active_hw_profile != null ? `<div class="row-between mt-12"><span class="field-label">Profil interne</span>${seg([0, 1, 2].map((n) => [n, `Profil ${n + 1}`]), dev.active_hw_profile, "cs-hwprof", { dev: i })}</div>` : ""}
-      ${dev.hw_winlock != null ? `<div class="mt-12">${sw(!!dev.hw_winlock, "Bloquer la touche Windows (dans le clavier)", "cs-winlock", { dev: i })}</div>` : ""}
     </div>
     ${ex ? `
-      ${dev.hw_winlock != null ? `
-        <div class="card expert-card">
-          <div class="card-head"><h2 class="card-title">Raccourcis bloqués par le verrou Windows ${expertTag()}</h2></div>
-          <div class="row">${[[1, "Touche Windows"], [2, "Alt + Tab"], [4, "Alt + F4"], [8, "Maj + Tab"]].map(([bit, lbl]) => `<label class="mini-check"><input type="checkbox" data-change="cs-wl-bit" data-dev="${i}" data-bit="${bit}" ${mask & bit ? "checked" : ""} />${esc(lbl)}</label>`).join("")}</div>
-        </div>` : ""}
-      ${dev.debounce_enabled != null ? `
-        <div class="card expert-card">
-          <div class="card-head"><div><h2 class="card-title">Anti-rebond matériel ${expertTag()}</h2><div class="card-desc">Délai pendant lequel un second appui est ignoré. Plus bas = plus réactif, mais risque de doubles frappes.</div></div></div>
-          <div class="row">
-            ${sw(!!dev.debounce_enabled, "Activé", "cs-deb", { dev: i }, { id: `cs-deb-en-${i}` })}
-            <select id="cs-deb-ms-${i}" class="og-select auto" data-change="cs-deb" data-dev="${i}" aria-label="Délai anti-rebond">${[0, 1, 2, 3, 5, 10, 15, 20, 30, 60].map((v) => `<option value="${v}" ${deb === v ? "selected" : ""}>${v} ms</option>`).join("")}</select>
-            ${deb > 5 ? `<button type="button" class="btn btn-sm btn-secondary" data-act="cs-deb-boost" data-dev="${i}">Passer à 2 ms</button>` : `<span class="pill emerald">Latence optimisée</span>`}
-          </div>
-        </div>` : ""}
       <div class="card expert-card">
         <div class="card-head"><h2 class="card-title">Couleurs des voyants ${expertTag()}</h2></div>
         <div class="row">
@@ -257,11 +248,7 @@ function ficheLogiHeadset(d, h, i) {
   return `
     ${ficheHead(d)}
     ${hi.variants.length > 1 ? `<div class="row">${hi.variants.map((v, vi) => `<button type="button" class="variant-chip ${vi === local.selectedHeadsetVariant ? "active" : ""}" data-act="headset-variant" data-idx="${vi}">${esc(String(v.label).replace("PRO X ", ""))}</button>`).join("")}</div>` : ""}
-    <div class="card accent-purple">
-      <div class="card-head"><div><h2 class="card-title">Retour micro (sidetone)</h2><div class="card-desc">T'entendre dans le casque quand tu parles, sans latence.</div></div></div>
-      ${sliderRow("Niveau", { id: `hs-side-${i}`, min: 0, max: 100, value: num(h.sidetone_pct), input: "label", change: "logi-side", data: { dev: i, fmt: "pct100" }, display: `${num(h.sidetone_pct)} %` })}
-      <div class="row mt-12"><button type="button" class="btn btn-sm btn-secondary" data-act="logi-side-quick" data-dev="${i}" data-pct="0">Couper</button></div>
-    </div>
+    ${deviceSettings(h.device_id, { sections: ["audio"], title: "Audio" })}
     ${eq ? `
       <div class="card">
         <div class="card-head"><div><h2 class="card-title">Égaliseur</h2><div class="card-desc">Appliqué directement dans le casque.</div></div>${e.dirty ? `<span class="pill amber">Non appliqué</span>` : ""}</div>

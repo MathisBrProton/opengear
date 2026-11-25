@@ -8,9 +8,9 @@
 //!   applies the marker immediately;
 //! - and, as a last resort, the next GUI launch applies any marker left behind.
 
-use opengear_asus::{
-    FanChannelConfig, SuperIoSavedState, apply_asus_wmi_curve, restore_superio_saved_states,
-};
+use opengear_asus::apply_asus_wmi_curve;
+use opengear_core::cooling::FanChannelConfig;
+use opengear_mainboard::{SuperIoSavedState, restore_superio_saved_states};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
@@ -219,7 +219,7 @@ mod tests {
         let m = FanOverrideMarker {
             pid: 42,
             wmi_restore: vec![FanChannelConfig::default_for(
-                opengear_asus::FanHeaderKind::AioPump,
+                opengear_core::cooling::FanHeaderKind::AioPump,
             )],
             superio_restore: vec![SuperIoSavedState {
                 index: 1,
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn partial_restore_retains_failed_entries_only() {
-        use opengear_asus::FanHeaderKind;
+        use opengear_core::cooling::FanHeaderKind;
         let m = FanOverrideMarker {
             pid: 99,
             wmi_restore: vec![

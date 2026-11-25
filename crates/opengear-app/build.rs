@@ -21,7 +21,7 @@ fn main() {
     emit_rerun_tree(Path::new("ui"));
     emit_rerun_tree(Path::new("assets"));
 
-    let pawnio_src = Path::new("../opengear-asus/pawnio_modules");
+    let pawnio_src = Path::new("../opengear-platform/pawnio_modules");
     emit_rerun_tree(pawnio_src);
 
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".into());

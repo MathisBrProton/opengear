@@ -6,6 +6,9 @@
 pub mod elevation;
 pub mod keyboard;
 pub mod laptop;
+#[cfg(windows)]
+pub mod named_mutex;
+pub mod pawnio;
 pub mod power;
 pub mod telemetry;
 pub mod wmi;
@@ -16,5 +19,6 @@ pub use laptop::{
     DisplayInfo, LaptopBatteryInfo, is_laptop_chassis, read_display_info, read_laptop_battery,
     set_display_brightness, set_display_refresh_rate,
 };
+pub use pawnio::PawnIoAvailability;
 pub use power::{PowerPlan, list_power_plans, set_active_power_plan};
 pub use telemetry::{GpuTelemetry, StaticSystemInfo, SystemTelemetry, TelemetryCollector};

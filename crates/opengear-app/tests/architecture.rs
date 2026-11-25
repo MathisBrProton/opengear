@@ -1,8 +1,8 @@
 //! Architecture guard: fails `cargo test` when a crate breaks the layering described in AGENTS.md.
 //!
-//! - `opengear-core` and `opengear-platform` know no hardware vendor.
+//! - `opengear-core`, `opengear-platform` and `opengear-mainboard` know no hardware vendor.
 //! - Every other library crate except `opengear-input` is a vendor crate (`opengear-<brand>`) and
-//!   may depend only on `opengear-core` / `opengear-platform`, never on another vendor crate.
+//!   may depend only on those neutral crates, never on another vendor crate.
 //! - A vendor's protocol identifiers (WMI classes, HID protocol names…) appear in code only inside
 //!   that vendor's crate. Comments and string literals (labels, docs) are ignored.
 //! - `opengear-app` orchestrates: no direct HID / WMI / IOCTL access.
@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const NEUTRAL: &[&str] = &["opengear-core", "opengear-platform"];
+const NEUTRAL: &[&str] = &["opengear-core", "opengear-platform", "opengear-mainboard"];
 const APP: &str = "opengear-app";
 const INPUT: &str = "opengear-input";
 
@@ -21,6 +21,7 @@ const VENDOR_MARKERS: &[(&str, &[&str])] = &[
     ("opengear-asus", &["asusmanagement"]),
     ("opengear-corsair", &["bragi"]),
     ("opengear-logitech", &["hidpp", "hid++"]),
+    ("opengear-openrgb", &["orgb"]),
 ];
 
 /// Low-level I/O that only driver crates may perform.
@@ -132,13 +133,21 @@ fn find_markers(crate_name: &str, markers: &[&str]) -> Vec<String> {
 #[test]
 fn crate_dependencies_follow_the_layering() {
     let deps = internal_deps();
-    assert!(deps.contains_key("opengear-platform") && deps.contains_key("opengear-hp"));
+    for expected in [
+        "opengear-platform",
+        "opengear-mainboard",
+        "opengear-hp",
+        "opengear-openrgb",
+    ] {
+        assert!(deps.contains_key(expected), "{expected} manquant");
+    }
     let mut violations = Vec::new();
     for (name, ds) in &deps {
         for d in ds {
             let allowed = match name.as_str() {
                 "opengear-core" => false,
                 "opengear-platform" => d == "opengear-core",
+                "opengear-mainboard" => d == "opengear-core" || d == "opengear-platform",
                 APP => true,
                 _ => NEUTRAL.contains(&d.as_str()),
             };

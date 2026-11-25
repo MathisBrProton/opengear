@@ -2,6 +2,7 @@
 
 mod app_log;
 mod audio_ext;
+mod drivers;
 mod fan_watchdog;
 mod local_assets;
 mod selftest;
@@ -12,10 +13,7 @@ mod ui;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use opengear_asus::{
-    AuraHwMode, AuraMainboardController, EneRamMode, apply_ram_rgb, probe_asus_wmi_cooling,
-    probe_ram_rgb, read_hardware_sensors,
-};
+use opengear_asus::{AuraHwMode, AuraMainboardController, probe_asus_wmi_cooling};
 use opengear_core::{
     EffectKind, OperatingMode, PollingRate, Rgb, RgbEffectConfig, scan_hid_devices,
 };
@@ -24,6 +22,7 @@ use opengear_hp::probe_hp_omen;
 use opengear_logitech::{
     BatteryPowerModel, LodLevel, LogitechHeadset, LogitechKeyboard, LogitechMouse, OnboardMode,
 };
+use opengear_mainboard::{EneRamMode, read_hardware_sensors};
 use opengear_platform::{
     TelemetryCollector, list_power_plans, read_display_info, read_laptop_battery,
 };
@@ -643,15 +642,15 @@ fn cmd_corsair(action: CorsairCmd) -> Result<()> {
 fn cmd_asus(action: AsusCmd) -> Result<()> {
     match action {
         AsusCmd::RamScan => {
-            let st = probe_ram_rgb();
-            println!("=== RAM DDR5 & ENE SMBus (ASUSManagement WMI) ===");
+            let st = drivers::ram_rgb().probe();
+            println!("=== RAM DDR RGB (contrôleurs ENE) ===");
             println!(
                 "Admin UAC      : {}",
                 if st.is_admin { "OUI" } else { "NON" }
             );
             println!(
-                "WMI SMBus      : {}",
-                if st.wmi_smbus_available {
+                "Bus SMBus      : {}",
+                if st.bus_available {
                     "Actif"
                 } else {
                     "Indisponible"
@@ -672,9 +671,10 @@ fn cmd_asus(action: AsusCmd) -> Result<()> {
             println!("Contrôleurs ENE: {}", st.ene_modules.len());
             for m in &st.ene_modules {
                 println!(
-                    "  addr=0x{:02X} (wmi_slave=0x{:02X}) | FW={} | {} | {} LEDs | mode={}",
+                    "  addr=0x{:02X} ({} / bus 0x{:02X}) | FW={} | {} | {} LEDs | mode={}",
                     m.address_7bit,
-                    m.wmi_slave_arg,
+                    m.backend,
+                    m.bus_arg,
                     m.firmware,
                     if m.is_v2 { "V2" } else { "V1" },
                     m.led_count,
@@ -690,10 +690,17 @@ fn cmd_asus(action: AsusCmd) -> Result<()> {
             speed,
             save,
         } => {
-            let st = probe_ram_rgb();
+            let st = drivers::ram_rgb().probe();
             let rgb = Rgb::from_hex(&color).context("Couleur hex invalide")?;
             let m = EneRamMode::from_str_id(&mode);
-            let res = apply_ram_rgb(&st.ene_modules, None, m, rgb, speed, false, save)?;
+            let effect = opengear_mainboard::RamEffect {
+                mode: m,
+                color: rgb,
+                speed,
+                reverse: false,
+                save_eeprom: save,
+            };
+            let res = drivers::ram_rgb().apply(&st.ene_modules, None, &effect)?;
             println!(
                 "RAM DDR5 RGB appliqué : {} ({}, speed={}, save_eeprom={}) -> {}",
                 m.label(),

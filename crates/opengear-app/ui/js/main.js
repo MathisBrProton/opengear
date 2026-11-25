@@ -309,6 +309,8 @@ const ACT = {
   "paint-toggle": () => { local.paintMode = !local.paintMode; render(); },
   "clear-per-key": (el) => call("clear_per_key", {}, { btn: el, ok: "Peinture par touche effacée" }),
   "kb-view": (el) => { local.kbViewMode = el.dataset.val; render(); },
+  // Shared device model: choice buttons (`data-val`) and quick actions (`data-json`).
+  "dev-set": (el) => setDeviceSetting(el, el.dataset.json !== undefined ? JSON.parse(el.dataset.json) : el.dataset.val, el),
   "kb-key": (el) => {
     local.selectedKeyId = el.dataset.keyId;
     if (local.tab === "lighting" && local.paintMode) {
@@ -319,20 +321,13 @@ const ACT = {
   },
 
   // Corsair
-  "cs-bright-quick": (el) => call("corsair_set_brightness", { device_index: devIdx(el), percent: Number(el.dataset.pct) }, { btn: el, ok: `Luminosité : ${el.dataset.pct} %` }),
-  "cs-winlock-quick": (el) => call("corsair_set_hw_winlock", { device_index: devIdx(el), enabled: el.dataset.on === "1" }, { btn: el, ok: el.dataset.on === "1" ? "Touche Windows bloquée" : "Touche Windows débloquée" }),
   "cm-stage": (el) => call("corsair_mouse_set_active_stage", { device_index: devIdx(el), stage: Number(el.dataset.stage) }, { btn: el, ok: `Palier DPI ${Number(el.dataset.stage) + 1} activé` }),
   "cm-dpi-save": (el) => {
     const v = Number(inputVal(`cm-dpi-${devIdx(el)}-${el.dataset.stage}`));
     if (!Number.isFinite(v) || v < 100 || v > 30000) { toast("Le DPI doit être compris entre 100 et 30 000.", "err"); return; }
     call("corsair_mouse_set_dpi_stage", { device_index: devIdx(el), stage: Number(el.dataset.stage), dpi: v }, { btn: el, ok: `Palier ${Number(el.dataset.stage) + 1} : ${v} DPI` });
   },
-  "cm-lod": (el) => call("corsair_mouse_set_lift_height", { device_index: devIdx(el), level: Number(el.dataset.val) }, { btn: el, ok: `Distance de décrochage : ${el.textContent.trim()}` }),
-  "cs-hz": (el) => call("corsair_set_pollrate", { device_index: devIdx(el), hz: Number(el.dataset.val) }, { btn: el, ok: `Fréquence d'envoi : ${Number(el.dataset.val) >= 1000 ? `${Number(el.dataset.val) / 1000} kHz` : `${el.dataset.val} Hz`}` }),
-  "chs-side-quick": (el) => call("corsair_headset_set_sidetone", { device_index: devIdx(el), percent: Number(el.dataset.pct), muted: Number(el.dataset.pct) === 0 }, { btn: el, ok: Number(el.dataset.pct) ? `Retour micro : ${el.dataset.pct} %` : "Retour micro coupé" }),
-  "cs-hwprof": (el) => call("corsair_set_hw_profile", { device_index: devIdx(el), index: Number(el.dataset.val) }, { btn: el, ok: `Profil interne ${Number(el.dataset.val) + 1} activé` }),
   "cs-mode": (el) => call("corsair_set_mode", { device_index: devIdx(el), mode: el.dataset.val }, { btn: el, ok: el.dataset.val === "sw" ? "Éclairage piloté par OpenGear" : "Le clavier gère son éclairage seul" }),
-  "cs-deb-boost": (el) => call("corsair_set_debounce", { device_index: devIdx(el), enabled: true, timeout_ms: 2 }, { btn: el, ok: "Anti-rebond matériel réglé à 2 ms" }),
   "cs-ind": (el) => call("corsair_set_indicator_color", { device_index: devIdx(el), indicator: inputVal(`cs-ind-${devIdx(el)}`), color: safeHex(inputVal(`cs-ind-col-${devIdx(el)}`)) }, { btn: el, ok: "Couleur du voyant appliquée" }),
   "cs-hwp-reload": (el) => call("corsair_reload_hwp", { device_index: devIdx(el) }, { btn: el, ok: "Mémoire du clavier relue" }),
   "cs-hwp-flash": (el) => {
@@ -360,11 +355,9 @@ const ACT = {
     if (!m || !m.dpi) return;
     call("logi_set_dpi", { device_index: devIdx(el), x: m.dpi.dpi_x, y: m.dpi.dpi_y, lod: el.dataset.val }, { btn: el, ok: `Distance de décrochage : ${el.textContent.trim()}` });
   },
-  "logi-hz": (el) => call("logi_set_pollrate", { device_index: devIdx(el), hz: Number(el.dataset.val) }, { btn: el, ok: `Fréquence d'envoi : ${Number(el.dataset.val) >= 1000 ? `${Number(el.dataset.val) / 1000} kHz` : `${el.dataset.val} Hz`}` }),
   "lkb-quick": (el) => call("logi_kb_set_rgb", { device_index: devIdx(el), mode: el.dataset.mode, color: safeHex(S.config.profile.rgb.primary) }, { btn: el, ok: "Éclairage du clavier appliqué" }),
   "lkb-apply": (el) => call("logi_kb_set_rgb", { device_index: devIdx(el), mode: inputVal(`lkb-mode-${devIdx(el)}`), color: safeHex(inputVal(`lkb-col-${devIdx(el)}`)) }, { btn: el, ok: "Éclairage du clavier appliqué" }),
   "lml-apply": (el) => call("logi_set_led", { device_index: devIdx(el), mode: inputVal(`lml-mode-${devIdx(el)}`), color: safeHex(inputVal(`lml-col-${devIdx(el)}`)) }, { btn: el, ok: "Éclairage de la souris appliqué" }),
-  "logi-side-quick": (el) => call("logi_set_sidetone", { device_index: devIdx(el), percent: Number(el.dataset.pct) }, { btn: el, ok: Number(el.dataset.pct) ? `Retour micro : ${el.dataset.pct} %` : "Retour micro coupé" }),
   "eq-preset": (el) => {
     const i = devIdx(el);
     const h = S.logi_headsets[i];
@@ -388,7 +381,6 @@ const ACT = {
   "mbtn-sel": (el) => { local.btnSel[devIdx(el)] = Number(el.dataset.btn); render(); },
   "mouse-variant": (el) => { local.selectedMouseVariant = Number(el.dataset.idx); render(); },
   "headset-variant": (el) => { local.selectedHeadsetVariant = Number(el.dataset.idx); render(); },
-  "logi-mode": (el) => call("logi_set_mode", { device_index: devIdx(el), mode: el.dataset.val }, { btn: el, ok: el.dataset.val === "Host" ? "Souris pilotée par OpenGear" : "La souris utilise ses profils internes" }),
   "logi-prof-sel": (el) => {
     const i = devIdx(el);
     if (local.drafts[i] && local.drafts[i].dirty) toast("Brouillon non écrit abandonné pour ce profil.", "info");
@@ -678,7 +670,13 @@ const ACT = {
   },
 };
 
+/** Apply one setting of the shared device model. */
+function setDeviceSetting(el, value, btn = null) {
+  return call("device_set", { device: el.dataset.device, setting: el.dataset.setting, value }, { btn, ok: "Réglage appliqué" });
+}
+
 const CHANGE = {
+  "dev-set": (el) => setDeviceSetting(el, el.type === "checkbox" ? el.checked : el.type === "range" ? Number(el.value) : el.value),
   "switch-profile": (el) => call("switch_profile", { name: el.value }, { ok: `Profil « ${el.value} » activé` }),
   "rgb-enable-sw": (el) => call("set_rgb_config", { enable_rgb: el.checked }, { ok: el.checked ? "Éclairage allumé" : "Éclairage coupé" }),
   "rgb-commit": (el) => {
@@ -688,12 +686,9 @@ const CHANGE = {
   },
   "sync-all": (el) => call("set_sync_all", { enabled: el.checked }, { ok: el.checked ? "Toutes les marques sont synchronisées" : "Synchronisation désactivée" }),
   "rgb-reverse": (el) => call("set_rgb_config", { reverse: el.checked, commit: true }, { silent: true }),
-  "cs-bright": (el) => call("corsair_set_brightness", { device_index: devIdx(el), percent: Number(el.value) }, { ok: `Luminosité : ${el.value} %` }),
   "argb-count": (el) => call("asus_set_led_count", { channel: Number(el.dataset.ch), count: Number(el.value) }, { ok: `Connecteur réglé sur ${el.value} LEDs` }),
   "asus-direct-sw": (el) => call("asus_set_direct", { enabled: el.checked }, { ok: el.checked ? "Carte mère synchronisée avec OpenGear" : "Carte mère en mode autonome" }),
   "sl3-thermal": (el) => call("cooling_sl3_argb", { channel: Number(inputVal("sl3-ch")), thermal: el.checked }, { ok: el.checked ? "Couleur selon la température activée" : "Couleur selon la température désactivée" }),
-  "lkb-bright": (el) => call("logi_kb_set_brightness", { device_index: devIdx(el), percent: Number(el.value) }, { ok: `Luminosité : ${el.value} %` }),
-  "logi-asnap": (el) => call("logi_set_angle_snapping", { device_index: devIdx(el), enabled: el.checked }, { ok: `Correction d'angle ${el.checked ? "activée" : "désactivée"}` }),
   "cool-src": (el) => {
     const ch = S.cooling.channels[local.selectedCoolingIdx];
     if (!ch) return;
@@ -728,7 +723,6 @@ const CHANGE = {
   "input-winlock": (el) => call("input_set_winlock", { enabled: el.checked }, { ok: el.checked ? "Touche Windows bloquée" : "Touche Windows débloquée" }),
   "kb-form": (el) => call("set_keyboard_layout", { form_factor: el.value }, { ok: "Format du clavier mis à jour" }),
   "kb-std": (el) => call("set_keyboard_layout", { standard: el.value }, { ok: "Norme du clavier mise à jour" }),
-  "cs-flashtap": (el) => call("corsair_set_flashtap", { device_index: Number(el.dataset.dev), enabled: el.checked }),
   "socd-en": (el) => call("input_set_esports", { socd_enabled: el.checked }, { ok: el.checked ? "Snap Tap activé" : "Snap Tap désactivé" }),
   "socd-preset": (el) => call("input_set_esports", { socd_preset: el.value }, { ok: "Touches Snap Tap mises à jour" }),
   "es-chatter": (el) => call("input_set_esports", { key_chatter_ms: Number(el.value) }, { ok: `Anti-rebond clavier : ${LABEL_FMT.ms(el.value)}` }),
@@ -761,19 +755,6 @@ const CHANGE = {
     local.hwpProfSel[devIdx(el)] = Number(el.value);
     render();
   },
-  "cs-winlock": (el) => call("corsair_set_hw_winlock", { device_index: devIdx(el), enabled: el.checked }, { ok: el.checked ? "Touche Windows bloquée" : "Touche Windows débloquée" }),
-  "cs-wl-bit": (el) => {
-    let mask = 0;
-    document.querySelectorAll(`[data-change="cs-wl-bit"][data-dev="${devIdx(el)}"]:checked`).forEach((x) => { mask |= Number(x.dataset.bit); });
-    call("corsair_set_winlock_shortcuts", { device_index: devIdx(el), mask }, { ok: "Raccourcis bloqués mis à jour" });
-  },
-  "cs-deb": (el) => {
-    const i = devIdx(el);
-    const en = document.getElementById(`cs-deb-en-${i}`);
-    call("corsair_set_debounce", { device_index: i, enabled: en ? en.checked : true, timeout_ms: Number(inputVal(`cs-deb-ms-${i}`) ?? 30) }, { ok: "Anti-rebond matériel mis à jour" });
-  },
-  "chs-side": (el) => call("corsair_headset_set_sidetone", { device_index: devIdx(el), percent: Number(el.value), muted: Number(el.value) === 0 }, { ok: `Retour micro : ${el.value} %` }),
-  "logi-side": (el) => call("logi_set_sidetone", { device_index: devIdx(el), percent: Number(el.value) }, { ok: `Retour micro : ${el.value} %` }),
   "wa-vol": (el) => call("audio_set_volume", { is_mic: el.dataset.mic === "1", percent: Number(el.value) }, { rerender: false, ok: `${el.dataset.mic === "1" ? "Micro" : "Volume"} : ${el.value} %` }),
   "sys-pref": (el) => call("sys_set_prefs", { [el.dataset.key]: el.checked }, { ok: "Préférence enregistrée" }),
   "sys-pref-num": (el) => call("sys_set_prefs", { [el.dataset.key]: Number(el.value) }, { ok: "Préférence enregistrée" }),

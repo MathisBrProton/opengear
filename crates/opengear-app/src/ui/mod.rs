@@ -1,5 +1,6 @@
 pub(crate) mod backend;
 pub(crate) mod commands;
+pub(crate) mod devices;
 pub(crate) mod keyboard_view;
 pub(crate) mod state;
 
@@ -12,8 +13,8 @@ use crate::tray_icon::{
     release_single_instance, start_system_tray, stop_system_tray, trim_working_set,
 };
 use anyhow::Result;
-use opengear_asus::{HardwareSensorsSnapshot, read_hardware_sensors};
 use opengear_core::{AppConfig, EffectKind};
+use opengear_mainboard::{HardwareSensorsSnapshot, read_hardware_sensors};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};

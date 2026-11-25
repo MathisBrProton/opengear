@@ -2,6 +2,7 @@ pub mod device;
 pub mod hwp;
 pub mod k70_tkl;
 pub mod keymap;
+pub mod model;
 pub mod proto;
 pub mod transport;
 

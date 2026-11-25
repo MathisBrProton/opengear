@@ -7,12 +7,17 @@ modification est mal placée, pas que le test est à assouplir.
 ## 1. Architecture des crates
 
 ```
-opengear-core        types partagés, sans marque : couleurs/effets, profils TOML, géométrie clavier
-opengear-platform    services Windows sans marque : client WMI COM, élévation UAC, plans
-                     d'alimentation, télémétrie, batterie/écran portable, disposition clavier OS
+opengear-core        types partagés, sans marque : modèle d'appareil (`driver`), couleurs/effets,
+                     profils TOML, modèle de ventilation (`cooling`), géométrie clavier
+opengear-platform    services Windows sans marque : client WMI COM, pilote PawnIO, mutex
+                     inter-applications, élévation UAC, plans d'alimentation, télémétrie,
+                     batterie/écran portable, disposition clavier OS
+opengear-mainboard   puces de carte mère sans marque : SMBus (trait `SmbusBus`), contrôleurs RGB
+                     de RAM ENE, SuperIO Nuvoton, température CPU, capteurs
 opengear-input       hook clavier/souris : remap, macros, SOCD, anti-rebond
-opengear-<marque>    UN crate par fabricant : corsair, logitech, asus, hp…
+opengear-<marque>    UN crate par fabricant ou protocole : corsair, logitech, asus, hp, openrgb…
 opengear-app         orchestration : CLI, backend de l'UI, tray, installeur. Aucun protocole.
+                     `src/drivers.rs` est le SEUL endroit où les pilotes sont branchés.
 ```
 
 Dépendances autorisées (vérifiées par le test) :
@@ -21,14 +26,15 @@ Dépendances autorisées (vérifiées par le test) :
 |---|---|
 | `opengear-core` | rien d'interne |
 | `opengear-platform` | `opengear-core` |
-| `opengear-input`, `opengear-<marque>` | `opengear-core`, `opengear-platform` |
+| `opengear-mainboard` | `opengear-core`, `opengear-platform` |
+| `opengear-input`, `opengear-<marque>` | `opengear-core`, `opengear-platform`, `opengear-mainboard` |
 | `opengear-app` | tout |
 
 Interdits absolus :
 
 - **Un crate marque ne dépend jamais d'un autre crate marque.** Du code HP n'a rien à faire dans
   `opengear-asus` (c'est exactement l'erreur corrigée en novembre 2026).
-- **Rien de propre à une marque dans `core` ou `platform`** : classes WMI (`hpqBIntM`,
+- **Rien de propre à une marque dans `core`, `platform` ou `mainboard`** : classes WMI (`hpqBIntM`,
   `ASUSManagement`), noms de protocole (Bragi, HID++), valeurs « fil » d'un protocole. Si une brique
   générique manque (ex. appel WMI avec objet imbriqué), on l'ajoute **générique** dans `platform`
   et le wrapper spécifique reste dans le crate marque.
@@ -40,8 +46,29 @@ Interdits absolus :
 1. Ça dépend d'une marque / d'un modèle précis ? → `opengear-<marque>` (le créer s'il n'existe pas,
    l'ajouter au workspace **et** à `VENDOR_MARKERS` dans `tests/architecture.rs`).
 2. C'est un service Windows utile à plusieurs marques ? → `opengear-platform`.
+   Une puce standard de carte mère (bus, contrôleur générique) ? → `opengear-mainboard`.
 3. C'est un type de données ou un calcul pur partagé ? → `opengear-core`.
 4. C'est de l'assemblage pour l'UI ou la CLI ? → `opengear-app`.
+
+### Ajouter un appareil ou une marque (ex. Razer)
+
+1. Crate `opengear-razer` : le protocole, et `impl Driver` + `impl Device` (`opengear_core::driver`).
+2. `Device::settings()` décrit chaque réglage comme **donnée** (`Setting::toggle/slider/choice/color`,
+   `.expert()`, `.stored_in_device()`, `.help()`). Réglage partagé → id de `setting_ids`
+   (polling, luminosité, verrou Windows, SOCD matériel…) ; réglage propre à la marque → id préfixé
+   (`"razer.hyperpolling"`). `apply_setting` ne reçoit que des valeurs déjà validées.
+3. Une ligne dans `device_drivers()` de `crates/opengear-app/src/drivers.rs`.
+4. C'est tout : l'appareil apparaît dans Appareils, ses réglages dans chaque onglet (filtrés par
+   section et par mode Simple / Expert), sa batterie dans les alertes. **Aucune commande IPC ni
+   aucun écran par marque à écrire** : la commande générique est `device_set`.
+5. Un transport RGB de RAM : `impl RamRgbBackend` (`opengear_mainboard::ram`) + une ligne dans
+   `ram_rgb()`. Un bus SMBus constructeur : `impl SmbusBus`, et le protocole ENE est réutilisé tel
+   quel.
+
+Capacités riches (éclairage synchronisé, égaliseur, paliers DPI, mémoire embarquée, courbes de
+ventilateur) : chacune devient un trait à côté de `Device` avec **une** vue générique. Tant
+qu'une capacité n'est pas migrée, elle reste servie par l'ancien code de la marque — ne pas en
+ajouter de nouvelle sous cette forme.
 
 ## 2. Matériel « dynamique », jamais câblé sur un appareil
 
@@ -86,8 +113,12 @@ La CI exécute exactement ces commandes. Si `cargo fmt` ou `cargo clippy` est in
 
 ## 5. Dette connue (à résorber, ne pas aggraver)
 
-- `opengear-asus` contient encore PawnIO, SuperIO Nuvoton, capteurs et RAM ENE, qui ne sont pas
-  propres à ASUS (cible : un crate `opengear-mainboard`). `pawnio.rs` importe des types de
-  `ram_rgb.rs`.
+- Corsair et Logitech sont encore ouverts par le moteur d'éclairage via des listes typées
+  (`corsair_devices`, `logi_*`) au lieu du registre `device_drivers()` : à migrer quand le trait
+  d'éclairage existera. Leurs réglages simples passent déjà par le modèle commun.
+- Commandes encore propres à une marque, à remplacer par des capacités : éclairage (`corsair_set_mode`,
+  `asus_*`, `logi_set_led`, `omen_set_kb_*`), couleurs de voyants Corsair (écriture seule),
+  paliers DPI, égaliseur, mémoire embarquée Logitech / Corsair, ventilateurs (ASUS, SuperIO, OMEN),
+  réglages OMEN (mode thermique, puissance GPU) et écran du portable.
 - `opengear-core::profile` stocke des réglages par marque (Aura, OMEN…) dans le profil global.
 - JIS / ABNT utilisent la géométrie ISO dans `physical_layout`.

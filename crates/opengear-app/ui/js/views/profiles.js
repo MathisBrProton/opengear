@@ -1,6 +1,6 @@
 import { arr, esc, num, plural } from "../utils.js";
 import { S } from "../state.js";
-import { pageHeader, seg, sw } from "../components.js";
+import { pageHeader, seg, settingInline, sw } from "../components.js";
 import { presetCard } from "./home.js";
 
 export function viewProfiles() {
@@ -8,8 +8,9 @@ export function viewProfiles() {
   const sp = S.system_prefs;
   const linked = arr(prof.linked_apps);
   const hw = [];
-  S.corsair_devices.forEach((d, i) => {
-    if (d.active_hw_profile != null) hw.push(`<div class="list-row"><div><strong>${esc(d.product_name)}</strong><div class="muted small">Profils enregistrés dans le clavier</div></div>${seg([0, 1, 2].map((n) => [n, `Profil ${n + 1}`]), d.active_hw_profile, "cs-hwprof", { dev: i })}</div>`);
+  S.corsair_devices.forEach((d) => {
+    const ctl = settingInline(d.device_id, "corsair.hw_profile", { label: d.product_name });
+    if (ctl) hw.push(`<div class="list-row"><div class="grow">${ctl}<div class="muted small">Profils enregistrés dans le clavier</div></div></div>`);
   });
   S.logi_mice.forEach((m, i) => {
     const ob = m.onboard;

@@ -14,16 +14,18 @@ use crate::system_ext::{
 };
 use crate::tray_icon::tray_notify;
 use opengear_asus::{
-    AsusWmiCoolingStatus, AuraChannelKind, AuraHwMode, AuraMainboardController, EneRamMode,
-    FanChannelConfig, FanHeaderKind, FanPolicyMode, FanTempSource, HardwareSensorsSnapshot,
-    RamRgbStatus, SuperIoSnapshot, apply_asus_wmi_curve, probe_asus_wmi_cooling, probe_ram_rgb,
-    read_asus_wmi_channel, read_superio_snapshot, restore_all_superio_fans_auto,
-    set_ram_modes_only,
+    AsusWmiCoolingStatus, AuraChannelKind, AuraHwMode, AuraMainboardController,
+    apply_asus_wmi_curve, probe_asus_wmi_cooling, read_asus_wmi_channel,
 };
+use opengear_core::cooling::{FanChannelConfig, FanHeaderKind, FanPolicyMode, FanTempSource};
 use opengear_hp::{
     HpOmenStatus, OmenKeyboardType, OmenThermalMode, probe_hp_omen, read_hp_omen_live_fans,
     set_hp_omen_fan_level, set_hp_omen_kb_backlight, set_hp_omen_kb_zones, set_hp_omen_max_fan,
     set_hp_omen_thermal_mode,
+};
+use opengear_mainboard::{
+    EneRamMode, HardwareSensorsSnapshot, RamRgbStatus, SuperIoSnapshot, read_superio_snapshot,
+    restore_all_superio_fans_auto,
 };
 use opengear_platform::{
     DisplayInfo, LaptopBatteryInfo, PowerPlan, SystemTelemetry, TelemetryCollector, is_elevated,
@@ -59,6 +61,10 @@ pub(crate) struct BackendEngine {
     pub logi_mice: Vec<LogitechMouse>,
     pub logi_keyboards: Vec<LogitechKeyboard>,
     pub logi_headsets: Vec<LogitechHeadset>,
+    /// Registered device drivers (see `crate::drivers::device_drivers`).
+    pub drivers: Vec<Box<dyn opengear_core::driver::Driver>>,
+    /// Devices opened through `drivers`.
+    pub driver_devices: Vec<Box<dyn opengear_core::driver::Device>>,
     pub last_hid_sig: Vec<(u16, u16, u16)>,
     pub telemetry: TelemetryCollector,
     pub last_tel: SystemTelemetry,
@@ -162,6 +168,8 @@ impl BackendEngine {
         let power_plans = list_power_plans();
 
         let corsair_devices = CorsairDevice::connect_all();
+        let drivers = crate::drivers::device_drivers();
+        let driver_devices = super::devices::discover_all(&drivers);
         let (mut asus_aura, asus_err) = match AuraMainboardController::connect() {
             Ok(a) => (Some(a), None),
             Err(e) => (None, Some(e.to_string())),
@@ -217,7 +225,7 @@ impl BackendEngine {
         } else {
             probe_asus_wmi_cooling()
         };
-        let ram_rgb = probe_ram_rgb();
+        let ram_rgb = crate::drivers::ram_rgb().probe();
         let initial_cooling_channels: Vec<Option<FanChannelConfig>> = FanHeaderKind::ALL
             .iter()
             .map(|&h| {
@@ -258,6 +266,8 @@ impl BackendEngine {
             logi_mice,
             logi_keyboards,
             logi_headsets,
+            drivers,
+            driver_devices,
             last_hid_sig,
             telemetry,
             last_tel,
@@ -366,7 +376,7 @@ impl BackendEngine {
                 .filter(|&i| self.smart_fan_last_duty[i].is_some())
                 .filter_map(|i| self.wmi_restore_config(i))
                 .collect(),
-            superio_restore: opengear_asus::saved_superio_states(),
+            superio_restore: opengear_mainboard::saved_superio_states(),
         };
         fan_watchdog::write_marker(&marker);
         if !marker.is_empty() && !self.watchdog_spawned {
@@ -415,7 +425,7 @@ impl BackendEngine {
             low.contains("échou") || low.contains("erreur") || low.contains("impossible")
         });
         let remaining_superio = if superio_failed {
-            opengear_asus::saved_superio_states()
+            opengear_mainboard::saved_superio_states()
         } else {
             Vec::new()
         };
@@ -818,7 +828,7 @@ impl BackendEngine {
             } => {
                 if refresh_hw {
                     self.superio = read_superio_snapshot();
-                    self.ram_rgb = probe_ram_rgb();
+                    self.ram_rgb = crate::drivers::ram_rgb().probe();
                 }
                 if let Some(rep) = selftest {
                     self.last_selftest = Some(rep);
@@ -1081,6 +1091,7 @@ impl BackendEngine {
                 Err(e) => self.asus_err = Some(e.to_string()),
             }
         }
+        self.rediscover_drivers_for(vendors);
         self.scanned_devices = scan_hid_devices(false).unwrap_or_default();
     }
 
@@ -1102,6 +1113,7 @@ impl BackendEngine {
         self.logi_mice = LogitechMouse::connect_all();
         self.logi_keyboards = LogitechKeyboard::connect_all();
         self.logi_headsets = LogitechHeadset::connect_all();
+        self.driver_devices = super::devices::discover_all(&self.drivers);
 
         self.cooling_status = probe_asus_wmi_cooling();
         self.power_plans = list_power_plans();
@@ -1236,14 +1248,14 @@ impl BackendEngine {
         if restore.is_empty() {
             return;
         }
-        let targets: Vec<(&opengear_asus::EneRamModule, u8)> = self
+        let targets: Vec<(&opengear_mainboard::EneRamModule, u8)> = self
             .ram_rgb
             .ene_modules
             .iter()
             .filter(|m| restore.iter().any(|(a, _)| *a == m.address_7bit))
             .map(|m| (m, EneRamMode::Off as u8))
             .collect();
-        match set_ram_modes_only(&targets) {
+        match crate::drivers::ram_rgb().set_modes(&targets) {
             Ok(n) if n > 0 => self.ram_restore_modes = Some(restore),
             Ok(_) => {}
             Err(e) => error!("Extinction RAM impossible : {e}"),
@@ -1254,7 +1266,7 @@ impl BackendEngine {
         let Some(restore) = self.ram_restore_modes.take() else {
             return;
         };
-        let targets: Vec<(&opengear_asus::EneRamModule, u8)> = restore
+        let targets: Vec<(&opengear_mainboard::EneRamModule, u8)> = restore
             .iter()
             .filter_map(|(addr, mode)| {
                 self.ram_rgb
@@ -1264,7 +1276,7 @@ impl BackendEngine {
                     .map(|m| (m, *mode))
             })
             .collect();
-        if let Err(e) = set_ram_modes_only(&targets) {
+        if let Err(e) = crate::drivers::ram_rgb().set_modes(&targets) {
             error!("Rallumage RAM impossible : {e}");
         }
     }

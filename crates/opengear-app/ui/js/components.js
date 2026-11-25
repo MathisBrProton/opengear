@@ -1,5 +1,5 @@
 import { ICONS, SWATCHES, arr, clamp, dataAttrs, esc, fmtHz, num, setBar, setTxt } from "./utils.js";
-import { S, isExpert, k70Image, local } from "./state.js";
+import { S, deviceById, isExpert, k70Image, local } from "./state.js";
 
 export function pageHeader(title, subHtml, actionsHtml = "", accent = "") {
   return `
@@ -237,4 +237,53 @@ export function keyboardSetup() {
         </select>
       </div>
     </div>`;
+}
+
+/** One control for a setting of the shared device model (`S.device_list[].settings[]`). */
+export function settingControl(deviceId, s, opts = {}) {
+  const data = { device: deviceId, setting: s.id };
+  const label = opts.label || s.label;
+  const tags = `${s.level === "expert" ? ` ${expertTag()}` : ""}${s.persistence === "device" ? ` <span class="pill" title="Enregistré dans la mémoire de l'appareil : conservé même débranché">mémorisé</span>` : ""}`;
+  const help = s.help ? `<div class="muted small">${esc(s.help)}</div>` : "";
+  const c = s.control || {};
+  const domId = `set-${deviceId}-${s.id}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+  let ctl;
+  if (c.type === "toggle") {
+    ctl = sw(!!s.value, `${esc(label)}${tags}`, "dev-set", data);
+  } else if (c.type === "slider") {
+    const v = num(s.value, c.min);
+    ctl = `${sliderRow(label, { id: domId, min: c.min, max: c.max, step: c.step || 1, value: v, input: "label", change: "dev-set", data: { ...data, unit: c.unit || "" }, display: `${v}${c.unit ? ` ${c.unit}` : ""}` })}${tags ? `<div class="row">${tags}</div>` : ""}`;
+  } else if (c.type === "choice") {
+    const opts2 = arr(c.options);
+    const field = opts2.length <= 4
+      ? seg(opts2.map((o) => [o.id, o.label]), s.value, "dev-set", data)
+      : `<select id="${domId}" class="og-select auto" data-change="dev-set" ${dataAttrs(data)}>${opts2.map((o) => `<option value="${esc(o.id)}" ${String(o.id) === String(s.value) ? "selected" : ""}>${esc(o.label)}</option>`).join("")}</select>`;
+    ctl = `<div class="row-between"><span class="field-label">${esc(label)}${tags}</span>${field}</div>`;
+  } else if (c.type === "color") {
+    ctl = `<div class="row-between"><label class="field-label" for="${domId}">${esc(label)}${tags}</label><input type="color" id="${domId}" class="og-color" value="${esc(s.value || "#000000")}" data-change="dev-set" ${dataAttrs(data)} /></div>`;
+  } else {
+    return "";
+  }
+  return `<div class="setting">${ctl}${help}</div>`;
+}
+
+/** One named setting of a device, or nothing when the device does not offer it. */
+export function settingInline(deviceId, settingId, opts = {}) {
+  const d = deviceById(deviceId);
+  const s = d && d.settings.find((x) => x.id === settingId);
+  return s ? settingControl(deviceId, s, opts) : "";
+}
+
+/**
+ * Settings of a device, filtered by section (`["performance"]`…) and by the Simple / Expert mode.
+ * `bare` returns the controls without a card.
+ */
+export function deviceSettings(deviceId, { sections = null, title = "Réglages", bare = false } = {}) {
+  const d = deviceById(deviceId);
+  if (!d) return "";
+  const ex = isExpert();
+  const list = d.settings.filter((s) => (!sections || sections.includes(s.section)) && (ex || s.level === "simple"));
+  if (!list.length) return "";
+  const body = `<div class="stack" style="gap:12px">${list.map((s) => settingControl(deviceId, s)).join("")}</div>`;
+  return bare ? body : `<div class="card"><div class="card-head"><h2 class="card-title">${esc(title)}</h2></div>${body}</div>`;
 }

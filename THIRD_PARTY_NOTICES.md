@@ -6,12 +6,12 @@ l'exécutable, restent soumis à **leur propre licence**.
 
 ## PawnIO.Modules — LGPL-2.1
 
-- Fichiers : `crates/opengear-asus/pawnio_modules/*.bin`
+- Fichiers : `crates/opengear-platform/pawnio_modules/*.bin`
   (`SmbusPIIX4`, `SmbusI801`, `AMDFamily17`, `IntelMSR`, `LpcIO`)
 - Projet : PawnIO.Modules (namazso) — modules de bytecode signés exécutés par le pilote PawnIO
 - Version : v0.2.12
 - Licence : GNU Lesser General Public License v2.1 — texte complet dans
-  `crates/opengear-asus/pawnio_modules/COPYING`
+  `crates/opengear-platform/pawnio_modules/COPYING`
 - Le code source correspondant est publié par le projet amont (dépôt PawnIO.Modules de namazso).
 - Ces modules ne sont **pas** incorporés statiquement dans `OpenGear.exe` : ils sont copiés
   comme fichiers séparés et remplaçables dans le dossier `pawnio_modules/` à côté de

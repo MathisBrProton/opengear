@@ -116,11 +116,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-and-run.ps1
 
 | Crate | Rôle |
 |---|---|
-| `opengear-core` | Types partagés sans marque : couleurs et moteur d'effets, profils TOML, scanner HID, géométrie clavier |
-| `opengear-platform` | Services Windows sans marque : client WMI COM, élévation, plans d'alimentation, télémétrie, batterie / écran, disposition clavier |
+| `opengear-core` | Types partagés sans marque : modèle d'appareil (`Driver` / `Device` / réglages), couleurs et moteur d'effets, profils TOML, modèle de ventilation, géométrie clavier |
+| `opengear-platform` | Services Windows sans marque : client WMI COM, pilote PawnIO, élévation, plans d'alimentation, télémétrie, batterie / écran, disposition clavier |
+| `opengear-mainboard` | Puces de carte mère sans marque : SMBus, RGB de RAM ENE (multi-transport), SuperIO Nuvoton, température CPU, capteurs |
 | `opengear-corsair` | Driver Corsair Bragi v2 (RGB par touche, polling, profils flash HWP) |
 | `opengear-logitech` | HID++ 2.0 (DPI, batterie, profils et macros embarqués, égaliseur) |
-| `opengear-asus` | Aura USB, RAM ENE, ventilateurs (WMI, SuperIO), capteurs |
+| `opengear-asus` | Aura USB, ventilateurs ASUS WMI, transport SMBus ASUS WMI pour la RAM |
+| `opengear-openrgb` | Client du SDK réseau d'OpenRGB (implémentation propre du protocole) |
 | `opengear-hp` | HP OMEN / Victus via le BIOS WMI `hpqBIntM` |
 | `opengear-input` | Hook clavier bas niveau : remap, macros, SOCD, anti-rebond |
 | `opengear-app` | Exécutable : CLI + interface WebView2 (`ui/` embarqué), tray, installeur |
