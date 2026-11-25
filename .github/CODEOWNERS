@@ -1,0 +1,22 @@
+# Code owners: reviewed by the maintainer before any merge to main.
+# Enforced by the protect-main ruleset (Require review from Code Owners).
+
+# Default: everything goes through the maintainer
+*                                 @MathisBrProton
+
+# Hardware zones: a mistake can damage a device or write to flash
+crates/opengear-platform/        @MathisBrProton
+crates/opengear-mainboard/       @MathisBrProton
+crates/opengear-input/           @MathisBrProton
+crates/opengear-logitech/        @MathisBrProton
+crates/opengear-corsair/         @MathisBrProton
+crates/opengear-asus/            @MathisBrProton
+crates/opengear-hp/              @MathisBrProton
+crates/opengear-razer/           @MathisBrProton
+
+# Governance and build chain
+/.github/                        @MathisBrProton
+/AGENTS.md                       @MathisBrProton
+/Cargo.toml                      @MathisBrProton
+/Cargo.lock                      @MathisBrProton
+/tools/                          @MathisBrProton
