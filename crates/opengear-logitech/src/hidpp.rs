@@ -46,6 +46,110 @@ pub struct BatteryInfo {
     pub percent: Option<u8>,
     pub voltage_mv: Option<u16>,
     pub state: BatteryState,
+    #[serde(default)]
+    pub estimated_hours: Option<u16>,
+}
+
+/// Tag ID verified from `Feature8103GlobalDeviceSettings` (`lghub_agent.exe`).
+pub(crate) const TAG_POWER_OFF_TIMEOUT: u16 = 0x0002;
+
+/// Read a single-byte global setting via `0x8103` `fn 2` (`readGlobalDeviceSettingsTag`).
+pub(crate) fn read_global_setting_u8(t: &HidppTransport, tag: u16) -> Option<u8> {
+    t.get_feature_index(FEAT_GLOBAL_DEVICE_SETTINGS)?;
+    let b = tag.to_be_bytes();
+    let r = t
+        .request_feature(FEAT_GLOBAL_DEVICE_SETTINGS, 0x20, &[b[0], b[1]])
+        .ok()?;
+    r.get(2).copied().or_else(|| r.first().copied())
+}
+
+/// Write a single-byte global setting via `0x8103` `fn 5` (`writeGlobalDeviceSettingsTag`).
+pub(crate) fn write_global_setting_u8(
+    t: &HidppTransport,
+    tag: u16,
+    value: u8,
+) -> Result<(), HidppError> {
+    let b = tag.to_be_bytes();
+    t.request_feature(FEAT_GLOBAL_DEVICE_SETTINGS, 0x50, &[b[0], b[1], value])?;
+    Ok(())
+}
+
+/// Apply `0x8070` (`fn 3`) / `0x8071` (`fn 1`) zone lighting payload shared across mice and headsets.
+pub(crate) fn write_led_zone_raw(
+    t: &HidppTransport,
+    prefer_color_led: bool,
+    params: &[u8],
+) -> Result<(), HidppError> {
+    let order = if prefer_color_led {
+        [(FEAT_COLOR_LED_EFFECTS, 0x30u8), (FEAT_RGB_EFFECTS, 0x10u8)]
+    } else {
+        [(FEAT_RGB_EFFECTS, 0x10u8), (FEAT_COLOR_LED_EFFECTS, 0x30u8)]
+    };
+    for (feat, func) in order {
+        if t.get_feature_index(feat).is_some() {
+            t.request_feature(feat, func, params)?;
+            return Ok(());
+        }
+    }
+    Err(HidppError::UnsupportedFeature(if prefer_color_led {
+        FEAT_COLOR_LED_EFFECTS
+    } else {
+        FEAT_RGB_EFFECTS
+    }))
+}
+
+/// Estimate remaining battery hours for wireless Logitech devices from G HUB `powermodel` ratings.
+pub(crate) fn estimate_rated_battery_hours(
+    pid: u16,
+    name: &str,
+    percent: u8,
+    report_rate_hz: Option<u16>,
+) -> Option<u16> {
+    let pct = percent.min(100) as f32 / 100.0;
+    let upper = name.to_ascii_uppercase();
+    // Exact powermodel XML from depots/pro_x_wireless_mouse (046D:4093): 874 mWh / (1.5456 + 2.3064 + radio_mw)
+    if pid == 0x4093 || upper.contains("SUPERLIGHT") {
+        let radio_mw = match report_rate_hz.unwrap_or(1000) {
+            0..=180 => 2.2036,
+            181..=350 => 3.0738,
+            351..=750 => 4.8142,
+            _ => 8.2951,
+        };
+        let total_mw = 1.5456 + 2.3064 + radio_mw;
+        return Some(((874.0 * pct) / total_mw).round() as u16);
+    }
+    let rated_hours: f32 = match pid {
+        0x407F | 0x408E => 60.0,               // G502 LIGHTSPEED / G502 X LIGHTSPEED
+        0x4067 | 0x4086 => 140.0,              // G903 / G903 HERO (LED off nominal)
+        0x4070 | 0x4088 => 35.0,               // G703 / G703 LIGHTSPEED HERO
+        0x4079 => 24.0,                        // G PRO WIRELESS (RGB default)
+        0x4074 => 250.0,                       // G305 / G304
+        0x408A => 240.0,                       // G604 LIGHTSPEED
+        0x4092 | 0x4096 => 145.0,              // G303 Shroud Edition
+        0x0ABA => 20.0,                        // PRO X WIRELESS Headset (depots powermodel)
+        0x0AB5 => 29.0,                        // G733 LIGHTSPEED Headset
+        0x0AB7 => 56.0,                        // G735 Wireless Headset
+        0x0AC4 => 33.0,                        // G535 Wireless Headset
+        0x0A66 => 15.0,                        // G533 Wireless Headset
+        0x0A5B | 0x0A89 => 12.0,               // G933 / G935 Wireless Headset
+        0xB357 => 30.0,                        // G915 LIGHTSPEED
+        0xB35E => 40.0,                        // G915 TKL LIGHTSPEED
+        _ if upper.contains("G502") => 60.0,
+        _ if upper.contains("G903") => 140.0,
+        _ if upper.contains("G703") => 35.0,
+        _ if upper.contains("G305") || upper.contains("G304") => 250.0,
+        _ if upper.contains("PRO WIRELESS") => 48.0,
+        _ if upper.contains("PRO X WIRELESS") => 20.0,
+        _ if upper.contains("G735") => 56.0,
+        _ if upper.contains("G733") => 29.0,
+        _ if upper.contains("G535") => 33.0,
+        _ if upper.contains("G533") => 15.0,
+        _ if upper.contains("G935") || upper.contains("G933") => 12.0,
+        _ if upper.contains("G915") && upper.contains("TKL") => 40.0,
+        _ if upper.contains("G915") => 30.0,
+        _ => return None,
+    };
+    Some((rated_hours * pct).round() as u16)
 }
 
 /// Parse HID++ 2.0 `0x1004` Unified Battery charging status byte (`0..=7`).
@@ -562,6 +666,7 @@ pub(crate) fn read_battery_info(t: &HidppTransport) -> Option<BatteryInfo> {
             percent: if pct <= 100 { Some(pct) } else { None },
             voltage_mv: None,
             state: parse_unified_battery_status(r[2]),
+            estimated_hours: None,
         });
     }
     if let Ok(r) = t.request_feature(FEAT_BATTERY_STATUS, 0x00, &[])
@@ -572,6 +677,7 @@ pub(crate) fn read_battery_info(t: &HidppTransport) -> Option<BatteryInfo> {
             percent: Some(pct.min(100)),
             voltage_mv: None,
             state: parse_unified_battery_status(r[2]),
+            estimated_hours: None,
         });
     }
     if let Ok(r) = t.request_feature(FEAT_BATTERY_VOLTAGE, 0x00, &[])
@@ -589,6 +695,7 @@ pub(crate) fn read_battery_info(t: &HidppTransport) -> Option<BatteryInfo> {
             percent: Some(pct),
             voltage_mv: Some(mv),
             state,
+            estimated_hours: None,
         });
     }
     None

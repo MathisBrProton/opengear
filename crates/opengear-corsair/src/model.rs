@@ -97,7 +97,7 @@ impl Device for CorsairDevice {
     fn status(&self) -> DeviceStatus {
         DeviceStatus {
             battery_pct: self.info.battery_pct,
-            charging: None,
+            ..Default::default()
         }
     }
 

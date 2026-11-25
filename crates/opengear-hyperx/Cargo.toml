@@ -1,0 +1,12 @@
+[package]
+name = "opengear-hyperx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HyperX HID peripherals (experimental, clean-room implementation from docs/protocols/hyperx.md)"
+
+[dependencies]
+anyhow.workspace = true
+hidapi.workspace = true
+tracing.workspace = true
+opengear-core.workspace = true

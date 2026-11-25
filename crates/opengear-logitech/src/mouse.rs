@@ -1,6 +1,9 @@
 use crate::features::*;
 pub use crate::hidpp::{BatteryInfo, BatteryState};
-use crate::hidpp::{HidppError, HidppTransport, read_battery_info};
+use crate::hidpp::{
+    HidppError, HidppTransport, TAG_POWER_OFF_TIMEOUT, estimate_rated_battery_hours,
+    read_battery_info, read_global_setting_u8, write_global_setting_u8, write_led_zone_raw,
+};
 use crate::onboard::{OnboardMemoryDesc, OnboardProfile};
 use opengear_core::Rgb;
 use serde::{Deserialize, Serialize};
@@ -148,6 +151,17 @@ pub struct LedZoneInfo {
     pub num_effects: u8,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmartShiftInfo {
+    pub enhanced: bool,
+    /// `1` = débrayage libre (FreeSpin), `2` = cranté (Ratchet).
+    pub wheel_mode: u8,
+    pub auto_disengage: u8,
+    pub torque: u8,
+    pub max_torque: u8,
+    pub tunable_torque: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct LogitechMouseInfo {
     pub vid: u16,
@@ -165,6 +179,8 @@ pub struct LogitechMouseInfo {
     pub onboard_profiles: Vec<OnboardProfile>,
     pub angle_snapping: Option<bool>,
     pub led_zones: Vec<LedZoneInfo>,
+    pub smart_shift: Option<SmartShiftInfo>,
+    pub power_off_minutes: Option<u8>,
 }
 
 pub struct LogitechMouse {
@@ -205,9 +221,15 @@ impl LogitechMouse {
         let firmware = transport.read_firmware_versions();
         let proto_version = format!("{}.{}", transport.proto_major, transport.proto_minor);
 
-        let battery = Self::read_battery_inner(&transport);
+        let mut battery = Self::read_battery_inner(&transport);
         let dpi = Self::read_dpi_inner(&transport);
         let report_rate = Self::read_report_rate_inner(&transport);
+        let rr_hz = report_rate.as_ref().map(|r| r.current_hz);
+        if let Some(b) = battery.as_mut()
+            && let Some(pct) = b.percent
+        {
+            b.estimated_hours = estimate_rated_battery_hours(transport.pid, &name, pct, rr_hz);
+        }
         let onboard = Self::read_onboard_inner(&transport);
         let (onboard_desc, onboard_profiles) = if onboard.is_some() {
             match OnboardProfile::read_all(&transport) {
@@ -219,6 +241,8 @@ impl LogitechMouse {
         };
         let angle_snapping = Self::read_angle_snapping_inner(&transport);
         let led_zones = Self::read_led_zones_inner(&transport);
+        let smart_shift = Self::read_smart_shift_inner(&transport);
+        let power_off_minutes = read_global_setting_u8(&transport, TAG_POWER_OFF_TIMEOUT);
 
         let info = LogitechMouseInfo {
             vid: transport.vid,
@@ -236,6 +260,8 @@ impl LogitechMouse {
             onboard_profiles,
             angle_snapping,
             led_zones,
+            smart_shift,
+            power_off_minutes,
         };
 
         info!(
@@ -274,6 +300,8 @@ impl LogitechMouse {
             onboard_profiles: Vec::new(),
             angle_snapping: None,
             led_zones,
+            smart_shift: None,
+            power_off_minutes: None,
         };
         Self {
             transport,
@@ -369,8 +397,21 @@ impl LogitechMouse {
         if let Some(rr) = Self::read_report_rate_inner(&self.transport) {
             self.info.report_rate = Some(rr);
         }
+        let rr_hz = self.info.report_rate.as_ref().map(|r| r.current_hz);
+        if let Some(b) = self.info.battery.as_mut()
+            && let Some(pct) = b.percent
+        {
+            b.estimated_hours =
+                estimate_rated_battery_hours(self.info.pid, &self.info.name, pct, rr_hz);
+        }
         if let Some(ob) = Self::read_onboard_inner(&self.transport) {
             self.info.onboard = Some(ob);
+        }
+        if let Some(ss) = Self::read_smart_shift_inner(&self.transport) {
+            self.info.smart_shift = Some(ss);
+        }
+        if let Some(mins) = read_global_setting_u8(&self.transport, TAG_POWER_OFF_TIMEOUT) {
+            self.info.power_off_minutes = Some(mins);
         }
     }
 
@@ -487,6 +528,36 @@ impl LogitechMouse {
         None
     }
 
+    fn switch_to_host_mode_if_onboard(&mut self) -> Result<bool, HidppError> {
+        if self.transport.get_feature_index(FEAT_ONBOARD_PROFILES).is_none() {
+            return Ok(false);
+        }
+        if matches!(
+            self.info.onboard.as_ref().map(|o| o.mode),
+            Some(OnboardMode::Host)
+        ) {
+            return Ok(false);
+        }
+        self.set_onboard_mode(OnboardMode::Host)?;
+        Ok(true)
+    }
+
+    /// Executes a volatile RAM write and, when the mouse rejects it while in `Onboard` mode,
+    /// switches `0x8100` volatile mode to `Host` (never writes flash) and retries once.
+    fn run_host_unlocked<F>(&mut self, mut op: F) -> Result<(), HidppError>
+    where
+        F: FnMut(&HidppTransport) -> Result<(), HidppError>,
+    {
+        match op(&self.transport) {
+            Err(HidppError::Protocol(0x02 | 0x05 | 0x09, _))
+                if self.switch_to_host_mode_if_onboard().unwrap_or(false) =>
+            {
+                op(&self.transport)
+            }
+            other => other,
+        }
+    }
+
     pub fn set_dpi(
         &mut self,
         dpi_x: u16,
@@ -500,25 +571,26 @@ impl LogitechMouse {
         let clamped_x = dpi_x.clamp(info.min_dpi, info.max_dpi);
         let clamped_y = dpi_y.unwrap_or(clamped_x).clamp(info.min_dpi, info.max_dpi);
 
-        if info.extended {
-            let x_b = clamped_x.to_be_bytes();
-            let mut params = vec![0x00, x_b[0], x_b[1]];
-            if info.supports_independent_xy {
-                let y_b = clamped_y.to_be_bytes();
-                params.push(y_b[0]);
-                params.push(y_b[1]);
+        self.run_host_unlocked(|t| {
+            if info.extended {
+                let x_b = clamped_x.to_be_bytes();
+                let mut params = vec![0x00, x_b[0], x_b[1]];
+                if info.supports_independent_xy {
+                    let y_b = clamped_y.to_be_bytes();
+                    params.push(y_b[0]);
+                    params.push(y_b[1]);
+                }
+                if info.supports_lod {
+                    let l = lod.or(info.lod).unwrap_or(LodLevel::Medium) as u8;
+                    params.push(l);
+                }
+                t.request_feature(FEAT_EXTENDED_ADJUSTABLE_DPI, 0x60, &params)?;
+            } else {
+                let x_b = clamped_x.to_be_bytes();
+                t.request_feature(FEAT_ADJUSTABLE_DPI, 0x30, &[0x00, x_b[0], x_b[1]])?;
             }
-            if info.supports_lod {
-                let l = lod.or(info.lod).unwrap_or(LodLevel::Medium) as u8;
-                params.push(l);
-            }
-            self.transport
-                .request_feature(FEAT_EXTENDED_ADJUSTABLE_DPI, 0x60, &params)?;
-        } else {
-            let x_b = clamped_x.to_be_bytes();
-            self.transport
-                .request_feature(FEAT_ADJUSTABLE_DPI, 0x30, &[0x00, x_b[0], x_b[1]])?;
-        }
+            Ok(())
+        })?;
 
         if let Some(d) = self.info.dpi.as_mut() {
             d.dpi_x = clamped_x;
@@ -568,10 +640,12 @@ impl LogitechMouse {
             let list_r = t
                 .request_feature(FEAT_EXTENDED_REPORT_RATE, 0x10, &[])
                 .ok()?;
-            let flags = u16::from_be_bytes([
-                list_r.first().copied().unwrap_or(0),
-                list_r.get(1).copied().unwrap_or(0),
-            ]);
+            // G HUB Feature8061ExtendedAdjustableReportRate::fn1 reads mask at byte 1 (`resp[1]`).
+            let flags = if list_r.len() >= 2 {
+                list_r[1]
+            } else {
+                list_r.first().copied().unwrap_or(0)
+            };
             let mut supported = Vec::new();
             for bit in 0..7u8 {
                 if (flags & (1 << bit)) != 0
@@ -582,6 +656,7 @@ impl LogitechMouse {
             }
             let cur_r = t
                 .request_feature(FEAT_EXTENDED_REPORT_RATE, 0x20, &[])
+                .or_else(|_| t.request_feature(FEAT_EXTENDED_REPORT_RATE, 0x20, &[0x00]))
                 .ok()?;
             let cur_hz = cur_r
                 .first()
@@ -616,15 +691,11 @@ impl LogitechMouse {
         None
     }
 
-    pub fn set_report_rate_hz(&mut self, hz: u16) -> Result<(), HidppError> {
-        let Some(ref rr) = self.info.report_rate.clone() else {
-            return Err(HidppError::UnsupportedFeature(FEAT_REPORT_RATE));
-        };
-        if rr.extended {
+    fn write_report_rate_raw(t: &HidppTransport, extended: bool, hz: u16) -> Result<(), HidppError> {
+        if extended {
             let idx =
                 Self::hz_to_ext_rate_idx(hz).ok_or(HidppError::Protocol(0x02, "Hz invalide"))?;
-            self.transport
-                .request_feature(FEAT_EXTENDED_REPORT_RATE, 0x30, &[idx])?;
+            t.request_feature(FEAT_EXTENDED_REPORT_RATE, 0x30, &[idx])?;
         } else {
             let ms = match hz {
                 125 => 8,
@@ -633,9 +704,24 @@ impl LogitechMouse {
                 1000 => 1,
                 _ => return Err(HidppError::Protocol(0x02, "Hz non supporté par 0x8060")),
             };
-            self.transport
-                .request_feature(FEAT_REPORT_RATE, 0x20, &[ms])?;
+            t.request_feature(FEAT_REPORT_RATE, 0x20, &[ms])?;
         }
+        Ok(())
+    }
+
+    pub fn set_report_rate_hz(&mut self, hz: u16) -> Result<(), HidppError> {
+        let Some(ref rr) = self.info.report_rate.clone() else {
+            return Err(HidppError::UnsupportedFeature(FEAT_REPORT_RATE));
+        };
+        let mut res = self.run_host_unlocked(|t| Self::write_report_rate_raw(t, rr.extended, hz));
+        if let Err(HidppError::Protocol(0x02 | 0x05 | 0x09, _)) = res
+            && rr.extended
+            && hz <= 1000
+            && self.transport.get_feature_index(FEAT_REPORT_RATE).is_some()
+        {
+            res = self.run_host_unlocked(|t| Self::write_report_rate_raw(t, false, hz));
+        }
+        res?;
         if let Some(r) = self.info.report_rate.as_mut() {
             r.current_hz = hz;
         }
@@ -825,21 +911,81 @@ impl LogitechMouse {
                 zone_idx, 0x0A, color.r, color.g, color.b, sp[0], sp[1], 0x01, 100, 0, 0, 0,
             ],
         };
-        if self
-            .transport
-            .get_feature_index(FEAT_COLOR_LED_EFFECTS)
-            .is_some()
+        if self.transport.get_feature_index(FEAT_COLOR_LED_EFFECTS).is_some()
+            || self.transport.get_feature_index(FEAT_RGB_EFFECTS).is_some()
         {
-            self.transport
-                .request_feature(FEAT_COLOR_LED_EFFECTS, 0x30, &params)?;
-            return Ok(());
-        }
-        if self.transport.get_feature_index(FEAT_RGB_EFFECTS).is_some() {
-            self.transport
-                .request_feature(FEAT_RGB_EFFECTS, 0x10, &params)?;
-            return Ok(());
+            return write_led_zone_raw(&self.transport, true, &params);
         }
         Err(HidppError::UnsupportedFeature(FEAT_COLOR_LED_EFFECTS))
+    }
+
+    fn read_smart_shift_inner(t: &HidppTransport) -> Option<SmartShiftInfo> {
+        if t.get_feature_index(FEAT_SMART_SHIFT_ENHANCED).is_some() {
+            let caps = t
+                .request_feature(FEAT_SMART_SHIFT_ENHANCED, 0x00, &[])
+                .ok()?;
+            let tunable_torque = caps.first().is_some_and(|&f| (f & 0x01) != 0);
+            let max_torque = caps.get(3).copied().unwrap_or(100).max(1);
+            let cur = t
+                .request_feature(FEAT_SMART_SHIFT_ENHANCED, 0x10, &[])
+                .ok()?;
+            return Some(SmartShiftInfo {
+                enhanced: true,
+                wheel_mode: cur.first().copied().unwrap_or(2),
+                auto_disengage: cur.get(1).copied().unwrap_or(0xFF),
+                torque: cur.get(2).copied().unwrap_or(50),
+                max_torque,
+                tunable_torque,
+            });
+        }
+        if t.get_feature_index(FEAT_SMART_SHIFT).is_some() {
+            let cur = t.request_feature(FEAT_SMART_SHIFT, 0x00, &[]).ok()?;
+            return Some(SmartShiftInfo {
+                enhanced: false,
+                wheel_mode: cur.first().copied().unwrap_or(2),
+                auto_disengage: cur.get(1).copied().unwrap_or(0xFF),
+                torque: 50,
+                max_torque: 100,
+                tunable_torque: false,
+            });
+        }
+        None
+    }
+
+    /// Configure SmartShift wheel mode (`1=FreeSpin`, `2=Ratchet`), auto-disengage threshold & tunable torque.
+    pub fn set_smart_shift(
+        &mut self,
+        wheel_mode: u8,
+        auto_disengage: u8,
+        torque: Option<u8>,
+    ) -> Result<(), HidppError> {
+        let Some(ref ss) = self.info.smart_shift.clone() else {
+            return Err(HidppError::UnsupportedFeature(FEAT_SMART_SHIFT));
+        };
+        let tq = torque.unwrap_or(ss.torque).min(ss.max_torque);
+        if ss.enhanced {
+            self.transport.request_feature(
+                FEAT_SMART_SHIFT_ENHANCED,
+                0x20,
+                &[wheel_mode, auto_disengage, tq],
+            )?;
+        } else {
+            self.transport
+                .request_feature(FEAT_SMART_SHIFT, 0x10, &[wheel_mode, auto_disengage])?;
+        }
+        if let Some(cur) = self.info.smart_shift.as_mut() {
+            cur.wheel_mode = wheel_mode;
+            cur.auto_disengage = auto_disengage;
+            cur.torque = tq;
+        }
+        Ok(())
+    }
+
+    /// Set wireless auto-sleep / power-off timer in minutes (`0 = Never`) via `0x8103`.
+    pub fn set_power_off_minutes(&mut self, minutes: u8) -> Result<(), HidppError> {
+        write_global_setting_u8(&self.transport, TAG_POWER_OFF_TIMEOUT, minutes)?;
+        self.info.power_off_minutes = Some(minutes);
+        Ok(())
     }
 }
 
@@ -967,5 +1113,102 @@ mod tests {
         assert!(!dpi2.extended);
         assert_eq!(dpi2.dpi_x, 1600);
         assert_eq!(dpi2.default_dpi, 800);
+    }
+
+    #[test]
+    fn report_rate_switches_to_host_mode_when_onboard_rejects_write() {
+        let mut t = HidppTransport::from_io(
+            Box::new(ScriptedHid::new(vec![
+                // 1. 0x8060 fn 2 (sw 0xA -> 0x2A) returns HID++ 2.0 error 0x02 (Invalid Argument)
+                vec![0x11, 0xFF, 0xFF, 0x01, 0x2A, 0x02],
+                // 2. 0x8100 fn 1 (sw 0xA -> 0x1A) succeeds setting Host mode [0x02]
+                resp(2, 0x1A, &[]),
+                // 3. Retry 0x8060 fn 2 succeeds
+                resp(1, 0x2A, &[]),
+            ])),
+            0xFF,
+            true,
+        );
+        t.features = vec![
+            FeatureEntry {
+                index: 1,
+                id: FEAT_REPORT_RATE,
+                flags: 0,
+                version: 0,
+                name: "ReportRate".into(),
+            },
+            FeatureEntry {
+                index: 2,
+                id: FEAT_ONBOARD_PROFILES,
+                flags: 0,
+                version: 0,
+                name: "OnboardProfiles".into(),
+            },
+        ];
+
+        let mut mouse = LogitechMouse {
+            transport: t,
+            info: LogitechMouseInfo {
+                vid: 0x046D,
+                pid: 0x4093,
+                device_index: 0x02,
+                name: "PRO X Wireless".into(),
+                proto_version: "4.5".into(),
+                firmware: vec![],
+                features: vec![],
+                battery: None,
+                dpi: None,
+                report_rate: Some(ReportRateInfo {
+                    extended: false,
+                    current_hz: 1000,
+                    supported_hz: vec![125, 250, 500, 1000],
+                }),
+                onboard: Some(OnboardProfilesSummary {
+                    mode: OnboardMode::Onboard,
+                    profile_count: 5,
+                    button_count: 5,
+                    active_profile: 1,
+                    active_dpi_index: 0,
+                }),
+                onboard_desc: None,
+                onboard_profiles: vec![],
+                angle_snapping: None,
+                led_zones: vec![],
+                smart_shift: None,
+                power_off_minutes: None,
+            },
+            last_frame: vec![],
+        };
+
+        mouse.set_report_rate_hz(500).unwrap();
+        assert_eq!(mouse.info.onboard.as_ref().unwrap().mode, OnboardMode::Host);
+        assert_eq!(mouse.info.report_rate.as_ref().unwrap().current_hz, 500);
+    }
+
+    #[test]
+    fn extended_report_rate_reads_flags_at_byte1_with_nonzero_byte0() {
+        let mut t = HidppTransport::from_io(
+            Box::new(ScriptedHid::new(vec![
+                // 0x8061 fn 1 (sw 0xA -> 0x1A): nonzero resp[0], mask in resp[1] = 0x2F (125..1000 + 4000 Hz)
+                resp(1, 0x1A, &[0x07, 0x2F, 0x00]),
+                // 0x8061 fn 2 with &[] rejects with 0x02 so reader falls back to &[0x00]
+                vec![0x11, 0xFF, 0xFF, 0x01, 0x2A, 0x02],
+                // 0x8061 fn 2 with &[0x00]: 4000 Hz (idx 5)
+                resp(1, 0x2A, &[0x05, 0x00, 0x00]),
+            ])),
+            0xFF,
+            true,
+        );
+        t.features = vec![FeatureEntry {
+            index: 1,
+            id: FEAT_EXTENDED_REPORT_RATE,
+            flags: 0,
+            version: 0,
+            name: "ExtReportRate".into(),
+        }];
+        let rr = LogitechMouse::read_report_rate_inner(&t).unwrap();
+        assert!(rr.extended);
+        assert_eq!(rr.current_hz, 4000);
+        assert_eq!(rr.supported_hz, vec![125, 250, 500, 1000, 4000]);
     }
 }

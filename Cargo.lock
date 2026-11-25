@@ -1490,12 +1490,14 @@ dependencies = [
  "opengear-core",
  "opengear-corsair",
  "opengear-hp",
+ "opengear-hyperx",
  "opengear-input",
  "opengear-logitech",
  "opengear-mainboard",
  "opengear-openrgb",
  "opengear-platform",
  "opengear-razer",
+ "opengear-steelseries",
  "serde",
  "serde_json",
  "tao",
@@ -1554,6 +1556,16 @@ dependencies = [
  "opengear-core",
  "opengear-platform",
  "serde",
+]
+
+[[package]]
+name = "opengear-hyperx"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "hidapi",
+ "opengear-core",
+ "tracing",
 ]
 
 [[package]]
@@ -1622,6 +1634,16 @@ dependencies = [
  "opengear-platform",
  "serde",
  "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "opengear-steelseries"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "hidapi",
+ "opengear-core",
  "tracing",
 ]
 

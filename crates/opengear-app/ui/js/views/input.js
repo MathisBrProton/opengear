@@ -249,16 +249,16 @@ function mouseStage(m, i, buttons, btnCount) {
     return { px: Number((31 + (num(mk.x_pct) / 100) * 38).toFixed(1)), py: Number((8 + (num(mk.y_pct) / 100) * 84).toFixed(1)) };
   };
   const callouts = [
-    { idx: 0, id: "M1 · Gauche", ...proj(0, 42, 28), lx: 2, ly: 12 },
-    { idx: 1, id: "M2 · Droit", ...proj(1, 58, 28), lx: 72, ly: 12 },
-    { idx: 2, id: "M3 · Molette", ...proj(2, 50, 24), lx: 72, ly: 38 },
-    { idx: 4, id: "M5 · Avant", ...proj(4, 34, 41), lx: 2, ly: 40 },
-    { idx: 3, id: "M4 · Arrière", ...proj(3, 34, 53), lx: 2, ly: 66 },
+    { idx: 0, id: "M1 · Gauche", ...proj(0, 41.5, 28), lx: 2, ly: 12 },
+    { idx: 1, id: "M2 · Droit", ...proj(1, 58.5, 28), lx: 72, ly: 12 },
+    { idx: 2, id: "M3 · Molette", ...proj(2, 50, 26), lx: 72, ly: 38 },
+    { idx: 4, id: "M5 · Avant", ...proj(4, 33.5, 42), lx: 2, ly: 40 },
+    { idx: 3, id: "M4 · Arrière", ...proj(3, 33.5, 53), lx: 2, ly: 66 },
   ].filter((c) => c.idx < btnCount);
   return `
     <div class="hero-stage" style="padding:0">
       <div class="mouse-stage-inner">
-        <img src="${esc(imgInfo.url)}" class="${imgInfo.official ? "cutout" : ""}" alt="${esc(m.name)}" />
+        <img src="${esc(imgInfo.url)}" class="cutout" alt="${esc(m.name)}" />
         <svg class="mouse-svg-overlay" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
           ${callouts.map((c) => {
             const on = sel === c.idx;

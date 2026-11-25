@@ -1,0 +1,752 @@
+//! HyperX device catalogue and LED offset tables from `docs/protocols/hyperx.md` and `hyperx_ngenuity.md`.
+
+use opengear_core::driver::DeviceKind;
+
+pub const KINGSTON_VID: u16 = 0x0951;
+pub const HP_HYPERX_VID: u16 = 0x03F0;
+
+/// Hardware protocol family determining HID packet framing and supported controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolFamily {
+    AlloyElite,
+    AlloyFps,
+    Frame0x81Keyboard { slots: usize, header_byte9: u8 },
+    OriginsCore,
+    Report0x44Origins265,
+    Report0x44Eve1800,
+    AlloyMkw100,
+    UniversalKeyboard,
+    PulsefireSurge,
+    PulsefireFpsCore,
+    PulsefireFpsPro2,
+    PulsefireRaid,
+    PulsefireDart,
+    PulsefireHaste,
+    PulsefireHasteWireless,
+    UniversalMouse { max_poll_hz: u16, max_dpi: u16 },
+    Mat0x81 { led_count: usize },
+    QuadCastS,
+    DuoCast,
+    QuadCast2S,
+    QuadCast2,
+    SoloCast,
+    CloudFlightWireless,
+    CloudFlightS,
+    CloudAlphaS,
+    CloudAlphaWireless,
+    CloudIIWireless,
+    CloudIIWirelessDts,
+    CloudStinger2Wireless,
+    CloudStingerCoreWireless,
+    CloudIII,
+    CloudIIICoreWireless,
+    CloudIIISWireless,
+    UniversalHeadset,
+    UniversalTioDongle,
+    AudioOnlyHeadset,
+}
+
+/// Hardware equalizer family supported over USB HID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EqHwMode {
+    None,
+    Universal0x66,
+    Cloud3S,
+    TuneEqAlphaS,
+    TuneEqFlightS,
+}
+
+/// Device capability matrix derived from `ProtocolFamily` and hardware metadata.
+#[derive(Debug, Clone, Copy)]
+pub struct HxCapabilities {
+    pub battery: bool,
+    pub polling_rates: &'static [u16],
+    pub max_dpi: u16,
+    pub dpi_stages: u8,
+    pub lod_and_snap: bool,
+    pub angle_tuning: bool,
+    pub low_battery_alert: bool,
+    pub dart_save: bool,
+    pub win_lock: bool,
+    pub game_mode_keys: bool,
+    pub brightness: bool,
+    pub brightness_feature_pad: bool,
+    pub backlight_fade: bool,
+    pub ambient_brightness: bool,
+    pub sidetone_toggle: bool,
+    pub sidetone_pct: bool,
+    pub sidetone_signed_db: bool,
+    pub mic_mute: bool,
+    pub mic_gain: bool,
+    pub mic_polar_pattern: u8,
+    pub mic_high_pass: bool,
+    pub mic_monitor_balance: bool,
+    pub universal_audio_full: bool,
+    pub reverse_lights: bool,
+    pub auto_sleep: bool,
+    pub noise_gate: bool,
+    pub voice_prompt: bool,
+    pub eq_preset: bool,
+    pub eq_10band: EqHwMode,
+    pub universal: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HxDeviceDef {
+    pub vid: u16,
+    pub pid: u16,
+    pub name: &'static str,
+    pub kind: DeviceKind,
+    pub wireless: bool,
+    pub family: ProtocolFamily,
+    pub interface: i32,
+    pub usage_page: Option<u16>,
+    pub usage: Option<u16>,
+    pub led_count: usize,
+}
+
+const CAPS_EMPTY: HxCapabilities = HxCapabilities {
+    battery: false,
+    polling_rates: &[],
+    max_dpi: 0,
+    dpi_stages: 0,
+    lod_and_snap: false,
+    angle_tuning: false,
+    low_battery_alert: false,
+    dart_save: false,
+    win_lock: false,
+    game_mode_keys: false,
+    brightness: false,
+    brightness_feature_pad: false,
+    backlight_fade: false,
+    ambient_brightness: false,
+    sidetone_toggle: false,
+    sidetone_pct: false,
+    sidetone_signed_db: false,
+    mic_mute: false,
+    mic_gain: false,
+    mic_polar_pattern: 0,
+    mic_high_pass: false,
+    mic_monitor_balance: false,
+    universal_audio_full: false,
+    reverse_lights: false,
+    auto_sleep: false,
+    noise_gate: false,
+    voice_prompt: false,
+    eq_preset: false,
+    eq_10band: EqHwMode::None,
+    universal: false,
+};
+
+impl HxDeviceDef {
+    pub fn caps(&self) -> HxCapabilities {
+        match self.family {
+            ProtocolFamily::UniversalMouse { max_poll_hz, max_dpi } => HxCapabilities {
+                battery: self.wireless,
+                polling_rates: if max_poll_hz >= 8000 {
+                    &[125, 250, 500, 1000, 2000, 4000, 8000]
+                } else if max_poll_hz >= 4000 {
+                    &[125, 250, 500, 1000, 2000, 4000]
+                } else {
+                    &[125, 250, 500, 1000]
+                },
+                max_dpi,
+                dpi_stages: 5,
+                lod_and_snap: true,
+                angle_tuning: true,
+                low_battery_alert: self.wireless,
+                brightness: self.led_count > 0,
+                auto_sleep: self.wireless,
+                universal: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::PulsefireDart | ProtocolFamily::PulsefireHasteWireless => HxCapabilities {
+                battery: true,
+                polling_rates: &[125, 250, 500, 1000],
+                max_dpi: 16000,
+                dpi_stages: 5,
+                low_battery_alert: true,
+                dart_save: matches!(self.family, ProtocolFamily::PulsefireDart),
+                brightness: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::PulsefireFpsPro2 | ProtocolFamily::PulsefireHaste => HxCapabilities {
+                polling_rates: &[125, 250, 500, 1000],
+                max_dpi: 16000,
+                dpi_stages: 5,
+                brightness: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::UniversalKeyboard => HxCapabilities {
+                battery: self.wireless,
+                polling_rates: &[125, 250, 500, 1000, 2000, 4000, 8000],
+                win_lock: true,
+                game_mode_keys: true,
+                brightness: true,
+                backlight_fade: true,
+                ambient_brightness: self.name.contains("Alloy Rise"),
+                auto_sleep: self.wireless,
+                low_battery_alert: self.wireless,
+                universal: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::UniversalHeadset => HxCapabilities {
+                battery: self.wireless,
+                brightness: self.led_count > 0,
+                sidetone_toggle: true,
+                sidetone_pct: true,
+                mic_mute: true,
+                mic_gain: true,
+                universal_audio_full: true,
+                reverse_lights: self.led_count > 0,
+                auto_sleep: self.wireless,
+                noise_gate: true,
+                voice_prompt: true,
+                eq_preset: true,
+                eq_10band: EqHwMode::Universal0x66,
+                universal: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::UniversalTioDongle => HxCapabilities {
+                universal: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::CloudAlphaWireless => HxCapabilities {
+                battery: true,
+                sidetone_toggle: true,
+                sidetone_pct: true,
+                mic_mute: true,
+                auto_sleep: true,
+                voice_prompt: false,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::CloudIIWireless | ProtocolFamily::CloudFlightS => HxCapabilities {
+                battery: true,
+                sidetone_toggle: true,
+                sidetone_pct: matches!(self.family, ProtocolFamily::CloudFlightS),
+                auto_sleep: true,
+                eq_preset: true,
+                eq_10band: EqHwMode::TuneEqFlightS,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::CloudIIWirelessDts | ProtocolFamily::CloudStinger2Wireless => HxCapabilities {
+                battery: true,
+                sidetone_toggle: true,
+                sidetone_pct: true,
+                noise_gate: matches!(self.family, ProtocolFamily::CloudStinger2Wireless),
+                auto_sleep: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::CloudIIICoreWireless => HxCapabilities {
+                battery: true,
+                sidetone_toggle: true,
+                sidetone_signed_db: true,
+                mic_mute: true,
+                auto_sleep: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::CloudIIISWireless => HxCapabilities {
+                battery: true,
+                sidetone_toggle: true,
+                mic_mute: true,
+                auto_sleep: true,
+                eq_preset: true,
+                eq_10band: EqHwMode::Cloud3S,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::CloudFlightWireless => HxCapabilities {
+                battery: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::CloudAlphaS => HxCapabilities {
+                sidetone_toggle: true,
+                eq_preset: true,
+                eq_10band: EqHwMode::TuneEqAlphaS,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::CloudIII => HxCapabilities {
+                sidetone_toggle: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::CloudStingerCoreWireless => HxCapabilities {
+                battery: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::QuadCast2S => HxCapabilities {
+                brightness: true,
+                mic_mute: true,
+                mic_gain: true,
+                mic_polar_pattern: 4,
+                mic_high_pass: true,
+                mic_monitor_balance: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::QuadCast2 => HxCapabilities {
+                mic_mute: true,
+                mic_polar_pattern: 4,
+                mic_high_pass: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::DuoCast => HxCapabilities {
+                brightness: true,
+                sidetone_toggle: true,
+                mic_gain: true,
+                mic_polar_pattern: 2,
+                mic_high_pass: true,
+                reverse_lights: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::QuadCastS => HxCapabilities {
+                brightness: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::SoloCast => HxCapabilities {
+                mic_mute: true,
+                ..CAPS_EMPTY
+            },
+            ProtocolFamily::Mat0x81 { .. } => HxCapabilities {
+                brightness_feature_pad: matches!(self.pid, 0x1705 | 0x0493),
+                ..CAPS_EMPTY
+            },
+            _ => HxCapabilities {
+                brightness: matches!(
+                    self.family,
+                    ProtocolFamily::Frame0x81Keyboard { .. }
+                        | ProtocolFamily::OriginsCore
+                        | ProtocolFamily::Report0x44Eve1800
+                ),
+                ..CAPS_EMPTY
+            },
+        }
+    }
+
+    /// Official rated maximum wireless battery life (hours at 100%) when published.
+    pub fn rated_battery_hours(&self) -> Option<u16> {
+        if !self.wireless {
+            return None;
+        }
+        match self.family {
+            ProtocolFamily::CloudAlphaWireless => Some(300),
+            ProtocolFamily::CloudIIICoreWireless => Some(if self.name.contains("Cloud III") { 120 } else { 80 }),
+            ProtocolFamily::CloudIIISWireless => Some(120),
+            ProtocolFamily::UniversalHeadset => Some(if self.name.contains("MIX 2") { 110 } else { 100 }),
+            ProtocolFamily::CloudIIWireless
+            | ProtocolFamily::CloudIIWirelessDts
+            | ProtocolFamily::CloudFlightS
+            | ProtocolFamily::CloudFlightWireless
+            | ProtocolFamily::CloudStingerCoreWireless => Some(30),
+            ProtocolFamily::CloudStinger2Wireless => Some(20),
+            ProtocolFamily::UniversalMouse { .. } | ProtocolFamily::PulsefireHasteWireless => {
+                Some(if self.name.contains("Haste 2 S") { 120 } else { 100 })
+            }
+            ProtocolFamily::PulsefireDart => Some(50),
+            _ => None,
+        }
+    }
+}
+
+pub const DEVICES: &[HxDeviceDef] = &[
+    // Keyboards (Legacy + Extended + Universal)
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x16BE, name: "HyperX Alloy Elite RGB", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::AlloyElite, interface: 2, usage_page: Some(0xFF01), usage: None, led_count: 128 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x16DC, name: "HyperX Alloy FPS RGB", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::AlloyFps, interface: 2, usage_page: Some(0xFF01), usage: None, led_count: 106 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x1711, name: "HyperX Alloy Elite 2", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::Frame0x81Keyboard { slots: 144, header_byte9: 0x00 }, interface: 3, usage_page: Some(0xFF90), usage: None, led_count: 144 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x058F, name: "HyperX Alloy Elite 2", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::Frame0x81Keyboard { slots: 144, header_byte9: 0x00 }, interface: 3, usage_page: Some(0xFF90), usage: None, led_count: 144 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x16E5, name: "HyperX Alloy Origins", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::Frame0x81Keyboard { slots: 126, header_byte9: 0x09 }, interface: 3, usage_page: None, usage: None, led_count: 126 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0591, name: "HyperX Alloy Origins", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::Frame0x81Keyboard { slots: 126, header_byte9: 0x09 }, interface: 3, usage_page: Some(0xFF90), usage: None, led_count: 126 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x1734, name: "HyperX Alloy Origins 60", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::Frame0x81Keyboard { slots: 71, header_byte9: 0x05 }, interface: 3, usage_page: None, usage: None, led_count: 71 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0C8E, name: "HyperX Alloy Origins 60", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::Frame0x81Keyboard { slots: 71, header_byte9: 0x05 }, interface: 3, usage_page: None, usage: None, led_count: 71 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x038F, name: "HyperX Alloy Origins 65", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::Frame0x81Keyboard { slots: 77, header_byte9: 0x05 }, interface: 3, usage_page: None, usage: None, led_count: 77 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x16E6, name: "HyperX Alloy Origins Core", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::OriginsCore, interface: 2, usage_page: None, usage: None, led_count: 87 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x098F, name: "HyperX Alloy Origins Core", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::OriginsCore, interface: 2, usage_page: None, usage: None, led_count: 87 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x1756, name: "HyperX Alloy MKW 100", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::AlloyMkw100, interface: 0, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0B8F, name: "HyperX Alloy MKW 100", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::AlloyMkw100, interface: 0, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0CC2, name: "HyperX Alloy Origins 2 65", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::Report0x44Origins265, interface: 3, usage_page: None, usage: None, led_count: 74 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x08C2, name: "HyperX Alloy Eve 1800", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::Report0x44Eve1800, interface: 2, usage_page: None, usage: None, led_count: 10 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0FA0, name: "HyperX Alloy Rise", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::UniversalKeyboard, interface: 2, usage_page: None, usage: None, led_count: 104 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x02A1, name: "HyperX Alloy Rise 75", kind: DeviceKind::Keyboard, wireless: false, family: ProtocolFamily::UniversalKeyboard, interface: 2, usage_page: None, usage: None, led_count: 84 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0EB8, name: "HyperX Alloy Rise 75 Wireless (USB)", kind: DeviceKind::Keyboard, wireless: true, family: ProtocolFamily::UniversalKeyboard, interface: 2, usage_page: None, usage: None, led_count: 84 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x01B9, name: "HyperX Alloy Rise 75 Wireless", kind: DeviceKind::Keyboard, wireless: true, family: ProtocolFamily::UniversalKeyboard, interface: 2, usage_page: None, usage: None, led_count: 84 },
+    // Mice (Legacy + Universal)
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x16D3, name: "HyperX Pulsefire Surge", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::PulsefireSurge, interface: 1, usage_page: Some(0xFF01), usage: None, led_count: 33 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0490, name: "HyperX Pulsefire Surge", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::PulsefireSurge, interface: 1, usage_page: Some(0xFF01), usage: None, led_count: 33 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x16D7, name: "HyperX Pulsefire FPS Pro", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::PulsefireFpsCore, interface: 1, usage_page: Some(0xFF01), usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0E8F, name: "HyperX Pulsefire FPS Pro", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::PulsefireFpsCore, interface: 1, usage_page: Some(0xFF01), usage: None, led_count: 1 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x1729, name: "HyperX Pulsefire FPS Pro 2", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::PulsefireFpsPro2, interface: 2, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0693, name: "HyperX Pulsefire FPS Pro 2", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::PulsefireFpsPro2, interface: 2, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x16DE, name: "HyperX Pulsefire Core", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::PulsefireFpsCore, interface: 1, usage_page: Some(0xFF01), usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0D8F, name: "HyperX Pulsefire Core", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::PulsefireFpsCore, interface: 1, usage_page: Some(0xFF01), usage: None, led_count: 1 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x16E1, name: "HyperX Pulsefire Dart (Wireless)", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::PulsefireDart, interface: 2, usage_page: Some(0xFF00), usage: None, led_count: 2 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x068E, name: "HyperX Pulsefire Dart (Wireless)", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::PulsefireDart, interface: 2, usage_page: Some(0xFF00), usage: None, led_count: 2 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x16E2, name: "HyperX Pulsefire Dart (USB)", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::PulsefireDart, interface: 1, usage_page: Some(0xFF13), usage: None, led_count: 2 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x088E, name: "HyperX Pulsefire Dart (USB)", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::PulsefireDart, interface: 1, usage_page: Some(0xFF13), usage: None, led_count: 2 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x16E4, name: "HyperX Pulsefire Raid", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::PulsefireRaid, interface: 1, usage_page: Some(0xFF01), usage: Some(0x01), led_count: 2 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0290, name: "HyperX Pulsefire Raid", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::PulsefireRaid, interface: 1, usage_page: Some(0xFF01), usage: Some(0x01), led_count: 2 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x1727, name: "HyperX Pulsefire Haste", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::PulsefireHaste, interface: 3, usage_page: Some(0xFF90), usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0F8F, name: "HyperX Pulsefire Haste", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::PulsefireHaste, interface: 3, usage_page: Some(0xFF90), usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x048E, name: "HyperX Pulsefire Haste Wireless (USB)", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::PulsefireHasteWireless, interface: 2, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x028E, name: "HyperX Pulsefire Haste Wireless", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::PulsefireHasteWireless, interface: 2, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0B97, name: "HyperX Pulsefire Haste 2", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::UniversalMouse { max_poll_hz: 8000, max_dpi: 26000 }, interface: 2, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0D97, name: "HyperX Pulsefire Haste 2 Wireless (USB)", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::UniversalMouse { max_poll_hz: 1000, max_dpi: 26000 }, interface: 2, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0F98, name: "HyperX Pulsefire Haste 2 Wireless", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::UniversalMouse { max_poll_hz: 1000, max_dpi: 26000 }, interface: 2, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0BA0, name: "HyperX Pulsefire Haste 2 Mini Wireless (USB)", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::UniversalMouse { max_poll_hz: 1000, max_dpi: 26000 }, interface: 2, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0DA0, name: "HyperX Pulsefire Haste 2 Mini Wireless", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::UniversalMouse { max_poll_hz: 1000, max_dpi: 26000 }, interface: 2, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x04B5, name: "HyperX Pulsefire Haste 2 Core", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::UniversalMouse { max_poll_hz: 1000, max_dpi: 26000 }, interface: 2, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0AB5, name: "HyperX Pulsefire Haste 2 Core Wireless", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::UniversalMouse { max_poll_hz: 1000, max_dpi: 26000 }, interface: 2, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0AB8, name: "HyperX Pulsefire Haste 2 S Wireless (USB)", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::UniversalMouse { max_poll_hz: 1000, max_dpi: 26000 }, interface: 2, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0BB8, name: "HyperX Pulsefire Haste 2 S Wireless", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::UniversalMouse { max_poll_hz: 1000, max_dpi: 26000 }, interface: 2, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0ABD, name: "HyperX Pulsefire Haste 2 Pro (USB)", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::UniversalMouse { max_poll_hz: 4000, max_dpi: 26000 }, interface: 2, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0CBD, name: "HyperX Pulsefire Haste 2 Pro", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::UniversalMouse { max_poll_hz: 4000, max_dpi: 26000 }, interface: 3, usage_page: None, usage: None, led_count: 1 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0FBD, name: "HyperX Pulsefire Fuse Wireless", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::UniversalMouse { max_poll_hz: 1000, max_dpi: 12000 }, interface: 2, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0EBE, name: "HyperX Pulsefire Saga", kind: DeviceKind::Mouse, wireless: false, family: ProtocolFamily::UniversalMouse { max_poll_hz: 8000, max_dpi: 26000 }, interface: 2, usage_page: None, usage: None, led_count: 2 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x04BF, name: "HyperX Pulsefire Saga Pro (USB)", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::UniversalMouse { max_poll_hz: 4000, max_dpi: 26000 }, interface: 2, usage_page: None, usage: None, led_count: 2 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x06BF, name: "HyperX Pulsefire Saga Pro", kind: DeviceKind::Mouse, wireless: true, family: ProtocolFamily::UniversalMouse { max_poll_hz: 4000, max_dpi: 26000 }, interface: 3, usage_page: None, usage: None, led_count: 2 },
+    // Headsets (Wired + Wireless + 3-in-1 Dongles)
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x16C4, name: "HyperX Cloud Flight Wireless", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudFlightWireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x1723, name: "HyperX Cloud Flight Wireless", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudFlightWireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0E90, name: "HyperX Cloud Flight Wireless", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudFlightWireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x16EA, name: "HyperX Cloud Flight S", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudFlightS, interface: 5, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x16ED, name: "HyperX Cloud Alpha S", kind: DeviceKind::Headset, wireless: false, family: ProtocolFamily::CloudAlphaS, interface: 5, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0C91, name: "HyperX Cloud Alpha S", kind: DeviceKind::Headset, wireless: false, family: ProtocolFamily::CloudAlphaS, interface: 5, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x1709, name: "HyperX Cloud Stinger Core + 7.1", kind: DeviceKind::Headset, wireless: false, family: ProtocolFamily::AudioOnlyHeadset, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x1715, name: "HyperX Cloud Stinger S", kind: DeviceKind::Headset, wireless: false, family: ProtocolFamily::AudioOnlyHeadset, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x170B, name: "HyperX Cloud Stinger Core Wireless + 7.1", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudStingerCoreWireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x1718, name: "HyperX Cloud II Wireless", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudIIWireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x1719, name: "HyperX Cloud II Wireless (USB)", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudIIWireless, interface: -1, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0C8A, name: "HyperX Cloud II Wireless", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudIIWireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x018B, name: "HyperX Cloud II Wireless DTS", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudIIWirelessDts, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x058B, name: "HyperX Cloud II Wireless DTS (USB)", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudIIWirelessDts, interface: -1, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0696, name: "HyperX Cloud II Wireless DTS", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudIIWirelessDts, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x038B, name: "HyperX Cloud II Wireless DTS (USB)", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudIIWirelessDts, interface: -1, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x1743, name: "HyperX Cloud Alpha Wireless", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudAlphaWireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x1765, name: "HyperX Cloud Alpha Wireless", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudAlphaWireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x098D, name: "HyperX Cloud Alpha Wireless", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudAlphaWireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0D93, name: "HyperX Cloud Stinger 2 Wireless", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudStinger2Wireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0995, name: "HyperX Cloud II Core Wireless", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudIIICoreWireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x069F, name: "HyperX Cloud II Core Wireless", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudIIICoreWireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x089D, name: "HyperX Cloud III", kind: DeviceKind::Headset, wireless: false, family: ProtocolFamily::CloudIII, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0C9D, name: "HyperX Cloud III Wireless", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudIIICoreWireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0E9D, name: "HyperX Cloud III Wireless (USB)", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudIIICoreWireless, interface: -1, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x05B7, name: "HyperX Cloud III Wireless Atlas", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudIIICoreWireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x06B7, name: "HyperX Cloud III Wireless Atlas (USB)", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudIIICoreWireless, interface: -1, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x06BE, name: "HyperX Cloud III S Wireless", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::CloudIIISWireless, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0AC1, name: "HyperX Cloud Flight 2 Wireless", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::UniversalHeadset, interface: 3, usage_page: None, usage: None, led_count: 2 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0BC1, name: "HyperX Cloud Flight 2 Wireless (USB)", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::UniversalHeadset, interface: 3, usage_page: None, usage: None, led_count: 2 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x078A, name: "HyperX Cloud MIX Buds", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::UniversalHeadset, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x039E, name: "HyperX Cloud MIX Buds 2", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::UniversalHeadset, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0FAE, name: "HyperX Cloud MIX 2", kind: DeviceKind::Headset, wireless: true, family: ProtocolFamily::UniversalHeadset, interface: 3, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x01BF, name: "HyperX Wireless Dongle 3-en-1", kind: DeviceKind::Other, wireless: true, family: ProtocolFamily::UniversalTioDongle, interface: 5, usage_page: None, usage: None, led_count: 0 },
+    // Mousemats
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x1705, name: "HyperX FURY Ultra", kind: DeviceKind::Mousepad, wireless: false, family: ProtocolFamily::Mat0x81 { led_count: 20 }, interface: 0, usage_page: None, usage: None, led_count: 20 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0493, name: "HyperX FURY Ultra", kind: DeviceKind::Mousepad, wireless: false, family: ProtocolFamily::Mat0x81 { led_count: 20 }, interface: 0, usage_page: None, usage: None, led_count: 20 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0F8D, name: "HyperX Pulsefire Mat", kind: DeviceKind::Mousepad, wireless: false, family: ProtocolFamily::Mat0x81 { led_count: 20 }, interface: 1, usage_page: Some(0xFF90), usage: Some(0xFF00), led_count: 20 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x1741, name: "HyperX Pulsefire Mat RGB XL", kind: DeviceKind::Mousepad, wireless: false, family: ProtocolFamily::Mat0x81 { led_count: 2 }, interface: 1, usage_page: Some(0xFF90), usage: Some(0xFF00), led_count: 2 },
+    // Microphones
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x171F, name: "HyperX QuadCast S", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::QuadCastS, interface: 0, usage_page: None, usage: None, led_count: 2 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0F8B, name: "HyperX QuadCast S", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::QuadCastS, interface: 0, usage_page: None, usage: None, led_count: 2 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x068C, name: "HyperX QuadCast S", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::QuadCastS, interface: 0, usage_page: None, usage: None, led_count: 2 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0294, name: "HyperX QuadCast S", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::QuadCastS, interface: 0, usage_page: None, usage: None, led_count: 2 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x028C, name: "HyperX QuadCast S", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::QuadCastS, interface: 0, usage_page: None, usage: None, led_count: 2 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x048C, name: "HyperX QuadCast S", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::QuadCastS, interface: 0, usage_page: None, usage: None, led_count: 2 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0D8B, name: "HyperX QuadCast S", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::QuadCastS, interface: 0, usage_page: None, usage: None, led_count: 2 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x098C, name: "HyperX DuoCast", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::DuoCast, interface: 0, usage_page: None, usage: None, led_count: 2 },
+    HxDeviceDef { vid: KINGSTON_VID, pid: 0x170F, name: "HyperX SoloCast", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::SoloCast, interface: 2, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x078B, name: "HyperX SoloCast", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::SoloCast, interface: 2, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0592, name: "HyperX SoloCast", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::SoloCast, interface: 2, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x098B, name: "HyperX SoloCast", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::SoloCast, interface: 2, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0992, name: "HyperX SoloCast", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::SoloCast, interface: 2, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x0B8B, name: "HyperX SoloCast", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::SoloCast, interface: 2, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x09AF, name: "HyperX QuadCast 2", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::QuadCast2, interface: 0, usage_page: None, usage: None, led_count: 0 },
+    HxDeviceDef { vid: HP_HYPERX_VID, pid: 0x02B5, name: "HyperX QuadCast 2 S", kind: DeviceKind::Other, wireless: false, family: ProtocolFamily::QuadCast2S, interface: 1, usage_page: Some(0xFF13), usage: Some(0xFF00), led_count: 108 },
+];
+
+pub fn find_device(vid: u16, pid: u16) -> Option<&'static HxDeviceDef> {
+    DEVICES.iter().find(|d| d.vid == vid && d.pid == pid)
+}
+
+/// Score a HID interface candidate against the catalogue entry (lower is less relevant / mismatched).
+pub fn match_score(def: &HxDeviceDef, interface: i32, usage_page: u16, usage: u16) -> i32 {
+    if def.interface >= 0 && interface >= 0 && interface != def.interface {
+        return -1;
+    }
+    let mut s = 1;
+    if def.interface >= 0 && interface == def.interface {
+        s += 10;
+    }
+    if let Some(up) = def.usage_page {
+        if usage_page != up {
+            return -1;
+        }
+        s += 20;
+    } else if usage_page >= 0xFF00 {
+        s += 5;
+    }
+    if let Some(u) = def.usage {
+        if usage == u {
+            s += 10;
+        }
+    }
+    s
+}
+
+/// Known TIO 3-in-1 dongle paired child PID -> product name.
+pub fn tio_child_name(pid: u16) -> Option<&'static str> {
+    match pid {
+        0x05BE => Some("HyperX Cloud III S Wireless"),
+        0x0ABD => Some("HyperX Pulsefire Haste 2 Pro"),
+        0x04BF => Some("HyperX Pulsefire Saga Pro"),
+        0x0BC1 => Some("HyperX Cloud Flight 2"),
+        _ => None,
+    }
+}
+
+/// §8.1 / §8.2 first 106 keys: `(report_offset, w3c_code, nx, ny)`.
+pub const ALLOY_ELITE_KEY_OFFSETS: &[(usize, &str, f32, f32)] = &[
+    (0x08, "Escape", 0.02, 0.08),
+    (0x09, "Backquote", 0.02, 0.24),
+    (0x0A, "Tab", 0.03, 0.40),
+    (0x0B, "CapsLock", 0.03, 0.56),
+    (0x0C, "ShiftLeft", 0.04, 0.72),
+    (0x0D, "ControlLeft", 0.02, 0.88),
+    (0x0E, "F12", 0.57, 0.08),
+    (0x0F, "Equal", 0.52, 0.24),
+    (0x10, "F9", 0.45, 0.08),
+    (0x11, "Digit9", 0.40, 0.24),
+    (0x12, "KeyO", 0.41, 0.40),
+    (0x13, "KeyL", 0.43, 0.56),
+    (0x14, "Comma", 0.41, 0.72),
+    (0x15, "ContextMenu", 0.54, 0.88),
+    (0x16, "Enter", 0.59, 0.48),
+    (0x17, "ArrowLeft", 0.65, 0.88),
+    (0x18, "F1", 0.08, 0.08),
+    (0x19, "Digit1", 0.06, 0.24),
+    (0x1A, "KeyQ", 0.08, 0.40),
+    (0x1B, "KeyA", 0.09, 0.56),
+    (0x1C, "IntlBackslash", 0.07, 0.72),
+    (0x1D, "MetaLeft", 0.07, 0.88),
+    (0x1E, "PrintScreen", 0.65, 0.08),
+    (0x20, "F10", 0.49, 0.08),
+    (0x21, "Digit0", 0.44, 0.24),
+    (0x22, "KeyP", 0.46, 0.40),
+    (0x23, "Semicolon", 0.47, 0.56),
+    (0x24, "Period", 0.45, 0.72),
+    (0x26, "Enter", 0.59, 0.56),
+    (0x27, "ArrowDown", 0.70, 0.88),
+    (0x28, "F2", 0.13, 0.08),
+    (0x29, "Digit2", 0.10, 0.24),
+    (0x2A, "KeyW", 0.12, 0.40),
+    (0x2B, "KeyS", 0.13, 0.56),
+    (0x2C, "KeyZ", 0.12, 0.72),
+    (0x2D, "AltLeft", 0.12, 0.88),
+    (0x2E, "ScrollLock", 0.70, 0.08),
+    (0x2F, "Backspace", 0.58, 0.24),
+    (0x30, "F11", 0.53, 0.08),
+    (0x31, "Minus", 0.48, 0.24),
+    (0x32, "BracketLeft", 0.50, 0.40),
+    (0x33, "Quote", 0.51, 0.56),
+    (0x34, "Slash", 0.50, 0.72),
+    (0x37, "ArrowRight", 0.74, 0.88),
+    (0x38, "F3", 0.17, 0.08),
+    (0x39, "Digit3", 0.15, 0.24),
+    (0x3A, "KeyE", 0.16, 0.40),
+    (0x3B, "KeyD", 0.17, 0.56),
+    (0x3C, "KeyX", 0.16, 0.72),
+    (0x3E, "Pause", 0.74, 0.08),
+    (0x3F, "Delete", 0.65, 0.40),
+    (0x41, "Numpad7", 0.81, 0.40),
+    (0x44, "NumLock", 0.81, 0.24),
+    (0x45, "Numpad6", 0.90, 0.56),
+    (0x48, "F4", 0.21, 0.08),
+    (0x49, "Digit4", 0.19, 0.24),
+    (0x4A, "KeyR", 0.20, 0.40),
+    (0x4B, "KeyF", 0.21, 0.56),
+    (0x4C, "KeyC", 0.20, 0.72),
+    (0x4D, "Space", 0.28, 0.88),
+    (0x4E, "Insert", 0.65, 0.24),
+    (0x4F, "End", 0.70, 0.40),
+    (0x51, "Numpad8", 0.86, 0.40),
+    (0x54, "NumpadDivide", 0.86, 0.24),
+    (0x55, "Numpad1", 0.81, 0.72),
+    (0x58, "F5", 0.27, 0.08),
+    (0x59, "Digit5", 0.23, 0.24),
+    (0x5A, "KeyT", 0.25, 0.40),
+    (0x5B, "KeyG", 0.25, 0.56),
+    (0x5C, "KeyV", 0.24, 0.72),
+    (0x5E, "Home", 0.70, 0.24),
+    (0x5F, "PageDown", 0.74, 0.40),
+    (0x61, "Numpad9", 0.90, 0.40),
+    (0x64, "NumpadMultiply", 0.90, 0.24),
+    (0x65, "Numpad2", 0.86, 0.72),
+    (0x68, "F6", 0.31, 0.08),
+    (0x69, "Digit6", 0.27, 0.24),
+    (0x6A, "KeyY", 0.29, 0.40),
+    (0x6B, "KeyH", 0.30, 0.56),
+    (0x6C, "KeyB", 0.28, 0.72),
+    (0x6E, "PageUp", 0.74, 0.24),
+    (0x6F, "ShiftRight", 0.57, 0.72),
+    (0x74, "NumpadSubtract", 0.95, 0.24),
+    (0x75, "Numpad3", 0.90, 0.72),
+    (0x78, "F7", 0.35, 0.08),
+    (0x79, "Digit7", 0.31, 0.24),
+    (0x7A, "KeyU", 0.33, 0.40),
+    (0x7B, "KeyJ", 0.34, 0.56),
+    (0x7C, "KeyN", 0.33, 0.72),
+    (0x7D, "AltRight", 0.45, 0.88),
+    (0x7E, "BracketRight", 0.54, 0.40),
+    (0x7F, "ControlRight", 0.59, 0.88),
+    (0x81, "Numpad4", 0.81, 0.56),
+    (0x84, "NumpadAdd", 0.95, 0.48),
+    (0x85, "Numpad0", 0.83, 0.88),
+    (0x88, "F8", 0.39, 0.08),
+    (0x89, "Digit8", 0.36, 0.24),
+    (0x8A, "KeyI", 0.37, 0.40),
+    (0x8B, "KeyK", 0.38, 0.56),
+    (0x8C, "KeyM", 0.37, 0.72),
+    (0x8D, "MetaRight", 0.50, 0.88),
+    (0x8E, "Backslash", 0.59, 0.40),
+    (0x8F, "ArrowUp", 0.70, 0.72),
+    (0x91, "Numpad5", 0.86, 0.56),
+    (0x94, "NumpadEnter", 0.95, 0.80),
+    (0x95, "NumpadDecimal", 0.90, 0.88),
+];
+
+/// §8.1 Alloy Elite channel 4 (18-LED lightbar + 4 media keys): `(off_r, off_g, off_b, opt_w3c, nx)`.
+pub const ALLOY_ELITE_EXT_OFFSETS: &[(usize, usize, usize, Option<&str>, f32)] = &[
+    (0x08, 0x29, 0x39, None, 0.03),
+    (0x48, 0x28, 0x38, None, 0.08),
+    (0x88, 0x78, 0x68, None, 0.14),
+    (0x09, 0x19, 0x3A, None, 0.19),
+    (0x89, 0x79, 0x69, None, 0.25),
+    (0x0A, 0x1A, 0x2A, None, 0.30),
+    (0x8A, 0x7A, 0x6A, None, 0.36),
+    (0x0B, 0x1B, 0x2B, None, 0.41),
+    (0x8B, 0x7B, 0x6B, None, 0.47),
+    (0x0C, 0x1C, 0x2C, None, 0.52),
+    (0x8C, 0x7C, 0x6C, None, 0.58),
+    (0x0D, 0x1D, 0x2D, None, 0.63),
+    (0x8D, 0x7D, 0x6D, None, 0.69),
+    (0x0E, 0x1E, 0x2E, None, 0.74),
+    (0x8F, 0x6E, 0x5E, None, 0.80),
+    (0x8E, 0x7E, 0x5D, None, 0.85),
+    (0x0F, 0x1F, 0x2F, None, 0.91),
+    (0x4F, 0x6F, 0x5F, None, 0.96),
+    (0x92, 0x82, 0x72, Some("MediaTrackPrevious"), 0.82),
+    (0x13, 0x23, 0x33, Some("MediaPlayPause"), 0.86),
+    (0x93, 0x83, 0x73, Some("MediaTrackNext"), 0.90),
+    (0x12, 0x22, 0x32, Some("AudioVolumeMute"), 0.94),
+];
+
+/// §8.7 Alloy Origins Core ANSI hardware values: `(hw_v, row, col, w3c_code)`.
+pub const ORIGINS_CORE_KEYS: &[(usize, u8, u8, &str)] = &[
+    (0, 0, 0, "Escape"), (1, 0, 2, "F1"), (2, 0, 3, "F2"), (3, 0, 4, "F3"), (4, 0, 5, "F4"),
+    (5, 0, 6, "F5"), (6, 0, 7, "F6"), (7, 0, 8, "F7"), (48, 0, 9, "F8"), (49, 0, 10, "F9"),
+    (50, 0, 11, "F10"), (51, 0, 12, "F11"), (52, 0, 13, "F12"), (53, 0, 14, "PrintScreen"),
+    (54, 0, 15, "ScrollLock"), (55, 0, 16, "Pause"),
+    (8, 1, 0, "Backquote"), (9, 1, 1, "Digit1"), (10, 1, 2, "Digit2"), (11, 1, 3, "Digit3"),
+    (12, 1, 4, "Digit4"), (13, 1, 5, "Digit5"), (14, 1, 6, "Digit6"), (15, 1, 7, "Digit7"),
+    (16, 1, 8, "Digit8"), (56, 1, 9, "Digit9"), (57, 1, 10, "Digit0"), (58, 1, 11, "Minus"),
+    (59, 1, 12, "Equal"), (60, 1, 13, "Backspace"), (61, 1, 14, "Insert"), (62, 1, 15, "Home"),
+    (63, 1, 16, "PageUp"),
+    (17, 2, 0, "Tab"), (18, 2, 1, "KeyQ"), (19, 2, 2, "KeyW"), (20, 2, 3, "KeyE"),
+    (21, 2, 4, "KeyR"), (22, 2, 5, "KeyT"), (23, 2, 6, "KeyY"), (24, 2, 7, "KeyU"),
+    (64, 2, 8, "KeyI"), (65, 2, 9, "KeyO"), (66, 2, 10, "KeyP"), (67, 2, 11, "BracketLeft"),
+    (68, 2, 12, "BracketRight"), (69, 2, 13, "Backslash"), (70, 2, 14, "Delete"),
+    (71, 2, 15, "End"), (72, 2, 16, "PageDown"),
+    (25, 3, 0, "CapsLock"), (26, 3, 1, "KeyA"), (27, 3, 2, "KeyS"), (28, 3, 3, "KeyD"),
+    (29, 3, 4, "KeyF"), (30, 3, 5, "KeyG"), (31, 3, 6, "KeyH"), (32, 3, 7, "KeyJ"),
+    (73, 3, 8, "KeyK"), (74, 3, 9, "KeyL"), (75, 3, 10, "Semicolon"), (76, 3, 11, "Quote"),
+    (78, 3, 13, "Enter"),
+    (33, 4, 0, "ShiftLeft"), (35, 4, 2, "KeyZ"), (36, 4, 3, "KeyX"), (37, 4, 4, "KeyC"),
+    (38, 4, 5, "KeyV"), (39, 4, 6, "KeyB"), (40, 4, 7, "KeyN"), (79, 4, 8, "KeyM"),
+    (80, 4, 9, "Comma"), (81, 4, 10, "Period"), (82, 4, 11, "Slash"), (84, 4, 13, "ShiftRight"),
+    (85, 4, 15, "ArrowUp"),
+    (41, 5, 0, "ControlLeft"), (42, 5, 1, "MetaLeft"), (43, 5, 2, "AltLeft"), (45, 5, 6, "Space"),
+    (86, 5, 10, "AltRight"), (87, 5, 11, "Fn"), (88, 5, 12, "ContextMenu"),
+    (89, 5, 13, "ControlRight"), (90, 5, 14, "ArrowLeft"), (91, 5, 15, "ArrowDown"),
+    (92, 5, 16, "ArrowRight"),
+];
+
+/// Compute `(green_offset, red_offset, blue_offset)` in the 380-byte Origins Core buffer (§3.4).
+pub const fn origins_core_offsets(v: usize) -> (usize, usize, usize) {
+    let p = 48 * (v / 12) + 8 * ((v / 6) % 2) + (v % 6);
+    (p, p + 16, p + 32)
+}
+
+/// §8.5 Alloy Origins 60 W3C slot codes (empty slots = `None`).
+pub const ORIGINS_60_SLOTS: &[Option<&str>] = &[
+    None, Some("Escape"), Some("Digit1"), Some("Digit2"), Some("Digit3"), Some("Digit4"),
+    Some("Digit5"), Some("Digit6"), Some("Digit7"), Some("Digit8"), Some("Digit9"), Some("Digit0"),
+    Some("Minus"), Some("Equal"), None, Some("Backspace"), Some("Tab"), Some("KeyQ"), Some("KeyW"),
+    Some("KeyE"), Some("KeyR"), Some("KeyT"), Some("KeyY"), Some("KeyU"), Some("KeyI"),
+    Some("KeyO"), Some("KeyP"), Some("BracketLeft"), Some("BracketRight"), Some("Backslash"),
+    Some("CapsLock"), Some("KeyA"), Some("KeyS"), Some("KeyD"), Some("KeyF"), Some("KeyG"),
+    Some("KeyH"), Some("KeyJ"), Some("KeyK"), Some("KeyL"), Some("Semicolon"), Some("Quote"), None,
+    Some("Enter"), Some("ShiftLeft"), None, Some("KeyZ"), Some("KeyX"), Some("KeyC"), Some("KeyV"),
+    Some("KeyB"), Some("KeyN"), Some("KeyM"), Some("Comma"), Some("Period"), Some("Slash"), None,
+    Some("ShiftRight"), Some("ControlLeft"), Some("MetaLeft"), Some("AltLeft"), Some("Space"),
+    Some("Space"), Some("Space"), Some("AltRight"), Some("ContextMenu"), Some("ControlRight"), None,
+    None, None, Some("Fn"),
+];
+
+/// §8.6 extra slots (68..=76) extending Origins 60 into Origins 65 (77 slots).
+pub const ORIGINS_65_TAIL: &[Option<&str>] = &[
+    Some("Fn"), Some("Home"), Some("Delete"), Some("PageUp"), Some("PageDown"), Some("ArrowUp"),
+    Some("ArrowLeft"), Some("ArrowDown"), Some("ArrowRight"),
+];
+
+/// §8.8 Origins 2 65 W3C slots (74 slots).
+pub const ORIGINS_2_65_SLOTS: &[Option<&str>] = &[
+    Some("Escape"), Some("Digit1"), Some("Digit2"), Some("Digit3"), Some("Digit4"), Some("Digit5"),
+    Some("Digit6"), Some("Digit7"), Some("Digit8"), Some("Digit9"), Some("Digit0"), Some("Minus"),
+    Some("Equal"), Some("Backspace"), Some("Delete"), Some("Tab"), Some("KeyQ"), Some("KeyW"),
+    Some("KeyE"), Some("KeyR"), Some("KeyT"), Some("KeyY"), Some("KeyU"), Some("KeyI"),
+    Some("KeyO"), Some("KeyP"), Some("BracketLeft"), Some("BracketRight"), None, Some("Home"),
+    Some("CapsLock"), Some("KeyA"), Some("KeyS"), Some("KeyD"), Some("KeyF"), Some("KeyG"),
+    Some("KeyH"), Some("KeyJ"), Some("KeyK"), Some("KeyL"), Some("Semicolon"), Some("Quote"),
+    Some("Backslash"), Some("Enter"), Some("PageUp"), Some("ShiftLeft"), Some("KeyZ"), Some("KeyX"),
+    Some("KeyC"), Some("KeyV"), Some("KeyB"), Some("KeyN"), Some("KeyM"), Some("Comma"),
+    Some("Period"), Some("Slash"), Some("ShiftRight"), Some("ArrowUp"), None, Some("PageDown"),
+    Some("ControlLeft"), Some("IntlBackslash"), Some("MetaLeft"), Some("AltLeft"), None,
+    Some("Space"), Some("Space"), Some("Space"), None, Some("AltRight"), Some("Fn"),
+    Some("ArrowLeft"), Some("ArrowDown"), Some("ArrowRight"),
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn devices_table_has_no_duplicate_vid_pid_entries() {
+        let mut seen = BTreeSet::new();
+        for d in DEVICES {
+            assert!(
+                seen.insert((d.vid, d.pid)),
+                "Duplicate VID:PID in DEVICES: {:04x}:{:04x} ({})",
+                d.vid,
+                d.pid,
+                d.name
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_cover_headsets_and_universal_mice() {
+        let haste2 = find_device(HP_HYPERX_VID, 0x0B97).expect("Haste 2");
+        assert_eq!(haste2.caps().max_dpi, 26000);
+        assert!(haste2.caps().polling_rates.contains(&8000));
+        assert!(haste2.caps().lod_and_snap);
+
+        let cloud3w = find_device(HP_HYPERX_VID, 0x0C9D).expect("Cloud III Wireless");
+        assert!(cloud3w.caps().battery);
+        assert!(cloud3w.caps().sidetone_signed_db);
+        assert!(cloud3w.caps().mic_mute);
+        assert!(cloud3w.caps().auto_sleep);
+
+        let qc2s = find_device(HP_HYPERX_VID, 0x02B5).expect("QuadCast 2 S");
+        assert_eq!(qc2s.caps().mic_polar_pattern, 4);
+        assert!(qc2s.caps().mic_monitor_balance);
+
+        let cloud3s = find_device(HP_HYPERX_VID, 0x06BE).expect("Cloud III S Wireless");
+        assert_eq!(cloud3s.caps().eq_10band, EqHwMode::Cloud3S);
+    }
+}

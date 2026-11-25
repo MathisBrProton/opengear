@@ -1,5 +1,10 @@
 use crate::features::*;
-use crate::hidpp::{BatteryInfo, HidppError, HidppTransport, read_battery_info};
+use crate::hidpp::{
+    BatteryInfo, HidppError, HidppTransport, TAG_POWER_OFF_TIMEOUT, estimate_rated_battery_hours,
+    read_battery_info, read_global_setting_u8, write_global_setting_u8, write_led_zone_raw,
+};
+use crate::MouseLedMode;
+use opengear_core::Rgb;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -65,6 +70,8 @@ pub const EQ_PRESETS: &[EqPreset] = &[
 pub struct LogitechHeadsetInfo {
     pub vid: u16,
     pub pid: u16,
+    pub device_index: u8,
+    pub is_wireless: bool,
     pub name: String,
     pub proto_version: String,
     pub firmware: Vec<String>,
@@ -72,19 +79,52 @@ pub struct LogitechHeadsetInfo {
     pub battery: Option<BatteryInfo>,
     pub supports_sidetone: bool,
     pub sidetone_pct: u8,
+    pub supports_mic_mute: bool,
+    pub mic_muted: Option<bool>,
+    pub bass_tone: Option<u8>,
+    pub eq_preset: Option<String>,
+    pub power_off_minutes: Option<u8>,
+    pub led_zones_count: u8,
     pub equalizer: Option<EqualizerInfo>,
 }
 
 pub struct LogitechHeadset {
-    transport: HidppTransport,
+    pub(crate) transport: HidppTransport,
     pub info: LogitechHeadsetInfo,
+    pub(crate) last_frame: Vec<Rgb>,
 }
 
 impl LogitechHeadset {
+    /// Determine whether an enumerated HID++ interface on `0xFF43` actually belongs to a headset.
+    /// Logitech wired keyboards (e.g. G513) also expose `0xFF43` and must stay out of headsets.
+    pub fn is_headset(t: &HidppTransport) -> bool {
+        if let Some(dt) = t.read_device_type() {
+            return dt == 8;
+        }
+        if crate::keyboard::LogitechKeyboard::is_keyboard(t) {
+            return false;
+        }
+        let has_dpi = t.get_feature_index(FEAT_ADJUSTABLE_DPI).is_some()
+            || t.get_feature_index(FEAT_EXTENDED_ADJUSTABLE_DPI).is_some();
+        if has_dpi {
+            return false;
+        }
+        let has_hs_feat = t.get_feature_index(FEAT_SIDETONE).is_some()
+            || t.get_feature_index(FEAT_HEADSET_AUDIO_SIDETONE).is_some()
+            || t.get_feature_index(FEAT_HEADSET_OUT).is_some()
+            || t.get_feature_index(FEAT_HEADSET_MIC_GAIN).is_some()
+            || t.get_feature_index(FEAT_EQUALIZER).is_some();
+        has_hs_feat
+            || (t.proto_major == 0
+                && (t.pid == 0x0AAA
+                    || t.product_string.to_ascii_lowercase().contains("headset")))
+    }
+
     /// Discover and connect to ALL Logitech HID++ headsets on UsagePage `0xFF43`.
     pub fn connect_all() -> Vec<Self> {
         HidppTransport::open_all_matching(0xFF43, Some(0x0202))
             .into_iter()
+            .filter(Self::is_headset)
             .map(Self::from_transport)
             .collect()
     }
@@ -108,13 +148,41 @@ impl LogitechHeadset {
                 .is_some()
             || transport.pid == 0x0AAA;
 
-        let battery = read_battery_info(&transport);
+        let mut battery = read_battery_info(&transport);
+        let is_wireless = battery.is_some()
+            || (transport.device_index != 0xFF && transport.device_index != 0)
+            || matches!(
+                transport.pid,
+                0x0ABA | 0x0AB5 | 0x0AB7 | 0x0AC4 | 0x0A66 | 0x0A5B | 0x0A89
+            );
+        if let Some(b) = battery.as_mut()
+            && let Some(pct) = b.percent
+        {
+            b.estimated_hours = estimate_rated_battery_hours(transport.pid, &name, pct, None);
+        }
         let sidetone_pct = Self::read_sidetone_inner(&transport).unwrap_or(0);
         let equalizer = Self::read_equalizer_inner(&transport);
+        let eq_preset = equalizer
+            .as_ref()
+            .and_then(|eq| Self::match_eq_preset(&eq.gains_db));
+        let supports_mic_mute = transport
+            .get_feature_index(FEAT_CENTURION_MIC_MUTE)
+            .is_some()
+            || (transport.get_feature_index(FEAT_SIDETONE).is_some()
+                && transport
+                    .request_feature(FEAT_SIDETONE, 0x20, &[])
+                    .is_ok());
+        let mic_muted = Self::read_mic_mute_inner(&transport);
+        let bass_tone = Self::read_bass_tone_inner(&transport);
+        let power_off_minutes = read_global_setting_u8(&transport, TAG_POWER_OFF_TIMEOUT)
+            .or_else(|| Self::read_centurion_sleep_inner(&transport));
+        let led_zones_count = Self::read_led_zone_count(&transport);
 
         let info = LogitechHeadsetInfo {
             vid: transport.vid,
             pid: transport.pid,
+            device_index: transport.device_index,
+            is_wireless,
             name,
             proto_version,
             firmware,
@@ -122,6 +190,12 @@ impl LogitechHeadset {
             battery,
             supports_sidetone,
             sidetone_pct,
+            supports_mic_mute,
+            mic_muted,
+            bass_tone,
+            eq_preset,
+            power_off_minutes,
+            led_zones_count,
             equalizer,
         };
 
@@ -134,7 +208,11 @@ impl LogitechHeadset {
             info.features.len()
         );
 
-        Self { transport, info }
+        Self {
+            transport,
+            info,
+            last_frame: Vec::new(),
+        }
     }
 
     fn read_sidetone_inner(t: &HidppTransport) -> Option<u8> {
@@ -264,8 +342,187 @@ impl LogitechHeadset {
                     .unwrap_or(0)
                     .clamp(cur.min_db, cur.max_db);
             }
+            self.info.eq_preset = Self::match_eq_preset(&cur.gains_db);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_transport(transport: HidppTransport) -> Self {
+        Self::from_transport(transport)
+    }
+
+    pub fn refresh_telemetry(&mut self) {
+        self.info.battery = read_battery_info(&self.transport);
+        if let Some(b) = self.info.battery.as_mut()
+            && let Some(pct) = b.percent
+        {
+            b.estimated_hours =
+                estimate_rated_battery_hours(self.info.pid, &self.info.name, pct, None);
+        }
+        if let Some(st) = Self::read_sidetone_inner(&self.transport) {
+            self.info.sidetone_pct = st;
+        }
+        if let Some(muted) = Self::read_mic_mute_inner(&self.transport) {
+            self.info.mic_muted = Some(muted);
+        }
+        if let Some(bass) = Self::read_bass_tone_inner(&self.transport) {
+            self.info.bass_tone = Some(bass);
+        }
+        if let Some(mins) = read_global_setting_u8(&self.transport, TAG_POWER_OFF_TIMEOUT)
+            .or_else(|| Self::read_centurion_sleep_inner(&self.transport))
+        {
+            self.info.power_off_minutes = Some(mins);
+        }
+    }
+
+    fn expand_preset_gains(gains_5: [i8; 5], band_count: usize) -> Vec<i8> {
+        if band_count <= 5 {
+            return gains_5[..band_count].to_vec();
+        }
+        let mut out = Vec::with_capacity(band_count);
+        for i in 0..band_count {
+            let src = (i * 4) / (band_count - 1).max(1);
+            out.push(gains_5[src.min(4)]);
+        }
+        out
+    }
+
+    fn match_eq_preset(gains: &[i8]) -> Option<String> {
+        let len = gains.len();
+        EQ_PRESETS
+            .iter()
+            .find(|p| Self::expand_preset_gains(p.gains_5, len) == gains)
+            .map(|p| p.name.to_string())
+    }
+
+    /// Apply a verified G HUB EQ preset by name across 5-band or 10-band hardware EQ.
+    pub fn apply_eq_preset(&mut self, preset_name: &str) -> Result<(), HidppError> {
+        let preset = EQ_PRESETS
+            .iter()
+            .find(|p| p.name == preset_name)
+            .ok_or(HidppError::Protocol(0x02, "Préréglage EQ inconnu"))?;
+        let count = self
+            .info
+            .equalizer
+            .as_ref()
+            .map(|e| e.band_count)
+            .unwrap_or(5);
+        let expanded = Self::expand_preset_gains(preset.gains_5, count);
+        self.set_equalizer_gains(&expanded)?;
+        self.info.eq_preset = Some(preset.name.to_string());
+        Ok(())
+    }
+
+    fn read_mic_mute_inner(t: &HidppTransport) -> Option<bool> {
+        if let Ok(r) = t.request_feature(FEAT_CENTURION_MIC_MUTE, 0x00, &[]) {
+            return r.first().map(|&b| (b & 0x01) != 0);
+        }
+        if let Ok(r) = t.request_feature(FEAT_SIDETONE, 0x20, &[]) {
+            return r.first().map(|&b| b != 0);
+        }
+        None
+    }
+
+    pub fn set_mic_mute(&mut self, muted: bool) -> Result<(), HidppError> {
+        if self
+            .transport
+            .get_feature_index(FEAT_CENTURION_MIC_MUTE)
+            .is_some()
+        {
+            self.transport.request_feature(
+                FEAT_CENTURION_MIC_MUTE,
+                0x10,
+                &[u8::from(muted)],
+            )?;
+        } else if self.transport.get_feature_index(FEAT_SIDETONE).is_some() {
+            self.transport
+                .request_feature(FEAT_SIDETONE, 0x30, &[u8::from(muted)])?;
+        } else {
+            return Err(HidppError::UnsupportedFeature(FEAT_SIDETONE));
+        }
+        self.info.mic_muted = Some(muted);
+        Ok(())
+    }
+
+    fn read_bass_tone_inner(t: &HidppTransport) -> Option<u8> {
+        let r = t.request_feature(FEAT_BASS_TONE, 0x00, &[]).ok()?;
+        r.first().copied()
+    }
+
+    pub fn set_bass_tone(&mut self, level: u8) -> Result<(), HidppError> {
+        let clamped = level.min(100);
+        self.transport
+            .request_feature(FEAT_BASS_TONE, 0x10, &[clamped])?;
+        self.info.bass_tone = Some(clamped);
+        Ok(())
+    }
+
+    fn read_centurion_sleep_inner(t: &HidppTransport) -> Option<u8> {
+        let r = t
+            .request_feature(FEAT_CENTURION_AUTO_SLEEP, 0x00, &[])
+            .ok()?;
+        r.first().copied()
+    }
+
+    pub fn set_power_off_minutes(&mut self, minutes: u8) -> Result<(), HidppError> {
+        if self
+            .transport
+            .get_feature_index(FEAT_GLOBAL_DEVICE_SETTINGS)
+            .is_some()
+        {
+            write_global_setting_u8(&self.transport, TAG_POWER_OFF_TIMEOUT, minutes)?;
+        } else if self
+            .transport
+            .get_feature_index(FEAT_CENTURION_AUTO_SLEEP)
+            .is_some()
+        {
+            self.transport
+                .request_feature(FEAT_CENTURION_AUTO_SLEEP, 0x10, &[minutes, 0, 0])?;
+        } else {
+            return Err(HidppError::UnsupportedFeature(FEAT_GLOBAL_DEVICE_SETTINGS));
+        }
+        self.info.power_off_minutes = Some(minutes);
+        Ok(())
+    }
+
+    fn read_led_zone_count(t: &HidppTransport) -> u8 {
+        if t.get_feature_index(FEAT_COLOR_LED_EFFECTS).is_some() {
+            return t
+                .request_feature(FEAT_COLOR_LED_EFFECTS, 0x00, &[])
+                .ok()
+                .and_then(|r| r.first().copied())
+                .unwrap_or(1)
+                .clamp(1, 4);
+        }
+        if t.get_feature_index(FEAT_RGB_EFFECTS).is_some() {
+            return t
+                .request_feature(FEAT_RGB_EFFECTS, 0x00, &[])
+                .ok()
+                .and_then(|r| r.first().copied())
+                .unwrap_or(1)
+                .clamp(1, 4);
+        }
+        0
+    }
+
+    pub fn set_led_zone(
+        &mut self,
+        zone_idx: u8,
+        mode: MouseLedMode,
+        color: Rgb,
+        speed_ms: u16,
+    ) -> Result<(), HidppError> {
+        let sp = speed_ms.to_be_bytes();
+        let params: [u8; 12] = match mode {
+            MouseLedMode::Off => [zone_idx, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            MouseLedMode::Fixed => [zone_idx, 0x01, color.r, color.g, color.b, 0, 0, 0, 0, 0, 0, 0],
+            MouseLedMode::Cycle => [zone_idx, 0x03, 0, 0, 0, 0, 0, sp[0], sp[1], 100, 0, 0],
+            MouseLedMode::Breathing => {
+                [zone_idx, 0x0A, color.r, color.g, color.b, sp[0], sp[1], 0x01, 100, 0, 0, 0]
+            }
+        };
+        write_led_zone_raw(&self.transport, true, &params)
     }
 }
 

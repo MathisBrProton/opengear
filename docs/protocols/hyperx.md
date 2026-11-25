@@ -1189,3 +1189,9 @@ Offsets dans le tampon de 380 octets (formule du §3.4). Variante ABNT2 (octet 5
 | 71 | Left Arrow | ArrowLeft |
 | 72 | Down Arrow | ArrowDown |
 | 73 | Right Arrow | ArrowRight |
+
+---
+
+## 9. Protocoles étendus (Universel, Souris, Casques, Claviers & Micros)
+
+Le catalogue USB complet (VID `0x0951` / `0x03F0`), le protocole Universel 64 octets (`0x10..0x71`, dongles TIO 3-en-1), ainsi que les commandes de batterie, sidetone, extinction automatique, DPI, fréquence d'interrogation et capteur des casques et souris sont documentés dans [hyperx_ngenuity.md](hyperx_ngenuity.md).

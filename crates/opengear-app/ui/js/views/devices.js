@@ -33,7 +33,7 @@ function ficheHead(d, extraHtml = "") {
       <div class="grow">
         <h2 class="fiche-title">${esc(d.name)}</h2>
         <div class="muted">${esc(d.vendor)} · ${esc(d.type)}</div>
-        <div class="row mt-8"><span class="pill ${d.status.cls}"><span class="dot"></span>${esc(d.status.label)}</span>${d.battery != null ? batteryBadge(d.battery, d.charging) : ""}${extraHtml}</div>
+        <div class="row mt-8"><span class="pill ${d.status.cls}"><span class="dot"></span>${esc(d.status.label)}</span>${d.battery != null ? batteryBadge(d.battery, d.charging, d.batteryHours) : ""}${extraHtml}</div>
       </div>
     </div>`;
 }
@@ -107,7 +107,9 @@ function ficheGeneric(d) {
     ${deviceSettings(d.deviceId)}
     ${deviceFans(d.deviceId)}
     <div class="card"><div class="card-head"><h2 class="card-title">Informations</h2></div>${infoTable([
-      ["Fabricant", dev.info.vendor], ["Connexion", conn], ["Firmware", dev.info.firmware, true], isExpert() ? ["Identifiant", dev.info.id, true] : null,
+      ["Fabricant", dev.info.vendor], ["Connexion", conn], ["Firmware", dev.info.firmware, true],
+      d.batteryHours != null && !d.charging ? ["Autonomie estimée", `≈ ${num(d.batteryHours)} heures`] : null,
+      isExpert() ? ["Identifiant", dev.info.id, true] : null,
     ])}</div>
     ${dev.cooling ? `<div class="card"><div class="card-head"><h2 class="card-title">Capteurs en direct</h2></div><div class="sensor-chip-row" id="cool-live">${sensorChips(S.telemetry)}</div></div>` : ""}`;
 }

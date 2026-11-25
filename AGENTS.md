@@ -147,4 +147,10 @@ La CI exécute exactement ces commandes. Si `cargo fmt` ou `cargo clippy` est in
   90 octets uniquement (177 appareils). Non pris en charge : casques Kraken, contrôleur ARGB, AIO
   Hanbo, modèles « custom », appareils relayés par un récepteur sans fil, maintien d'éclairage des
   Blade 14 (0270, 028C). Aucune écriture en mémoire de l'appareil.
+- Pilotes SteelSeries (`opengear-steelseries`), HyperX (`opengear-hyperx`) et pont complet
+  OpenRGB (`opengear-openrgb::OpenRgbDriver`) : **expérimentaux** (opt-in), écrits en salle
+  blanche à partir des fiches de `docs/protocols/`, non encore testés sur matériel réel.
+- Contrôle direct SuperIO (`opengear-mainboard::superio`) : supporte Nuvoton `NCT679xD` et
+  ITE `IT86xx`/`IT87xx` (lecture + PWM manuel vérifié avec retour au BIOS ; ITE non testé sur
+  matériel réel).
 - JIS / ABNT utilisent la géométrie ISO dans `physical_layout`.

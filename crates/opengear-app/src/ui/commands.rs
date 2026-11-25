@@ -1695,7 +1695,10 @@ mod tests {
     fn static_routes_allow_known_modules_and_reject_unknown_or_external_origins() {
         assert!(resolve_static_asset("/").is_some());
         assert!(resolve_static_asset("/js/main.js").is_some());
-        assert!(resolve_static_asset("/assets/mouse.svg").is_some());
+        assert!(resolve_static_asset("/assets/mouse.webp").is_some());
+        assert!(resolve_static_asset("/assets/ram.webp").is_some());
+        assert!(resolve_static_asset("/assets/laptop.webp").is_some());
+        assert!(resolve_static_asset("/assets/generic_device.webp").is_some());
         assert!(resolve_static_asset("/../src/main.rs").is_none());
         assert!(resolve_static_asset("/app.js").is_none());
 

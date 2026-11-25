@@ -43,6 +43,7 @@ par un chemin en lecture seule et respecter les garde-fous d'écriture d'AGENTS.
 | [razer.md](razer.md) | Razer : protocole générique 90 octets (claviers, souris, tapis, accessoires, portables Blade), contrôleur ARGB, casques Kraken / Kraken V3 / Kraken V4, AIO Hanbo ; 203 entrées d'appareils ; grilles de touches |
 | [steelseries.md](steelseries.md) | SteelSeries : souris Aerox/Rival/Sensei, claviers Apex (G1–G3, M750, OG, Apex 3), casques Siberia/Arctis, tapis QCK ; codes de touche Apex |
 | [hyperx.md](hyperx.md) | HyperX : claviers Alloy/Origins, souris Pulsefire, tapis, micros QuadCast ; tables d'emplacements des claviers |
+| [logitech.md](logitech.md) | Logitech G : HID++ 2.0, récepteurs Lightspeed, batterie unifiée & autonomie (`powermodel`), souris (`0x2110..0x8061`), claviers (`0x40A2..0x8081`), audio (`0x8300..0x8310`) et Centurion (`0x0108`/`0x06xx`) |
 
 Fiches à venir (autres lots) : voir la colonne « OpenGear » du catalogue.
 
@@ -51,5 +52,5 @@ Fiches à venir (autres lots) : voir la colonne « OpenGear » du catalogue.
 | Fiche | Crate | État |
 |---|---|---|
 | `razer.md` | `opengear-razer` (tables générées par `tools/protocol-lab/gen_razer_tables.py`) | protocole générique 90 octets, expérimental, non testé sur matériel |
-| `steelseries.md` | — | à faire |
-| `hyperx.md` | — | à faire |
+| `steelseries.md` | `opengear-steelseries` | expérimental (opt-in), non testé sur matériel |
+| `hyperx.md` / `hyperx_ngenuity.md` | `opengear-hyperx` | expérimental (opt-in), non testé sur matériel |

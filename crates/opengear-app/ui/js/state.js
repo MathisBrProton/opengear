@@ -132,8 +132,8 @@ export function mouseImage() {
     return { url: vars[idx].asset_url, official: true, variants: vars };
   }
   const builtin = [
-    { label: "Noir", asset_url: "/assets/mouse.svg" },
-    { label: "Blanc", asset_url: "/assets/mouse_white.svg" },
+    { label: "Noir", asset_url: "/assets/mouse.webp" },
+    { label: "Blanc", asset_url: "/assets/mouse_white.webp" },
   ];
   const idx = Math.min(local.selectedMouseVariant, builtin.length - 1);
   return { url: builtin[idx].asset_url, official: false, variants: builtin };
@@ -145,7 +145,7 @@ export function headsetImage() {
     const idx = Math.min(local.selectedHeadsetVariant, vars.length - 1);
     return { url: vars[idx].asset_url, official: true, variants: vars };
   }
-  return { url: "/assets/headset.svg", official: false, variants: [] };
+  return { url: "/assets/headset.webp", official: false, variants: [] };
 }
 
 /** Label Windows gives the key bound to `id` (falls back to the identifier itself). */
@@ -185,7 +185,7 @@ export function k70Image() {
     const f = imgs.find((x) => x.id === wanted) || imgs.find((x) => x.id === "thumb") || imgs[0];
     return { url: f.asset_url, official: true };
   }
-  return { url: "/assets/keyboard.svg", official: false };
+  return { url: "/assets/keyboard.webp", official: false };
 }
 
 const qa = (label, act, data = {}, title = "") => ({ label, act, data, title });
@@ -199,7 +199,7 @@ export function devicesList() {
     const kind = d.kind;
     const base = { key: `corsair:${i}`, deviceId: d.device_id, vendor: "Corsair", kind, name: d.product_name || "Appareil Corsair", type: d.kind_label || "Corsair", battery: d.battery_pct, status: { label: "Connecté", cls: "emerald" }, quick: [] };
     if (kind === "Mouse") {
-      Object.assign(base, { img: mouseImage().url, icon: "mouse" });
+      Object.assign(base, { img: mouseImage().url, imgCls: "cutout", icon: "mouse" });
       if (d.mouse) {
         const st = num(d.mouse.active_stage);
         const stages = arr(d.mouse.dpi_stages);
@@ -207,14 +207,14 @@ export function devicesList() {
         if (stages.length) base.quick.push(qa("Palier DPI suivant", "cm-stage", { dev: i, stage: (st + 1) % stages.length }));
       }
     } else if (kind === "Headset") {
-      Object.assign(base, { img: headsetImage().url, icon: "headset" });
+      Object.assign(base, { img: headsetImage().url, imgCls: "cutout", icon: "headset" });
       const side = num(d.headset && d.headset.sidetone_pct);
       base.quick.push(qa(side > 0 ? "Couper le retour micro" : "Activer le retour micro", "dev-set", { device: d.device_id, setting: "sidetone", json: side > 0 ? 0 : 50 }));
     } else if (kind === "CoolerHub") {
-      Object.assign(base, { img: "/assets/aio.svg", icon: "fan" });
+      Object.assign(base, { img: "/assets/aio.webp", imgCls: "cutout", icon: "fan" });
     } else if (kind === "Keyboard") {
       const k = k70Image();
-      Object.assign(base, { img: k.url, imgCls: k.official ? "cutout" : "", icon: "keyboard" });
+      Object.assign(base, { img: k.url, imgCls: "cutout", icon: "keyboard" });
       base.status = d.pollrate_hz ? { label: fmtHzShort(d.pollrate_hz), cls: "emerald" } : base.status;
       base.quick.push(qa(prof.enable_rgb ? "Couper l'éclairage" : "Allumer l'éclairage", "rgb-enable", { on: prof.enable_rgb ? "0" : "1" }));
       const br = num(d.hw_brightness_pct, 100);
@@ -222,7 +222,7 @@ export function devicesList() {
       base.quick.push(qa(`Luminosité ${next} %`, "dev-set", { device: d.device_id, setting: "hw_brightness", json: next }));
       if (d.hw_winlock != null) base.quick.push(qa(d.hw_winlock ? "Débloquer Windows" : "Bloquer Windows", "dev-set", { device: d.device_id, setting: "win_lock", json: !d.hw_winlock }, "Bloque la touche Windows pendant le jeu"));
     } else {
-      Object.assign(base, { img: "/assets/generic_device.svg", icon: "chip" });
+      Object.assign(base, { img: "/assets/generic_device.webp", imgCls: "cutout", icon: "chip" });
     }
     out.push(base);
   });
@@ -232,7 +232,7 @@ export function devicesList() {
     const dpi = m.dpi;
     const item = {
       key: `logi-mouse:${i}`, deviceId: m.device_id, vendor: "Logitech", kind: "Mouse", name: m.name || "Souris Logitech", type: "Souris Logitech G",
-      img: mi.url, imgCls: mi.official ? "cutout" : "", icon: "mouse",
+      img: mi.url, imgCls: "cutout", icon: "mouse",
       battery: bat ? bat.percent : null, charging: !!(bat && bat.is_charging),
       status: { label: dpi ? `${dpi.dpi_x} DPI` : "Connectée", cls: "cyan" }, quick: [],
     };
@@ -253,7 +253,7 @@ export function devicesList() {
     quick.push(qa(num(h.sidetone_pct) > 0 ? "Couper le retour micro" : "Retour micro 50 %", "dev-set", { device: h.device_id, setting: "sidetone", json: num(h.sidetone_pct) > 0 ? 0 : 50 }));
     out.push({
       key: `logi-hs:${i}`, deviceId: h.device_id, vendor: "Logitech", kind: "Headset", name: h.name || "Casque Logitech", type: "Casque Logitech G",
-      img: hi.url, imgCls: hi.official ? "cutout" : "", icon: "headset",
+      img: hi.url, imgCls: "cutout", icon: "headset",
       battery: bat ? bat.percent : null, charging: !!(bat && bat.is_charging),
       status: { label: "Connecté", cls: "purple" }, quick,
     });
@@ -262,7 +262,7 @@ export function devicesList() {
     const c = S.cooling;
     out.push({
       key: "cooling", vendor: "Refroidissement", kind: "Cooling", name: "Ventilation & watercooling", type: `${c.channels.length} canaux`,
-      img: "/assets/aio.svg", icon: "fan",
+      img: "/assets/aio.webp", imgCls: "cutout", icon: "fan",
       status: c.is_admin ? { label: c.wmi_available ? "Pilotable" : "Lecture seule", cls: c.wmi_available ? "emerald" : "amber" } : { label: "Admin requis", cls: "amber" },
       quick: [qa("Silence", "sl3-preset", { preset: "ultra_silent" }), qa("Équilibré", "sl3-preset", { preset: "default" }), qa("Performance", "sl3-preset", { preset: "max_perf" })],
     });
@@ -272,11 +272,18 @@ export function devicesList() {
   arr(S.device_list).filter((d) => !known.has(d.info.id)).forEach((d) => {
     const bat = d.status.battery_pct;
     const icon = KIND_ICON[d.info.kind] || (d.info.kind === "memory" ? "ram" : "chip");
-    const img = d.info.kind === "memory" ? "/assets/ram.svg"
-      : d.info.kind === "motherboard" ? "/assets/motherboard.svg"
-      : d.info.kind === "keyboard" ? "/assets/keyboard.svg"
-      : d.info.kind === "laptop" ? "/assets/laptop.svg"
-      : undefined;
+    const KIND_IMG = {
+      memory: "/assets/ram.webp",
+      motherboard: "/assets/motherboard.webp",
+      keyboard: "/assets/keyboard.webp",
+      mouse: "/assets/mouse.webp",
+      headset: "/assets/headset.webp",
+      cooler: "/assets/aio.webp",
+      laptop: "/assets/laptop.webp",
+      led_controller: "/assets/generic_device.webp",
+      other: "/assets/generic_device.webp",
+    };
+    const img = KIND_IMG[d.info.kind] || "/assets/generic_device.webp";
     // A laptop reports the system battery; other devices their own.
     const sysBat = d.info.kind === "laptop" && S.laptop_battery && S.laptop_battery.present ? S.laptop_battery : null;
     // Performance profile (shared setting id) as quick actions.
@@ -288,8 +295,9 @@ export function devicesList() {
     const curProf = prof && arr(prof.control.options).find((o) => o.id === prof.value);
     out.push({
       key: `dev:${d.info.id}`, deviceId: d.info.id, vendor: d.info.vendor, kind: d.info.kind, name: d.info.model,
-      type: KIND_LABEL[d.info.kind] || "Appareil", icon, img,
+      type: KIND_LABEL[d.info.kind] || "Appareil", icon, img, imgCls: "cutout",
       battery: sysBat ? sysBat.percent : bat != null ? bat : null, charging: sysBat ? !!sysBat.charging : !!d.status.charging,
+      batteryHours: !sysBat && d.status.battery_hours != null ? d.status.battery_hours : null,
       status: forced ? { label: "Ventilation forcée", cls: "amber" } : { label: curProf ? curProf.label : "Connecté", cls: "emerald" },
       quick,
     });

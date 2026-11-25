@@ -6,6 +6,8 @@
 
 use anyhow::{Context, Result};
 use opengear_core::Rgb;
+use opengear_core::driver::{Connection, Device, DeviceInfo, DeviceKind, Driver};
+use opengear_core::lighting::{Led, Lighting, Zone, ZoneKind};
 use opengear_mainboard::ram::{EneRamMode, EneRamModule, RamEffect, RamProbe, RamRgbBackend};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -95,17 +97,35 @@ impl OrgbClient {
     /// Put controller `idx` in custom (direct) mode and set every LED to `color`.
     pub fn set_all_leds(&mut self, idx: u32, led_count: usize, color: Rgb) -> Result<()> {
         let _ = self.send(idx, PKT_SET_CUSTOM_MODE, &[]);
-        let n = led_count.clamp(1, 32);
-        let size = (6 + n * 4) as u32;
-        let mut payload = Vec::with_capacity(size as usize);
-        payload.extend_from_slice(&size.to_le_bytes());
-        payload.extend_from_slice(&(n as u16).to_le_bytes());
-        for _ in 0..n {
-            payload.extend_from_slice(&[color.r, color.g, color.b, 0]);
-        }
+        let colors = vec![color; led_count.clamp(1, 32)];
+        self.update_leds(idx, &colors)
+    }
+
+    pub fn set_custom_mode(&mut self, idx: u32) -> Result<()> {
+        self.send(idx, PKT_SET_CUSTOM_MODE, &[])
+            .context("Échec passage en mode direct OpenRGB SDK")
+    }
+
+    /// Encode and transmit a full `PKT_UPDATE_LEDS` frame.
+    pub fn update_leds(&mut self, idx: u32, colors: &[Rgb]) -> Result<()> {
+        let payload = encode_update_leds(colors);
         self.send(idx, PKT_UPDATE_LEDS, &payload)
             .context("Échec envoi couleurs OpenRGB SDK")
     }
+}
+
+pub(crate) fn encode_update_leds(colors: &[Rgb]) -> Vec<u8> {
+    let max_leds = ((MAX_PACKET_LEN as usize).saturating_sub(6) / 4).min(u16::MAX as usize);
+    let n = colors.len().clamp(1, max_leds);
+    let size = (6 + n * 4) as u32;
+    let mut payload = Vec::with_capacity(size as usize);
+    payload.extend_from_slice(&size.to_le_bytes());
+    payload.extend_from_slice(&(n as u16).to_le_bytes());
+    for i in 0..n {
+        let c = colors.get(i).copied().unwrap_or(Rgb::BLACK);
+        payload.extend_from_slice(&[c.r, c.g, c.b, 0]);
+    }
+    payload
 }
 
 /// Little-endian reader over a controller-data payload.
@@ -141,6 +161,284 @@ impl Reader<'_> {
                 .trim_end_matches('\0')
                 .to_string(),
         )
+    }
+}
+
+/// Parsed OpenRGB controller metadata and zones (beyond DRAM).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedController {
+    pub dev_type: u32,
+    pub name: String,
+    pub vendor: String,
+    pub version: String,
+    pub zones: Vec<Zone>,
+    pub total_leds: usize,
+}
+
+fn map_openrgb_device_kind(dev_type: u32) -> DeviceKind {
+    match dev_type {
+        0 => DeviceKind::Motherboard,
+        1 => DeviceKind::Memory,
+        2 => DeviceKind::Other, // GPU
+        3 => DeviceKind::Cooler,
+        4 | 11 | 15 => DeviceKind::LedController,
+        5 | 18 => DeviceKind::Keyboard,
+        6 => DeviceKind::Mouse,
+        7 => DeviceKind::Mousepad,
+        8 | 9 => DeviceKind::Headset,
+        _ => DeviceKind::Other,
+    }
+}
+
+/// Parse an OpenRGB controller-data payload into structured metadata and positioned LED zones.
+pub fn parse_controller(data: &[u8]) -> Option<ParsedController> {
+    let mut r = Reader { buf: data, off: 4 };
+    let dev_type = r.u32()?;
+    let name = r.string()?;
+    let vendor = r.string().unwrap_or_default();
+    let _description = r.string();
+    let version = r.string().unwrap_or_default();
+    let _serial = r.string();
+    let _location = r.string();
+
+    let modes = r.u16()? as usize;
+    let _active_mode = r.u32()?;
+    for _ in 0..modes.min(64) {
+        let _mode_name = r.string()?;
+        r.skip(4 * 12)?;
+        let colors = r.u16()? as usize;
+        r.skip(colors * 4)?;
+    }
+
+    let zone_count = r.u16()? as usize;
+    let mut parsed_zones = Vec::new();
+    for zi in 0..zone_count.min(32) {
+        let zname = r.string()?;
+        let ztype = r.u32()?; // 0 = Single, 1 = Linear, 2 = Matrix
+        let _leds_min = r.u32()?;
+        let _leds_max = r.u32()?;
+        let leds_count = (r.u32()? as usize).min(2048);
+        let matrix_size = r.u16()? as usize;
+        let mut matrix_dims = None;
+        if ztype == 2 && matrix_size >= 8 {
+            let h = r.u32()? as usize;
+            let w = r.u32()? as usize;
+            let remaining = matrix_size - 8;
+            let mut map = Vec::with_capacity(h.saturating_mul(w).min(2048));
+            let entries = (remaining / 4).min(h.saturating_mul(w));
+            for _ in 0..entries {
+                map.push(r.u32()?);
+            }
+            if entries * 4 < remaining {
+                r.skip(remaining - entries * 4)?;
+            }
+            matrix_dims = Some((h, w, map));
+        } else if matrix_size > 0 {
+            r.skip(matrix_size)?;
+        }
+
+        let zid = format!("orgb_z{zi}");
+        let zone = if let Some((h, w, map)) = matrix_dims
+            && h > 0
+            && w > 0
+            && leds_count > 0
+        {
+            let mut coords = vec![(0.5f32, 0.5f32); leds_count];
+            for row in 0..h {
+                for col in 0..w {
+                    if let Some(&idx) = map.get(row * w + col)
+                        && (idx as usize) < leds_count
+                    {
+                        let x = if w <= 1 { 0.5 } else { col as f32 / (w - 1) as f32 };
+                        let y = if h <= 1 { 0.5 } else { row as f32 / (h - 1) as f32 };
+                        coords[idx as usize] = (x, y);
+                    }
+                }
+            }
+            let leds = coords
+                .into_iter()
+                .enumerate()
+                .map(|(i, (x, y))| Led::at(format!("{zname} {}", i + 1), x, y))
+                .collect();
+            Zone {
+                id: zid,
+                name: zname,
+                kind: ZoneKind::Matrix,
+                leds,
+                resizable: None,
+            }
+        } else if ztype == 0 || leds_count <= 1 {
+            Zone::single(
+                &zid,
+                &zname,
+                0.5,
+                (zi as f32 + 0.5) / zone_count.max(1) as f32,
+            )
+        } else {
+            Zone::linear(
+                &zid,
+                &zname,
+                leds_count,
+                (zi as f32 + 0.5) / zone_count.max(1) as f32,
+            )
+        };
+        if !zone.leds.is_empty() {
+            parsed_zones.push(zone);
+        }
+    }
+
+    let reported_leds = r.u16().map(|v| v as usize).unwrap_or(0);
+    let zone_sum: usize = parsed_zones.iter().map(|z| z.leds.len()).sum();
+    let total_leds = if zone_sum > 0 { zone_sum } else { reported_leds };
+    if total_leds == 0 {
+        return None;
+    }
+    if parsed_zones.is_empty() {
+        parsed_zones.push(Zone::linear("orgb_z0", &name, total_leds.min(512), 0.5));
+    }
+    Some(ParsedController {
+        dev_type,
+        name,
+        vendor,
+        version,
+        zones: parsed_zones,
+        total_leds,
+    })
+}
+
+/// Optional bridge exposing any non-DRAM OpenRGB SDK controller as an OpenGear `Device + Lighting`.
+/// Marked `experimental` (opt-in) so users enable it when bridging MSI/Gigabyte/Lian Li/NZXT gear.
+pub struct OpenRgbDriver;
+
+impl Driver for OpenRgbDriver {
+    fn name(&self) -> &'static str {
+        "openrgb"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "OpenRGB SDK (pont réseau 127.0.0.1:6742)"
+    }
+
+    fn experimental(&self) -> bool {
+        true
+    }
+
+    fn discover(&self) -> Vec<Box<dyn Device>> {
+        let Some(mut client) = OrgbClient::connect() else {
+            return Vec::new();
+        };
+        let count = client.controller_count().unwrap_or(0);
+        let mut out: Vec<Box<dyn Device>> = Vec::new();
+        for idx in 0..count {
+            let Some(data) = client.controller_data(idx) else {
+                continue;
+            };
+            let Some(parsed) = parse_controller(&data) else {
+                continue;
+            };
+            // DRAM controllers are already bridged cleanly by `OpenRgbRamBackend`.
+            if parsed.dev_type == DEVICE_TYPE_DRAM {
+                continue;
+            }
+            out.push(Box::new(OpenRgbBridgeDevice {
+                idx,
+                parsed,
+                client: None,
+                custom_mode_active: false,
+            }));
+        }
+        out
+    }
+}
+
+pub struct OpenRgbBridgeDevice {
+    idx: u32,
+    parsed: ParsedController,
+    client: Option<OrgbClient>,
+    custom_mode_active: bool,
+}
+
+impl OpenRgbBridgeDevice {
+    fn ensure_client(&mut self) -> Result<&mut OrgbClient> {
+        if self.client.is_none() {
+            self.client = OrgbClient::connect();
+            self.custom_mode_active = false;
+        }
+        self.client
+            .as_mut()
+            .context("Serveur OpenRGB SDK (127.0.0.1:6742) indisponible")
+    }
+}
+
+impl Device for OpenRgbBridgeDevice {
+    fn info(&self) -> DeviceInfo {
+        let slug: String = self
+            .parsed
+            .name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(16)
+            .collect();
+        DeviceInfo {
+            id: format!("openrgb:{}:{}", self.idx, slug.to_ascii_lowercase()),
+            vendor: if self.parsed.vendor.is_empty() {
+                "OpenRGB".to_string()
+            } else {
+                self.parsed.vendor.clone()
+            },
+            model: self.parsed.name.clone(),
+            kind: map_openrgb_device_kind(self.parsed.dev_type),
+            connection: Connection::Usb,
+            firmware: (!self.parsed.version.is_empty()).then(|| self.parsed.version.clone()),
+        }
+    }
+
+    fn lighting(&mut self) -> Option<&mut dyn Lighting> {
+        Some(self)
+    }
+
+    fn diagnostic_lines(&self) -> Vec<String> {
+        vec![format!(
+            "OpenRGB SDK contrôleur #{} : {} zone(s), {} LEDs",
+            self.idx,
+            self.parsed.zones.len(),
+            self.parsed.total_leds
+        )]
+    }
+}
+
+impl Lighting for OpenRgbBridgeDevice {
+    fn zones(&self) -> Vec<Zone> {
+        self.parsed.zones.clone()
+    }
+
+    fn max_fps(&self) -> u8 {
+        20
+    }
+
+    fn set_frame(&mut self, colors: &[Rgb]) -> Result<()> {
+        let idx = self.idx;
+        let need_mode = !self.custom_mode_active;
+        let res = {
+            let client = self.ensure_client()?;
+            if need_mode {
+                let _ = client.set_custom_mode(idx);
+            }
+            client.update_leds(idx, colors)
+        };
+        if res.is_err() {
+            self.client = None;
+            self.custom_mode_active = false;
+            return res;
+        }
+        self.custom_mode_active = true;
+        Ok(())
+    }
+
+    fn release(&mut self) -> Result<()> {
+        self.custom_mode_active = false;
+        self.client = None;
+        Ok(())
     }
 }
 
@@ -281,5 +579,40 @@ mod tests {
         );
         d[4] = 2; // not DRAM
         assert_eq!(parse_dram(&d), None);
+    }
+
+    #[test]
+    fn full_controller_and_update_packet_are_parsed_and_encoded() {
+        let s = |v: &mut Vec<u8>, text: &str| {
+            v.extend_from_slice(&(text.len() as u16 + 1).to_le_bytes());
+            v.extend_from_slice(text.as_bytes());
+            v.push(0);
+        };
+        let mut d = vec![0u8; 4];
+        d.extend_from_slice(&4u32.to_le_bytes()); // Ledstrip
+        for t in ["Lian Li Strimer", "ARGB Controller", "desc", "2.1", "sn", "USB"] {
+            s(&mut d, t);
+        }
+        d.extend_from_slice(&0u16.to_le_bytes()); // modes
+        d.extend_from_slice(&0u32.to_le_bytes()); // active mode
+        d.extend_from_slice(&1u16.to_le_bytes()); // zones
+        s(&mut d, "Strip A");
+        d.extend_from_slice(&1u32.to_le_bytes()); // Linear
+        d.extend_from_slice(&1u32.to_le_bytes()); // min
+        d.extend_from_slice(&60u32.to_le_bytes()); // max
+        d.extend_from_slice(&8u32.to_le_bytes()); // count
+        d.extend_from_slice(&0u16.to_le_bytes()); // matrix size
+        d.extend_from_slice(&8u16.to_le_bytes()); // leds
+        let parsed = parse_controller(&d).unwrap();
+        assert_eq!(parsed.name, "Lian Li Strimer");
+        assert_eq!(parsed.vendor, "ARGB Controller");
+        assert_eq!(parsed.total_leds, 8);
+        assert_eq!(parsed.zones.len(), 1);
+        assert_eq!(parsed.zones[0].kind, ZoneKind::Linear);
+
+        let pkt = encode_update_leds(&[Rgb::RED, Rgb::CYAN]);
+        assert_eq!(u32::from_le_bytes(pkt[0..4].try_into().unwrap()), 14);
+        assert_eq!(u16::from_le_bytes(pkt[4..6].try_into().unwrap()), 2);
+        assert_eq!(&pkt[6..14], &[255, 0, 0, 0, 0, 210, 255, 0]);
     }
 }

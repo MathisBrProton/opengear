@@ -28,11 +28,12 @@ signature Authenticode) depuis sa source officielle.
 Copié à côté de l'exécutable par `crates/opengear-app/build.rs` depuis la crate
 `webview2-com-sys`. Redistribué selon les conditions du SDK Microsoft Edge WebView2.
 
-## Visuels matériels (`crates/opengear-app/assets/*.svg`)
+## Visuels matériels (`crates/opengear-app/assets/*.webp`)
 
-Schémas vectoriels SVG originaux produits pour OpenGear et distribués sous la même licence
-(`MIT OR Apache-2.0`). Si G HUB ou iCUE 5 sont déjà installés localement sur la machine de
-l'utilisateur, OpenGear peut lire leurs visuels locaux à la volée sans jamais les redistribuer.
+Rendus 3D studio originaux et sans marque produits pour OpenGear, distribués sous la même
+licence (`MIT OR Apache-2.0`). Si G HUB ou iCUE 5 sont déjà installés localement sur la
+machine de l'utilisateur, OpenGear peut lire leurs visuels locaux à la volée sans jamais les
+redistribuer.
 
 ## Dépendances Rust
 

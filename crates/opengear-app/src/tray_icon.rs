@@ -514,7 +514,20 @@ mod win_tray {
                 TRAY_HICON.store(hicon as isize, Ordering::SeqCst);
                 let _ = taskbar_created_msg_id();
                 let _ = graceful_quit_msg_id();
-                let _ = wake_message_id();
+                let wake_id = wake_message_id();
+                if wake_id != 0 {
+                    #[link(name = "user32")]
+                    unsafe extern "system" {
+                        fn ChangeWindowMessageFilterEx(
+                            hwnd: HWND,
+                            message: u32,
+                            action: u32,
+                            p_change_filter_struct: *mut core::ffi::c_void,
+                        ) -> i32;
+                    }
+                    // Allow non-elevated second launches to wake an already-elevated tray window.
+                    let _ = ChangeWindowMessageFilterEx(hwnd, wake_id, 1, std::ptr::null_mut());
+                }
                 register_tray_icon(hwnd, hicon);
 
                 let mut msg: MSG = std::mem::zeroed();
@@ -694,100 +707,325 @@ pub fn trim_working_set() {
     }
 }
 
-// ================= WINDOWS AUTOSTART (HKCU Run) & SHORTCUTS =================
+// ================= WINDOWS AUTOSTART (ELEVATED TASK / HKCU RUN) & SHORTCUTS =================
+
+const TASK_AUTOSTART: &str = r"\OpenGear\AutoStart";
+const TASK_LAUNCH: &str = r"\OpenGear\LaunchAdmin";
+
+#[cfg(windows)]
+const WIN_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn build_task_xml(
+    exe: &Path,
+    args: &str,
+    user_account: Option<&str>,
+    logon_trigger: bool,
+    enabled: bool,
+) -> String {
+    let user_xml = user_account
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(|u| format!("\n      <UserId>{}</UserId>", xml_escape(u)))
+        .unwrap_or_default();
+    let trigger_xml = if logon_trigger {
+        format!(
+            "\n  <Triggers>\n    <LogonTrigger>\n      <Enabled>{}</Enabled>{user_xml}\n    </LogonTrigger>\n  </Triggers>",
+            if enabled { "true" } else { "false" }
+        )
+    } else {
+        "\n  <Triggers />".to_string()
+    };
+    let args_xml = if args.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n      <Arguments>{}</Arguments>", xml_escape(args))
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
+<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
+  <Principals>\r\n\
+    <Principal id=\"Author\">{user_xml}\r\n\
+      <LogonType>InteractiveToken</LogonType>\r\n\
+      <RunLevel>HighestAvailable</RunLevel>\r\n\
+    </Principal>\r\n\
+  </Principals>{trigger_xml}\r\n\
+  <Settings>\r\n\
+    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>\r\n\
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n\
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n\
+    <AllowHardTerminate>true</AllowHardTerminate>\r\n\
+    <StartWhenAvailable>false</StartWhenAvailable>\r\n\
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n\
+    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n\
+    <Enabled>{enabled}</Enabled>\r\n\
+    <Hidden>false</Hidden>\r\n\
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n\
+    <Priority>5</Priority>\r\n\
+  </Settings>\r\n\
+  <Actions Context=\"Author\">\r\n\
+    <Exec>\r\n\
+      <Command>{}</Command>{args_xml}\r\n\
+    </Exec>\r\n\
+  </Actions>\r\n\
+</Task>\r\n",
+        xml_escape(&exe.display().to_string())
+    )
+}
+
+fn decode_task_xml_stdout(raw: &[u8]) -> String {
+    if raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE {
+        let units: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    String::from_utf8_lossy(raw).into_owned()
+}
+
+#[cfg(windows)]
+fn register_elevated_task(
+    task_name: &str,
+    exe: &Path,
+    args: &str,
+    user_account: Option<&str>,
+    logon_trigger: bool,
+    enabled: bool,
+) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    let xml = build_task_xml(exe, args, user_account, logon_trigger, enabled);
+    let mut bytes = Vec::with_capacity(2 + xml.len() * 2);
+    bytes.extend_from_slice(&[0xFF, 0xFE]);
+    for u in xml.encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    let tmp_path = std::env::temp_dir().join(format!("opengear_task_{}.xml", std::process::id()));
+    std::fs::write(&tmp_path, bytes).context("écriture XML tâche planifiée")?;
+
+    let out = std::process::Command::new("schtasks")
+        .args(["/Create", "/TN", task_name, "/XML"])
+        .arg(&tmp_path)
+        .arg("/F")
+        .creation_flags(WIN_CREATE_NO_WINDOW)
+        .output();
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let out = out.context("exécution schtasks /Create")?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("Échec création tâche {task_name}: {}", msg.trim());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn delete_scheduled_task(task_name: &str) {
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new("schtasks")
+        .args(["/Delete", "/TN", task_name, "/F"])
+        .creation_flags(WIN_CREATE_NO_WINDOW)
+        .output();
+}
+
+#[cfg(windows)]
+fn task_enabled_state(task_name: &str) -> Option<bool> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", task_name, "/XML"])
+        .creation_flags(WIN_CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let xml = decode_task_xml_stdout(&out.stdout);
+    Some(!xml.contains("<Enabled>false</Enabled>"))
+}
+
+/// Attempt to hand off launch to the pre-authorized elevated Task Scheduler task (`0 UAC`).
+pub fn try_launch_via_elevated_task(minimized: bool) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // If an OpenGear instance is already running, wake it up directly instead of starting another.
+        if !acquire_single_instance() {
+            return true;
+        }
+        release_single_instance();
+
+        let primary = if minimized { TASK_AUTOSTART } else { TASK_LAUNCH };
+        for tn in [primary, TASK_LAUNCH] {
+            if let Ok(out) = std::process::Command::new("schtasks")
+                .args(["/Run", "/TN", tn])
+                .creation_flags(WIN_CREATE_NO_WINDOW)
+                .output()
+                && out.status.success()
+            {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = minimized;
+        false
+    }
+}
+
+#[cfg(windows)]
+fn is_run_autostart_enabled() -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+    };
+    let subkey: Vec<u16> = OsStr::new("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let val_name: Vec<u16> = OsStr::new("OpenGear")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let mut hkey: HKEY = std::ptr::null_mut();
+    let open_rc =
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey) };
+    if open_rc != 0 {
+        return false;
+    }
+    let mut sz: u32 = 0;
+    let query_rc = unsafe {
+        RegQueryValueExW(
+            hkey,
+            val_name.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sz,
+        )
+    };
+    unsafe { RegCloseKey(hkey) };
+    query_rc == 0 && sz > 0
+}
 
 pub fn is_autostart_enabled() -> bool {
     #[cfg(windows)]
     {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::System::Registry::{
-            HKEY, HKEY_CURRENT_USER, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
-        };
-        let subkey: Vec<u16> = OsStr::new("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        let val_name: Vec<u16> = OsStr::new("OpenGear")
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        let mut hkey: HKEY = std::ptr::null_mut();
-        let open_rc =
-            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey) };
-        if open_rc != 0 {
-            return false;
-        }
-        let mut sz: u32 = 0;
-        let query_rc = unsafe {
-            RegQueryValueExW(
-                hkey,
-                val_name.as_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut sz,
-            )
-        };
-        unsafe { RegCloseKey(hkey) };
-        query_rc == 0 && sz > 0
+        task_enabled_state(TASK_AUTOSTART) == Some(true) || is_run_autostart_enabled()
     }
     #[cfg(not(windows))]
     false
 }
 
+#[cfg(windows)]
+fn set_run_autostart_enabled(enabled: bool, start_minimized: bool) -> Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_SZ, RegCloseKey, RegDeleteValueW,
+        RegOpenKeyExW, RegSetValueExW,
+    };
+    let subkey: Vec<u16> = OsStr::new("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let val_name: Vec<u16> = OsStr::new("OpenGear")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let mut hkey: HKEY = std::ptr::null_mut();
+    let rc =
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_WRITE, &mut hkey) };
+    if rc != 0 {
+        anyhow::bail!("Impossible d'ouvrir HKCU\\...\\Run (code {rc})");
+    }
+    if enabled {
+        let exe = std::env::current_exe().context("current_exe")?;
+        let cmd = if start_minimized {
+            format!("\"{}\" --minimized", exe.display())
+        } else {
+            format!("\"{}\"", exe.display())
+        };
+        let wide: Vec<u16> = OsStr::new(&cmd).encode_wide().chain(Some(0)).collect();
+        let set_rc = unsafe {
+            RegSetValueExW(
+                hkey,
+                val_name.as_ptr(),
+                0,
+                REG_SZ,
+                wide.as_ptr() as *const u8,
+                (wide.len() * 2) as u32,
+            )
+        };
+        unsafe { RegCloseKey(hkey) };
+        if set_rc != 0 {
+            anyhow::bail!("Échec écriture registre démarrage Windows (code {set_rc})");
+        }
+    } else {
+        unsafe {
+            RegDeleteValueW(hkey, val_name.as_ptr());
+            RegCloseKey(hkey);
+        }
+    }
+    Ok(())
+}
+
 pub fn set_autostart_enabled(enabled: bool, start_minimized: bool) -> Result<()> {
     #[cfg(windows)]
     {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::System::Registry::{
-            HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_SZ, RegCloseKey, RegDeleteValueW,
-            RegOpenKeyExW, RegSetValueExW,
-        };
-        let subkey: Vec<u16> = OsStr::new("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        let val_name: Vec<u16> = OsStr::new("OpenGear")
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        let mut hkey: HKEY = std::ptr::null_mut();
-        let rc =
-            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_WRITE, &mut hkey) };
-        if rc != 0 {
-            anyhow::bail!("Impossible d'ouvrir HKCU\\...\\Run (code {rc})");
-        }
-        if enabled {
+        if opengear_platform::is_elevated() {
+            let _ = set_run_autostart_enabled(false, false);
             let exe = std::env::current_exe().context("current_exe")?;
-            let cmd = if start_minimized {
-                format!("\"{}\" --minimized", exe.display())
+            let args = if start_minimized {
+                "--minimized --elevated-entry"
             } else {
-                format!("\"{}\"", exe.display())
+                "--elevated-entry"
             };
-            let wide: Vec<u16> = OsStr::new(&cmd).encode_wide().chain(Some(0)).collect();
-            let set_rc = unsafe {
-                RegSetValueExW(
-                    hkey,
-                    val_name.as_ptr(),
-                    0,
-                    REG_SZ,
-                    wide.as_ptr() as *const u8,
-                    (wide.len() * 2) as u32,
-                )
-            };
-            unsafe { RegCloseKey(hkey) };
-            if set_rc != 0 {
-                anyhow::bail!("Échec écriture registre démarrage Windows (code {set_rc})");
-            }
-        } else {
-            unsafe {
-                RegDeleteValueW(hkey, val_name.as_ptr());
-                RegCloseKey(hkey);
-            }
+            register_elevated_task(TASK_AUTOSTART, &exe, args, None, true, enabled)?;
+            let _ = register_elevated_task(
+                TASK_LAUNCH,
+                &exe,
+                "--elevated-entry",
+                None,
+                false,
+                true,
+            );
+            return Ok(());
         }
-        Ok(())
+        if task_enabled_state(TASK_AUTOSTART).is_some() {
+            use std::os::windows::process::CommandExt;
+            let flag = if enabled { "/ENABLE" } else { "/DISABLE" };
+            let ok = std::process::Command::new("schtasks")
+                .args(["/Change", "/TN", TASK_AUTOSTART, flag])
+                .creation_flags(WIN_CREATE_NO_WINDOW)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if ok {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "Relancez OpenGear en administrateur pour modifier le démarrage automatique élevé."
+            );
+        }
+        set_run_autostart_enabled(enabled, start_minimized)
     }
     #[cfg(not(windows))]
     {
@@ -975,13 +1213,18 @@ fn copy_dir_files(src: &Path, dst: &Path) {
     }
 }
 
-/// Self-install OpenGear cleanly into `%LOCALAPPDATA%\Programs\OpenGear\`:
+/// Self-install OpenGear cleanly into `%LOCALAPPDATA%\Programs\OpenGear\` (or `install_dir_override`):
 /// - Signals any running instance to quit gracefully (waiting up to 2 s before fallback)
 /// - Copies `OpenGear.exe`, `WebView2Loader.dll`, `pawnio_modules/`, and `opengear.ico`
+/// - Registers elevated Windows Task Scheduler tasks (`\OpenGear\AutoStart` & `\OpenGear\LaunchAdmin`) when elevated
 /// - Registers OpenGear in Windows Installed Apps (HKCU Uninstall key)
 /// - Creates Desktop & Start Menu shortcuts via native COM `IShellLinkW`
 /// - Launches the installed `OpenGear.exe` (passing `--cleanup-dir` when invoked from setup)
-pub fn install_to_windows(cleanup_dir: Option<&Path>) -> Result<()> {
+pub fn install_to_windows(
+    install_dir_override: Option<&Path>,
+    install_user: Option<&str>,
+    cleanup_dir: Option<&Path>,
+) -> Result<()> {
     #[cfg(windows)]
     {
         use std::ffi::OsStr;
@@ -992,13 +1235,18 @@ pub fn install_to_windows(cleanup_dir: Option<&Path>) -> Result<()> {
             RegSetValueExW,
         };
 
-        let local_app_data = std::env::var("LOCALAPPDATA")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .context("Variable LOCALAPPDATA introuvable")?;
-        let install_dir = PathBuf::from(&local_app_data)
-            .join("Programs")
-            .join("OpenGear");
+        let install_dir = match install_dir_override {
+            Some(p) if p.is_absolute() && !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => {
+                let local_app_data = std::env::var("LOCALAPPDATA")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .context("Variable LOCALAPPDATA introuvable")?;
+                PathBuf::from(&local_app_data)
+                    .join("Programs")
+                    .join("OpenGear")
+            }
+        };
         std::fs::create_dir_all(&install_dir)
             .with_context(|| format!("Impossible de créer {}", install_dir.display()))?;
 
@@ -1012,13 +1260,12 @@ pub fn install_to_windows(cleanup_dir: Option<&Path>) -> Result<()> {
         request_running_instances_exit_gracefully();
 
         // Fallback termination only if the previous process did not exit or still locks dst_exe.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let my_pid = std::process::id();
         let pid_filter = format!("PID ne {my_pid}");
         if src_exe != dst_exe && std::fs::copy(&src_exe, &dst_exe).is_err() {
             let _ = std::process::Command::new("taskkill")
                 .args(["/F", "/IM", "OpenGear.exe", "/FI", &pid_filter])
-                .creation_flags(CREATE_NO_WINDOW)
+                .creation_flags(WIN_CREATE_NO_WINDOW)
                 .output();
             std::thread::sleep(std::time::Duration::from_millis(300));
             std::fs::copy(&src_exe, &dst_exe)
@@ -1033,6 +1280,28 @@ pub fn install_to_windows(cleanup_dir: Option<&Path>) -> Result<()> {
             &install_dir.join("pawnio_modules"),
         );
         std::fs::write(&dst_ico, encode_multi_ico(&[32, 64]))?;
+
+        // Configure zero-UAC elevated autostart + direct-launch Task Scheduler tasks when installed as Admin.
+        let is_admin = opengear_platform::is_elevated();
+        if is_admin {
+            let _ = set_run_autostart_enabled(false, false);
+            let _ = register_elevated_task(
+                TASK_AUTOSTART,
+                &dst_exe,
+                "--minimized --elevated-entry",
+                install_user,
+                true,
+                true,
+            );
+            let _ = register_elevated_task(
+                TASK_LAUNCH,
+                &dst_exe,
+                "--elevated-entry",
+                install_user,
+                false,
+                true,
+            );
+        }
 
         // Create Desktop & Start Menu shortcuts pointing to installed OpenGear.exe
         let _ = create_shortcuts_for(&dst_exe);
@@ -1086,9 +1355,12 @@ pub fn install_to_windows(cleanup_dir: Option<&Path>) -> Result<()> {
             unsafe { RegCloseKey(hkey) };
         }
 
-        // Launch installed OpenGear GUI cleanly (zero console window!)
+        // Launch installed OpenGear GUI cleanly (inherits elevated Admin token when installed elevated)
         let mut launch = std::process::Command::new(&dst_exe);
         launch.current_dir(&install_dir);
+        if is_admin {
+            launch.arg("--elevated-entry");
+        }
         if let Some(dir) = cleanup_dir {
             launch.arg("--cleanup-dir").arg(dir);
         }
@@ -1097,12 +1369,12 @@ pub fn install_to_windows(cleanup_dir: Option<&Path>) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
-        let _ = cleanup_dir;
+        let _ = (install_dir_override, install_user, cleanup_dir);
         anyhow::bail!("Non supporté hors Windows")
     }
 }
 
-/// Cleanly uninstall OpenGear shortcuts, autostart entry, uninstall registry key, and install folder.
+/// Cleanly uninstall OpenGear shortcuts, elevated/legacy autostart entries, uninstall key, and install folder.
 pub fn uninstall_from_windows() -> Result<()> {
     #[cfg(windows)]
     {
@@ -1112,7 +1384,9 @@ pub fn uninstall_from_windows() -> Result<()> {
         use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Programs};
         use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteTreeW};
 
-        let _ = set_autostart_enabled(false, false);
+        let _ = set_run_autostart_enabled(false, false);
+        delete_scheduled_task(TASK_AUTOSTART);
+        delete_scheduled_task(TASK_LAUNCH);
 
         let subkey: Vec<u16> =
             OsStr::new("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\OpenGear")
@@ -1161,4 +1435,37 @@ pub fn uninstall_from_windows() -> Result<()> {
     }
     #[cfg(not(windows))]
     anyhow::bail!("Non supporté hors Windows")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_xml_sets_highest_interactive_and_battery_tolerant() {
+        let xml = build_task_xml(
+            Path::new(r"C:\Users\A&B\Programs\OpenGear\OpenGear.exe"),
+            "--minimized --elevated-entry",
+            Some(r"PC\A&B"),
+            true,
+            true,
+        );
+        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains(r"<UserId>PC\A&amp;B</UserId>"));
+        assert!(xml.contains("<Arguments>--minimized --elevated-entry</Arguments>"));
+        assert!(xml.contains("<LogonTrigger>"));
+    }
+
+    #[test]
+    fn decode_utf16le_bom_reads_schtasks_output() {
+        let src = "<Task><Enabled>true</Enabled></Task>";
+        let mut raw = vec![0xFF, 0xFE];
+        for u in src.encode_utf16() {
+            raw.extend_from_slice(&u.to_le_bytes());
+        }
+        assert_eq!(decode_task_xml_stdout(&raw), src);
+    }
 }

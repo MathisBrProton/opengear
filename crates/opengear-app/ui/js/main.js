@@ -685,7 +685,7 @@ const CHANGE = {
       const hi = i === ch.curve.length - 1 ? 100 - (ch.curve.length - 1 - i) : num(ch.curve[i + 1].temp_c) - 1;
       pt.temp_c = clamp(v, lo, Math.max(lo, hi));
     } else {
-      pt.duty_pct = clamp(v, ch.is_pump ? 40 : 0, 100);
+      pt.duty_pct = clamp(v, ch.is_pump ? 45 : 0, 100);
     }
     ch.curve[i] = pt;
     ch.policy = "Manual";

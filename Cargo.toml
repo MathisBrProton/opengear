@@ -10,6 +10,8 @@ members = [
     "crates/opengear-hp",
     "crates/opengear-openrgb",
     "crates/opengear-razer",
+    "crates/opengear-steelseries",
+    "crates/opengear-hyperx",
     "crates/opengear-input",
     "crates/opengear-app",
 ]
@@ -78,6 +80,8 @@ opengear-hp = { path = "crates/opengear-hp" }
 opengear-mainboard = { path = "crates/opengear-mainboard" }
 opengear-openrgb = { path = "crates/opengear-openrgb" }
 opengear-razer = { path = "crates/opengear-razer" }
+opengear-steelseries = { path = "crates/opengear-steelseries" }
+opengear-hyperx = { path = "crates/opengear-hyperx" }
 opengear-corsair = { path = "crates/opengear-corsair" }
 opengear-asus = { path = "crates/opengear-asus" }
 opengear-logitech = { path = "crates/opengear-logitech" }

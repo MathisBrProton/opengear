@@ -28,5 +28,7 @@ opengear-hp.workspace = true
 opengear-mainboard.workspace = true
 opengear-openrgb.workspace = true
 opengear-razer.workspace = true
+opengear-steelseries.workspace = true
+opengear-hyperx.workspace = true
 opengear-logitech.workspace = true
 opengear-input.workspace = true

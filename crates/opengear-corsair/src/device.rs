@@ -590,8 +590,41 @@ impl CorsairDevice {
         {
             return Err(BragiError::PollrateExceedsMax(rate.hz(), max.hz()));
         }
-        self.transport
-            .set_property(PROP_POLLRATE, pollrate_to_wire(rate))?;
+        if self.info.pollrate == Some(rate) {
+            return Ok(());
+        }
+        let send_res = self
+            .transport
+            .set_property(PROP_POLLRATE, pollrate_to_wire(rate));
+
+        // Changing USB polling rate on AXON/Bragi keyboards triggers a USB re-enumeration that
+        // invalidates the open HID handle (`os error 1167`). Wait briefly and re-open cleanly.
+        if !self.transport.path.starts_with("mock://") {
+            match send_res {
+                Ok(()) | Err(BragiError::Hid(_)) | Err(BragiError::Timeout) => {
+                    self.lighting_handle_open = false;
+                    std::thread::sleep(Duration::from_millis(450));
+                    self.transport.reopen()?;
+                    if self.info.mode == OperatingMode::Software {
+                        let _ = self.transport.set_property(PROP_MODE, MODE_SOFTWARE);
+                    }
+                    let actual = self
+                        .transport
+                        .get_property(PROP_POLLRATE)
+                        .ok()
+                        .and_then(pollrate_from_wire);
+                    if let Err(orig_err) = send_res
+                        && actual != Some(rate)
+                    {
+                        return Err(orig_err);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            send_res?;
+        }
+
         self.info.pollrate = Some(rate);
         Ok(())
     }

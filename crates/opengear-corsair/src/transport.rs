@@ -267,8 +267,64 @@ impl BragiTransport {
         }
     }
 
-    /// Send a Bragi packet and wait for its matching response.
+    /// Wait for the device to finish a USB re-enumeration (e.g. after a polling rate change)
+    /// and re-open its HID interface cleanly without dropping the higher-level `CorsairDevice`.
+    pub fn reopen(&mut self) -> Result<(), BragiError> {
+        if self.path.starts_with("mock://") {
+            return Err(BragiError::DeviceNotFound);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_millis(3500);
+        loop {
+            if let Ok(cands) = Self::enumerate_candidates() {
+                let found = cands
+                    .iter()
+                    .find(|c| {
+                        c.vid == self.vid
+                            && c.pid == self.pid
+                            && !self.serial.is_empty()
+                            && c.serial == self.serial
+                    })
+                    .or_else(|| {
+                        cands
+                            .iter()
+                            .find(|c| c.vid == self.vid && c.pid == self.pid)
+                    });
+                if let Some(cand) = found
+                    && let Ok(fresh) = Self::open_candidate(cand, self.subdevice_id)
+                {
+                    self.dev = fresh.dev;
+                    self.path = fresh.path;
+                    self.out_report_len = fresh.out_report_len;
+                    self.in_report_len = fresh.in_report_len;
+                    self.tx_buf = fresh.tx_buf;
+                    self.rx_buf = fresh.rx_buf;
+                    debug!(
+                        "Corsair {:04X}:{:04X} réouvert après ré-énumération USB",
+                        self.vid, self.pid
+                    );
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(BragiError::DeviceNotFound);
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+
+    /// Send a Bragi packet and wait for its matching response, reopening automatically on USB reset.
     pub fn exchange(&mut self, payload: &[u8]) -> Result<Vec<u8>, BragiError> {
+        match self.exchange_once(payload) {
+            Err(BragiError::Hid(_)) if !self.path.starts_with("mock://") => {
+                std::thread::sleep(Duration::from_millis(250));
+                self.reopen()?;
+                self.exchange_once(payload)
+            }
+            other => other,
+        }
+    }
+
+    fn exchange_once(&mut self, payload: &[u8]) -> Result<Vec<u8>, BragiError> {
         let copy_n = payload.len().min(self.payload_len());
         self.tx_buf.fill(0);
         self.tx_buf[0] = 0x00;
@@ -307,8 +363,19 @@ impl BragiTransport {
         }
     }
 
-    /// Fire-and-forget write for high-speed live RGB streaming.
+    /// Fire-and-forget write for high-speed live RGB streaming, reopening automatically on USB reset.
     pub fn write_chunk(&mut self, payload: &[u8], wait_reply: bool) -> Result<(), BragiError> {
+        match self.write_chunk_once(payload, wait_reply) {
+            Err(BragiError::Hid(_)) if !self.path.starts_with("mock://") => {
+                std::thread::sleep(Duration::from_millis(250));
+                self.reopen()?;
+                self.write_chunk_once(payload, wait_reply)
+            }
+            other => other,
+        }
+    }
+
+    fn write_chunk_once(&mut self, payload: &[u8], wait_reply: bool) -> Result<(), BragiError> {
         let copy_n = payload.len().min(self.payload_len());
         self.tx_buf.fill(0);
         self.tx_buf[0] = 0x00;

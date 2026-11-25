@@ -59,6 +59,8 @@ pub struct DeviceInfo {
 pub struct DeviceStatus {
     pub battery_pct: Option<u8>,
     pub charging: Option<bool>,
+    /// Estimated remaining battery runtime in hours when known by the driver.
+    pub battery_hours: Option<u16>,
 }
 
 /// Where a setting is shown.

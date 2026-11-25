@@ -70,11 +70,12 @@ export function sliderRow(label, { id, min, max, step = 1, value, input, change,
     </div>`;
 }
 
-export function batteryBadge(pct, charging) {
+export function batteryBadge(pct, charging, hours = null) {
   const p = num(pct, -1);
   if (p < 0) return "";
   const cls = p <= 15 ? "low" : p <= 35 ? "mid" : "";
-  return `<span class="battery ${cls}" title="Batterie ${p} %${charging ? " (en charge)" : ""}">${ICONS.battery}<span>${p} %${charging ? " · en charge" : ""}</span></span>`;
+  const est = !charging && hours != null ? ` · ≈ ${num(hours)} h` : "";
+  return `<span class="battery ${cls}" title="Batterie ${p} %${charging ? " (en charge)" : est}">${ICONS.battery}<span>${p} %${charging ? " · en charge" : est}</span></span>`;
 }
 
 export function deviceVisual(d, cls = "") {
@@ -193,7 +194,7 @@ export function renderKeyboard(mode, kb) {
             : `<span class="muted">Clique sur une touche pour la configurer. Point orange = touche modifiée.</span>`}
       </div>
       ${showPhoto
-        ? `<div style="padding:8px 0"><img class="kb-real-photo ${photo.official ? "cutout" : ""}" src="${esc(photo.url)}" alt="Photo du clavier" /></div>`
+        ? `<div style="padding:8px 0"><img class="kb-real-photo cutout" src="${esc(photo.url)}" alt="Photo du clavier" /></div>`
         : `<div class="kb-canvas-wrap" role="group" aria-label="Touches du clavier" style="aspect-ratio:${maxX} / ${maxY};max-width:${Math.round((300 * maxX) / maxY)}px">
             ${kbv.keys.map((k) => {
               const left = (num(k.x) / maxX) * 100;

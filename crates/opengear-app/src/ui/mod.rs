@@ -44,15 +44,15 @@ const JS_VIEW_PROFILES: &[u8] = include_bytes!("../../ui/js/views/profiles.js");
 const JS_VIEW_DEVICES: &[u8] = include_bytes!("../../ui/js/views/devices.js");
 const JS_VIEW_SYSTEM: &[u8] = include_bytes!("../../ui/js/views/system.js");
 
-const IMG_MOUSE: &[u8] = include_bytes!("../../assets/mouse.svg");
-const IMG_MOUSE_WHITE: &[u8] = include_bytes!("../../assets/mouse_white.svg");
-const IMG_KEYBOARD: &[u8] = include_bytes!("../../assets/keyboard.svg");
-const IMG_MOTHERBOARD: &[u8] = include_bytes!("../../assets/motherboard.svg");
-const IMG_HEADSET: &[u8] = include_bytes!("../../assets/headset.svg");
-const IMG_AIO: &[u8] = include_bytes!("../../assets/aio.svg");
-const IMG_RAM: &[u8] = include_bytes!("../../assets/ram.svg");
-const IMG_LAPTOP: &[u8] = include_bytes!("../../assets/laptop.svg");
-const IMG_GENERIC: &[u8] = include_bytes!("../../assets/generic_device.svg");
+const IMG_MOUSE: &[u8] = include_bytes!("../../assets/mouse.webp");
+const IMG_MOUSE_WHITE: &[u8] = include_bytes!("../../assets/mouse_white.webp");
+const IMG_KEYBOARD: &[u8] = include_bytes!("../../assets/keyboard.webp");
+const IMG_MOTHERBOARD: &[u8] = include_bytes!("../../assets/motherboard.webp");
+const IMG_HEADSET: &[u8] = include_bytes!("../../assets/headset.webp");
+const IMG_AIO: &[u8] = include_bytes!("../../assets/aio.webp");
+const IMG_RAM: &[u8] = include_bytes!("../../assets/ram.webp");
+const IMG_LAPTOP: &[u8] = include_bytes!("../../assets/laptop.webp");
+const IMG_GENERIC: &[u8] = include_bytes!("../../assets/generic_device.webp");
 
 const CSP_HEADER: &str = "default-src 'self' http://opengear.localhost https://opengear.localhost; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: http://opengear.localhost https://opengear.localhost; font-src 'self' data:; connect-src 'none'; object-src 'none'; frame-ancestors 'none'";
 
@@ -153,27 +153,27 @@ pub(crate) fn resolve_static_asset(path: &str) -> Option<(&'static [u8], &'stati
             "application/javascript; charset=utf-8",
             false,
         )),
-        "/assets/mouse.svg" | "/assets/mouse_superlight.jpg" => {
-            Some((IMG_MOUSE, "image/svg+xml", false))
+        "/assets/mouse.webp" | "/assets/mouse_superlight.jpg" => {
+            Some((IMG_MOUSE, "image/webp", false))
         }
-        "/assets/mouse_white.svg" | "/assets/mouse_superlight_white.jpg" => {
-            Some((IMG_MOUSE_WHITE, "image/svg+xml", false))
+        "/assets/mouse_white.webp" | "/assets/mouse_superlight_white.jpg" => {
+            Some((IMG_MOUSE_WHITE, "image/webp", false))
         }
-        "/assets/keyboard.svg" | "/assets/keyboard_k70_tkl.jpg" => {
-            Some((IMG_KEYBOARD, "image/svg+xml", false))
+        "/assets/keyboard.webp" | "/assets/keyboard_k70_tkl.jpg" => {
+            Some((IMG_KEYBOARD, "image/webp", false))
         }
-        "/assets/motherboard.svg" | "/assets/motherboard_b650a.jpg" => {
-            Some((IMG_MOTHERBOARD, "image/svg+xml", false))
+        "/assets/motherboard.webp" | "/assets/motherboard_b650a.jpg" => {
+            Some((IMG_MOTHERBOARD, "image/webp", false))
         }
-        "/assets/headset.svg" | "/assets/headset_prox.jpg" => {
-            Some((IMG_HEADSET, "image/svg+xml", false))
+        "/assets/headset.webp" | "/assets/headset_prox.jpg" => {
+            Some((IMG_HEADSET, "image/webp", false))
         }
-        "/assets/aio.svg" | "/assets/aio_silentloop3.jpg" => {
-            Some((IMG_AIO, "image/svg+xml", false))
+        "/assets/aio.webp" | "/assets/aio_silentloop3.jpg" => {
+            Some((IMG_AIO, "image/webp", false))
         }
-        "/assets/ram.svg" => Some((IMG_RAM, "image/svg+xml", false)),
-        "/assets/laptop.svg" => Some((IMG_LAPTOP, "image/svg+xml", false)),
-        "/assets/generic_device.svg" => Some((IMG_GENERIC, "image/svg+xml", false)),
+        "/assets/ram.webp" => Some((IMG_RAM, "image/webp", false)),
+        "/assets/laptop.webp" => Some((IMG_LAPTOP, "image/webp", false)),
+        "/assets/generic_device.webp" => Some((IMG_GENERIC, "image/webp", false)),
         _ => None,
     }
 }

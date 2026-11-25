@@ -21,13 +21,36 @@ export function viewPerformance() {
 
 function perfInputs() {
   const cards = [];
-  S.logi_mice.forEach((m, i) => cards.push(cardLogiDpi(m, i)));
+  const covered = new Set();
+  S.logi_mice.forEach((m, i) => {
+    covered.add(m.device_id);
+    cards.push(cardLogiDpi(m, i));
+  });
   S.corsair_devices.forEach((d, i) => {
-    if (d.kind === "Mouse" && d.mouse) cards.push(cardCorsairMouse(d, i));
-    else if (d.kind === "Keyboard" && d.pollrate_hz) cards.push(cardCorsairPoll(d, i));
+    if (d.kind === "Mouse" && d.mouse) {
+      covered.add(d.device_id);
+      cards.push(cardCorsairMouse(d, i));
+    } else if (d.kind === "Keyboard" && d.pollrate_hz) {
+      covered.add(d.device_id);
+      cards.push(cardCorsairPoll(d, i));
+    }
+  });
+  arr(S.device_list).forEach((d) => {
+    if (covered.has(d.info.id)) return;
+    if (d.info.kind !== "mouse" && d.info.kind !== "keyboard") return;
+    const html = deviceSettings(d.info.id, { sections: ["performance", "input"], bare: true });
+    if (!html) return;
+    cards.push(`
+      <div class="card accent-cyan">
+        <div class="card-head">
+          <div><h2 class="card-title">${esc(d.info.model)}</h2><div class="card-desc">${esc(d.info.vendor)} · Réglages matériels</div></div>
+          <span class="pill cyan">Connecté</span>
+        </div>
+        ${html}
+      </div>`);
   });
   if (!cards.length) {
-    return emptyState("Aucune souris ni clavier réglable détecté", "Branche une souris Logitech G (récepteur LIGHTSPEED / Bolt ou câble) ou un périphérique Corsair compatible, puis relance la recherche.",
+    return emptyState("Aucune souris ni clavier réglable détecté", "Branche une souris ou un clavier compatible (Logitech G, Corsair, HyperX, SteelSeries, Razer…), puis relance la recherche.",
       `<button type="button" class="btn btn-primary" data-act="rescan">Relancer la recherche</button>`);
   }
   return `<div class="grid-2">${cards.join("")}</div>${advancedHint("Angle snapping et sensibilité X/Y séparée sont disponibles en mode Expert.")}`;
@@ -293,8 +316,8 @@ export function renderFanCurve() {
     html += `<line x1="${x}" y1="${padT}" x2="${x}" y2="${H - padB}" stroke="rgba(255,255,255,0.06)"/><text x="${x}" y="${H - 10}" fill="#8592ab" font-size="10.5" text-anchor="middle" font-family="Consolas,monospace">${t}°C</text>`;
   }
   if (ch.is_pump) {
-    const fy = dy(40);
-    html += `<rect x="${padL}" y="${fy}" width="${pw}" height="${H - padB - fy}" fill="rgba(255,61,99,0.08)"/><line x1="${padL}" y1="${fy}" x2="${W - padR}" y2="${fy}" stroke="rgba(255,61,99,0.45)" stroke-dasharray="4 4"/><text x="${padL + 8}" y="${fy + 15}" fill="rgba(255,150,170,0.9)" font-size="10.5">Plancher de sécurité de la pompe (40 % min.)</text>`;
+    const fy = dy(45);
+    html += `<rect x="${padL}" y="${fy}" width="${pw}" height="${H - padB - fy}" fill="rgba(255,61,99,0.08)"/><line x1="${padL}" y1="${fy}" x2="${W - padR}" y2="${fy}" stroke="rgba(255,61,99,0.45)" stroke-dasharray="4 4"/><text x="${padL + 8}" y="${fy + 15}" fill="rgba(255,150,170,0.9)" font-size="10.5">Plancher de sécurité de la pompe (45 % min.)</text>`;
   }
   const sensors = S.telemetry.sensors || {};
   const liveT = sensors.cpu_temp_c != null ? sensors.cpu_temp_c : S.telemetry.gpu && S.telemetry.gpu.temp_c;
@@ -349,7 +372,7 @@ export function renderFanCurve() {
     const minT = dragIdx === 0 ? 20 : num(ch.curve[dragIdx - 1].temp_c) + 1;
     const maxT = dragIdx === n - 1 ? 100 - (n - 1 - dragIdx) : num(ch.curve[dragIdx + 1].temp_c) - 1;
     const nt = clamp(Math.round(20 + ((sx - padL) / pw) * 80), minT, Math.max(minT, maxT));
-    const nd = clamp(Math.round((1 - (sy - padT) / ph) * 100), ch.is_pump ? 40 : 0, 100);
+    const nd = clamp(Math.round((1 - (sy - padT) / ph) * 100), ch.is_pump ? 45 : 0, 100);
     ch.curve[dragIdx] = { temp_c: nt, duty_pct: nd };
     ch.policy = "Manual";
     syncDomInPlace(dragIdx);

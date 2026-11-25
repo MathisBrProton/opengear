@@ -14,7 +14,7 @@ pub use model::LogitechDriver;
 pub use mouse::{
     BatteryInfo, BatteryPowerModel, BatteryState, DpiSensorInfo, LedZoneInfo, LodLevel,
     LogitechMouse, LogitechMouseInfo, MouseLedMode, OnboardMode, OnboardProfilesSummary,
-    ReportRateInfo,
+    ReportRateInfo, SmartShiftInfo,
 };
 pub use onboard::{
     MouseButtonAction, OnboardMacroStep, OnboardMemoryDesc, OnboardProfile, SectorBackup,

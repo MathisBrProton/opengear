@@ -41,6 +41,15 @@ struct Cli {
     /// Installer OpenGear dans Windows (%LOCALAPPDATA%\Programs\OpenGear + Menu Démarrer + Bureau)
     #[arg(long)]
     install: bool,
+    /// (interne) Dossier cible transmis par OpenGear-Setup avant élévation UAC.
+    #[arg(long, hide = true, value_name = "DIR")]
+    install_dir: Option<std::path::PathBuf>,
+    /// (interne) Compte Windows (DOMAINE\Utilisateur) transmis par OpenGear-Setup.
+    #[arg(long, hide = true, value_name = "USER")]
+    install_user: Option<String>,
+    /// (interne) Marque un lancement déjà passé par le Planificateur de tâches pour éviter toute boucle.
+    #[arg(long, hide = true)]
+    elevated_entry: bool,
     /// Désinstaller OpenGear proprement de Windows
     #[arg(long)]
     uninstall: bool,
@@ -205,7 +214,11 @@ fn main() -> Result<()> {
         return fan_watchdog::run_watchdog(parent_pid);
     }
     if cli.install {
-        tray_icon::install_to_windows(cli.cleanup_dir.as_deref())?;
+        tray_icon::install_to_windows(
+            cli.install_dir.as_deref(),
+            cli.install_user.as_deref(),
+            cli.cleanup_dir.as_deref(),
+        )?;
         return Ok(());
     }
     if let Some(dir) = cli.cleanup_dir.as_deref() {
@@ -217,6 +230,13 @@ fn main() -> Result<()> {
     }
 
     let is_gui = matches!(cli.command, None | Some(Commands::Gui));
+    if is_gui
+        && !cli.elevated_entry
+        && !opengear_platform::is_elevated()
+        && tray_icon::try_launch_via_elevated_task(cli.minimized)
+    {
+        return Ok(());
+    }
     if !is_gui {
         attach_parent_console_for_cli();
     }

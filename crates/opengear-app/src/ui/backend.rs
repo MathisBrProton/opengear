@@ -510,7 +510,9 @@ impl BackendEngine {
             }
 
             let ui_open = UI_VISIBLE.load(Ordering::Relaxed);
-            let (live_rgb_active, thermal_rgb_active) = self.lighting_activity_flags();
+            let (live_rgb_active, animated_rgb_active, thermal_rgb_active) =
+                self.lighting_activity_flags();
+            let pending_static_rgb = live_rgb_active && self.has_pending_live_frame();
             let smart_fan_active = self.cooling_status.is_admin
                 && self.cooling_status.wmi_available
                 && self
@@ -520,7 +522,11 @@ impl BackendEngine {
             THERMAL_RGB_ACTIVE.store(thermal_rgb_active, Ordering::Relaxed);
             SMART_FAN_ACTIVE.store(smart_fan_active, Ordering::Relaxed);
 
-            let wait_ms = if live_rgb_active && !self.blackout_applied && !self.suspended {
+            let wait_ms = if live_rgb_active
+                && (animated_rgb_active || pending_static_rgb)
+                && !self.blackout_applied
+                && !self.suspended
+            {
                 12
             } else if ui_open || smart_fan_active {
                 150
@@ -799,11 +805,13 @@ impl BackendEngine {
                 }
             }
 
-            // 4. Live RGB streaming
-            let rgb_interval = if live_rgb_active {
+            // 4. Live RGB streaming (fast 35ms only for animated effects or pending static flush)
+            let rgb_interval = if live_rgb_active && pending_static_rgb {
+                Duration::ZERO
+            } else if live_rgb_active && animated_rgb_active {
                 Duration::from_millis(35)
             } else {
-                Duration::from_millis(500)
+                Duration::from_millis(1000)
             };
             if !self.suspended
                 && !self.blackout_applied
@@ -947,9 +955,10 @@ impl BackendEngine {
         self.keyboard_view_cache = None;
     }
 
-    pub(crate) fn lighting_activity_flags(&mut self) -> (bool, bool) {
+    pub(crate) fn lighting_activity_flags(&mut self) -> (bool, bool, bool) {
         let prof = self.config.active_profile_mut().clone();
         let mut any_live = false;
+        let mut any_animated = false;
         let mut any_thermal = false;
         for d in &mut self.driver_devices {
             let id = d.info().id;
@@ -969,8 +978,10 @@ impl BackendEngine {
                     LightingOverride::Hardware { .. } | LightingOverride::Off => return,
                 };
                 any_live = true;
-                if kind == EffectKind::Thermal {
-                    any_thermal = true;
+                match kind {
+                    EffectKind::Static | EffectKind::PerKey | EffectKind::Gradient | EffectKind::Off => {}
+                    EffectKind::Thermal => any_thermal = true,
+                    _ => any_animated = true,
                 }
             };
             let base = cfg.mode.as_ref().unwrap_or(&LightingOverride::Global);
@@ -979,7 +990,30 @@ impl BackendEngine {
                 consider(ov);
             }
         }
-        (any_live, any_thermal)
+        (any_live, any_animated, any_thermal)
+    }
+
+    /// True if at least one enabled software-lit device has not received a frame since the last
+    /// lighting configuration change.
+    pub(crate) fn has_pending_live_frame(&mut self) -> bool {
+        let prof = self.config.active_profile_mut().clone();
+        self.driver_devices.iter_mut().any(|d| {
+            let id = d.info().id;
+            if d.lighting().is_none() {
+                return false;
+            }
+            let Some(cfg) = prof.device_lighting.get(&id) else {
+                return false;
+            };
+            let base = cfg.mode.as_ref().unwrap_or(&LightingOverride::Global);
+            let has_sw = cfg.enabled
+                && (!matches!(base, LightingOverride::Hardware { .. })
+                    || cfg
+                        .zones
+                        .values()
+                        .any(|z| !matches!(z, LightingOverride::Hardware { .. })));
+            has_sw && !self.last_device_frame_at.contains_key(&id)
+        })
     }
 
     fn compute_thermal_rgb(&self) -> Rgb {

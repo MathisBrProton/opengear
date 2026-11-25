@@ -7,11 +7,13 @@ use opengear_asus::{AsusAuraDriver, AsusWmiRamBackend};
 use opengear_core::driver::Driver;
 use opengear_corsair::CorsairDriver;
 use opengear_hp::HpOmenDriver;
+use opengear_hyperx::HyperXDriver;
 use opengear_logitech::LogitechDriver;
 use opengear_mainboard::{PawnIoRamBackend, RamRgb, RamRgbDriver};
-use opengear_openrgb::OpenRgbRamBackend;
+use opengear_openrgb::{OpenRgbDriver, OpenRgbRamBackend};
 use opengear_platform::LaptopDisplayDriver;
 use opengear_razer::RazerDriver;
+use opengear_steelseries::SteelSeriesDriver;
 
 /// Device drivers discovered through the shared model (`opengear_core::driver`).
 ///
@@ -27,6 +29,9 @@ pub fn device_drivers() -> Vec<Box<dyn Driver>> {
         Box::new(HpOmenDriver),
         Box::new(LaptopDisplayDriver),
         Box::new(RazerDriver),
+        Box::new(SteelSeriesDriver),
+        Box::new(HyperXDriver),
+        Box::new(OpenRgbDriver),
     ]
 }
 
