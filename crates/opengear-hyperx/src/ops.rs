@@ -179,32 +179,30 @@ pub fn probe_and_refresh(
     let caps = def.caps();
     let mut buf = [0u8; 65];
     if caps.universal {
-        if st.univ_info.is_none() {
-            if let Some(n) = exchange_out(io, &univ_get_device_info_pkt(st.tio_slot), &mut buf) {
-                if let Some(info) = parse_univ_device_info(&buf[..n]) {
-                    st.univ_info = Some(info);
-                }
-            }
+        if st.univ_info.is_none()
+            && let Some(n) = exchange_out(io, &univ_get_device_info_pkt(st.tio_slot), &mut buf)
+            && let Some(info) = parse_univ_device_info(&buf[..n])
+        {
+            st.univ_info = Some(info);
         }
-        if caps.battery {
-            if let Some(n) = exchange_out(io, &univ_get_battery_pkt(st.tio_slot), &mut buf) {
-                if let Some((pct, chg)) = parse_univ_battery(&buf[..n]) {
-                    st.status.battery_pct = Some(pct);
-                    st.status.charging = chg;
-                    update_battery_hours(def, &mut st.status);
-                }
-            }
+        if caps.battery
+            && let Some(n) = exchange_out(io, &univ_get_battery_pkt(st.tio_slot), &mut buf)
+            && let Some((pct, chg)) = parse_univ_battery(&buf[..n])
+        {
+            st.status.battery_pct = Some(pct);
+            st.status.charging = chg;
+            update_battery_hours(def, &mut st.status);
         }
         return st.status.clone();
     }
 
     match def.family {
         ProtocolFamily::PulsefireDart | ProtocolFamily::PulsefireHasteWireless => {
-            if let Some(n) = exchange_out(io, &legacy_mouse_battery_req(), &mut buf) {
-                if let Some((pct, chg)) = parse_legacy_mouse_battery(&buf[..n]) {
-                    st.status.battery_pct = Some(pct);
-                    st.status.charging = chg;
-                }
+            if let Some(n) = exchange_out(io, &legacy_mouse_battery_req(), &mut buf)
+                && let Some((pct, chg)) = parse_legacy_mouse_battery(&buf[..n])
+            {
+                st.status.battery_pct = Some(pct);
+                st.status.charging = chg;
             }
         }
         ProtocolFamily::CloudAlphaWireless => {
@@ -250,12 +248,15 @@ pub fn probe_and_refresh(
             }
         }
         ProtocolFamily::CloudFlightWireless => {
-            if let Some(n) = exchange_out(io, &cloud_flight_wireless_battery_req(), &mut buf) {
-                if n >= 5 && buf[0] == 0x21 && buf[1] == 0xFF && buf[2] == 0x05 {
-                    let (pct, chg) = cloud_flight_battery_pct(buf[3], buf[4]);
-                    st.status.battery_pct = Some(pct);
-                    st.status.charging = Some(chg);
-                }
+            if let Some(n) = exchange_out(io, &cloud_flight_wireless_battery_req(), &mut buf)
+                && n >= 5
+                && buf[0] == 0x21
+                && buf[1] == 0xFF
+                && buf[2] == 0x05
+            {
+                let (pct, chg) = cloud_flight_battery_pct(buf[3], buf[4]);
+                st.status.battery_pct = Some(pct);
+                st.status.charging = Some(chg);
             }
         }
         ProtocolFamily::CloudIIICoreWireless => {
@@ -274,15 +275,17 @@ pub fn probe_and_refresh(
         }
         ProtocolFamily::CloudIIISWireless => {
             let mut resp = [0u8; 65];
-            if let Some(n) = exchange_out(io, &cloud3s_wireless_pkt(0x06, 0, 0), &mut resp) {
-                if n >= 7 && (resp[0] == 0x0C || resp[0] == 0x0D) {
-                    st.status.battery_pct = Some(resp[6].min(100));
-                }
+            if let Some(n) = exchange_out(io, &cloud3s_wireless_pkt(0x06, 0, 0), &mut resp)
+                && n >= 7
+                && (resp[0] == 0x0C || resp[0] == 0x0D)
+            {
+                st.status.battery_pct = Some(resp[6].min(100));
             }
-            if let Some(n) = exchange_out(io, &cloud3s_wireless_pkt(0x48, 0, 0), &mut resp) {
-                if n >= 7 && (resp[0] == 0x0C || resp[0] == 0x0D) {
-                    st.status.charging = Some(resp[6] == 1 || resp[6] == 2);
-                }
+            if let Some(n) = exchange_out(io, &cloud3s_wireless_pkt(0x48, 0, 0), &mut resp)
+                && n >= 7
+                && (resp[0] == 0x0C || resp[0] == 0x0D)
+            {
+                st.status.charging = Some(resp[6] == 1 || resp[6] == 2);
             }
         }
         ProtocolFamily::CloudStingerCoreWireless => {
@@ -291,11 +294,11 @@ pub fn probe_and_refresh(
                 .is_ok()
             {
                 std::thread::sleep(std::time::Duration::from_millis(20));
-                if let Ok(n) = io.get_feature(&mut buf) {
-                    if let Some((pct, chg)) = parse_cloud_stinger_core_wireless_battery(&buf[..n]) {
-                        st.status.battery_pct = Some(pct);
-                        st.status.charging = chg;
-                    }
+                if let Ok(n) = io.get_feature(&mut buf)
+                    && let Some((pct, chg)) = parse_cloud_stinger_core_wireless_battery(&buf[..n])
+                {
+                    st.status.battery_pct = Some(pct);
+                    st.status.charging = chg;
                 }
             }
         }
@@ -1490,25 +1493,24 @@ fn spawn_tio_children(
     let mut buf = [0u8; 64];
     for slot in 1..=3u8 {
         let mut io = SharedHxIo(shared.clone());
-        if let Some(n) = exchange_out(&mut io, &univ_get_device_info_pkt(slot), &mut buf) {
-            if let Some(info) = parse_univ_device_info(&buf[..n]) {
-                if info.primary_pid != 0 {
-                    let child_def = find_device(HP_HYPERX_VID, info.primary_pid).unwrap_or(def);
-                    let mut dev = HyperXDevice::new(
-                        child_def,
-                        Box::new(SharedHxIo(shared.clone())),
-                        format!("{path_tag}#slot{slot}"),
-                    );
-                    dev.set_tio_slot(
-                        slot,
-                        tio_child_name(info.primary_pid).map(ToOwned::to_owned),
-                        info,
-                    );
-                    let _ = dev.probe_on_discover();
-                    out.push(Box::new(dev));
-                    found_child = true;
-                }
-            }
+        if let Some(n) = exchange_out(&mut io, &univ_get_device_info_pkt(slot), &mut buf)
+            && let Some(info) = parse_univ_device_info(&buf[..n])
+            && info.primary_pid != 0
+        {
+            let child_def = find_device(HP_HYPERX_VID, info.primary_pid).unwrap_or(def);
+            let mut dev = HyperXDevice::new(
+                child_def,
+                Box::new(SharedHxIo(shared.clone())),
+                format!("{path_tag}#slot{slot}"),
+            );
+            dev.set_tio_slot(
+                slot,
+                tio_child_name(info.primary_pid).map(ToOwned::to_owned),
+                info,
+            );
+            let _ = dev.probe_on_discover();
+            out.push(Box::new(dev));
+            found_child = true;
         }
     }
     if !found_child {

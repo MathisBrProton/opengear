@@ -1731,10 +1731,10 @@ pub fn match_score(def: &HxDeviceDef, interface: i32, usage_page: u16, usage: u1
     } else if usage_page >= 0xFF00 {
         s += 5;
     }
-    if let Some(u) = def.usage {
-        if usage == u {
-            s += 10;
-        }
+    if let Some(u) = def.usage
+        && usage == u
+    {
+        s += 10;
     }
     s
 }
