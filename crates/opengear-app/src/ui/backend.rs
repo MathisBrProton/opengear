@@ -1,6 +1,6 @@
 use super::state::battery_is_charging;
 use super::{
-    BackendMsg, SMART_FAN_ACTIVE, SHUTDOWN_REQUESTED, THERMAL_RGB_ACTIVE, UI_VISIBLE, UserEvent,
+    BackendMsg, SHUTDOWN_REQUESTED, SMART_FAN_ACTIVE, THERMAL_RGB_ACTIVE, UI_VISIBLE, UserEvent,
     send_reply, should_use_live_rgb,
 };
 use crate::audio_ext::read_output_peak;
@@ -14,23 +14,27 @@ use crate::system_ext::{
 };
 use crate::tray_icon::tray_notify;
 use opengear_asus::{
-    AuraChannelKind, AuraHwMode, AuraMainboardController, AsusWmiCoolingStatus, DisplayInfo,
-    EneRamMode, FanChannelConfig, FanHeaderKind, FanPolicyMode, FanTempSource,
-    HardwareSensorsSnapshot, HpOmenStatus, LaptopBatteryInfo, OmenKeyboardType, OmenThermalMode,
-    PowerPlan, RamRgbStatus, SuperIoSnapshot, SystemTelemetry, TelemetryCollector,
-    apply_asus_wmi_curve, is_elevated, is_laptop_chassis, list_power_plans,
-    probe_asus_wmi_cooling, probe_hp_omen, probe_ram_rgb, read_asus_wmi_channel,
-    read_display_info, read_hp_omen_live_fans, read_laptop_battery, read_superio_snapshot,
-    restore_all_superio_fans_auto, set_display_refresh_rate, set_hp_omen_fan_level,
-    set_hp_omen_kb_backlight, set_hp_omen_kb_zones, set_hp_omen_max_fan,
-    set_hp_omen_thermal_mode, set_ram_modes_only,
+    AsusWmiCoolingStatus, AuraChannelKind, AuraHwMode, AuraMainboardController, EneRamMode,
+    FanChannelConfig, FanHeaderKind, FanPolicyMode, FanTempSource, HardwareSensorsSnapshot,
+    RamRgbStatus, SuperIoSnapshot, apply_asus_wmi_curve, probe_asus_wmi_cooling, probe_ram_rgb,
+    read_asus_wmi_channel, read_superio_snapshot, restore_all_superio_fans_auto,
+    set_ram_modes_only,
+};
+use opengear_hp::{
+    HpOmenStatus, OmenKeyboardType, OmenThermalMode, probe_hp_omen, read_hp_omen_live_fans,
+    set_hp_omen_fan_level, set_hp_omen_kb_backlight, set_hp_omen_kb_zones, set_hp_omen_max_fan,
+    set_hp_omen_thermal_mode,
+};
+use opengear_platform::{
+    DisplayInfo, LaptopBatteryInfo, PowerPlan, SystemTelemetry, TelemetryCollector, is_elevated,
+    is_laptop_chassis, list_power_plans, read_display_info, read_laptop_battery,
+    set_display_refresh_rate,
 };
 
 const SMART_FAN_FAILSAFE_TEMP_C: f32 = 100.0;
-use opengear_core::{
-    AppConfig, DetectedDevice, EffectKind, OperatingMode, Rgb, scan_hid_devices,
-};
-use opengear_corsair::{CorsairDevice, CorsairDeviceKind, K70_TKL_KEYS};
+use super::keyboard_view::KeyboardView;
+use opengear_core::{AppConfig, DetectedDevice, EffectKind, OperatingMode, Rgb, scan_hid_devices};
+use opengear_corsair::{CorsairDevice, CorsairDeviceKind};
 use opengear_input::{InputEngine, reset_held_state};
 use opengear_logitech::{LogitechHeadset, LogitechKeyboard, LogitechMouse};
 use serde_json::json;
@@ -90,6 +94,8 @@ pub(crate) struct BackendEngine {
     pub battery_alerted: std::collections::HashMap<String, u8>,
     pub ram_restore_modes: Option<Vec<(u8, u8)>>,
     pub is_laptop: bool,
+    /// Key editor geometry + active Windows layout, rebuilt every few seconds (see `keyboard_view`).
+    pub keyboard_view_cache: Option<(Instant, KeyboardView)>,
     pub hp_omen: HpOmenStatus,
     pub laptop_battery: LaptopBatteryInfo,
     pub laptop_display: DisplayInfo,
@@ -127,7 +133,11 @@ pub(crate) fn changed_vendors(old: &[(u16, u16, u16)], new: &[(u16, u16, u16)]) 
     v
 }
 
-pub(crate) fn battery_alert_step(last: Option<u8>, pct: u8, charging: bool) -> (Option<u8>, Option<u8>) {
+pub(crate) fn battery_alert_step(
+    last: Option<u8>,
+    pct: u8,
+    charging: bool,
+) -> (Option<u8>, Option<u8>) {
     if charging || pct > 20 {
         return (None, None);
     }
@@ -224,7 +234,10 @@ impl BackendEngine {
             FanHeaderKind::ALL
                 .iter()
                 .zip(&initial_cooling_channels)
-                .map(|(&h, read)| read.clone().unwrap_or_else(|| FanChannelConfig::default_for(h)))
+                .map(|(&h, read)| {
+                    read.clone()
+                        .unwrap_or_else(|| FanChannelConfig::default_for(h))
+                })
                 .collect()
         };
         let superio = if is_laptop {
@@ -280,6 +293,7 @@ impl BackendEngine {
             battery_alerted: std::collections::HashMap::new(),
             ram_restore_modes: None,
             is_laptop,
+            keyboard_view_cache: None,
             hp_omen,
             laptop_battery,
             laptop_display,
@@ -333,14 +347,16 @@ impl BackendEngine {
 
     fn wmi_restore_config(&self, idx: usize) -> Option<FanChannelConfig> {
         let header = FanHeaderKind::ALL.get(idx).copied()?;
-        Some(match self.initial_cooling_channels.get(idx).cloned().flatten() {
-            Some(original) => original,
-            None => {
-                let mut auto = FanChannelConfig::default_for(header);
-                auto.policy = FanPolicyMode::Standard;
-                auto
-            }
-        })
+        Some(
+            match self.initial_cooling_channels.get(idx).cloned().flatten() {
+                Some(original) => original,
+                None => {
+                    let mut auto = FanChannelConfig::default_for(header);
+                    auto.policy = FanPolicyMode::Standard;
+                    auto
+                }
+            },
+        )
     }
 
     pub(crate) fn sync_fan_marker(&mut self) {
@@ -369,10 +385,10 @@ impl BackendEngine {
                 let _ = dev.set_mode(OperatingMode::Hardware);
             }
         }
-        if let Some(aura) = self.asus_aura.as_mut() {
-            if aura.is_in_direct_mode() {
-                let _ = aura.set_all_hw_mode(self.aura_hw_mode, self.aura_hw_color, false);
-            }
+        if let Some(aura) = self.asus_aura.as_mut()
+            && aura.is_in_direct_mode()
+        {
+            let _ = aura.set_all_hw_mode(self.aura_hw_mode, self.aura_hw_color, false);
         }
         self.ram_restore();
         if self.omen_fan_modified && self.hp_omen.wmi_accessible {
@@ -382,13 +398,15 @@ impl BackendEngine {
 
         let mut remaining_wmi = Vec::new();
         for i in 0..self.smart_fan_last_duty.len() {
-            if self.smart_fan_last_duty[i].take().is_some() {
-                if let Some(cfg) = self.wmi_restore_config(i) {
-                    if let Err(e) = apply_asus_wmi_curve(&cfg) {
-                        error!("Restauration ventilateur {:?} impossible à la fermeture : {e}", cfg.header);
-                        remaining_wmi.push(cfg);
-                    }
-                }
+            if self.smart_fan_last_duty[i].take().is_some()
+                && let Some(cfg) = self.wmi_restore_config(i)
+                && let Err(e) = apply_asus_wmi_curve(&cfg)
+            {
+                error!(
+                    "Restauration ventilateur {:?} impossible à la fermeture : {e}",
+                    cfg.header
+                );
+                remaining_wmi.push(cfg);
             }
         }
         let superio_logs = restore_all_superio_fans_auto();
@@ -443,7 +461,8 @@ impl BackendEngine {
             let omen_sync_active = self.config.omen_sync_rgb
                 && self.hp_omen.wmi_accessible
                 && self.hp_omen.keyboard_type.is_software_rgb();
-            let live_rgb_active = should_use_live_rgb(&prof_snapshot, is_corsair_kb_sw, omen_sync_active);
+            let live_rgb_active =
+                should_use_live_rgb(&prof_snapshot, is_corsair_kb_sw, omen_sync_active);
             let thermal_rgb_active = prof_snapshot.silent_loop3_thermal_rgb;
             let smart_fan_active = self.cooling_status.is_admin
                 && self.cooling_status.wmi_available
@@ -481,68 +500,62 @@ impl BackendEngine {
             }
 
             // Deferred resume reconnect (non-blocking 1.2s USB settle after wake)
-            if let Some(at) = self.resume_reconnect_at {
-                if Instant::now() >= at {
-                    self.resume_reconnect_at = None;
-                    info!("Reconnexion matérielle post-veille");
-                    self.reconnect_all();
-                    self.reapply_runtime_state();
-                    if UI_VISIBLE.load(Ordering::Relaxed) {
-                        let st = self.full_state_json();
-                        let _ = proxy.send_event(UserEvent::EvalJs(format!(
-                            "window.__ogHotplug && window.__ogHotplug({st});"
-                        )));
-                    }
+            if let Some(at) = self.resume_reconnect_at
+                && Instant::now() >= at
+            {
+                self.resume_reconnect_at = None;
+                info!("Reconnexion matérielle post-veille");
+                self.reconnect_all();
+                self.reapply_runtime_state();
+                if UI_VISIBLE.load(Ordering::Relaxed) {
+                    let st = self.full_state_json();
+                    let _ = proxy.send_event(UserEvent::EvalJs(format!(
+                        "window.__ogHotplug && window.__ogHotplug({st});"
+                    )));
                 }
             }
 
             // 0. Foreground window check (auto-profile switching & anti-SOCD suspension)
-            let need_fg = self.config.auto_profile_switch
-                || self.config.active_profile_mut().socd.enabled;
+            let need_fg =
+                self.config.auto_profile_switch || self.config.active_profile_mut().socd.enabled;
             if need_fg && last_fg_check.elapsed() >= Duration::from_millis(750) {
                 let fg = get_foreground_exe_name();
                 if fg != self.foreground_app {
                     self.foreground_app = fg.clone();
                     let mut state_changed = false;
 
-                    if self.config.auto_profile_switch {
-                        if let Some(ref exe) = fg {
-                            if exe != "opengear.exe" {
-                                let matched = self
-                                    .config
-                                    .profiles
-                                    .iter()
-                                    .find(|pr| {
-                                        pr.linked_apps
-                                            .iter()
-                                            .any(|a| a.eq_ignore_ascii_case(exe))
-                                    })
-                                    .map(|pr| pr.name.clone());
+                    if self.config.auto_profile_switch
+                        && let Some(ref exe) = fg
+                        && exe != "opengear.exe"
+                    {
+                        let matched = self
+                            .config
+                            .profiles
+                            .iter()
+                            .find(|pr| pr.linked_apps.iter().any(|a| a.eq_ignore_ascii_case(exe)))
+                            .map(|pr| pr.name.clone());
 
-                                if let Some(target_prof) = matched {
-                                    if self.config.active_profile != target_prof {
-                                        if !self.auto_switched {
-                                            self.manual_profile_name =
-                                                self.config.active_profile.clone();
-                                        }
-                                        self.config.active_profile = target_prof;
-                                        self.auto_switched = true;
-                                        self.sync_input_rules();
-                                        state_changed = true;
-                                    }
-                                } else if self.auto_switched
-                                    && self
-                                        .config
-                                        .profiles
-                                        .iter()
-                                        .any(|pr| pr.name == self.manual_profile_name)
-                                {
-                                    self.config.active_profile = self.manual_profile_name.clone();
-                                    self.auto_switched = false;
-                                    self.sync_input_rules();
-                                    state_changed = true;
+                        if let Some(target_prof) = matched {
+                            if self.config.active_profile != target_prof {
+                                if !self.auto_switched {
+                                    self.manual_profile_name = self.config.active_profile.clone();
                                 }
+                                self.config.active_profile = target_prof;
+                                self.auto_switched = true;
+                                self.sync_input_rules();
+                                state_changed = true;
                             }
+                        } else if self.auto_switched
+                            && self
+                                .config
+                                .profiles
+                                .iter()
+                                .any(|pr| pr.name == self.manual_profile_name)
+                        {
+                            self.config.active_profile = self.manual_profile_name.clone();
+                            self.auto_switched = false;
+                            self.sync_input_rules();
+                            state_changed = true;
                         }
                     }
 
@@ -622,10 +635,8 @@ impl BackendEngine {
                     let raw_t = measured.unwrap_or(SMART_FAN_FAILSAFE_TEMP_C);
                     let hyst = ch.hysteresis_c as f32;
                     let ref_t = self.smart_fan_ref_temp[idx];
-                    let eff_t = if raw_t >= ref_t {
-                        self.smart_fan_ref_temp[idx] = raw_t;
-                        raw_t
-                    } else if raw_t <= ref_t - hyst {
+                    // Rising: follow immediately. Falling: only once below the hysteresis band.
+                    let eff_t = if raw_t >= ref_t || raw_t <= ref_t - hyst {
                         self.smart_fan_ref_temp[idx] = raw_t;
                         raw_t
                     } else {
@@ -659,9 +670,7 @@ impl BackendEngine {
             }
 
             // 2. Fallback hotplug poll only when UI is open (WM_DEVICECHANGE handles tray mode)
-            if ui_open
-                && !self.suspended
-                && last_hotplug_check.elapsed() >= Duration::from_secs(30)
+            if ui_open && !self.suspended && last_hotplug_check.elapsed() >= Duration::from_secs(30)
             {
                 if self.check_hotplug() {
                     let st = self.full_state_json();
@@ -741,9 +750,7 @@ impl BackendEngine {
             if !self.suspended {
                 let blackout = self.blackout_lock || self.blackout_idle;
                 if blackout {
-                    if !self.blackout_applied
-                        || last_rgb_push.elapsed() >= Duration::from_secs(1)
-                    {
+                    if !self.blackout_applied || last_rgb_push.elapsed() >= Duration::from_secs(1) {
                         self.push_blackout_frame();
                         last_rgb_push = Instant::now();
                     }
@@ -873,6 +880,29 @@ impl BackendEngine {
         }
     }
 
+    /// Key editor view, rebuilt when older than 2 s so a Windows layout switch (Alt+Maj), a
+    /// keyboard plugged in or a setting change shows up without an explicit refresh.
+    pub(crate) fn keyboard_view(&mut self) -> &KeyboardView {
+        let stale = self
+            .keyboard_view_cache
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(2));
+        if stale {
+            let view = KeyboardView::build(&self.config, &self.corsair_devices, self.is_laptop);
+            self.keyboard_view_cache = Some((Instant::now(), view));
+        }
+        &self
+            .keyboard_view_cache
+            .as_ref()
+            .expect("cache filled above")
+            .1
+    }
+
+    /// Forget the cached view after a change that affects it.
+    pub(crate) fn invalidate_keyboard_view(&mut self) {
+        self.keyboard_view_cache = None;
+    }
+
     fn push_live_rgb_frame(&mut self) {
         let t = self.start_time.elapsed().as_secs_f32();
         let prof = self.config.active_profile_mut().clone();
@@ -883,10 +913,10 @@ impl BackendEngine {
         let any_strip_rgb = prof.enable_rgb || prof.sync_asus_aura || omen_sync;
 
         let needs_ambilight = any_strip_rgb && prof.rgb.kind == EffectKind::Ambilight;
-        if needs_ambilight {
-            if let Some(frame) = sample_ambilight_screen(self.last_ambilight.as_ref()) {
-                self.last_ambilight = Some(frame);
-            }
+        if needs_ambilight
+            && let Some(frame) = sample_ambilight_screen(self.last_ambilight.as_ref())
+        {
+            self.last_ambilight = Some(frame);
         }
 
         let needs_audio_vis = any_strip_rgb && prof.rgb.kind == EffectKind::AudioVisualizer;
@@ -904,15 +934,11 @@ impl BackendEngine {
                 if !self.input_engine.is_running() {
                     let _ = self.input_engine.start();
                 }
-                self.input_engine
-                    .recent_key_ripples(1.1)
+                let ripples = self.input_engine.recent_key_ripples(1.1);
+                let view = self.keyboard_view();
+                ripples
                     .into_iter()
-                    .filter_map(|(kname, age)| {
-                        K70_TKL_KEYS
-                            .iter()
-                            .find(|k| k.id.eq_ignore_ascii_case(&kname))
-                            .map(|k| (k.norm_x(), k.norm_y(), age))
-                    })
+                    .filter_map(|(kname, age)| view.norm_center(&kname).map(|(x, y)| (x, y, age)))
                     .collect()
             } else {
                 Vec::new()
@@ -988,17 +1014,16 @@ impl BackendEngine {
             let sensors = self.latest_sensors();
             if let (Some(ch_idx), Some(aura)) =
                 (prof.silent_loop3_argb_channel, self.asus_aura.as_mut())
+                && let Some(ch) = aura.info.channels.get(ch_idx)
             {
-                if let Some(ch) = aura.info.channels.get(ch_idx) {
-                    let temp = sensors
-                        .cpu_temp_c
-                        .or(self.last_tel.gpu.edge_temp_c)
-                        .or(self.last_tel.gpu.hotspot_temp_c)
-                        .unwrap_or(35.0 + self.last_tel.cpu_usage_pct * 0.5);
-                    let col = thermal_rgb(temp);
-                    let leds = vec![col; ch.led_count];
-                    let _ = aura.send_channel_direct(ch_idx, &leds);
-                }
+                let temp = sensors
+                    .cpu_temp_c
+                    .or(self.last_tel.gpu.edge_temp_c)
+                    .or(self.last_tel.gpu.hotspot_temp_c)
+                    .unwrap_or(35.0 + self.last_tel.cpu_usage_pct * 0.5);
+                let col = thermal_rgb(temp);
+                let leds = vec![col; ch.led_count];
+                let _ = aura.send_channel_direct(ch_idx, &leds);
             }
         }
 
@@ -1097,7 +1122,11 @@ impl BackendEngine {
     pub(crate) fn reapply_runtime_state(&mut self) {
         let (sync, thermal, counts) = {
             let p = self.config.active_profile_mut();
-            (p.sync_asus_aura, p.silent_loop3_thermal_rgb, p.asus_argb_led_counts.clone())
+            (
+                p.sync_asus_aura,
+                p.silent_loop3_thermal_rgb,
+                p.asus_argb_led_counts.clone(),
+            )
         };
         let blackout = self.blackout_lock || self.blackout_idle;
         if let Some(aura) = self.asus_aura.as_mut() {
@@ -1109,10 +1138,11 @@ impl BackendEngine {
             }
         }
         self.blackout_applied = false;
-        if self.profile_needs_input_engine() && !self.input_engine.is_running() {
-            if let Err(e) = self.input_engine.start() {
-                error!("Moteur clavier non redémarré : {e}");
-            }
+        if self.profile_needs_input_engine()
+            && !self.input_engine.is_running()
+            && let Err(e) = self.input_engine.start()
+        {
+            error!("Moteur clavier non redémarré : {e}");
         }
     }
 
@@ -1127,7 +1157,12 @@ impl BackendEngine {
 
         let (enable_rgb, sync_aura, thermal, counts) = {
             let p = self.config.active_profile_mut();
-            (p.enable_rgb, p.sync_asus_aura, p.silent_loop3_thermal_rgb, p.asus_argb_led_counts.clone())
+            (
+                p.enable_rgb,
+                p.sync_asus_aura,
+                p.silent_loop3_thermal_rgb,
+                p.asus_argb_led_counts.clone(),
+            )
         };
         if !enable_rgb {
             for dev in &mut self.corsair_devices {
@@ -1187,9 +1222,7 @@ impl BackendEngine {
     }
 
     fn ram_blackout(&mut self) {
-        if self.ram_restore_modes.is_some()
-            || self.ram_rgb.ene_modules.is_empty()
-            || !is_elevated()
+        if self.ram_restore_modes.is_some() || self.ram_rgb.ene_modules.is_empty() || !is_elevated()
         {
             return;
         }
@@ -1250,10 +1283,10 @@ impl BackendEngine {
                 }
             }
         }
-        if !(sync || thermal) {
-            if let Some(aura) = self.asus_aura.as_mut() {
-                let _ = aura.set_all_hw_mode(self.aura_hw_mode, self.aura_hw_color, false);
-            }
+        if !(sync || thermal)
+            && let Some(aura) = self.asus_aura.as_mut()
+        {
+            let _ = aura.set_all_hw_mode(self.aura_hw_mode, self.aura_hw_color, false);
         }
         self.ram_restore();
         if self.omen_kb_restore_backlight.take() == Some(true)
@@ -1293,13 +1326,14 @@ impl BackendEngine {
             };
             if self.laptop_display.supported_hz.contains(&60)
                 && self.laptop_display.current_hz != Some(60)
+                && set_display_refresh_rate(60).is_ok()
             {
-                if set_display_refresh_rate(60).is_ok() {
-                    self.laptop_display = read_display_info();
-                }
+                self.laptop_display = read_display_info();
             }
             if self.hp_omen.wmi_accessible {
-                if set_hp_omen_thermal_mode(self.hp_omen.thermal_version, OmenThermalMode::Cool).is_ok() {
+                if set_hp_omen_thermal_mode(self.hp_omen.thermal_version, OmenThermalMode::Cool)
+                    .is_ok()
+                {
                     self.hp_omen.thermal_mode = OmenThermalMode::Cool;
                 }
                 if self.hp_omen.keyboard_type.is_software_rgb()
@@ -1315,16 +1349,17 @@ impl BackendEngine {
                 .ac_saved_hz
                 .take()
                 .or_else(|| self.laptop_display.supported_hz.iter().copied().max());
-            if let Some(hz) = restore_hz {
-                if self.laptop_display.current_hz != Some(hz) && set_display_refresh_rate(hz).is_ok() {
-                    self.laptop_display = read_display_info();
-                }
+            if let Some(hz) = restore_hz
+                && self.laptop_display.current_hz != Some(hz)
+                && set_display_refresh_rate(hz).is_ok()
+            {
+                self.laptop_display = read_display_info();
             }
             if self.hp_omen.wmi_accessible {
-                if let Some(mode) = self.ac_saved_thermal.take() {
-                    if set_hp_omen_thermal_mode(self.hp_omen.thermal_version, mode).is_ok() {
-                        self.hp_omen.thermal_mode = mode;
-                    }
+                if let Some(mode) = self.ac_saved_thermal.take()
+                    && set_hp_omen_thermal_mode(self.hp_omen.thermal_version, mode).is_ok()
+                {
+                    self.hp_omen.thermal_mode = mode;
                 }
                 if self.hp_omen.keyboard_type.is_software_rgb()
                     && self.ac_saved_kb_backlight.take() == Some(true)
@@ -1348,27 +1383,27 @@ impl BackendEngine {
         }
         let mut readings: Vec<(String, String, u8, bool)> = Vec::new();
         for m in &self.logi_mice {
-            if let Some(b) = &m.info.battery {
-                if let Some(pct) = b.percent {
-                    readings.push((
-                        format!("mouse-{:04X}-{}", m.info.pid, m.info.device_index),
-                        m.info.name.clone(),
-                        pct,
-                        battery_is_charging(b.state),
-                    ));
-                }
+            if let Some(b) = &m.info.battery
+                && let Some(pct) = b.percent
+            {
+                readings.push((
+                    format!("mouse-{:04X}-{}", m.info.pid, m.info.device_index),
+                    m.info.name.clone(),
+                    pct,
+                    battery_is_charging(b.state),
+                ));
             }
         }
         for k in &self.logi_keyboards {
-            if let Some(b) = &k.info.battery {
-                if let Some(pct) = b.percent {
-                    readings.push((
-                        format!("kb-{:04X}-{}", k.info.pid, k.info.device_index),
-                        k.info.name.clone(),
-                        pct,
-                        battery_is_charging(b.state),
-                    ));
-                }
+            if let Some(b) = &k.info.battery
+                && let Some(pct) = b.percent
+            {
+                readings.push((
+                    format!("kb-{:04X}-{}", k.info.pid, k.info.device_index),
+                    k.info.name.clone(),
+                    pct,
+                    battery_is_charging(b.state),
+                ));
             }
         }
         for (key, name, pct, charging) in readings {
@@ -1397,10 +1432,10 @@ impl BackendEngine {
     }
 
     pub(crate) fn visible_apps_cached(&mut self) -> Vec<String> {
-        if let Some((at, apps)) = &self.visible_apps_cache {
-            if at.elapsed() < Duration::from_secs(5) {
-                return apps.clone();
-            }
+        if let Some((at, apps)) = &self.visible_apps_cache
+            && at.elapsed() < Duration::from_secs(5)
+        {
+            return apps.clone();
         }
         let apps = list_visible_apps();
         self.visible_apps_cache = Some((Instant::now(), apps.clone()));
@@ -1465,10 +1500,6 @@ pub(crate) fn thermal_rgb(temp_c: f32) -> Rgb {
         )
     } else {
         let f = (t - 66.0) / 19.0;
-        Rgb::new(
-            255,
-            (185.0 - f * 155.0) as u8,
-            (30.0 + f * 40.0) as u8,
-        )
+        Rgb::new(255, (185.0 - f * 155.0) as u8, (30.0 + f * 40.0) as u8)
     }
 }

@@ -17,9 +17,7 @@ mod win_audio {
     use super::SystemAudioState;
     use anyhow::Context;
     use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
-    use windows::Win32::Media::Audio::Endpoints::{
-        IAudioEndpointVolume, IAudioMeterInformation,
-    };
+    use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioMeterInformation};
     use windows::Win32::Media::Audio::{
         EDataFlow, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture, eConsole, eRender,
     };
@@ -36,9 +34,13 @@ mod win_audio {
         fn enter() -> Option<Self> {
             let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
             if hr.is_ok() {
-                Some(Self { should_uninit: true })
+                Some(Self {
+                    should_uninit: true,
+                })
             } else if hr == RPC_E_CHANGED_MODE {
-                Some(Self { should_uninit: false })
+                Some(Self {
+                    should_uninit: false,
+                })
             } else {
                 None
             }

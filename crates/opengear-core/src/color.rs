@@ -10,12 +10,24 @@ pub struct Rgb {
 
 impl Rgb {
     pub const BLACK: Self = Self { r: 0, g: 0, b: 0 };
-    pub const WHITE: Self = Self { r: 255, g: 255, b: 255 };
+    pub const WHITE: Self = Self {
+        r: 255,
+        g: 255,
+        b: 255,
+    };
     pub const RED: Self = Self { r: 255, g: 0, b: 0 };
     pub const GREEN: Self = Self { r: 0, g: 255, b: 0 };
     pub const BLUE: Self = Self { r: 0, g: 0, b: 255 };
-    pub const CYAN: Self = Self { r: 0, g: 210, b: 255 };
-    pub const CORSAIR_YELLOW: Self = Self { r: 255, g: 200, b: 0 };
+    pub const CYAN: Self = Self {
+        r: 0,
+        g: 210,
+        b: 255,
+    };
+    pub const CORSAIR_YELLOW: Self = Self {
+        r: 255,
+        g: 200,
+        b: 0,
+    };
 
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
@@ -184,7 +196,8 @@ impl RgbEffectConfig {
                 let dy = (norm_y - 0.5) * 0.45;
                 let angle = dy.atan2(dx).to_degrees();
                 let dist = (dx * dx + dy * dy).sqrt();
-                let hue = (angle + dist * 240.0 - dir * t_sec * 140.0 * self.speed).rem_euclid(360.0);
+                let hue =
+                    (angle + dist * 240.0 - dir * t_sec * 140.0 * self.speed).rem_euclid(360.0);
                 Rgb::from_hsv(hue, 1.0, 1.0)
             }
             EffectKind::SpectrumCycle => {
@@ -193,11 +206,15 @@ impl RgbEffectConfig {
             }
             EffectKind::Breathing => {
                 let phase = (t_sec * 2.0 * self.speed).sin() * 0.5 + 0.5;
-                self.primary.lerp(self.secondary, phase).scale(0.15 + 0.85 * phase)
+                self.primary
+                    .lerp(self.secondary, phase)
+                    .scale(0.15 + 0.85 * phase)
             }
             EffectKind::ColorWave => {
                 let dir = if self.reverse { -1.0 } else { 1.0 };
-                let wave = ((norm_x * std::f32::consts::TAU) - dir * t_sec * 3.0 * self.speed).sin() * 0.5 + 0.5;
+                let wave =
+                    ((norm_x * std::f32::consts::TAU) - dir * t_sec * 3.0 * self.speed).sin() * 0.5
+                        + 0.5;
                 self.primary.lerp(self.secondary, wave)
             }
             EffectKind::Visor => {

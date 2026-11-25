@@ -1,0 +1,16 @@
+[package]
+name = "opengear-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vendor-neutral Windows services: COM WMI client, UAC elevation, power plans, system telemetry, laptop battery & display"
+
+[dependencies]
+anyhow.workspace = true
+opengear-core.workspace = true
+serde.workspace = true
+tracing.workspace = true
+libloading.workspace = true
+libc.workspace = true
+windows.workspace = true
+windows-sys.workspace = true

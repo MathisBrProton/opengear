@@ -1489,8 +1489,10 @@ dependencies = [
  "opengear-asus",
  "opengear-core",
  "opengear-corsair",
+ "opengear-hp",
  "opengear-input",
  "opengear-logitech",
+ "opengear-platform",
  "serde",
  "serde_json",
  "tao",
@@ -1510,6 +1512,7 @@ dependencies = [
  "libc",
  "libloading",
  "opengear-core",
+ "opengear-platform",
  "serde",
  "sha2",
  "thiserror 2.0.21",
@@ -1545,6 +1548,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "opengear-hp"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "opengear-core",
+ "opengear-platform",
+ "serde",
+]
+
+[[package]]
 name = "opengear-input"
 version = "0.4.0"
 dependencies = [
@@ -1564,6 +1577,20 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "opengear-platform"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "libloading",
+ "opengear-core",
+ "serde",
+ "tracing",
+ "windows",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

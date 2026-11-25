@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
-pub(crate) enum WmiVal {
+pub enum WmiVal {
     Null,
     String(String),
     U8(u8),
@@ -22,14 +22,14 @@ pub(crate) enum WmiVal {
 }
 
 impl WmiVal {
-    pub(crate) fn as_str(&self) -> Option<&str> {
+    pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(s) => Some(s.as_str()),
             _ => None,
         }
     }
 
-    pub(crate) fn as_bool(&self) -> Option<bool> {
+    pub fn as_bool(&self) -> Option<bool> {
         match *self {
             Self::Bool(b) => Some(b),
             Self::U8(v) => Some(v != 0),
@@ -40,7 +40,7 @@ impl WmiVal {
         }
     }
 
-    pub(crate) fn as_u64(&self) -> Option<u64> {
+    pub fn as_u64(&self) -> Option<u64> {
         match *self {
             Self::U8(v) => Some(v as u64),
             Self::U32(v) => Some(v as u64),
@@ -52,7 +52,7 @@ impl WmiVal {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn as_i64(&self) -> Option<i64> {
+    pub fn as_i64(&self) -> Option<i64> {
         match *self {
             Self::U8(v) => Some(v as i64),
             Self::U32(v) => Some(v as i64),
@@ -63,7 +63,7 @@ impl WmiVal {
         }
     }
 
-    pub(crate) fn as_f64(&self) -> Option<f64> {
+    pub fn as_f64(&self) -> Option<f64> {
         match *self {
             Self::F64(v) => Some(v),
             Self::U8(v) => Some(v as f64),
@@ -75,21 +75,21 @@ impl WmiVal {
         }
     }
 
-    pub(crate) fn as_bytes(&self) -> Option<&[u8]> {
+    pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Bytes(b) => Some(b.as_slice()),
             _ => None,
         }
     }
 
-    pub(crate) fn as_ints(&self) -> Option<&[i64]> {
+    pub fn as_ints(&self) -> Option<&[i64]> {
         match self {
             Self::Ints(v) => Some(v.as_slice()),
             _ => None,
         }
     }
 
-    pub(crate) fn as_object(&self) -> Option<&BTreeMap<String, WmiVal>> {
+    pub fn as_object(&self) -> Option<&BTreeMap<String, WmiVal>> {
         match self {
             Self::Object(m) => Some(m),
             _ => None,
@@ -99,7 +99,7 @@ impl WmiVal {
 
 /// Resolve an executable or DLL inside `%SystemRoot%\System32` (never searching `PATH` or CWD).
 #[cfg(windows)]
-pub(crate) fn system32_path(file: &str) -> PathBuf {
+pub fn system32_path(file: &str) -> PathBuf {
     use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
     let mut buf = [0u16; 260];
     let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
@@ -112,7 +112,7 @@ pub(crate) fn system32_path(file: &str) -> PathBuf {
 }
 
 #[cfg(windows)]
-pub(crate) fn load_system32_library(dll_name: &str) -> Result<libloading::Library> {
+pub fn load_system32_library(dll_name: &str) -> Result<libloading::Library> {
     let full = system32_path(dll_name);
     unsafe { libloading::Library::new(&full) }
         .with_context(|| format!("Impossible de charger {}", full.display()))
@@ -145,19 +145,22 @@ mod imp {
     const RPC_C_AUTHN_WINNT: u32 = 10;
     const RPC_C_AUTHZ_NONE: u32 = 0;
 
-    pub(crate) struct ComGuard {
+    pub struct ComGuard {
         uninit: bool,
     }
 
     impl ComGuard {
-        pub(crate) fn new() -> Result<Self> {
+        pub fn new() -> Result<Self> {
             let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
             if hr == S_OK || hr == S_FALSE {
                 Ok(Self { uninit: true })
             } else if hr == RPC_E_CHANGED_MODE {
                 Ok(Self { uninit: false })
             } else {
-                Err(anyhow::anyhow!("CoInitializeEx failed: 0x{:08X}", hr.0 as u32))
+                Err(anyhow::anyhow!(
+                    "CoInitializeEx failed: 0x{:08X}",
+                    hr.0 as u32
+                ))
             }
         }
     }
@@ -170,21 +173,29 @@ mod imp {
         }
     }
 
-    pub(crate) struct WmiConn {
+    pub struct WmiConn {
         // Declared BEFORE `_com` so `IWbemServices::Release()` runs prior to `CoUninitialize()`.
         services: IWbemServices,
         _com: ComGuard,
     }
 
     impl WmiConn {
-        pub(crate) fn connect(namespace: &str) -> Result<Self> {
+        pub fn connect(namespace: &str) -> Result<Self> {
             let com = ComGuard::new()?;
             let locator: IWbemLocator =
                 unsafe { CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER) }
                     .context("CoCreateInstance(WbemLocator)")?;
             let ns = BSTR::from(namespace);
             let services = unsafe {
-                locator.ConnectServer(&ns, &BSTR::new(), &BSTR::new(), &BSTR::new(), 0, &BSTR::new(), None)
+                locator.ConnectServer(
+                    &ns,
+                    &BSTR::new(),
+                    &BSTR::new(),
+                    &BSTR::new(),
+                    0,
+                    &BSTR::new(),
+                    None,
+                )
             }
             .with_context(|| format!("ConnectServer({namespace})"))?;
 
@@ -202,10 +213,13 @@ mod imp {
             }
             .context("CoSetProxyBlanket")?;
 
-            Ok(Self { services, _com: com })
+            Ok(Self {
+                services,
+                _com: com,
+            })
         }
 
-        pub(crate) fn query(&self, wql: &str) -> Result<Vec<BTreeMap<String, WmiVal>>> {
+        pub fn query(&self, wql: &str) -> Result<Vec<BTreeMap<String, WmiVal>>> {
             let lang = BSTR::from("WQL");
             let q = BSTR::from(wql);
             let enumerator = unsafe {
@@ -265,20 +279,20 @@ mod imp {
             Ok(wv.as_str().map(|s| s.to_string()))
         }
 
-        pub(crate) fn first_instance_path(&self, class_name: &str) -> Result<Option<String>> {
+        pub fn first_instance_path(&self, class_name: &str) -> Result<Option<String>> {
             self.instance_path_by_wql(&format!("SELECT * FROM {class_name}"))
         }
 
-        pub(crate) fn first_active_instance_path(&self, class_name: &str) -> Result<Option<String>> {
-            if let Ok(Some(path)) =
-                self.instance_path_by_wql(&format!("SELECT * FROM {class_name} WHERE Active = TRUE"))
+        pub fn first_active_instance_path(&self, class_name: &str) -> Result<Option<String>> {
+            if let Ok(Some(path)) = self
+                .instance_path_by_wql(&format!("SELECT * FROM {class_name} WHERE Active = TRUE"))
             {
                 return Ok(Some(path));
             }
             self.first_instance_path(class_name)
         }
 
-        pub(crate) fn exec_method(
+        pub fn exec_method(
             &self,
             object_path: &str,
             class_name: &str,
@@ -348,59 +362,35 @@ mod imp {
             }
         }
 
-        /// Execute an HP BIOS WMI command via `hpqBIntM::<method_name>` with a `hpqBDataIn` packet.
-        pub(crate) fn exec_hpq_bios_int(
+        /// Call `class_name::method_name` on `object_path`, passing a freshly spawned instance of
+        /// `embedded_class` (filled with `embedded_props`) as the object parameter `param_name`.
+        /// `WmiVal::Bytes` values are sent as `VT_ARRAY | VT_UI1`. Vendor-specific wrappers (e.g.
+        /// HP `hpqBIntM`) live in their vendor crate on top of this method.
+        pub fn exec_method_with_object(
             &self,
+            object_path: &str,
+            class_name: &str,
             method_name: &str,
-            command: u32,
-            command_type: u32,
-            data: &[u8],
-        ) -> Result<(u32, Vec<u8>)> {
-            let object_path = self
-                .first_instance_path("hpqBIntM")?
-                .context("Instance hpqBIntM introuvable dans root\\wmi")?;
-
-            // 1. Spawn hpqBDataIn embedded object
-            let mut data_cls: Option<IWbemClassObject> = None;
-            let data_cls_bstr = BSTR::from("hpqBDataIn");
-            unsafe {
-                self.services.GetObject(
-                    &data_cls_bstr,
-                    WBEM_GENERIC_FLAG_TYPE(0),
-                    None,
-                    Some(&mut data_cls),
-                    None,
-                )
+            param_name: &str,
+            embedded_class: &str,
+            embedded_props: &[(&str, WmiVal)],
+        ) -> Result<BTreeMap<String, WmiVal>> {
+            let embedded_cls = self.class_object(embedded_class)?;
+            let embedded = unsafe { embedded_cls.SpawnInstance(0) }
+                .with_context(|| format!("SpawnInstance({embedded_class})"))?;
+            for (name, val) in embedded_props {
+                let v = match val {
+                    WmiVal::Bytes(b) => bytes_to_variant(b)?,
+                    other => wmi_to_variant(other),
+                };
+                put_variant(&embedded, name, v)?;
             }
-            .context("GetObject(hpqBDataIn)")?;
-            let data_cls = data_cls.context("Classe hpqBDataIn absente")?;
-            let in_data = unsafe { data_cls.SpawnInstance(0) }.context("SpawnInstance(hpqBDataIn)")?;
 
-            put_variant(&in_data, "Sign", bytes_to_variant(b"SECU")?)?;
-            put_variant(&in_data, "Command", VARIANT::from(command as i32))?;
-            put_variant(&in_data, "CommandType", VARIANT::from(command_type as i32))?;
-            put_variant(&in_data, "Size", VARIANT::from(data.len() as i32))?;
-            put_variant(&in_data, "hpqBData", bytes_to_variant(data)?)?;
-
-            // 2. Spawn InParameters for hpqBIntM::<method_name>
-            let mut intm_cls: Option<IWbemClassObject> = None;
-            let intm_cls_bstr = BSTR::from("hpqBIntM");
-            unsafe {
-                self.services.GetObject(
-                    &intm_cls_bstr,
-                    WBEM_GENERIC_FLAG_TYPE(0),
-                    None,
-                    Some(&mut intm_cls),
-                    None,
-                )
-            }
-            .context("GetObject(hpqBIntM)")?;
-            let intm_cls = intm_cls.context("Classe hpqBIntM absente")?;
-
+            let cls_obj = self.class_object(class_name)?;
             let meth_bstr = BSTR::from(method_name);
             let mut in_sig: Option<IWbemClassObject> = None;
             unsafe {
-                intm_cls.GetMethod(
+                cls_obj.GetMethod(
                     PCWSTR(meth_bstr.as_ptr()),
                     0,
                     &mut in_sig,
@@ -408,13 +398,16 @@ mod imp {
                 )
             }
             .with_context(|| format!("GetMethod({method_name})"))?;
-            let in_sig = in_sig.context("InParameters manquants sur hpqBIntM")?;
+            let in_sig = in_sig.with_context(|| {
+                format!("InParameters manquants sur {class_name}::{method_name}")
+            })?;
             let in_params = unsafe { in_sig.SpawnInstance(0) }?;
+            let unk: IUnknown = embedded
+                .cast()
+                .with_context(|| format!("Cast {embedded_class} -> IUnknown"))?;
+            put_variant(&in_params, param_name, unknown_to_variant(unk))?;
 
-            let unk: IUnknown = in_data.cast().context("Cast hpqBDataIn -> IUnknown")?;
-            put_variant(&in_params, "InData", unknown_to_variant(unk))?;
-
-            let obj_bstr = BSTR::from(object_path.as_str());
+            let obj_bstr = BSTR::from(object_path);
             let mut out_obj: Option<IWbemClassObject> = None;
             unsafe {
                 self.services.ExecMethod(
@@ -428,23 +421,26 @@ mod imp {
                 )
             }
             .with_context(|| format!("ExecMethod({method_name})"))?;
+            let out_obj = out_obj.with_context(|| {
+                format!("Aucun résultat renvoyé par {class_name}::{method_name}")
+            })?;
+            read_object_props(&out_obj)
+        }
 
-            let out_obj = out_obj.context("Aucun résultat OutData renvoyé par hpqBIntM")?;
-            let props = read_object_props(&out_obj)?;
-            let out_data = props
-                .get("OutData")
-                .and_then(|v| v.as_object())
-                .context("Propriété OutData absente ou non-objet")?;
-            let rw_rc = out_data
-                .get("rwReturnCode")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(u32::MAX as u64) as u32;
-            let bytes = out_data
-                .get("Data")
-                .and_then(|v| v.as_bytes())
-                .map(|b| b.to_vec())
-                .unwrap_or_default();
-            Ok((rw_rc, bytes))
+        fn class_object(&self, class_name: &str) -> Result<IWbemClassObject> {
+            let mut cls: Option<IWbemClassObject> = None;
+            let name = BSTR::from(class_name);
+            unsafe {
+                self.services.GetObject(
+                    &name,
+                    WBEM_GENERIC_FLAG_TYPE(0),
+                    None,
+                    Some(&mut cls),
+                    None,
+                )
+            }
+            .with_context(|| format!("GetObject({class_name})"))?;
+            cls.with_context(|| format!("Classe WMI {class_name} absente"))
         }
     }
 
@@ -601,12 +597,11 @@ mod imp {
             if vt == VT_NULL || vt == VT_EMPTY {
                 WmiVal::Null
             } else if vt == VT_UNKNOWN {
-                if let Some(unk) = raw.Anonymous.punkVal.as_ref() {
-                    if let Ok(obj) = unk.cast::<IWbemClassObject>() {
-                        if let Ok(map) = read_object_props(&obj) {
-                            return WmiVal::Object(map);
-                        }
-                    }
+                if let Some(unk) = raw.Anonymous.punkVal.as_ref()
+                    && let Ok(obj) = unk.cast::<IWbemClassObject>()
+                    && let Ok(map) = read_object_props(&obj)
+                {
+                    return WmiVal::Object(map);
                 }
                 WmiVal::Null
             } else if vt == VT_BSTR {
@@ -658,4 +653,4 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub(crate) use imp::WmiConn;
+pub use imp::WmiConn;

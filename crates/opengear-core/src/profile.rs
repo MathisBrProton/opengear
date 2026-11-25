@@ -1,5 +1,6 @@
 use crate::color::RgbEffectConfig;
-use crate::device::PollingRate;
+use crate::device::{KeyboardLayout, PollingRate};
+use crate::keyboard::FormFactor;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -24,10 +25,7 @@ pub enum KeyAction {
     /// Disable the key completely
     Disable,
     /// Multi-step macro sequence
-    Macro {
-        name: String,
-        steps: Vec<MacroStep>,
-    },
+    Macro { name: String, steps: Vec<MacroStep> },
     /// Send a text string
     Text { text: String, delay_ms: u32 },
 }
@@ -155,7 +153,12 @@ fn default_omen_zones() -> [String; 4] {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub active_profile: String,
-    pub use_azerty_labels: bool,
+    /// Keyboard drawn in the key editor when no driver provides an exact map (`None` = auto).
+    #[serde(default)]
+    pub keyboard_form_factor: Option<FormFactor>,
+    /// Physical standard (ANSI / ISO…) of that keyboard (`None` = guessed from the Windows layout).
+    #[serde(default)]
+    pub keyboard_standard: Option<KeyboardLayout>,
     #[serde(default = "default_true")]
     pub minimize_to_tray: bool,
     #[serde(default)]
@@ -197,7 +200,8 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             active_profile: "Default".to_string(),
-            use_azerty_labels: true,
+            keyboard_form_factor: None,
+            keyboard_standard: None,
             minimize_to_tray: true,
             start_minimized: false,
             auto_profile_switch: true,
@@ -226,7 +230,9 @@ impl AppConfig {
         let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) else {
             return Self::legacy_config_path();
         };
-        let path = PathBuf::from(appdata).join("OpenGear").join(CONFIG_FILE_NAME);
+        let path = PathBuf::from(appdata)
+            .join("OpenGear")
+            .join(CONFIG_FILE_NAME);
         if !path.exists() {
             let legacy = Self::legacy_config_path();
             if legacy.exists() {
@@ -241,7 +247,11 @@ impl AppConfig {
                     );
                     return legacy;
                 }
-                tracing::info!("Profils migrés de {} vers {}", legacy.display(), path.display());
+                tracing::info!(
+                    "Profils migrés de {} vers {}",
+                    legacy.display(),
+                    path.display()
+                );
             }
         }
         path
@@ -249,10 +259,10 @@ impl AppConfig {
 
     /// Historical location: next to the executable.
     pub fn legacy_config_path() -> PathBuf {
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                return dir.join(CONFIG_FILE_NAME);
-            }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            return dir.join(CONFIG_FILE_NAME);
         }
         PathBuf::from(CONFIG_FILE_NAME)
     }
@@ -303,12 +313,13 @@ impl AppConfig {
     pub fn save(&self, path: &Path) -> Result<()> {
         use std::io::Write;
 
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
-        let content = toml::to_string_pretty(self).context("Sérialisation TOML des profils impossible")?;
+        let content =
+            toml::to_string_pretty(self).context("Sérialisation TOML des profils impossible")?;
 
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".tmp");
@@ -371,8 +382,12 @@ mod tests {
             p.rgb.per_key.insert(42, Rgb::new(1, 2, 3));
             p.asus_argb_led_counts.insert(1, 60);
         }
-        cfg.save(&path).expect("config with per-key colors must save");
-        assert!(!dir.join(format!("{CONFIG_FILE_NAME}.tmp")).exists(), "temp file left behind");
+        cfg.save(&path)
+            .expect("config with per-key colors must save");
+        assert!(
+            !dir.join(format!("{CONFIG_FILE_NAME}.tmp")).exists(),
+            "temp file left behind"
+        );
 
         let back = AppConfig::load(&path).unwrap();
         let p = &back.profiles[0];
@@ -387,9 +402,12 @@ mod tests {
         let path = dir.join(CONFIG_FILE_NAME);
         let mut cfg = AppConfig::default();
         cfg.save(&path).unwrap();
-        cfg.use_azerty_labels = false;
+        cfg.keyboard_form_factor = Some(FormFactor::Compact75);
+        cfg.keyboard_standard = Some(KeyboardLayout::Iso);
         cfg.save(&path).unwrap();
-        assert!(!AppConfig::load(&path).unwrap().use_azerty_labels);
+        let back = AppConfig::load(&path).unwrap();
+        assert_eq!(back.keyboard_form_factor, Some(FormFactor::Compact75));
+        assert_eq!(back.keyboard_standard, Some(KeyboardLayout::Iso));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -412,6 +430,25 @@ mod tests {
             fs::read_to_string(backups[0].path()).unwrap(),
             "this is = not [valid toml"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_azerty_flag_is_ignored_and_keyboard_is_auto() {
+        let dir = temp_dir("legacy-azerty");
+        let path = dir.join(CONFIG_FILE_NAME);
+        let body = toml::to_string_pretty(&AppConfig::default()).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "use_azerty_labels = true
+{body}"
+            ),
+        )
+        .unwrap();
+        let cfg = AppConfig::load(&path).unwrap();
+        assert_eq!(cfg.keyboard_form_factor, None);
+        assert_eq!(cfg.keyboard_standard, None);
         let _ = fs::remove_dir_all(dir);
     }
 

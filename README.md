@@ -56,6 +56,8 @@ avancés ; le mode Expert donne accès à tout. Chaque changement de configurati
 | Logitech G | Souris LIGHTSPEED (PRO X Superlight…), claviers RGB, casque PRO X | HID++ 2.0 |
 | ASUS | Contrôleur AURA (`0B05:19AF`), ventilateurs via ASUS WMI, RAM ENE | USB HID, WMI, SMBus |
 | Nuvoton | SuperIO NCT679x (PWM direct) | PawnIO LpcIO |
+| HP | PC portables OMEN / Victus : modes thermiques, ventilateurs, puissance GPU, clavier 4 zones | BIOS WMI `hpqBIntM` |
+| Tout clavier | Remappage, macros, Snap Tap, avec la vraie disposition Windows (AZERTY, QWERTZ, UK…) et le format choisi (100 %, TKL, 75 %, 65 %, 60 %, ANSI/ISO) | Hook Windows |
 
 Le scanner (`opengear scan`) liste aussi les appareils détectés mais pas encore pilotés.
 
@@ -83,6 +85,7 @@ opengear corsair pollrate 4000      # 125 … 8000 Hz
 opengear logitech info              # souris / casque Logitech
 opengear asus info                  # contrôleur Aura
 opengear cooling status             # ventilateurs & capteurs
+opengear hp-probe                   # portable : GPU, batterie, écran, HP OMEN (lecture seule)
 ```
 
 `opengear --help` et `opengear <commande> --help` donnent la liste complète.
@@ -104,13 +107,18 @@ cargo test --workspace -- --ignored   # tests qui nécessitent du vrai matériel
 
 | Crate | Rôle |
 |---|---|
-| `opengear-core` | Types partagés : couleurs et moteur d'effets, profils TOML, scanner HID |
+| `opengear-core` | Types partagés sans marque : couleurs et moteur d'effets, profils TOML, scanner HID, géométrie clavier |
+| `opengear-platform` | Services Windows sans marque : client WMI COM, élévation, plans d'alimentation, télémétrie, batterie / écran, disposition clavier |
 | `opengear-corsair` | Driver Corsair Bragi v2 (RGB par touche, polling, profils flash HWP) |
 | `opengear-logitech` | HID++ 2.0 (DPI, batterie, profils et macros embarqués, égaliseur) |
-| `opengear-asus` | Aura USB, RAM ENE, ventilateurs (WMI, SuperIO), capteurs, télémétrie |
+| `opengear-asus` | Aura USB, RAM ENE, ventilateurs (WMI, SuperIO), capteurs |
+| `opengear-hp` | HP OMEN / Victus via le BIOS WMI `hpqBIntM` |
 | `opengear-input` | Hook clavier bas niveau : remap, macros, SOCD, anti-rebond |
 | `opengear-app` | Exécutable : CLI + interface WebView2 (`ui/` embarqué), tray, installeur |
 | `tools/opengear-setup` | Installeur autonome (`OpenGear-Setup.exe`) |
+
+Règles d'architecture (une marque = un crate, aucune disposition câblée dans l'UI…) : voir
+[`AGENTS.md`](AGENTS.md), vérifiées par `crates/opengear-app/tests/architecture.rs`.
 
 L'interface (`crates/opengear-app/ui/`) est en HTML / CSS / JavaScript sans dépendance,
 embarquée dans l'exécutable et reliée au backend Rust par IPC.

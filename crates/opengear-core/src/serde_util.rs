@@ -16,7 +16,8 @@ pub mod usize_key_map {
         V: Serialize,
         S: Serializer,
     {
-        let as_strings: BTreeMap<String, &V> = map.iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let as_strings: BTreeMap<String, &V> =
+            map.iter().map(|(k, v)| (k.to_string(), v)).collect();
         as_strings.serialize(serializer)
     }
 

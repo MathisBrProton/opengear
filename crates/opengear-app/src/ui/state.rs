@@ -62,7 +62,10 @@ impl BackendEngine {
             .as_ref()
             .map(|r| r.current_hz)
             .unwrap_or(1000);
-        if let Some(bm) = self.local_assets.find_battery_model(m.info.pid, &m.info.name) {
+        if let Some(bm) = self
+            .local_assets
+            .find_battery_model(m.info.pid, &m.info.name)
+        {
             Some(BatteryPowerModel::from_params(
                 pct,
                 bm.capacity_mwh,
@@ -85,11 +88,7 @@ impl BackendEngine {
                 .iter()
                 .enumerate()
                 .map(|(idx, &rpm)| FanRpmReading {
-                    name: names
-                        .get(idx)
-                        .copied()
-                        .unwrap_or("Ventilo")
-                        .to_string(),
+                    name: names.get(idx).copied().unwrap_or("Ventilo").to_string(),
                     rpm,
                 })
                 .collect();
@@ -173,7 +172,11 @@ impl BackendEngine {
         })
     }
 
-    pub(crate) fn serialize_corsair(&self, dev: &opengear_corsair::CorsairDevice, idx: usize) -> Value {
+    pub(crate) fn serialize_corsair(
+        &self,
+        dev: &opengear_corsair::CorsairDevice,
+        idx: usize,
+    ) -> Value {
         let i = &dev.info;
         let hwp_profiles: Vec<Value> = i
             .hwp_profiles
@@ -345,24 +348,6 @@ impl BackendEngine {
             })
             .collect();
 
-        let keys_layout: Vec<Value> = opengear_corsair::K70_TKL_KEYS
-            .iter()
-            .map(|k| {
-                json!({
-                    "id": k.id,
-                    "qwerty": k.label_qwerty,
-                    "azerty": k.label_azerty,
-                    "led_index": k.led_index,
-                    "x": k.x,
-                    "y": k.y,
-                    "w": k.width,
-                    "h": k.height,
-                    "norm_x": k.norm_x(),
-                    "norm_y": k.norm_y(),
-                })
-            })
-            .collect();
-
         let effects: Vec<Value> = EffectKind::ALL
             .iter()
             .map(|&e| json!({ "id": format!("{:?}", e), "label": e.label() }))
@@ -397,7 +382,6 @@ impl BackendEngine {
                 "description": description,
             })).collect::<Vec<_>>(),
             "bindable_keys": ALL_BINDABLE_KEYS,
-            "keys_layout": keys_layout,
             "effects": effects,
             "hwp_lighting_kinds": HwpLightingKind::ALL_SUPPORTED.iter().map(|&k| json!({
                 "id": k.id(),
@@ -412,7 +396,12 @@ impl BackendEngine {
 
     pub(crate) fn full_state_json(&mut self) -> Value {
         let active_profile = self.config.active_profile_mut().clone();
-        let profile_names: Vec<String> = self.config.profiles.iter().map(|p| p.name.clone()).collect();
+        let profile_names: Vec<String> = self
+            .config
+            .profiles
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
 
         let corsair_list: Vec<Value> = self
             .corsair_devices
@@ -633,7 +622,6 @@ impl BackendEngine {
             "config": {
                 "active_profile": self.config.active_profile,
                 "profiles": profile_names,
-                "use_azerty_labels": self.config.use_azerty_labels,
                 "profile": {
                     "name": active_profile.name,
                     "polling_rate_hz": active_profile.polling_rate.hz(),
@@ -661,7 +649,7 @@ impl BackendEngine {
             },
             "input_running": self.input_engine.is_running(),
             "bindable_keys": catalog["bindable_keys"],
-            "keys_layout": catalog["keys_layout"],
+            "keyboard": self.keyboard_view().to_json(),
             "effects": catalog["effects"],
             "hwp_lighting_kinds": catalog["hwp_lighting_kinds"],
             "aura_modes": catalog["aura_modes"],

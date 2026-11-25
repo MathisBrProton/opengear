@@ -9,13 +9,9 @@ use crate::tray_icon::{
     create_windows_shortcuts, is_autostart_enabled, release_single_instance, set_autostart_enabled,
 };
 use opengear_asus::{
-    AuraHwMode, CurvePoint, EneRamMode, FanPolicyMode, FanTempSource, OmenGpuPowerLevel,
-    OmenThermalMode, apply_asus_wmi_curve, apply_ram_rgb, install_official_pawnio, is_elevated,
-    list_power_plans, probe_hp_omen, probe_ram_rgb, read_asus_wmi_channel, read_display_info,
-    read_laptop_battery, read_superio_snapshot, relaunch_as_admin, restore_superio_fan_auto,
-    set_active_power_plan, set_display_brightness, set_display_refresh_rate,
-    set_hp_omen_fan_level, set_hp_omen_gpu_power, set_hp_omen_kb_backlight,
-    set_hp_omen_kb_zones, set_hp_omen_max_fan, set_hp_omen_thermal_mode, set_superio_fan_pwm,
+    AuraHwMode, CurvePoint, EneRamMode, FanPolicyMode, FanTempSource, apply_asus_wmi_curve,
+    apply_ram_rgb, install_official_pawnio, probe_ram_rgb, read_asus_wmi_channel,
+    read_superio_snapshot, restore_superio_fan_auto, set_superio_fan_pwm,
 };
 use opengear_core::{
     EffectKind, KeyAction, KeyboardProfile, MacroStep, OperatingMode, PollingRate, Rgb, SocdPair,
@@ -28,10 +24,19 @@ use opengear_corsair::proto::{
 use opengear_corsair::{
     CorsairDevice, CorsairDeviceKind, HwpLightingKind, list_corsair_backups, restore_corsair_backup,
 };
+use opengear_hp::{
+    OmenGpuPowerLevel, OmenThermalMode, probe_hp_omen, set_hp_omen_fan_level,
+    set_hp_omen_gpu_power, set_hp_omen_kb_backlight, set_hp_omen_kb_zones, set_hp_omen_max_fan,
+    set_hp_omen_thermal_mode,
+};
 use opengear_input::movement_keys_effective;
 use opengear_logitech::{
     KeyboardRgbMode, LodLevel, LogitechHeadset, LogitechMouse, MouseButtonAction, MouseLedMode,
     OnboardMacroStep, OnboardMode, backup_path_for, list_sector_backups,
+};
+use opengear_platform::{
+    is_elevated, list_power_plans, read_display_info, read_laptop_battery, relaunch_as_admin,
+    set_active_power_plan, set_display_brightness, set_display_refresh_rate,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -53,7 +58,7 @@ fn undo_label_for(cmd: &str) -> Option<&'static str> {
         "set_sync_all" => "Synchronisation de l'éclairage",
         "switch_profile" => "Changement de profil",
         "create_profile" => "Création de profil",
-        "set_azerty" => "Disposition du clavier",
+        "set_keyboard_layout" => "Format du clavier",
         "input_set_winlock" => "Verrou de la touche Windows",
         "input_set_binding" => "Assignation de touche",
         "input_remove_binding" => "Suppression d'assignation",
@@ -97,12 +102,7 @@ pub(crate) fn check_import_size(raw: &str) -> std::result::Result<(), String> {
 }
 
 impl BackendEngine {
-    pub(crate) fn spawn_async_job(
-        &self,
-        id: u64,
-        cmd: &str,
-        tx: mpsc::Sender<BackendMsg>,
-    ) {
+    pub(crate) fn spawn_async_job(&self, id: u64, cmd: &str, tx: mpsc::Sender<BackendMsg>) {
         let cmd_owned = cmd.to_string();
         std::thread::Builder::new()
             .name(format!("opengear-async-{cmd}"))
@@ -207,7 +207,10 @@ impl BackendEngine {
             .ok_or_else(|| "Casque Logitech non connecté".to_string())
     }
 
-    fn logi_kb_mut(&mut self, p: &Value) -> std::result::Result<&mut opengear_logitech::LogitechKeyboard, String> {
+    fn logi_kb_mut(
+        &mut self,
+        p: &Value,
+    ) -> std::result::Result<&mut opengear_logitech::LogitechKeyboard, String> {
         let idx = p["device_index"].as_u64().unwrap_or(0) as usize;
         self.logi_keyboards
             .get_mut(idx)
@@ -224,7 +227,11 @@ impl BackendEngine {
             "set_rgb_config" => p["commit"].as_bool().unwrap_or(true),
             _ => true,
         };
-        let Some(label) = (if record_undo { undo_label_for(cmd) } else { None }) else {
+        let Some(label) = (if record_undo {
+            undo_label_for(cmd)
+        } else {
+            None
+        }) else {
             return self.handle_cmd_inner(cmd, p, proxy);
         };
         let before = self.config.clone();
@@ -332,10 +339,16 @@ impl BackendEngine {
                 summary.push(format!(
                     "Ventilateurs : profil {} sur {applied} canal(aux){}",
                     policy.asus_profile_str(),
-                    if failed > 0 { format!(", {failed} refusé(s) par le BIOS") } else { String::new() }
+                    if failed > 0 {
+                        format!(", {failed} refusé(s) par le BIOS")
+                    } else {
+                        String::new()
+                    }
                 ));
             } else {
-                summary.push("Ventilateurs inchangés (droits administrateur + ASUS WMI requis)".into());
+                summary.push(
+                    "Ventilateurs inchangés (droits administrateur + ASUS WMI requis)".into(),
+                );
             }
         }
 
@@ -428,7 +441,11 @@ impl BackendEngine {
             push(
                 "asus_wmi",
                 "Interface ventilateurs ASUS (WMI)",
-                if self.cooling_status.wmi_available { "ok" } else { "warn" },
+                if self.cooling_status.wmi_available {
+                    "ok"
+                } else {
+                    "warn"
+                },
                 self.cooling_status.message.clone(),
                 Value::Null,
             );
@@ -465,10 +482,17 @@ impl BackendEngine {
             json!({ "label": "Relancer la détection", "cmd": "reconnect_all", "payload": {} }),
         );
 
-        if !self.is_laptop && !self.hp_omen.detected {
-            if let Some(err) = &self.asus_err {
-                push("aura", "Contrôleur ASUS Aura", "warn", format!("Non connecté : {err}"), Value::Null);
-            }
+        if !self.is_laptop
+            && !self.hp_omen.detected
+            && let Some(err) = &self.asus_err
+        {
+            push(
+                "aura",
+                "Contrôleur ASUS Aura",
+                "warn",
+                format!("Non connecté : {err}"),
+                Value::Null,
+            );
         }
 
         let needs_engine = {
@@ -483,7 +507,11 @@ impl BackendEngine {
         push(
             "input",
             "Moteur clavier (remaps, macros, SOCD)",
-            if !needs_engine || engine_ok { "ok" } else { "error" },
+            if !needs_engine || engine_ok {
+                "ok"
+            } else {
+                "error"
+            },
             if engine_ok {
                 "Actif.".into()
             } else if needs_engine {
@@ -499,7 +527,13 @@ impl BackendEngine {
         );
 
         match &self.config_warning {
-            Some(w) => push("config", "Fichier de profils", "error", w.clone(), Value::Null),
+            Some(w) => push(
+                "config",
+                "Fichier de profils",
+                "error",
+                w.clone(),
+                Value::Null,
+            ),
             None => push(
                 "config",
                 "Fichier de profils",
@@ -516,35 +550,75 @@ impl BackendEngine {
         use std::fmt::Write as _;
         let mut r = String::new();
         let s = &self.telemetry.static_info;
-        let _ = writeln!(r, "=== Rapport de diagnostic OpenGear {} ===", env!("CARGO_PKG_VERSION"));
-        let _ = writeln!(r, "Carte mère : {} (BIOS {})", s.motherboard, s.bios_version);
-        let _ = writeln!(r, "CPU : {} | GPU : {} | RAM : {:.0} Go", s.cpu_name, s.gpu_name, s.ram_total_gb);
-        let _ = writeln!(r, "Administrateur : {} | Mode UI : {}", is_elevated(), self.config.ui_mode);
+        let _ = writeln!(
+            r,
+            "=== Rapport de diagnostic OpenGear {} ===",
+            env!("CARGO_PKG_VERSION")
+        );
+        let _ = writeln!(
+            r,
+            "Carte mère : {} (BIOS {})",
+            s.motherboard, s.bios_version
+        );
+        let _ = writeln!(
+            r,
+            "CPU : {} | GPU : {} | RAM : {:.0} Go",
+            s.cpu_name, s.gpu_name, s.ram_total_gb
+        );
+        let _ = writeln!(
+            r,
+            "Administrateur : {} | Mode UI : {}",
+            is_elevated(),
+            self.config.ui_mode
+        );
         let _ = writeln!(r, "\n--- Appareils pilotés ---");
         for d in &self.corsair_devices {
             let _ = writeln!(
                 r,
                 "Corsair {} ({:04X}:{:04X}, {}) FW {} | mode {:?} | report {} o | FlashTap 0xF5 = {}",
-                d.info.product_name, d.info.vid, d.info.pid, d.info.kind.label(),
-                d.info.firmware_version, d.info.mode, d.info.out_report_len, d.info.flashtap_probe
+                d.info.product_name,
+                d.info.vid,
+                d.info.pid,
+                d.info.kind.label(),
+                d.info.firmware_version,
+                d.info.mode,
+                d.info.out_report_len,
+                d.info.flashtap_probe
             );
         }
         for m in &self.logi_mice {
             let _ = writeln!(
                 r,
                 "Logitech souris {} ({:04X}:{:04X}, slot 0x{:02X}) HID++ v{} FW {}",
-                m.info.name, m.info.vid, m.info.pid, m.info.device_index,
-                m.info.proto_version, m.info.firmware.join(" / ")
+                m.info.name,
+                m.info.vid,
+                m.info.pid,
+                m.info.device_index,
+                m.info.proto_version,
+                m.info.firmware.join(" / ")
             );
         }
         for k in &self.logi_keyboards {
-            let _ = writeln!(r, "Logitech clavier {} ({:04X}:{:04X})", k.info.name, k.info.vid, k.info.pid);
+            let _ = writeln!(
+                r,
+                "Logitech clavier {} ({:04X}:{:04X})",
+                k.info.name, k.info.vid, k.info.pid
+            );
         }
         for h in &self.logi_headsets {
-            let _ = writeln!(r, "Logitech casque {} ({:04X}:{:04X})", h.info.name, h.info.vid, h.info.pid);
+            let _ = writeln!(
+                r,
+                "Logitech casque {} ({:04X}:{:04X})",
+                h.info.name, h.info.vid, h.info.pid
+            );
         }
         if self.hp_omen.detected {
-            let zones: Vec<String> = self.hp_omen.zone_colors.iter().map(|c| c.to_hex()).collect();
+            let zones: Vec<String> = self
+                .hp_omen
+                .zone_colors
+                .iter()
+                .map(|c| c.to_hex())
+                .collect();
             let _ = writeln!(
                 r,
                 "HP OMEN {} ({}) wmi={} thermal_v={} mode={:?} max_fan={} fans={} rpms={:?} kbd={} backlight={} zones={:?}",
@@ -583,10 +657,20 @@ impl BackendEngine {
         }
         match &self.asus_aura {
             Some(a) => {
-                let _ = writeln!(r, "ASUS Aura {} FW {} | {} canaux", a.info.product_name, a.info.firmware_version, a.info.channels.len());
+                let _ = writeln!(
+                    r,
+                    "ASUS Aura {} FW {} | {} canaux",
+                    a.info.product_name,
+                    a.info.firmware_version,
+                    a.info.channels.len()
+                );
             }
             None if !self.is_laptop && !self.hp_omen.detected => {
-                let _ = writeln!(r, "ASUS Aura : {}", self.asus_err.as_deref().unwrap_or("absent"));
+                let _ = writeln!(
+                    r,
+                    "ASUS Aura : {}",
+                    self.asus_err.as_deref().unwrap_or("absent")
+                );
             }
             None => {}
         }
@@ -611,7 +695,11 @@ impl BackendEngine {
                 );
             }
         }
-        let _ = writeln!(r, "\n--- Fin du journal ({}) ---", crate::app_log::log_path().display());
+        let _ = writeln!(
+            r,
+            "\n--- Fin du journal ({}) ---",
+            crate::app_log::log_path().display()
+        );
         let _ = writeln!(r, "{}", crate::app_log::tail(60));
         mask_user_profile(&r)
     }
@@ -631,7 +719,8 @@ impl BackendEngine {
             "open_test_window" => {
                 #[cfg(windows)]
                 {
-                    let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+                    let sys_root =
+                        std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
                     let notepad = PathBuf::from(sys_root).join("System32").join("notepad.exe");
                     let path = std::env::temp_dir().join("opengear_test.txt");
                     let _ = std::fs::write(
@@ -659,10 +748,10 @@ impl BackendEngine {
                 }))
             }
             "set_ui_prefs" => {
-                if let Some(m) = p["ui_mode"].as_str() {
-                    if m == "simple" || m == "expert" {
-                        self.config.ui_mode = m.to_string();
-                    }
+                if let Some(m) = p["ui_mode"].as_str()
+                    && (m == "simple" || m == "expert")
+                {
+                    self.config.ui_mode = m.to_string();
                 }
                 if let Some(done) = p["onboarding_done"].as_bool() {
                     self.config.onboarding_done = done;
@@ -674,7 +763,8 @@ impl BackendEngine {
                 let preset = p["preset"].as_str().ok_or("Préréglage manquant")?;
                 let summary = self.apply_preset(preset)?;
                 let mut st = self.full_state_json();
-                st["last_action_msg"] = json!(format!("Préréglage appliqué — {}", summary.join(" · ")));
+                st["last_action_msg"] =
+                    json!(format!("Préréglage appliqué — {}", summary.join(" · ")));
                 Ok(st)
             }
             "undo_last" => {
@@ -725,7 +815,9 @@ impl BackendEngine {
                 self.config
                     .save(&self.config_path)
                     .map_err(|e| e.to_string())?;
-                Ok(json!({ "message": format!("Profils sauvegardés dans {}", self.config_path.display()) }))
+                Ok(
+                    json!({ "message": format!("Profils sauvegardés dans {}", self.config_path.display()) }),
+                )
             }
             "switch_profile" => {
                 let name = p["name"].as_str().ok_or("Nom de profil manquant")?;
@@ -750,8 +842,14 @@ impl BackendEngine {
                 self.persist_config();
                 Ok(self.full_state_json())
             }
-            "set_azerty" => {
-                self.config.use_azerty_labels = p["enabled"].as_bool().unwrap_or(true);
+            "set_keyboard_layout" => {
+                if let Some(f) = p["form_factor"].as_str() {
+                    self.config.keyboard_form_factor = opengear_core::FormFactor::from_id(f);
+                }
+                if let Some(s) = p["standard"].as_str() {
+                    self.config.keyboard_standard = super::keyboard_view::parse_standard(s);
+                }
+                self.invalidate_keyboard_view();
                 self.persist_config();
                 Ok(self.full_state_json())
             }
@@ -793,20 +891,20 @@ impl BackendEngine {
                     if let Some(en) = p["enable_rgb"].as_bool() {
                         prof.enable_rgb = en;
                     }
-                    if let Some(k) = p["kind"].as_str() {
-                        if let Some(ek) = parse_effect_kind(k) {
-                            prof.rgb.kind = ek;
-                        }
+                    if let Some(k) = p["kind"].as_str()
+                        && let Some(ek) = parse_effect_kind(k)
+                    {
+                        prof.rgb.kind = ek;
                     }
-                    if let Some(hex) = p["primary"].as_str() {
-                        if let Some(c) = Rgb::from_hex(hex) {
-                            prof.rgb.primary = c;
-                        }
+                    if let Some(hex) = p["primary"].as_str()
+                        && let Some(c) = Rgb::from_hex(hex)
+                    {
+                        prof.rgb.primary = c;
                     }
-                    if let Some(hex) = p["secondary"].as_str() {
-                        if let Some(c) = Rgb::from_hex(hex) {
-                            prof.rgb.secondary = c;
-                        }
+                    if let Some(hex) = p["secondary"].as_str()
+                        && let Some(c) = Rgb::from_hex(hex)
+                    {
+                        prof.rgb.secondary = c;
                     }
                     if let Some(sp) = p["speed"].as_f64() {
                         prof.rgb.speed = (sp as f32).clamp(0.1, 5.0);
@@ -935,33 +1033,38 @@ impl BackendEngine {
                     _ => PROP_ESPORTS_BACKLIGHT_COLOR,
                 };
                 let dev = self.corsair_mut(p)?;
-                dev.set_indicator_color(prop, col).map_err(|e| e.to_string())?;
+                dev.set_indicator_color(prop, col)
+                    .map_err(|e| e.to_string())?;
                 Ok(self.full_state_json())
             }
             "corsair_mouse_set_dpi_stage" => {
                 let stage = p["stage"].as_u64().unwrap_or(0) as u8;
                 let dpi = p["dpi"].as_u64().unwrap_or(800) as u16;
                 let dev = self.corsair_mut(p)?;
-                dev.set_mouse_dpi_stage(stage, dpi).map_err(|e| e.to_string())?;
+                dev.set_mouse_dpi_stage(stage, dpi)
+                    .map_err(|e| e.to_string())?;
                 Ok(self.full_state_json())
             }
             "corsair_mouse_set_active_stage" => {
                 let stage = p["stage"].as_u64().unwrap_or(0) as u8;
                 let dev = self.corsair_mut(p)?;
-                dev.set_mouse_active_stage(stage).map_err(|e| e.to_string())?;
+                dev.set_mouse_active_stage(stage)
+                    .map_err(|e| e.to_string())?;
                 Ok(self.full_state_json())
             }
             "corsair_mouse_set_lift_height" => {
                 let level = p["level"].as_u64().unwrap_or(1) as u8;
                 let dev = self.corsair_mut(p)?;
-                dev.set_mouse_lift_height(level).map_err(|e| e.to_string())?;
+                dev.set_mouse_lift_height(level)
+                    .map_err(|e| e.to_string())?;
                 Ok(self.full_state_json())
             }
             "corsair_headset_set_sidetone" => {
                 let pct = p["percent"].as_u64().unwrap_or(0) as u8;
                 let muted = p["muted"].as_bool().unwrap_or(pct == 0);
                 let dev = self.corsair_mut(p)?;
-                dev.set_headset_sidetone(pct, muted).map_err(|e| e.to_string())?;
+                dev.set_headset_sidetone(pct, muted)
+                    .map_err(|e| e.to_string())?;
                 Ok(self.full_state_json())
             }
             "corsair_reload_hwp" => {
@@ -972,7 +1075,10 @@ impl BackendEngine {
             "corsair_flash_hwp_lighting" => {
                 let prof_idx = p["profile_index"].as_u64().unwrap_or(0) as usize;
                 let kind = HwpLightingKind::parse_id(p["kind"].as_str().unwrap_or("StaticColor"));
-                let primary = p["primary"].as_str().and_then(Rgb::from_hex).unwrap_or(Rgb::CYAN);
+                let primary = p["primary"]
+                    .as_str()
+                    .and_then(Rgb::from_hex)
+                    .unwrap_or(Rgb::CYAN);
                 let secondary = p["secondary"]
                     .as_str()
                     .and_then(Rgb::from_hex)
@@ -1011,7 +1117,10 @@ impl BackendEngine {
             }
             "asus_set_hw_mode" => {
                 let mode_str = p["mode"].as_str().unwrap_or("Static");
-                let color = p["color"].as_str().and_then(Rgb::from_hex).unwrap_or(self.aura_hw_color);
+                let color = p["color"]
+                    .as_str()
+                    .and_then(Rgb::from_hex)
+                    .unwrap_or(self.aura_hw_color);
                 let commit = p["commit"].as_bool().unwrap_or(false);
                 let mode = parse_aura_mode(mode_str);
                 self.aura_hw_mode = mode;
@@ -1028,7 +1137,10 @@ impl BackendEngine {
             }
             "asus_set_shutdown_mode" => {
                 let mode_str = p["mode"].as_str().unwrap_or("Off");
-                let color = p["color"].as_str().and_then(Rgb::from_hex).unwrap_or(Rgb::BLACK);
+                let color = p["color"]
+                    .as_str()
+                    .and_then(Rgb::from_hex)
+                    .unwrap_or(Rgb::BLACK);
                 let mode = parse_aura_mode(mode_str);
                 self.aura_shutdown_mode = mode;
                 self.aura_shutdown_color = color;
@@ -1081,7 +1193,7 @@ impl BackendEngine {
                 self.ram_rgb.last_color = color.to_hex();
                 self.ram_rgb.last_speed = speed;
                 for m in self.ram_rgb.ene_modules.iter_mut() {
-                    if target_addr.map_or(true, |a| a == m.address_7bit) {
+                    if target_addr.is_none_or(|a| a == m.address_7bit) {
                         m.current_mode = mode as u8;
                     }
                 }
@@ -1159,12 +1271,11 @@ impl BackendEngine {
                 }
                 if let Some(btns) = p["buttons"].as_array() {
                     for (i, b) in btns.iter().enumerate() {
-                        if i < prof.buttons.len() {
-                            if let Some(hex) = b.as_str() {
-                                if let Some(raw) = parse_4byte_hex(hex) {
-                                    prof.buttons[i] = MouseButtonAction::decode(raw);
-                                }
-                            }
+                        if i < prof.buttons.len()
+                            && let Some(hex) = b.as_str()
+                            && let Some(raw) = parse_4byte_hex(hex)
+                        {
+                            prof.buttons[i] = MouseButtonAction::decode(raw);
                         }
                     }
                 }
@@ -1206,7 +1317,10 @@ impl BackendEngine {
                     "Cycle" => MouseLedMode::Cycle,
                     _ => MouseLedMode::Fixed,
                 };
-                let color = p["color"].as_str().and_then(Rgb::from_hex).unwrap_or(Rgb::CYAN);
+                let color = p["color"]
+                    .as_str()
+                    .and_then(Rgb::from_hex)
+                    .unwrap_or(Rgb::CYAN);
                 let m = self.logi_mouse_mut(p)?;
                 let zones: Vec<u8> = m.info.led_zones.iter().map(|z| z.index).collect();
                 for zid in zones {
@@ -1223,7 +1337,10 @@ impl BackendEngine {
                     "Wave" => KeyboardRgbMode::Wave,
                     _ => KeyboardRgbMode::Fixed,
                 };
-                let color = p["color"].as_str().and_then(Rgb::from_hex).unwrap_or(Rgb::CYAN);
+                let color = p["color"]
+                    .as_str()
+                    .and_then(Rgb::from_hex)
+                    .unwrap_or(Rgb::CYAN);
                 let kb = self.logi_kb_mut(p)?;
                 kb.set_rgb_effect(mode, color, 4000)
                     .map_err(|e| e.to_string())?;
@@ -1253,7 +1370,10 @@ impl BackendEngine {
             }
             "cooling_read_bios_curves" => {
                 if !self.cooling_status.wmi_available {
-                    return Err("Droits Admin + ASUSManagement WMI requis pour relire les courbes BIOS".into());
+                    return Err(
+                        "Droits Admin + ASUSManagement WMI requis pour relire les courbes BIOS"
+                            .into(),
+                    );
                 }
                 self.cooling_channels = opengear_asus::FanHeaderKind::ALL
                     .iter()
@@ -1285,7 +1405,10 @@ impl BackendEngine {
                     for (i, item) in pts.iter().take(8).enumerate() {
                         let t = item["temp_c"].as_u64().unwrap_or(50).clamp(20, 100) as u8;
                         let d = item["duty_pct"].as_u64().unwrap_or(50).clamp(0, 100) as u8;
-                        ch.curve[i] = CurvePoint { temp_c: t, duty_pct: d };
+                        ch.curve[i] = CurvePoint {
+                            temp_c: t,
+                            duty_pct: d,
+                        };
                     }
                 }
                 if let Some(src) = p["source"].as_str() {
@@ -1319,32 +1442,30 @@ impl BackendEngine {
                 }
                 if let Some(thermal) = p["thermal"].as_bool() {
                     self.config.active_profile_mut().silent_loop3_thermal_rgb = thermal;
-                    if thermal {
-                        if let Some(aura) = self.asus_aura.as_mut() {
-                            let _ = aura.enter_direct_mode();
-                        }
+                    if thermal && let Some(aura) = self.asus_aura.as_mut() {
+                        let _ = aura.enter_direct_mode();
                     }
                 }
-                if let Some(hex) = p["color"].as_str() {
-                    if let Some(col) = Rgb::from_hex(hex) {
-                        self.config.active_profile_mut().silent_loop3_thermal_rgb = false;
-                        let ch_idx = self
-                            .config
-                            .active_profile_mut()
-                            .silent_loop3_argb_channel
-                            .unwrap_or(1);
-                        if let Some(aura) = self.asus_aura.as_mut() {
-                            let _ = aura.enter_direct_mode();
-                            let count = aura
-                                .info
-                                .channels
-                                .get(ch_idx)
-                                .map(|c| c.led_count)
-                                .unwrap_or(16);
-                            let leds = vec![col; count];
-                            aura.send_channel_direct(ch_idx, &leds)
-                                .map_err(|e| e.to_string())?;
-                        }
+                if let Some(hex) = p["color"].as_str()
+                    && let Some(col) = Rgb::from_hex(hex)
+                {
+                    self.config.active_profile_mut().silent_loop3_thermal_rgb = false;
+                    let ch_idx = self
+                        .config
+                        .active_profile_mut()
+                        .silent_loop3_argb_channel
+                        .unwrap_or(1);
+                    if let Some(aura) = self.asus_aura.as_mut() {
+                        let _ = aura.enter_direct_mode();
+                        let count = aura
+                            .info
+                            .channels
+                            .get(ch_idx)
+                            .map(|c| c.led_count)
+                            .unwrap_or(16);
+                        let leds = vec![col; count];
+                        aura.send_channel_direct(ch_idx, &leds)
+                            .map_err(|e| e.to_string())?;
                     }
                 }
                 self.persist_config();
@@ -1393,7 +1514,10 @@ impl BackendEngine {
                     }
                     _ => return Err("Type d'action inconnu".into()),
                 };
-                self.config.active_profile_mut().bindings.insert(key, action);
+                self.config
+                    .active_profile_mut()
+                    .bindings
+                    .insert(key, action);
                 self.sync_input_rules();
                 self.persist_config();
                 Ok(self.full_state_json())
@@ -1414,14 +1538,32 @@ impl BackendEngine {
                     if let Some(preset) = p["socd_preset"].as_str() {
                         prof.socd.pairs = match preset {
                             "qwerty" => vec![
-                                SocdPair { key_a: "A".into(), key_b: "D".into() },
-                                SocdPair { key_a: "W".into(), key_b: "S".into() },
+                                SocdPair {
+                                    key_a: "A".into(),
+                                    key_b: "D".into(),
+                                },
+                                SocdPair {
+                                    key_a: "W".into(),
+                                    key_b: "S".into(),
+                                },
                             ],
-                            "qd_only" => vec![SocdPair { key_a: "Q".into(), key_b: "D".into() }],
-                            "ad_only" => vec![SocdPair { key_a: "A".into(), key_b: "D".into() }],
+                            "qd_only" => vec![SocdPair {
+                                key_a: "Q".into(),
+                                key_b: "D".into(),
+                            }],
+                            "ad_only" => vec![SocdPair {
+                                key_a: "A".into(),
+                                key_b: "D".into(),
+                            }],
                             _ => vec![
-                                SocdPair { key_a: "Q".into(), key_b: "D".into() },
-                                SocdPair { key_a: "Z".into(), key_b: "S".into() },
+                                SocdPair {
+                                    key_a: "Q".into(),
+                                    key_b: "D".into(),
+                                },
+                                SocdPair {
+                                    key_a: "Z".into(),
+                                    key_b: "S".into(),
+                                },
                             ],
                         };
                     }
@@ -1640,10 +1782,8 @@ impl BackendEngine {
                     .map_err(|e| e.to_string())?;
                 self.omen_color_table = Some(tbl);
                 self.hp_omen.zone_colors = cols;
-                if !self.hp_omen.backlight_on {
-                    if set_hp_omen_kb_backlight(true).is_ok() {
-                        self.hp_omen.backlight_on = true;
-                    }
+                if !self.hp_omen.backlight_on && set_hp_omen_kb_backlight(true).is_ok() {
+                    self.hp_omen.backlight_on = true;
                 }
                 self.persist_config();
                 Ok(self.full_state_json())
@@ -1800,7 +1940,11 @@ mod tests {
 
     #[test]
     fn only_the_brand_that_changed_is_reconnected() {
-        let before = [(0x046D, 0xC547, 0xFF00), (0x0B05, 0x19AF, 0xFF72), (0x1B1C, 0x1B73, 0xFF42)];
+        let before = [
+            (0x046D, 0xC547, 0xFF00),
+            (0x0B05, 0x19AF, 0xFF72),
+            (0x1B1C, 0x1B73, 0xFF42),
+        ];
         let after = [(0x0B05, 0x19AF, 0xFF72), (0x1B1C, 0x1B73, 0xFF42)];
         assert_eq!(changed_vendors(&before, &after), vec![0x046D]);
         assert_eq!(changed_vendors(&after[..1], &after), vec![0x1B1C]);

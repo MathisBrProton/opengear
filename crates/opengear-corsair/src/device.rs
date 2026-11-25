@@ -131,10 +131,10 @@ impl CorsairDevice {
                     // 2. Probe any connected SLIPSTREAM wireless subdevices (bits 1..=7 in 0x36)
                     if subdev_bitmap != 0 {
                         for slot in 1..=7u8 {
-                            if (subdev_bitmap & (1u32 << slot)) != 0 {
-                                if let Ok((sub_dev, _)) = Self::open_and_probe(&cand, slot) {
-                                    devices.push(sub_dev);
-                                }
+                            if (subdev_bitmap & (1u32 << slot)) != 0
+                                && let Ok((sub_dev, _)) = Self::open_and_probe(&cand, slot)
+                            {
+                                devices.push(sub_dev);
                             }
                         }
                     }
@@ -160,7 +160,10 @@ impl CorsairDevice {
         // Fail fast on hard HID I/O or timeout errors so a dead/disconnected device never presents
         // as a fake `Generic` `FW 0.0.0` device after 35 timeouts.
         let vid_probe = transport.get_property(PROP_VID);
-        if matches!(vid_probe, Err(BragiError::Hid(_)) | Err(BragiError::Timeout)) {
+        if matches!(
+            vid_probe,
+            Err(BragiError::Hid(_)) | Err(BragiError::Timeout)
+        ) {
             return Err(vid_probe.unwrap_err());
         }
         let vid = vid_probe
@@ -192,28 +195,37 @@ impl CorsairDevice {
         let poll_raw = transport.get_property(PROP_POLLRATE).ok();
         let max_poll_raw = transport.get_property(PROP_MAX_POLLRATE).ok();
 
-        let (hw_brightness_raw, brightness_is_coarse) = match transport.get_property(PROP_BRIGHTNESS) {
-            Ok(v) => (Some(v), false),
-            Err(_) => match transport.get_property(PROP_BRIGHTNESS_COARSE) {
-                Ok(v) => (Some(v), true),
-                Err(_) => (None, false),
-            },
-        };
+        let (hw_brightness_raw, brightness_is_coarse) =
+            match transport.get_property(PROP_BRIGHTNESS) {
+                Ok(v) => (Some(v), false),
+                Err(_) => match transport.get_property(PROP_BRIGHTNESS_COARSE) {
+                    Ok(v) => (Some(v), true),
+                    Err(_) => (None, false),
+                },
+            };
 
         let battery_pct = transport
             .get_property(PROP_BATTERY_LEVEL)
             .ok()
             .map(|v| ((v.min(1000)) / 10) as u8);
-        let battery_status = transport.get_property(PROP_BATTERY_STATUS).ok().map(|v| v as u8);
+        let battery_status = transport
+            .get_property(PROP_BATTERY_STATUS)
+            .ok()
+            .map(|v| v as u8);
 
         let subdev_bitmap = if subdevice_id == 0 {
-            transport.get_property(PROP_CONNECTED_SUBDEVICES).unwrap_or(0)
+            transport
+                .get_property(PROP_CONNECTED_SUBDEVICES)
+                .unwrap_or(0)
         } else {
             0
         };
 
         // Keyboard probes
-        let hw_winlock = transport.get_property(PROP_WINLOCK_ENABLED).ok().map(|v| v != 0);
+        let hw_winlock = transport
+            .get_property(PROP_WINLOCK_ENABLED)
+            .ok()
+            .map(|v| v != 0);
         let winlock_shortcuts_mask = transport
             .get_property(PROP_WINLOCK_DISABLED_SHORTCUTS)
             .ok()
@@ -226,10 +238,22 @@ impl CorsairDevice {
             .get_property(PROP_PRESS_DEBOUNCE_TIMEOUT)
             .ok()
             .map(|v| v as u8);
-        let esports_switch_on = transport.get_property(PROP_ESPORTS_SWITCH_POS).ok().map(|v| v != 0);
-        let active_hw_profile = transport.get_property(PROP_ACTIVE_HW_PROFILE).ok().map(|v| v as u8);
-        let storage_total_kb = transport.get_property(PROP_TOTAL_STORAGE_SIZE).ok().map(|v| v / 1024);
-        let storage_free_kb = transport.get_property(PROP_FREE_STORAGE_SIZE).ok().map(|v| v / 1024);
+        let esports_switch_on = transport
+            .get_property(PROP_ESPORTS_SWITCH_POS)
+            .ok()
+            .map(|v| v != 0);
+        let active_hw_profile = transport
+            .get_property(PROP_ACTIVE_HW_PROFILE)
+            .ok()
+            .map(|v| v as u8);
+        let storage_total_kb = transport
+            .get_property(PROP_TOTAL_STORAGE_SIZE)
+            .ok()
+            .map(|v| v / 1024);
+        let storage_free_kb = transport
+            .get_property(PROP_FREE_STORAGE_SIZE)
+            .ok()
+            .map(|v| v / 1024);
         // Only treat 0xF5 as FlashTap if it really behaves like an on/off switch.
         let flashtap_raw = transport.get_property(PROP_FLASHTAP_ENABLED);
         let flashtap_probe = match &flashtap_raw {
@@ -250,21 +274,36 @@ impl CorsairDevice {
             let s3 = transport.get_property(PROP_DPI_STAGE_3).unwrap_or(1600);
             let s4 = transport.get_property(PROP_DPI_STAGE_4).unwrap_or(3200);
             let s5 = transport.get_property(PROP_DPI_STAGE_5).unwrap_or(6400);
-            let sniper_dpi = transport.get_property(PROP_DPI_STAGE_SNIPER).ok().map(|v| v as u16);
+            let sniper_dpi = transport
+                .get_property(PROP_DPI_STAGE_SNIPER)
+                .ok()
+                .map(|v| v as u16);
             let active_stage = transport.get_property(PROP_DPI_CURRENT_STAGE).unwrap_or(0) as u8;
             let current_dpi_x = transport
                 .get_property(PROP_DPI_CURRENT_X)
                 .or_else(|_| transport.get_property(PROP_DPI_CURRENT))
                 .ok()
                 .map(|v| v as u16);
-            let current_dpi_y = transport.get_property(PROP_DPI_CURRENT_Y).ok().map(|v| v as u16);
-            let lift_height = transport.get_property(PROP_LIFT_HEIGHT).ok().map(|v| v as u8);
-            let motion_sync = transport.get_property_ext(PROP_EXT_MOTION_SYNC).ok().map(|v| v != 0);
+            let current_dpi_y = transport
+                .get_property(PROP_DPI_CURRENT_Y)
+                .ok()
+                .map(|v| v as u16);
+            let lift_height = transport
+                .get_property(PROP_LIFT_HEIGHT)
+                .ok()
+                .map(|v| v as u8);
+            let motion_sync = transport
+                .get_property_ext(PROP_EXT_MOTION_SYNC)
+                .ok()
+                .map(|v| v != 0);
             let angle_snapping = transport
                 .get_property_ext(PROP_EXT_ANGLE_SNAPPING)
                 .ok()
                 .map(|v| v != 0);
-            let auto_sleep_enabled = transport.get_property(PROP_AUTO_SLEEP_ENABLED).ok().map(|v| v != 0);
+            let auto_sleep_enabled = transport
+                .get_property(PROP_AUTO_SLEEP_ENABLED)
+                .ok()
+                .map(|v| v != 0);
             let auto_sleep_min = transport
                 .get_property(PROP_AUTO_SLEEP_TIMEOUT)
                 .ok()
@@ -293,7 +332,10 @@ impl CorsairDevice {
                 sidetone_muted: sidetone_mut.map(|v| v != 0),
                 sidetone_pct: sidetone_lvl.map(|v| ((v.min(1000)) / 10) as u8),
                 mic_muted: transport.get_property(PROP_MIC_MUTED).ok().map(|v| v != 0),
-                active_eq_preset: transport.get_property(PROP_ACTIVE_EQ_PRESET).ok().map(|v| v as u8),
+                active_eq_preset: transport
+                    .get_property(PROP_ACTIVE_EQ_PRESET)
+                    .ok()
+                    .map(|v| v as u8),
                 anc_mode: transport.get_property(PROP_ANC_MODE).ok().map(|v| v as u8),
             })
         } else {
@@ -376,10 +418,10 @@ impl CorsairDevice {
             kind,
             firmware_version: format_fw_version(fw_raw),
             bootloader_version: format_fw_version(bld_raw),
-            layout: KeyboardLayout::from_bragi_value(layout_raw.unwrap_or(0)),
+            layout: layout_from_wire(layout_raw.unwrap_or(0)),
             mode,
-            pollrate: poll_raw.and_then(PollingRate::from_bragi_value),
-            max_pollrate: max_poll_raw.and_then(PollingRate::from_bragi_value),
+            pollrate: poll_raw.and_then(pollrate_from_wire),
+            max_pollrate: max_poll_raw.and_then(pollrate_from_wire),
             hw_brightness_raw,
             brightness_is_coarse,
             out_report_len: transport.out_report_len(),
@@ -436,6 +478,7 @@ impl CorsairDevice {
     }
 
     /// Flash a new onboard Hardware Lighting Effect (and optional name) directly into the keyboard's internal flash!
+    #[allow(clippy::too_many_arguments)]
     pub fn flash_hwp_lighting(
         &mut self,
         profile_idx: usize,
@@ -455,14 +498,7 @@ impl CorsairDevice {
 
         self.with_flash_session(|t| {
             crate::hwp::flash_hwp_profile_lighting(
-                t,
-                &prof,
-                kind,
-                primary,
-                secondary,
-                speed,
-                direction,
-                new_name,
+                t, &prof, kind, primary, secondary, speed, direction, new_name,
             )
         })?;
         // Reload profiles & re-trigger active HW profile so MCU immediately renders the new flash effect!
@@ -529,8 +565,12 @@ impl CorsairDevice {
         let code = self.transport.open_handle(HANDLE_LIGHTING, res)?;
         if code != ERR_OK {
             let (alt_ep, alt_res) = match self.info.lighting_endpoint {
-                LightingEndpoint::Triplets0x22 => (LightingEndpoint::Planar0x01, RES_LIGHTING_PLANAR),
-                LightingEndpoint::Planar0x01 => (LightingEndpoint::Triplets0x22, RES_LIGHTING_TRIPLETS),
+                LightingEndpoint::Triplets0x22 => {
+                    (LightingEndpoint::Planar0x01, RES_LIGHTING_PLANAR)
+                }
+                LightingEndpoint::Planar0x01 => {
+                    (LightingEndpoint::Triplets0x22, RES_LIGHTING_TRIPLETS)
+                }
             };
             let code2 = self.transport.open_handle(HANDLE_LIGHTING, alt_res)?;
             if code2 != ERR_OK {
@@ -543,13 +583,13 @@ impl CorsairDevice {
     }
 
     pub fn set_pollrate(&mut self, rate: PollingRate) -> Result<(), BragiError> {
-        if let Some(max) = self.info.max_pollrate {
-            if rate > max {
-                return Err(BragiError::PollrateExceedsMax(rate.hz(), max.hz()));
-            }
+        if let Some(max) = self.info.max_pollrate
+            && rate > max
+        {
+            return Err(BragiError::PollrateExceedsMax(rate.hz(), max.hz()));
         }
         self.transport
-            .set_property(PROP_POLLRATE, rate.to_bragi_value())?;
+            .set_property(PROP_POLLRATE, pollrate_to_wire(rate))?;
         self.info.pollrate = Some(rate);
         Ok(())
     }
@@ -667,10 +707,15 @@ impl CorsairDevice {
         impl Drop for FlashModeGuard<'_> {
             fn drop(&mut self) {
                 self.dev.lighting_handle_open = false;
-                if self.restore_hw && self.dev.info.mode == OperatingMode::Software {
-                    if self.dev.transport.set_property(PROP_MODE, MODE_HARDWARE).is_ok() {
-                        self.dev.info.mode = OperatingMode::Hardware;
-                    }
+                if self.restore_hw
+                    && self.dev.info.mode == OperatingMode::Software
+                    && self
+                        .dev
+                        .transport
+                        .set_property(PROP_MODE, MODE_HARDWARE)
+                        .is_ok()
+                {
+                    self.dev.info.mode = OperatingMode::Hardware;
                 }
             }
         }
@@ -735,7 +780,8 @@ impl CorsairDevice {
     }
 
     pub fn set_mouse_lift_height(&mut self, level: u8) -> Result<(), BragiError> {
-        self.transport.set_property(PROP_LIFT_HEIGHT, level as u16)?;
+        self.transport
+            .set_property(PROP_LIFT_HEIGHT, level as u16)?;
         if let Some(m) = self.info.mouse.as_mut() {
             m.lift_height = Some(level);
         }
@@ -769,7 +815,11 @@ impl CorsairDevice {
     }
 
     /// Render an `RgbEffectConfig` to a Corsair Bragi keyboard / RGB device.
-    pub fn render_effect(&mut self, effect: &RgbEffectConfig, t_sec: f32) -> Result<(), BragiError> {
+    pub fn render_effect(
+        &mut self,
+        effect: &RgbEffectConfig,
+        t_sec: f32,
+    ) -> Result<(), BragiError> {
         self.render_custom_frame(|led_idx, nx, ny, _id| effect.sample(led_idx, nx, ny, t_sec))
     }
 
@@ -823,7 +873,8 @@ impl CorsairDevice {
                 buf
             }
         };
-        self.transport.write_handle_data(HANDLE_LIGHTING, &payload)?;
+        self.transport
+            .write_handle_data(HANDLE_LIGHTING, &payload)?;
         Ok(())
     }
 }

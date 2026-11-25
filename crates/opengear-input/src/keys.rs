@@ -1,5 +1,8 @@
 /// Canonical key names mapped to Windows Virtual-Key (VK) codes.
-/// Uses standard Windows VK values so AZERTY / QWERTY both work reliably.
+///
+/// The names are **stable identifiers persisted in user profiles** (bindings, macros): never
+/// rename one. Some OEM names come from the French layout where they were first used
+/// (`LBRACKET` is VK 0xDD); the UI never shows them, it shows the label Windows gives the key.
 pub const KEY_TABLE: &[(&str, u16)] = &[
     ("ESC", 0x1B),
     ("F1", 0x70),
@@ -128,17 +131,215 @@ pub const KEY_TABLE: &[(&str, u16)] = &[
 ];
 
 pub const ALL_BINDABLE_KEYS: &[&str] = &[
-    "ESC", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13",
-    "F14", "F15", "F16", "F17", "F18", "F19", "F20", "PRINTSCREEN", "SCROLLLOCK", "PAUSE",
-    "INSERT", "HOME", "PAGEUP", "DELETE", "END", "PAGEDOWN", "BACKSPACE", "TAB", "ENTER",
-    "CAPSLOCK", "SPACE", "LSHIFT", "RSHIFT", "LCTRL", "RCTRL", "LALT", "RALT", "LWIN", "RWIN",
-    "MENU", "LEFT", "UP", "RIGHT", "DOWN", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K",
-    "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "0", "1", "2", "3",
-    "4", "5", "6", "7", "8", "9", "MINUS", "NUMLOCK", "NUM0", "NUM1", "NUM2", "NUM3", "NUM4",
-    "NUM5", "NUM6", "NUM7", "NUM8", "NUM9", "NUM_MUL", "NUM_ADD", "NUM_SUB", "NUM_DEC", "NUM_DIV",
-    "VOLUME_MUTE", "VOLUME_DOWN", "VOLUME_UP", "MEDIA_NEXT", "MEDIA_PREV", "MEDIA_STOP",
+    "ESC",
+    "F1",
+    "F2",
+    "F3",
+    "F4",
+    "F5",
+    "F6",
+    "F7",
+    "F8",
+    "F9",
+    "F10",
+    "F11",
+    "F12",
+    "F13",
+    "F14",
+    "F15",
+    "F16",
+    "F17",
+    "F18",
+    "F19",
+    "F20",
+    "PRINTSCREEN",
+    "SCROLLLOCK",
+    "PAUSE",
+    "INSERT",
+    "HOME",
+    "PAGEUP",
+    "DELETE",
+    "END",
+    "PAGEDOWN",
+    "BACKSPACE",
+    "TAB",
+    "ENTER",
+    "CAPSLOCK",
+    "SPACE",
+    "LSHIFT",
+    "RSHIFT",
+    "LCTRL",
+    "RCTRL",
+    "LALT",
+    "RALT",
+    "LWIN",
+    "RWIN",
+    "MENU",
+    "LEFT",
+    "UP",
+    "RIGHT",
+    "DOWN",
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "J",
+    "K",
+    "L",
+    "M",
+    "N",
+    "O",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z",
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "MINUS",
+    "EQUALS",
+    "OEM_4",
+    "LBRACKET",
+    "RBRACKET",
+    "BACKSLASH",
+    "APOSTROPHE",
+    "OEM_7",
+    "EXCLAIM",
+    "ISO_BSLASH",
+    "COMMA",
+    "PERIOD",
+    "SLASH",
+    "NUMLOCK",
+    "NUM0",
+    "NUM1",
+    "NUM2",
+    "NUM3",
+    "NUM4",
+    "NUM5",
+    "NUM6",
+    "NUM7",
+    "NUM8",
+    "NUM9",
+    "NUM_MUL",
+    "NUM_ADD",
+    "NUM_SUB",
+    "NUM_DEC",
+    "NUM_DIV",
+    "VOLUME_MUTE",
+    "VOLUME_DOWN",
+    "VOLUME_UP",
+    "MEDIA_NEXT",
+    "MEDIA_PREV",
+    "MEDIA_STOP",
     "MEDIA_PLAY",
 ];
+
+/// VK code of a physical key (W3C `code`) whose meaning does not depend on the Windows layout.
+pub fn fixed_vk_for_code(code: &str) -> Option<u16> {
+    let fkey = code
+        .strip_prefix('F')
+        .and_then(|n| n.parse::<u16>().ok())
+        .filter(|n| (1..=24).contains(n));
+    if let Some(n) = fkey {
+        return Some(0x6F + n);
+    }
+    let numpad_digit = code
+        .strip_prefix("Numpad")
+        .and_then(|n| n.parse::<u16>().ok())
+        .filter(|n| *n <= 9);
+    if let Some(n) = numpad_digit {
+        return Some(0x60 + n);
+    }
+    Some(match code {
+        "Escape" => 0x1B,
+        "PrintScreen" => 0x2C,
+        "ScrollLock" => 0x91,
+        "Pause" => 0x13,
+        "Backspace" => 0x08,
+        "Tab" => 0x09,
+        "CapsLock" => 0x14,
+        "Enter" | "NumpadEnter" => 0x0D,
+        "ShiftLeft" => 0xA0,
+        "ShiftRight" => 0xA1,
+        "ControlLeft" => 0xA2,
+        "ControlRight" => 0xA3,
+        "AltLeft" => 0xA4,
+        "AltRight" => 0xA5,
+        "MetaLeft" => 0x5B,
+        "MetaRight" => 0x5C,
+        "ContextMenu" => 0x5D,
+        "Space" => 0x20,
+        "Insert" => 0x2D,
+        "Home" => 0x24,
+        "PageUp" => 0x21,
+        "Delete" => 0x2E,
+        "End" => 0x23,
+        "PageDown" => 0x22,
+        "ArrowUp" => 0x26,
+        "ArrowDown" => 0x28,
+        "ArrowLeft" => 0x25,
+        "ArrowRight" => 0x27,
+        "NumLock" => 0x90,
+        "NumpadDivide" => 0x6F,
+        "NumpadMultiply" => 0x6A,
+        "NumpadSubtract" => 0x6D,
+        "NumpadAdd" => 0x6B,
+        "NumpadDecimal" => 0x6E,
+        "MediaStop" => 0xB2,
+        "MediaTrackPrevious" => 0xB1,
+        "MediaPlayPause" => 0xB3,
+        "MediaTrackNext" => 0xB0,
+        "AudioVolumeMute" => 0xAD,
+        "AudioVolumeDown" => 0xAE,
+        "AudioVolumeUp" => 0xAF,
+        _ => return None,
+    })
+}
+
+/// VK code a layout-dependent key produces with the US QWERTY layout (fallback when Windows
+/// cannot be queried).
+pub fn us_vk_for_code(code: &str) -> Option<u16> {
+    if let Some(c) = code.strip_prefix("Key").filter(|c| c.len() == 1) {
+        return Some(c.as_bytes()[0] as u16);
+    }
+    if let Some(c) = code.strip_prefix("Digit").filter(|c| c.len() == 1) {
+        return Some(c.as_bytes()[0] as u16);
+    }
+    Some(match code {
+        "Backquote" => 0xC0,
+        "Minus" => 0xBD,
+        "Equal" => 0xBB,
+        "BracketLeft" => 0xDB,
+        "BracketRight" => 0xDD,
+        "Backslash" => 0xDC,
+        "Semicolon" => 0xBA,
+        "Quote" => 0xDE,
+        "Comma" => 0xBC,
+        "Period" => 0xBE,
+        "Slash" => 0xBF,
+        "IntlBackslash" => 0xE2,
+        _ => return None,
+    })
+}
 
 pub fn key_name_to_vk(name: &str) -> Option<u16> {
     let upper = name.trim().to_ascii_uppercase();
@@ -171,5 +372,16 @@ mod tests {
         assert_eq!(key_name_to_vk("minus"), Some(0xBD));
         assert_eq!(key_name_to_vk("num5"), Some(0x65));
         assert_eq!(vk_to_key_name(0xDC), Some("BACKSLASH"));
+        for name in ALL_BINDABLE_KEYS {
+            assert!(
+                key_name_to_vk(name).is_some(),
+                "touche assignable inconnue : {name}"
+            );
+        }
+        assert_eq!(fixed_vk_for_code("F12"), Some(0x7B));
+        assert_eq!(fixed_vk_for_code("Numpad7"), Some(0x67));
+        assert_eq!(fixed_vk_for_code("KeyQ"), None);
+        assert_eq!(us_vk_for_code("KeyQ"), Some(0x51));
+        assert_eq!(us_vk_for_code("Quote"), Some(0xDE));
     }
 }

@@ -1,13 +1,14 @@
 import { BTN_NAMES, ICONS, MACRO_PRESETS, arr, esc, fmtHz, num, plural } from "../utils.js";
 import { rpc } from "../ipc.js";
-import { S, getDraft, isExpert, local, mouseImage } from "../state.js";
-import { advancedHint, emptyState, expertTag, pageHeader, renderKeyboard, seg, sliderRow, subtabs, sw } from "../components.js";
+import { S, codeLabel, getDraft, isExpert, keyLabel, local, mouseImage } from "../state.js";
+import { advancedHint, emptyState, expertTag, keyboardSetup, pageHeader, renderKeyboard, seg, sliderRow, subtabs, sw } from "../components.js";
 
+// Physical positions; the hint shows what the key types on the active Windows layout.
 const SOCD_PADS = [
-  ["KeyA", "Gauche", "Q (AZERTY) / A (QWERTY)"],
-  ["KeyD", "Droite", "D"],
-  ["KeyW", "Avant", "Z (AZERTY) / W (QWERTY)"],
-  ["KeyS", "Arrière", "S"],
+  ["KeyA", "Gauche"],
+  ["KeyD", "Droite"],
+  ["KeyW", "Avant"],
+  ["KeyS", "Arrière"],
 ];
 const PAD_LIVE_KEYS = { KeyA: "left", KeyD: "right", KeyW: "forward", KeyS: "back" };
 
@@ -58,8 +59,7 @@ export function viewInput() {
   return `
     ${pageHeader("Touches & Macros", `Profil « ${esc(prof.name || S.config.active_profile || "")} »`,
       `${sw(!!S.input_running, "Moteur d'entrée actif", "input-engine")}
-       ${sw(!!prof.win_lock, "Bloquer la touche Windows", "input-winlock")}
-       ${sw(!!S.config.use_azerty_labels, "Clavier AZERTY", "azerty")}`, "purple")}
+       ${sw(!!prof.win_lock, "Bloquer la touche Windows", "input-winlock")}`, "purple")}
     ${!S.input_running && cur !== "mouse" ? `<div class="alert info"><span class="alert-icon">${ICONS.info}</span><div class="grow"><div class="alert-title">Le moteur d'entrée est arrêté</div><div class="muted">Les remappages, macros et le mode compétition ne s'appliquent que lorsque le moteur d'entrée est actif.</div></div><button type="button" class="btn btn-sm btn-primary" data-act="input-engine-on">Démarrer le moteur</button></div>` : ""}
     ${subtabs("input", items, cur)}
     ${body}`;
@@ -70,12 +70,13 @@ function inputKeys() {
   const sp = S.system_prefs;
   const bindings = Object.entries(prof.bindings || {});
   const kb = S.corsair_devices.find((d) => d.kind === "Keyboard") || null;
-  const keyOpts = (sel) => S.bindable_keys.map((k) => `<option value="${esc(k)}" ${k === sel ? "selected" : ""}>${esc(k)}</option>`).join("");
+  const keyOpts = (sel) => S.bindable_keys.map((k) => `<option value="${esc(k)}" ${k === sel ? "selected" : ""}>${esc(keyLabel(k))}</option>`).join("");
   return `
+    ${keyboardSetup()}
     ${renderKeyboard("macro", kb)}
     <div class="grid-2 mt-16">
       <div class="card">
-        <div class="card-head"><h2 class="card-title">Touche sélectionnée</h2><span class="pill purple">${esc(local.selectedKeyId)}</span></div>
+        <div class="card-head"><h2 class="card-title">Touche sélectionnée</h2><span class="pill purple">${esc(keyLabel(local.selectedKeyId))}</span></div>
         <div class="row">
           <label class="field-label" for="mac-remap">Remplacer par</label>
           <select id="mac-remap" class="og-select grow">${keyOpts("F13")}</select>
@@ -110,7 +111,7 @@ function inputKeys() {
             ? `<span style="color:#ff8aa2;font-weight:700">Enregistrement en cours… tape ta combinaison puis clique sur « Arrêter l'enregistrement ».</span>`
             : local.macroSteps.map((st, i) => `${i + 1}. ${st.down ? "Appui  " : "Relâche"} ${esc(st.key)} (${num(st.delay_ms)} ms)`).join("<br/>") || "Aucune étape pour l'instant."}
         </div>
-        <button type="button" class="btn btn-primary btn-sm mt-12" data-act="bind-macro">Assigner la macro à ${esc(local.selectedKeyId)}</button>
+        <button type="button" class="btn btn-primary btn-sm mt-12" data-act="bind-macro">Assigner la macro à ${esc(keyLabel(local.selectedKeyId))}</button>
       </div>
       <div class="card">
         <div class="card-head"><h2 class="card-title">Touches modifiées</h2><span class="pill">${plural(bindings.length, "règle", "règles")}</span></div>
@@ -120,12 +121,12 @@ function inputKeys() {
             <tbody>
               ${bindings.map(([k, act]) => {
                 let desc = "";
-                if (act.type === "Remap") desc = `→ ${act.target}`;
+                if (act.type === "Remap") desc = `→ ${keyLabel(act.target)}`;
                 else if (act.type === "Disable") desc = "Désactivée";
                 else if (act.type === "Text") desc = `Texte « ${act.text} »`;
                 else if (act.type === "Macro") desc = `Macro « ${act.name} » (${arr(act.steps).length} étapes)`;
                 else desc = String(act.type || "Action");
-                return `<tr><td class="mono" style="color:var(--cyan);font-weight:700">${esc(k)}</td><td>${esc(desc)}</td><td style="text-align:right"><button type="button" class="btn btn-sm btn-secondary" data-act="bind-remove" data-key="${esc(k)}" aria-label="Supprimer la règle ${esc(k)}">Supprimer</button></td></tr>`;
+                return `<tr><td class="mono" style="color:var(--cyan);font-weight:700" title="${esc(k)}">${esc(keyLabel(k))}</td><td>${esc(desc)}</td><td style="text-align:right"><button type="button" class="btn btn-sm btn-secondary" data-act="bind-remove" data-key="${esc(k)}" aria-label="Supprimer la règle ${esc(keyLabel(k))}">Supprimer</button></td></tr>`;
               }).join("")}
             </tbody>
           </table>`}
@@ -170,7 +171,7 @@ function socdTesterCard() {
         <button type="button" class="btn btn-sm btn-primary" data-act="open-test-window">Ouvrir le Bloc-notes de test</button>
       </div>
       <div class="socd-pads" role="group" aria-label="Touches reçues par les applications">
-        ${SOCD_PADS.map(([code, label, hint]) => `<div class="socd-pad" data-socd-pad="${code}" aria-pressed="false"><strong>${label}</strong><span class="muted">${hint}</span></div>`).join("")}
+        ${SOCD_PADS.map(([code, label]) => `<div class="socd-pad" data-socd-pad="${code}" aria-pressed="false"><strong>${label}</strong><span class="muted">Touche ${esc(codeLabel(code))}</span></div>`).join("")}
       </div>
       <div id="socd-live-note" class="muted mt-16">Les frappes faites dans la fenêtre d'OpenGear elle-même ne passent pas par le moteur clavier : teste dans une autre fenêtre.</div>
     </div>`;
@@ -181,8 +182,12 @@ function inputEsports() {
   const sp = S.system_prefs;
   const socd = prof.socd || { enabled: false, pairs: [], blocked_apps: [] };
   const pairs = arr(socd.pairs);
-  const pairLabel = pairs.map((p) => `${p.key_a}+${p.key_b}`).join(" · ") || "Q+D · Z+S";
-  const guess = pairLabel.includes("A+D") ? (pairs.length === 1 ? "ad_only" : "qwerty") : pairs.length === 1 ? "qd_only" : "azerty";
+  // The engine matches movement presets by physical position (scan codes): label them with
+  // what those keys type on the active Windows layout.
+  const lr = `${codeLabel("KeyA")}+${codeLabel("KeyD")}`;
+  const fb = `${codeLabel("KeyW")}+${codeLabel("KeyS")}`;
+  const guess = pairs.length === 1 ? "qd_only" : "azerty";
+  const pairLabel = guess === "qd_only" ? lr : `${lr} · ${fb}`;
   const chatter = num(prof.key_chatter_ms);
   const mdeb = num(prof.mouse_debounce_ms);
   return `
@@ -197,10 +202,8 @@ function inputEsports() {
         <div class="row-between">
           ${sw(!!socd.enabled, "Activer Snap Tap", "socd-en")}
           <select class="og-select auto" data-change="socd-preset" aria-label="Touches concernées">
-            <option value="azerty" ${guess === "azerty" ? "selected" : ""}>AZERTY (Q+D et Z+S)</option>
-            <option value="qd_only" ${guess === "qd_only" ? "selected" : ""}>AZERTY, gauche/droite (Q+D)</option>
-            <option value="qwerty" ${guess === "qwerty" ? "selected" : ""}>QWERTY (A+D et W+S)</option>
-            <option value="ad_only" ${guess === "ad_only" ? "selected" : ""}>QWERTY, gauche/droite (A+D)</option>
+            <option value="azerty" ${guess === "azerty" ? "selected" : ""}>Déplacements (${esc(lr)} et ${esc(fb)})</option>
+            <option value="qd_only" ${guess === "qd_only" ? "selected" : ""}>Gauche / droite seulement (${esc(lr)})</option>
           </select>
         </div>
         <div class="divider"></div>

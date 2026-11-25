@@ -1,12 +1,12 @@
 //! Safe DDR5/DDR4 RAM RGB controller via PawnIO SMBus, ASUS `ASUSManagement` COM WMI, or OpenRGB SDK.
 
-use crate::cooling::is_elevated;
 use crate::pawnio::{
     PawnIoAvailability, apply_pawnio_ene_ram, pawnio_availability, probe_pawnio_ene_ram,
     set_pawnio_ene_modes,
 };
 use anyhow::{Context, Result};
 use opengear_core::Rgb;
+use opengear_platform::is_elevated;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,7 +154,7 @@ impl EneRamMode {
 pub fn read_physical_dimms() -> Vec<PhysicalDimmInfo> {
     #[cfg(windows)]
     {
-        let Ok(conn) = crate::wmi_com::WmiConn::connect(r"root\cimv2") else {
+        let Ok(conn) = opengear_platform::wmi::WmiConn::connect(r"root\cimv2") else {
             return Vec::new();
         };
         let Ok(rows) = conn.query(
@@ -217,7 +217,7 @@ pub fn read_physical_dimms() -> Vec<PhysicalDimmInfo> {
 mod wmi_smbus {
     use super::*;
     use crate::pawnio::NamedMutexGuard;
-    use crate::wmi_com::{WmiConn, WmiVal};
+    use opengear_platform::wmi::{WmiConn, WmiVal};
 
     fn read_smbus_byte(conn: &WmiConn, obj_path: &str, slave: u32, cmd: u32) -> Option<u8> {
         let res = conn
@@ -237,7 +237,13 @@ mod wmi_smbus {
             .map(|d| (d & 0xFF) as u8)
     }
 
-    fn write_smbus_byte(conn: &WmiConn, obj_path: &str, slave: u32, cmd: u32, data: u32) -> Result<()> {
+    fn write_smbus_byte(
+        conn: &WmiConn,
+        obj_path: &str,
+        slave: u32,
+        cmd: u32,
+        data: u32,
+    ) -> Result<()> {
         let res = conn.exec_method(
             obj_path,
             "ASUSManagement",
@@ -255,7 +261,13 @@ mod wmi_smbus {
         Ok(())
     }
 
-    fn write_smbus_word(conn: &WmiConn, obj_path: &str, slave: u32, cmd: u32, data: u32) -> Result<()> {
+    fn write_smbus_word(
+        conn: &WmiConn,
+        obj_path: &str,
+        slave: u32,
+        cmd: u32,
+        data: u32,
+    ) -> Result<()> {
         let res = conn.exec_method(
             obj_path,
             "ASUSManagement",
@@ -316,8 +328,8 @@ mod wmi_smbus {
                     continue;
                 }
                 let mut mbytes = [0u8; 6];
-                for i in 0..6 {
-                    mbytes[i] = read_ene_reg(&conn, &obj_path, slave, 0x1030 + i as u16).unwrap_or(0);
+                for (i, b) in mbytes.iter_mut().enumerate() {
+                    *b = read_ene_reg(&conn, &obj_path, slave, 0x1030 + i as u16).unwrap_or(0);
                 }
                 if &mbytes == b"Micron" {
                     continue;
@@ -616,10 +628,16 @@ pub fn apply_ram_rgb(
 ) -> Result<String> {
     let targets: Vec<&EneRamModule> = modules
         .iter()
-        .filter(|m| target_addr_7bit.map(|a| a == m.address_7bit).unwrap_or(true))
+        .filter(|m| {
+            target_addr_7bit
+                .map(|a| a == m.address_7bit)
+                .unwrap_or(true)
+        })
         .collect();
     if targets.is_empty() {
-        anyhow::bail!("Aucune barrette RGB détectée à piloter (clique d'abord sur Scanner la RAM).");
+        anyhow::bail!(
+            "Aucune barrette RGB détectée à piloter (clique d'abord sur Scanner la RAM)."
+        );
     }
 
     let (pawnio, openrgb, wmi) = partition_ram_targets(&targets);
@@ -647,7 +665,9 @@ pub fn apply_ram_rgb(
 
     if !wmi.is_empty() {
         if !is_elevated() {
-            anyhow::bail!("Relance OpenGear en Administrateur pour contrôler le RGB de la RAM DDR5 via ASUSManagement WMI.");
+            anyhow::bail!(
+                "Relance OpenGear en Administrateur pour contrôler le RGB de la RAM DDR5 via ASUSManagement WMI."
+            );
         }
         #[cfg(windows)]
         {

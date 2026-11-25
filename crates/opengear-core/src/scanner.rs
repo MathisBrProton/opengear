@@ -43,7 +43,10 @@ fn classify_device(vid: u16, pid: u16, usage_page: u16) -> (&'static str, &'stat
             "Alienware AW2725DF Hub / AlienFX",
             "Prêt pour driver AlienFX",
         ),
-        (0x054C, 0x0CE6) => ("Sony DualSense Wireless Controller", "Prêt pour driver DualSense"),
+        (0x054C, 0x0CE6) => (
+            "Sony DualSense Wireless Controller",
+            "Prêt pour driver DualSense",
+        ),
         _ => ("", "Non mappé"),
     }
 }
@@ -59,7 +62,8 @@ pub fn scan_hid_devices(include_all: bool) -> Result<Vec<DetectedDevice>> {
             continue;
         }
 
-        let (known_name, status) = classify_device(dev.vendor_id(), dev.product_id(), dev.usage_page());
+        let (known_name, status) =
+            classify_device(dev.vendor_id(), dev.product_id(), dev.usage_page());
         let product_name = dev
             .product_string()
             .filter(|s| !s.trim().is_empty())
@@ -88,8 +92,13 @@ pub fn scan_hid_devices(include_all: bool) -> Result<Vec<DetectedDevice>> {
     }
 
     results.sort_by(|a, b| {
-        (a.vid, a.pid, a.interface_number, a.usage_page, a.usage)
-            .cmp(&(b.vid, b.pid, b.interface_number, b.usage_page, b.usage))
+        (a.vid, a.pid, a.interface_number, a.usage_page, a.usage).cmp(&(
+            b.vid,
+            b.pid,
+            b.interface_number,
+            b.usage_page,
+            b.usage,
+        ))
     });
     Ok(results)
 }

@@ -221,10 +221,8 @@ pub(crate) fn movement_preset_scan(name: &str) -> Option<(u16, bool)> {
 
 /// Resolve physical `(scan, extended)` for a Snap Tap pair endpoint.
 pub(crate) fn resolve_pair_scan(name: &str, vk: u16, use_movement_presets: bool) -> (u16, bool) {
-    if use_movement_presets {
-        if let Some(m) = movement_preset_scan(name) {
-            return m;
-        }
+    if use_movement_presets && let Some(m) = movement_preset_scan(name) {
+        return m;
     }
     #[cfg(windows)]
     {
@@ -493,10 +491,10 @@ fn macro_worker_tx() -> &'static Sender<MacroJob> {
                                 if MACRO_GENERATION.load(Ordering::SeqCst) != generation {
                                     break;
                                 }
-                                if let Some(vk) = key_name_to_vk(&step.key) {
-                                    if send_vk(vk, step.down) {
-                                        track_pressed(&mut pressed, vk, step.down);
-                                    }
+                                if let Some(vk) = key_name_to_vk(&step.key)
+                                    && send_vk(vk, step.down)
+                                {
+                                    track_pressed(&mut pressed, vk, step.down);
                                 }
                                 if step.delay_ms > 0
                                     && !sleep_unless_cancelled(
@@ -651,41 +649,40 @@ fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             }
 
             // 2. Reactive typing RGB ripple feed (fresh presses only, &'static str -> 0 allocs).
-            if is_down && !is_repeat {
-                if let Some(kname) = vk_to_key_name(vk) {
-                    if let Ok(mut q) = ripples_store().try_lock() {
-                        if q.len() >= 24 {
-                            q.pop_front();
-                        }
-                        q.push_back((kname, now));
-                    }
+            if is_down
+                && !is_repeat
+                && let Some(kname) = vk_to_key_name(vk)
+                && let Ok(mut q) = ripples_store().try_lock()
+            {
+                if q.len() >= 24 {
+                    q.pop_front();
                 }
+                q.push_back((kname, now));
             }
 
             // 3. Live Macro Recorder capture (ignore OS key-repeat; drop lock before CallNextHookEx).
             let recording_active = if let Ok(mut rec) = recorder_store().try_lock() {
                 if rec.recording {
-                    if !(is_down && is_repeat) {
-                        if let Some(kname) = vk_to_key_name(vk) {
-                            let delay_ms = rec
-                                .last_event
-                                .map(|prev| {
-                                    now.saturating_duration_since(prev).as_millis().min(2000)
-                                        as u32
-                                })
-                                .unwrap_or(0);
-                            if let Some(prev_step) = rec.steps.last_mut() {
-                                prev_step.delay_ms = delay_ms.max(5);
-                            }
-                            if rec.steps.len() < 128 {
-                                rec.steps.push(MacroStep {
-                                    key: kname.to_string(),
-                                    down: is_down,
-                                    delay_ms: 10,
-                                });
-                            }
-                            rec.last_event = Some(now);
+                    if !(is_down && is_repeat)
+                        && let Some(kname) = vk_to_key_name(vk)
+                    {
+                        let delay_ms = rec
+                            .last_event
+                            .map(|prev| {
+                                now.saturating_duration_since(prev).as_millis().min(2000) as u32
+                            })
+                            .unwrap_or(0);
+                        if let Some(prev_step) = rec.steps.last_mut() {
+                            prev_step.delay_ms = delay_ms.max(5);
                         }
+                        if rec.steps.len() < 128 {
+                            rec.steps.push(MacroStep {
+                                key: kname.to_string(),
+                                down: is_down,
+                                delay_ms: 10,
+                            });
+                        }
+                        rec.last_event = Some(now);
                     }
                     true
                 } else {
@@ -742,13 +739,12 @@ fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                         }
                     }
                     KeyAction::Remap { target } => {
-                        if is_down {
-                            if let Some(target_vk) = key_name_to_vk(&target) {
-                                if send_vk(target_vk, true) {
-                                    KEYS.begin_remap(vk, target_vk);
-                                    return 1;
-                                }
-                            }
+                        if is_down
+                            && let Some(target_vk) = key_name_to_vk(&target)
+                            && send_vk(target_vk, true)
+                        {
+                            KEYS.begin_remap(vk, target_vk);
+                            return 1;
                         }
                     }
                     KeyAction::Macro { steps, .. } => {
@@ -806,7 +802,8 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
 fn mouse_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && HOOK_ACTIVE.load(Ordering::Relaxed) {
         let wp = wparam as u32;
-        if wp == WM_LBUTTONDOWN || wp == WM_LBUTTONUP || wp == WM_RBUTTONDOWN || wp == WM_RBUTTONUP {
+        if wp == WM_LBUTTONDOWN || wp == WM_LBUTTONUP || wp == WM_RBUTTONDOWN || wp == WM_RBUTTONUP
+        {
             let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
             let is_injected =
                 (info.flags & LLMHF_INJECTED) != 0 || info.dwExtraInfo == OPENGEAR_INJECTED_TAG;
@@ -885,10 +882,10 @@ impl InputEngine {
 
     pub fn set_socd_suspended(&self, suspended: bool) {
         let prev = SOCD_SUSPENDED.swap(suspended, Ordering::SeqCst);
-        if prev != suspended {
-            if let Ok(mut st) = state_store().lock() {
-                st.socd.clear();
-            }
+        if prev != suspended
+            && let Ok(mut st) = state_store().lock()
+        {
+            st.socd.clear();
         }
     }
 
@@ -924,25 +921,25 @@ impl InputEngine {
         }
         let mut socd_pairs = Vec::new();
         for p in &socd.pairs {
-            if let (Some(va), Some(vb)) = (key_name_to_vk(&p.key_a), key_name_to_vk(&p.key_b)) {
-                if va != vb {
-                    let preset = is_movement_preset_pair(&p.key_a, &p.key_b);
-                    let (scan_a, ext_a) = resolve_pair_scan(&p.key_a, va, preset);
-                    let (scan_b, ext_b) = resolve_pair_scan(&p.key_b, vb, preset);
-                    socd_pairs.push(SocdPair {
-                        a: SocdKey {
-                            vk: va,
-                            scan: scan_a,
-                            extended: ext_a,
-                        },
-                        b: SocdKey {
-                            vk: vb,
-                            scan: scan_b,
-                            extended: ext_b,
-                        },
-                        mode: SocdMode::LastInputWins,
-                    });
-                }
+            if let (Some(va), Some(vb)) = (key_name_to_vk(&p.key_a), key_name_to_vk(&p.key_b))
+                && va != vb
+            {
+                let preset = is_movement_preset_pair(&p.key_a, &p.key_b);
+                let (scan_a, ext_a) = resolve_pair_scan(&p.key_a, va, preset);
+                let (scan_b, ext_b) = resolve_pair_scan(&p.key_b, vb, preset);
+                socd_pairs.push(SocdPair {
+                    a: SocdKey {
+                        vk: va,
+                        scan: scan_a,
+                        extended: ext_a,
+                    },
+                    b: SocdKey {
+                        vk: vb,
+                        scan: scan_b,
+                        extended: ext_b,
+                    },
+                    mode: SocdMode::LastInputWins,
+                });
             }
         }
         if let Ok(mut guard) = rules_store().write() {
@@ -1034,10 +1031,10 @@ impl InputEngine {
                 let _ = h.join();
             }
         }
-        if let Some((at, err)) = &self.last_start_failure {
-            if at.elapsed() < START_RETRY_BACKOFF {
-                anyhow::bail!("{err}");
-            }
+        if let Some((at, err)) = &self.last_start_failure
+            && at.elapsed() < START_RETRY_BACKOFF
+        {
+            anyhow::bail!("{err}");
         }
 
         let tid_slot = self.thread_id.clone();
@@ -1324,7 +1321,10 @@ mod tests {
 
     #[test]
     fn delays_are_capped() {
-        assert_eq!(capped_delay(50, MAX_MACRO_STEP_DELAY_MS), Duration::from_millis(50));
+        assert_eq!(
+            capped_delay(50, MAX_MACRO_STEP_DELAY_MS),
+            Duration::from_millis(50)
+        );
         assert_eq!(
             capped_delay(u32::MAX, MAX_MACRO_STEP_DELAY_MS),
             Duration::from_millis(MAX_MACRO_STEP_DELAY_MS as u64)

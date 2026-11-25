@@ -270,7 +270,7 @@ impl LogitechMouse {
             return Err(HidppError::Protocol(0x02, "Index bouton hors limites"));
         }
         let own_sector = prof.buttons[button_idx].referenced_macro_sector();
-        let old_action = prof.buttons[button_idx].clone();
+        let old_action = prof.buttons[button_idx];
         // Every macro sector referenced by any loaded profile (incl. G HUB's) is off-limits.
         let referenced: Vec<u16> = self
             .info
@@ -314,12 +314,15 @@ impl LogitechMouse {
             .onboard_desc
             .clone()
             .ok_or(HidppError::UnsupportedFeature(FEAT_ONBOARD_PROFILES))?;
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        let sector = crate::onboard::parse_backup_sector(name).ok_or_else(|| {
-            HidppError::Flash(format!("nom de sauvegarde non reconnu : {name}"))
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let sector = crate::onboard::parse_backup_sector(name)
+            .ok_or_else(|| HidppError::Flash(format!("nom de sauvegarde non reconnu : {name}")))?;
+        let bytes = std::fs::read(path).map_err(|e| {
+            HidppError::Flash(format!("lecture de {} impossible : {e}", path.display()))
         })?;
-        let bytes = std::fs::read(path)
-            .map_err(|e| HidppError::Flash(format!("lecture de {} impossible : {e}", path.display())))?;
         OnboardProfile::restore_sector_backup(&self.transport, &desc, sector, &bytes)?;
         self.reload_onboard_profiles()
     }
@@ -370,50 +373,50 @@ impl LogitechMouse {
 
     fn read_dpi_inner(t: &HidppTransport) -> Option<DpiSensorInfo> {
         // 1. Try 0x2202 Extended Adjustable DPI (HERO 2: X/Y + LOD!)
-        if t.get_feature_index(FEAT_EXTENDED_ADJUSTABLE_DPI).is_some() {
-            if let Ok(caps) = t.request_feature(FEAT_EXTENDED_ADJUSTABLE_DPI, 0x10, &[0x00]) {
-                let has_y = caps.get(2).map_or(false, |&b| (b & 0x01) != 0);
-                let has_lod = caps.get(2).map_or(false, |&b| (b & 0x02) != 0);
+        if t.get_feature_index(FEAT_EXTENDED_ADJUSTABLE_DPI).is_some()
+            && let Ok(caps) = t.request_feature(FEAT_EXTENDED_ADJUSTABLE_DPI, 0x10, &[0x00])
+        {
+            let has_y = caps.get(2).is_some_and(|&b| (b & 0x01) != 0);
+            let has_lod = caps.get(2).is_some_and(|&b| (b & 0x02) != 0);
 
-                let list_resp = t
-                    .request_feature(FEAT_EXTENDED_ADJUSTABLE_DPI, 0x20, &[0x00, 0x00])
-                    .unwrap_or_default();
-                let (min_dpi, max_dpi, step_dpi) = if list_resp.len() >= 5 {
-                    Self::parse_dpi_list(&list_resp[3..])
-                } else {
-                    (100, 32000, 50)
-                };
+            let list_resp = t
+                .request_feature(FEAT_EXTENDED_ADJUSTABLE_DPI, 0x20, &[0x00, 0x00])
+                .unwrap_or_default();
+            let (min_dpi, max_dpi, step_dpi) = if list_resp.len() >= 5 {
+                Self::parse_dpi_list(&list_resp[3..])
+            } else {
+                (100, 32000, 50)
+            };
 
-                if let Ok(cur) = t.request_feature(FEAT_EXTENDED_ADJUSTABLE_DPI, 0x50, &[0x00]) {
-                    debug!("0x2202 getDpi raw: {:02X?}", cur);
-                    if cur.len() >= 3 {
-                        // Byte 0 = sensor index, bytes 1..3 = X DPI, bytes 3..5 = Y DPI (if supported), followed by LOD
-                        let dpi_x = u16::from_be_bytes([cur[1], cur[2]]);
-                        let dpi_y = if has_y && cur.len() >= 5 {
-                            let y = u16::from_be_bytes([cur[3], cur[4]]);
-                            if y > 0 { y } else { dpi_x }
-                        } else {
-                            dpi_x
-                        };
-                        let lod_idx = if has_y { 5 } else { 3 };
-                        let lod = if has_lod && cur.len() > lod_idx {
-                            Some(LodLevel::from_u8(cur[lod_idx]))
-                        } else {
-                            None
-                        };
-                        return Some(DpiSensorInfo {
-                            extended: true,
-                            dpi_x,
-                            dpi_y,
-                            default_dpi: 800,
-                            min_dpi,
-                            max_dpi,
-                            step_dpi,
-                            supports_independent_xy: has_y,
-                            supports_lod: has_lod,
-                            lod,
-                        });
-                    }
+            if let Ok(cur) = t.request_feature(FEAT_EXTENDED_ADJUSTABLE_DPI, 0x50, &[0x00]) {
+                debug!("0x2202 getDpi raw: {:02X?}", cur);
+                if cur.len() >= 3 {
+                    // Byte 0 = sensor index, bytes 1..3 = X DPI, bytes 3..5 = Y DPI (if supported), followed by LOD
+                    let dpi_x = u16::from_be_bytes([cur[1], cur[2]]);
+                    let dpi_y = if has_y && cur.len() >= 5 {
+                        let y = u16::from_be_bytes([cur[3], cur[4]]);
+                        if y > 0 { y } else { dpi_x }
+                    } else {
+                        dpi_x
+                    };
+                    let lod_idx = if has_y { 5 } else { 3 };
+                    let lod = if has_lod && cur.len() > lod_idx {
+                        Some(LodLevel::from_u8(cur[lod_idx]))
+                    } else {
+                        None
+                    };
+                    return Some(DpiSensorInfo {
+                        extended: true,
+                        dpi_x,
+                        dpi_y,
+                        default_dpi: 800,
+                        min_dpi,
+                        max_dpi,
+                        step_dpi,
+                        supports_independent_xy: has_y,
+                        supports_lod: has_lod,
+                        lod,
+                    });
                 }
             }
         }
@@ -450,7 +453,12 @@ impl LogitechMouse {
         None
     }
 
-    pub fn set_dpi(&mut self, dpi_x: u16, dpi_y: Option<u16>, lod: Option<LodLevel>) -> Result<(), HidppError> {
+    pub fn set_dpi(
+        &mut self,
+        dpi_x: u16,
+        dpi_y: Option<u16>,
+        lod: Option<LodLevel>,
+    ) -> Result<(), HidppError> {
         let Some(ref info) = self.info.dpi.clone() else {
             return Err(HidppError::UnsupportedFeature(FEAT_ADJUSTABLE_DPI));
         };
@@ -480,11 +488,15 @@ impl LogitechMouse {
 
         if let Some(d) = self.info.dpi.as_mut() {
             d.dpi_x = clamped_x;
-            d.dpi_y = if d.supports_independent_xy { clamped_y } else { clamped_x };
-            if d.supports_lod {
-                if let Some(l) = lod {
-                    d.lod = Some(l);
-                }
+            d.dpi_y = if d.supports_independent_xy {
+                clamped_y
+            } else {
+                clamped_x
+            };
+            if d.supports_lod
+                && let Some(l) = lod
+            {
+                d.lod = Some(l);
             }
         }
         Ok(())
@@ -519,20 +531,24 @@ impl LogitechMouse {
     fn read_report_rate_inner(t: &HidppTransport) -> Option<ReportRateInfo> {
         // 1. Try 0x8061 Extended Adjustable Report Rate (up to 4K/8K Hz)
         if t.get_feature_index(FEAT_EXTENDED_REPORT_RATE).is_some() {
-            let list_r = t.request_feature(FEAT_EXTENDED_REPORT_RATE, 0x10, &[]).ok()?;
+            let list_r = t
+                .request_feature(FEAT_EXTENDED_REPORT_RATE, 0x10, &[])
+                .ok()?;
             let flags = u16::from_be_bytes([
                 list_r.first().copied().unwrap_or(0),
                 list_r.get(1).copied().unwrap_or(0),
             ]);
             let mut supported = Vec::new();
             for bit in 0..7u8 {
-                if (flags & (1 << bit)) != 0 {
-                    if let Some(hz) = Self::ext_rate_idx_to_hz(bit) {
-                        supported.push(hz);
-                    }
+                if (flags & (1 << bit)) != 0
+                    && let Some(hz) = Self::ext_rate_idx_to_hz(bit)
+                {
+                    supported.push(hz);
                 }
             }
-            let cur_r = t.request_feature(FEAT_EXTENDED_REPORT_RATE, 0x20, &[]).ok()?;
+            let cur_r = t
+                .request_feature(FEAT_EXTENDED_REPORT_RATE, 0x20, &[])
+                .ok()?;
             let cur_hz = cur_r
                 .first()
                 .copied()
@@ -571,7 +587,8 @@ impl LogitechMouse {
             return Err(HidppError::UnsupportedFeature(FEAT_REPORT_RATE));
         };
         if rr.extended {
-            let idx = Self::hz_to_ext_rate_idx(hz).ok_or(HidppError::Protocol(0x02, "Hz invalide"))?;
+            let idx =
+                Self::hz_to_ext_rate_idx(hz).ok_or(HidppError::Protocol(0x02, "Hz invalide"))?;
             self.transport
                 .request_feature(FEAT_EXTENDED_REPORT_RATE, 0x30, &[idx])?;
         } else {
@@ -582,7 +599,8 @@ impl LogitechMouse {
                 1000 => 1,
                 _ => return Err(HidppError::Protocol(0x02, "Hz non supporté par 0x8060")),
             };
-            self.transport.request_feature(FEAT_REPORT_RATE, 0x20, &[ms])?;
+            self.transport
+                .request_feature(FEAT_REPORT_RATE, 0x20, &[ms])?;
         }
         if let Some(r) = self.info.report_rate.as_mut() {
             r.current_hz = hz;
@@ -591,9 +609,7 @@ impl LogitechMouse {
     }
 
     fn read_onboard_inner(t: &HidppTransport) -> Option<OnboardProfilesSummary> {
-        if t.get_feature_index(FEAT_ONBOARD_PROFILES).is_none() {
-            return None;
-        }
+        t.get_feature_index(FEAT_ONBOARD_PROFILES)?;
         let desc = t.request_feature(FEAT_ONBOARD_PROFILES, 0x00, &[]).ok()?;
         let profile_count = desc.get(3).copied().unwrap_or(0);
         let button_count = desc.get(5).copied().unwrap_or(0);
@@ -680,7 +696,12 @@ impl LogitechMouse {
         if profile_idx_0based >= self.info.onboard_profiles.len() {
             return Err(HidppError::Protocol(0x02, "Index profil hors limites"));
         }
-        let enabled_flags: Vec<bool> = self.info.onboard_profiles.iter().map(|p| p.enabled).collect();
+        let enabled_flags: Vec<bool> = self
+            .info
+            .onboard_profiles
+            .iter()
+            .map(|p| p.enabled)
+            .collect();
         self.info.onboard_profiles[profile_idx_0based].flash_to_mouse(
             &self.transport,
             &desc,
@@ -732,35 +753,49 @@ impl LogitechMouse {
                     }
                 }
             }
-        } else if t.get_feature_index(FEAT_RGB_EFFECTS).is_some() {
-            if let Ok(info_r) = t.request_feature(FEAT_RGB_EFFECTS, 0x00, &[]) {
-                let count = info_r.first().copied().unwrap_or(0).max(1).min(8);
-                for z in 0..count {
-                    zones.push(LedZoneInfo {
-                        index: z,
-                        location: if count == 1 {
-                            "Zone RGB".to_string()
-                        } else {
-                            format!("Zone RGB {}", z + 1)
-                        },
-                        num_effects: 4,
-                    });
-                }
+        } else if t.get_feature_index(FEAT_RGB_EFFECTS).is_some()
+            && let Ok(info_r) = t.request_feature(FEAT_RGB_EFFECTS, 0x00, &[])
+        {
+            let count = info_r.first().copied().unwrap_or(0).clamp(1, 8);
+            for z in 0..count {
+                zones.push(LedZoneInfo {
+                    index: z,
+                    location: if count == 1 {
+                        "Zone RGB".to_string()
+                    } else {
+                        format!("Zone RGB {}", z + 1)
+                    },
+                    num_effects: 4,
+                });
             }
         }
         zones
     }
 
     /// Set Color LED effect on a zone via `0x8070` (`fn 0x30`) or fallback `0x8071` (`fn 0x10`).
-    pub fn set_led_zone(&mut self, zone_idx: u8, mode: MouseLedMode, color: Rgb, speed_ms: u16) -> Result<(), HidppError> {
+    pub fn set_led_zone(
+        &mut self,
+        zone_idx: u8,
+        mode: MouseLedMode,
+        color: Rgb,
+        speed_ms: u16,
+    ) -> Result<(), HidppError> {
         let sp = speed_ms.to_be_bytes();
         let params: Vec<u8> = match mode {
             MouseLedMode::Off => vec![zone_idx, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            MouseLedMode::Fixed => vec![zone_idx, 0x01, color.r, color.g, color.b, 0, 0, 0, 0, 0, 0, 0],
+            MouseLedMode::Fixed => vec![
+                zone_idx, 0x01, color.r, color.g, color.b, 0, 0, 0, 0, 0, 0, 0,
+            ],
             MouseLedMode::Cycle => vec![zone_idx, 0x03, 0, 0, 0, 0, 0, sp[0], sp[1], 100, 0, 0],
-            MouseLedMode::Breathing => vec![zone_idx, 0x0A, color.r, color.g, color.b, sp[0], sp[1], 0x01, 100, 0, 0, 0],
+            MouseLedMode::Breathing => vec![
+                zone_idx, 0x0A, color.r, color.g, color.b, sp[0], sp[1], 0x01, 100, 0, 0, 0,
+            ],
         };
-        if self.transport.get_feature_index(FEAT_COLOR_LED_EFFECTS).is_some() {
+        if self
+            .transport
+            .get_feature_index(FEAT_COLOR_LED_EFFECTS)
+            .is_some()
+        {
             self.transport
                 .request_feature(FEAT_COLOR_LED_EFFECTS, 0x30, &params)?;
             return Ok(());

@@ -60,12 +60,16 @@ export function normalizeState() {
   if (!S) return;
   [
     "corsair_devices", "logi_mice", "logi_keyboards", "logi_headsets", "power_plans", "effects",
-    "aura_modes", "ram_rgb_modes", "button_presets", "keys_layout", "bindable_keys", "devices",
+    "aura_modes", "ram_rgb_modes", "button_presets", "bindable_keys", "devices",
     "firmware_inventory", "hwp_lighting_kinds",
   ].forEach((k) => {
     if (!Array.isArray(S[k])) S[k] = [];
   });
   S.presets = arr(S.presets);
+  S.keyboard = S.keyboard || {};
+  S.keyboard.keys = arr(S.keyboard.keys);
+  S.keyboard.form_factors = arr(S.keyboard.form_factors);
+  S.keyboard.os_layout = S.keyboard.os_layout || {};
   S.telemetry = S.telemetry || {};
   S.cooling = S.cooling || {};
   S.cooling.channels = arr(S.cooling.channels);
@@ -146,10 +150,22 @@ export function headsetImage() {
   return { url: "/assets/headset.svg", official: false, variants: [] };
 }
 
+/** Label Windows gives the key bound to `id` (falls back to the identifier itself). */
+export function keyLabel(id) {
+  const k = S && S.keyboard ? S.keyboard.keys.find((x) => x.id === id) : null;
+  return k ? k.label : id;
+}
+
+/** Label of the key at a physical position (W3C code), e.g. `KeyA` -> `Q` on AZERTY. */
+export function codeLabel(code) {
+  const k = S && S.keyboard ? S.keyboard.keys.find((x) => x.code === code) : null;
+  return k ? k.label : code.replace(/^Key/, "");
+}
+
 export function k70Image() {
   const imgs = arr(S && S.local_assets.k70_images);
   if (imgs.length) {
-    const wanted = S.config.use_azerty_labels ? "fr" : "na";
+    const wanted = S.keyboard && S.keyboard.standard === "ansi" ? "na" : "fr";
     const f = imgs.find((x) => x.id === wanted) || imgs.find((x) => x.id === "thumb") || imgs[0];
     return { url: f.asset_url, official: true };
   }

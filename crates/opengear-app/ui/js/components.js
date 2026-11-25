@@ -168,38 +168,73 @@ export function updateTelemetryDom(tel) {
 }
 
 export function renderKeyboard(mode, kb) {
-  const az = !!S.config.use_azerty_labels;
+  const kbv = S.keyboard;
   const bindings = S.config.profile.bindings || {};
-  const maxX = 18.8;
-  const maxY = 7.6;
-  const photo = k70Image();
-  const showPhoto = mode === "paint" && local.kbViewMode === "photo";
-  if (!S.keys_layout.length) return `<div class="note">Disposition du clavier indisponible.</div>`;
+  const maxX = num(kbv.width, 1);
+  const maxY = num(kbv.height, 1);
+  const hasPhoto = !!kbv.device_name;
+  const photo = hasPhoto ? k70Image() : null;
+  const showPhoto = hasPhoto && mode === "paint" && local.kbViewMode === "photo";
+  if (!kbv.keys.length) return `<div class="note">Disposition du clavier indisponible.</div>`;
   return `
     <div class="kb-chassis">
       <div class="kb-topbar">
         <div class="kb-brand-strip">
-          <span>${esc(((kb && kb.product_name) || "Clavier").toUpperCase())}</span>
+          <span>${esc(((kb && kb.product_name) || kbv.device_name || "Clavier").toUpperCase())}</span>
+          <span class="pill" title="Disposition Windows active">${esc(kbv.os_layout.top_row || "?")} · ${esc(String(kbv.standard || "").toUpperCase())}</span>
           ${kb && kb.pollrate_hz ? `<span class="pill emerald"><span class="dot"></span>${fmtHz(kb.pollrate_hz)}</span>` : ""}
           ${kb && kb.esports_switch_on ? `<span class="pill rog"><span class="dot"></span>Mode tournoi</span>` : ""}
         </div>
-        ${mode === "paint"
+        ${mode === "paint" && hasPhoto
           ? seg([["interactive", "Vue interactive"], ["photo", "Photo"]], local.kbViewMode, "kb-view")
-          : `<span class="muted">Clique sur une touche pour la configurer. Point orange = touche modifiée.</span>`}
+          : mode === "paint"
+            ? `<span class="muted">Clique sur une touche pour la peindre.</span>`
+            : `<span class="muted">Clique sur une touche pour la configurer. Point orange = touche modifiée.</span>`}
       </div>
       ${showPhoto
         ? `<div style="padding:8px 0"><img class="kb-real-photo ${photo.official ? "cutout" : ""}" src="${esc(photo.url)}" alt="Photo du clavier" /></div>`
-        : `<div class="kb-canvas-wrap" role="group" aria-label="Touches du clavier">
-            ${S.keys_layout.map((k) => {
+        : `<div class="kb-canvas-wrap" role="group" aria-label="Touches du clavier" style="aspect-ratio:${maxX} / ${maxY};max-width:${Math.round((300 * maxX) / maxY)}px">
+            ${kbv.keys.map((k) => {
               const left = (num(k.x) / maxX) * 100;
               const top = (num(k.y) / maxY) * 100;
               const width = ((num(k.w, 1) - 0.1) / maxX) * 100;
               const height = ((num(k.h, 1) - 0.12) / maxY) * 100;
-              const label = az ? k.azerty : k.qwerty;
-              const isSel = local.selectedKeyId === k.id;
-              const isBound = !!bindings[k.id];
-              return `<button type="button" class="kb-key ${isSel ? "selected" : ""} ${isBound ? "bound" : ""}" data-act="kb-key" data-key-id="${esc(k.id)}" data-led="${num(k.led_index)}" data-nx="${num(k.norm_x)}" data-ny="${num(k.norm_y)}" style="left:${left.toFixed(2)}%;top:${top.toFixed(2)}%;width:${width.toFixed(2)}%;height:${height.toFixed(2)}%" aria-label="Touche ${esc(label)}${isBound ? " (modifiée)" : ""}" ${mode === "macro" ? `aria-pressed="${isSel}"` : ""}>${esc(label)}</button>`;
+              const label = k.label;
+              const usable = mode === "paint" ? k.led_index != null : !!k.id;
+              const isSel = !!k.id && local.selectedKeyId === k.id;
+              const isBound = !!k.id && !!bindings[k.id];
+              return `<button type="button" class="kb-key ${isSel ? "selected" : ""} ${isBound ? "bound" : ""}" ${usable ? "" : "disabled"} data-act="kb-key" data-key-id="${esc(k.id || "")}" data-led="${k.led_index == null ? -1 : num(k.led_index)}" data-nx="${num(k.norm_x)}" data-ny="${num(k.norm_y)}" style="left:${left.toFixed(2)}%;top:${top.toFixed(2)}%;width:${width.toFixed(2)}%;height:${height.toFixed(2)}%" aria-label="Touche ${esc(label)}${isBound ? " (modifiée)" : ""}" ${mode === "macro" ? `aria-pressed="${isSel}"` : ""}>${esc(label)}</button>`;
             }).join("")}
           </div>`}
+    </div>`;
+}
+
+/** Keyboard format / standard selector shown above the key editor. */
+export function keyboardSetup() {
+  const kbv = S.keyboard;
+  const os = kbv.os_layout || {};
+  const opt = (val, label, cur) => `<option value="${esc(val)}" ${String(val) === String(cur) ? "selected" : ""}>${esc(label)}</option>`;
+  const formCur = kbv.form_factor_auto ? "auto" : kbv.form_factor;
+  const stdCur = kbv.standard_auto ? "auto" : kbv.standard;
+  if (kbv.device_name) {
+    return `<div class="note mb-16">Carte exacte de <strong>${esc(kbv.device_name)}</strong> (${esc(String(kbv.standard || "").toUpperCase())}, lu dans le clavier). Libellés de la disposition Windows active : <strong>${esc(os.top_row || "?")}</strong>.</div>`;
+  }
+  const autoForm = (kbv.form_factors.find((f) => f.id === kbv.form_factor) || {}).label || "?";
+  return `
+    <div class="card mb-16">
+      <div class="card-head"><div><h2 class="card-title">Mon clavier</h2><div class="card-desc">Les libellés suivent la disposition Windows active (<strong>${esc(os.top_row || "?")}</strong>, langue ${esc(os.lang_id || "?")}) et s'adaptent si tu en changes. Choisis la forme de ton clavier si elle ne correspond pas.</div></div></div>
+      <div class="row">
+        <label class="field-label" for="kb-form">Format</label>
+        <select id="kb-form" class="og-select auto" data-change="kb-form">
+          ${opt("auto", `Automatique (${autoForm})`, formCur)}
+          ${kbv.form_factors.map((f) => opt(f.id, f.label, formCur)).join("")}
+        </select>
+        <label class="field-label" for="kb-std">Norme</label>
+        <select id="kb-std" class="og-select auto" data-change="kb-std">
+          ${opt("auto", `Automatique (${String(kbv.standard || "").toUpperCase()})`, stdCur)}
+          ${opt("iso", "ISO — Entrée en L, touche < > (Europe)", stdCur)}
+          ${opt("ansi", "ANSI — Entrée horizontale (États-Unis)", stdCur)}
+        </select>
+      </div>
     </div>`;
 }

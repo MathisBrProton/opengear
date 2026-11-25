@@ -61,10 +61,10 @@ pub fn write_marker(marker: &FanOverrideMarker) {
         return;
     };
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, json).is_ok() {
-        if let Err(e) = std::fs::rename(&tmp, &path) {
-            error!("Marqueur ventilateurs non écrit ({}) : {e}", path.display());
-        }
+    if std::fs::write(&tmp, json).is_ok()
+        && let Err(e) = std::fs::rename(&tmp, &path)
+    {
+        error!("Marqueur ventilateurs non écrit ({}) : {e}", path.display());
     }
 }
 
@@ -87,7 +87,10 @@ where
         match apply_wmi(cfg) {
             Ok(()) => log.push(format!("Ventilateur {:?} rendu au BIOS", cfg.header)),
             Err(e) => {
-                log.push(format!("Ventilateur {:?} : restauration échouée : {e}", cfg.header));
+                log.push(format!(
+                    "Ventilateur {:?} : restauration échouée : {e}",
+                    cfg.header
+                ));
                 remaining_wmi.push(cfg.clone());
             }
         }
@@ -124,14 +127,18 @@ pub fn recover_stale_marker() {
     if marker.pid == std::process::id() {
         return;
     }
-    if !opengear_asus::is_elevated() {
+    if !opengear_platform::is_elevated() {
         // WMI / SuperIO writes need admin: keep the marker for the next elevated launch.
-        warn!("Ventilateurs laissés en mode manuel par une session précédente : relance OpenGear en administrateur pour les rendre au BIOS.");
+        warn!(
+            "Ventilateurs laissés en mode manuel par une session précédente : relance OpenGear en administrateur pour les rendre au BIOS."
+        );
         return;
     }
     warn!("Ventilateurs laissés en mode manuel par une session précédente — restauration BIOS.");
     let (logs, remaining) = restore_from_marker_with(&marker, |cfg| {
-        apply_asus_wmi_curve(cfg).map(|_| ()).map_err(|e| e.to_string())
+        apply_asus_wmi_curve(cfg)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     });
     for line in logs {
         info!("{line}");
@@ -162,18 +169,20 @@ pub fn run_watchdog(parent_pid: u32) -> anyhow::Result<()> {
     wait_for_process_exit(parent_pid)?;
     // Give a clean shutdown a moment to delete its marker.
     std::thread::sleep(std::time::Duration::from_millis(500));
-    if let Some(marker) = read_marker() {
-        if marker.pid == parent_pid {
-            let (logs, remaining) = restore_from_marker_with(&marker, |cfg| {
-                apply_asus_wmi_curve(cfg).map(|_| ()).map_err(|e| e.to_string())
-            });
-            for line in logs {
-                info!("{line}");
-            }
-            match remaining {
-                Some(rem) => write_marker(&rem),
-                None => clear_marker(),
-            }
+    if let Some(marker) = read_marker()
+        && marker.pid == parent_pid
+    {
+        let (logs, remaining) = restore_from_marker_with(&marker, |cfg| {
+            apply_asus_wmi_curve(cfg)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        for line in logs {
+            info!("{line}");
+        }
+        match remaining {
+            Some(rem) => write_marker(&rem),
+            None => clear_marker(),
         }
     }
     Ok(())
@@ -209,8 +218,14 @@ mod tests {
     fn marker_round_trips_through_json() {
         let m = FanOverrideMarker {
             pid: 42,
-            wmi_restore: vec![FanChannelConfig::default_for(opengear_asus::FanHeaderKind::AioPump)],
-            superio_restore: vec![SuperIoSavedState { index: 1, mode: 0x40, cmd: 128 }],
+            wmi_restore: vec![FanChannelConfig::default_for(
+                opengear_asus::FanHeaderKind::AioPump,
+            )],
+            superio_restore: vec![SuperIoSavedState {
+                index: 1,
+                mode: 0x40,
+                cmd: 128,
+            }],
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: FanOverrideMarker = serde_json::from_str(&json).unwrap();

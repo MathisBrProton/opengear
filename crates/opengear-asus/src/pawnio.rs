@@ -16,10 +16,10 @@
 //! - Verifies the 16-byte read-only ENE hardware fingerprint (`0xA0..0xAF == 0x00..0x0F`) and
 //!   rejects Micron (`0x1030 == "Micron"`) before writing a single LED register.
 
-use crate::cooling::is_elevated;
 use crate::ram_rgb::{EneRamMode, EneRamModule};
 use anyhow::{Context, Result};
 use opengear_core::Rgb;
+use opengear_platform::is_elevated;
 use std::path::{Path, PathBuf};
 
 const I2C_SMBUS_WRITE: i64 = 0;
@@ -43,12 +43,12 @@ pub(crate) fn load_pawnio_module(filename: &str) -> Result<Vec<u8>> {
     }
 
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("pawnio_modules").join(filename));
-            if let Some(parent) = dir.parent() {
-                candidates.push(parent.join("pawnio_modules").join(filename));
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("pawnio_modules").join(filename));
+        if let Some(parent) = dir.parent() {
+            candidates.push(parent.join("pawnio_modules").join(filename));
         }
     }
     candidates.push(
@@ -59,8 +59,9 @@ pub(crate) fn load_pawnio_module(filename: &str) -> Result<Vec<u8>> {
 
     for path in &candidates {
         if path.is_file() {
-            return std::fs::read(path)
-                .with_context(|| format!("Impossible de lire le module PawnIO {}", path.display()));
+            return std::fs::read(path).with_context(|| {
+                format!("Impossible de lire le module PawnIO {}", path.display())
+            });
         }
     }
 
@@ -112,9 +113,7 @@ mod win_pio {
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::IO::DeviceIoControl;
-    use windows_sys::Win32::System::Threading::{
-        CreateMutexW, ReleaseMutex, WaitForSingleObject,
-    };
+    use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
     const DEVICE_TYPE: u32 = 41394u32 << 16;
     const IOCTL_PIO_LOAD_BINARY: u32 = DEVICE_TYPE | (0x821 << 2);
@@ -253,7 +252,7 @@ mod win_pio {
 
     fn ensure_service_started() {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let sc = crate::wmi_com::system32_path("sc.exe");
+        let sc = opengear_platform::wmi::system32_path("sc.exe");
         let _ = std::process::Command::new(sc)
             .args(["start", "PawnIO"])
             .creation_flags(CREATE_NO_WINDOW)
@@ -317,7 +316,8 @@ mod win_pio {
                 .checked_mul(8)
                 .and_then(|b| b.checked_add(FN_NAME_LEN))
                 .context("Dépassement taille entrée PawnIO")?;
-            let in_len_u32 = u32::try_from(in_payload_bytes).context("Entrée PawnIO trop grande")?;
+            let in_len_u32 =
+                u32::try_from(in_payload_bytes).context("Entrée PawnIO trop grande")?;
             let out_bytes_len = out_len
                 .checked_mul(8)
                 .context("Dépassement taille sortie PawnIO")?;
@@ -356,7 +356,9 @@ mod win_pio {
             let mut out = Vec::with_capacity(count);
             for i in 0..count {
                 let off = i * 8;
-                out.push(i64::from_le_bytes(out_raw[off..off + 8].try_into().unwrap()));
+                out.push(i64::from_le_bytes(
+                    out_raw[off..off + 8].try_into().unwrap(),
+                ));
             }
             Ok(out)
         }
@@ -431,17 +433,17 @@ mod win_pio {
             *guard = None;
         }
 
-        if let Ok(sess) = PawnIoSession::load_file("AMDFamily17.bin") {
-            if let Some(res) = read_amd_smn_temp(&sess) {
-                *guard = Some(CachedCpuTemp::Amd(sess));
-                return Some(res);
-            }
+        if let Ok(sess) = PawnIoSession::load_file("AMDFamily17.bin")
+            && let Some(res) = read_amd_smn_temp(&sess)
+        {
+            *guard = Some(CachedCpuTemp::Amd(sess));
+            return Some(res);
         }
-        if let Ok(sess) = PawnIoSession::load_file("IntelMSR.bin") {
-            if let Some(res) = read_intel_msr_temp(&sess) {
-                *guard = Some(CachedCpuTemp::Intel(sess));
-                return Some(res);
-            }
+        if let Ok(sess) = PawnIoSession::load_file("IntelMSR.bin")
+            && let Some(res) = read_intel_msr_temp(&sess)
+        {
+            *guard = Some(CachedCpuTemp::Intel(sess));
+            return Some(res);
         }
         None
     }
@@ -452,7 +454,12 @@ mod win_pio {
         let out = sess
             .execute(
                 "ioctl_smbus_xfer",
-                &[addr7 as i64, I2C_SMBUS_READ, cmd as i64, I2C_SMBUS_BYTE_DATA],
+                &[
+                    addr7 as i64,
+                    I2C_SMBUS_READ,
+                    cmd as i64,
+                    I2C_SMBUS_BYTE_DATA,
+                ],
                 1,
             )
             .ok()?;
@@ -512,8 +519,8 @@ mod win_pio {
 
     fn is_micron_dimm(sess: &PawnIoSession, addr7: u8) -> bool {
         let mut mbytes = [0u8; 6];
-        for i in 0..6 {
-            mbytes[i] = ene_read_reg(sess, addr7, 0x1030 + i as u16).unwrap_or(0);
+        for (i, b) in mbytes.iter_mut().enumerate() {
+            *b = ene_read_reg(sess, addr7, 0x1030 + i as u16).unwrap_or(0);
         }
         &mbytes == b"Micron"
     }
@@ -915,7 +922,7 @@ mod win_pio {
 
         type FnWinVerifyTrust = unsafe extern "system" fn(HWND, *const GUID, *mut c_void) -> i32;
 
-        let lib = crate::wmi_com::load_system32_library("wintrust.dll")?;
+        let lib = opengear_platform::wmi::load_system32_library("wintrust.dll")?;
         let win_verify_trust: FnWinVerifyTrust = *unsafe { lib.get(b"WinVerifyTrust\0") }?;
 
         let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -958,7 +965,10 @@ mod win_pio {
         }
 
         if status != 0 {
-            anyhow::bail!("Signature Authenticode invalide ou non approuvée (0x{:08X})", status as u32);
+            anyhow::bail!(
+                "Signature Authenticode invalide ou non approuvée (0x{:08X})",
+                status as u32
+            );
         }
         Ok(())
     }
@@ -1082,7 +1092,7 @@ pub fn install_official_pawnio() -> Result<String> {
         let url =
             "https://github.com/namazso/PawnIO.Setup/releases/download/2.2.0/PawnIO_setup.exe";
 
-        let ps = crate::wmi_com::system32_path(r"WindowsPowerShell\v1.0\powershell.exe");
+        let ps = opengear_platform::wmi::system32_path(r"WindowsPowerShell\v1.0\powershell.exe");
         let dl_script = format!(
             "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
              Invoke-WebRequest -UseBasicParsing -Uri '{url}' -OutFile '{dst}' -TimeoutSec 25",
@@ -1129,7 +1139,10 @@ pub fn install_official_pawnio() -> Result<String> {
             .encode_wide()
             .chain(Some(0))
             .collect();
-        let args: Vec<u16> = OsStr::new("-install").encode_wide().chain(Some(0)).collect();
+        let args: Vec<u16> = OsStr::new("-install")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
         let rc = unsafe {
             ShellExecuteW(
                 std::ptr::null_mut(),
@@ -1178,7 +1191,8 @@ mod tests {
         assert!(load_pawnio_module("../LpcIO.bin").is_err());
         assert!(load_pawnio_module("sub/LpcIO.bin").is_err());
         assert!(load_pawnio_module("not_a_module.txt").is_err());
-        let bytes = load_pawnio_module("LpcIO.bin").expect("LpcIO.bin should load from pawnio_modules/");
+        let bytes =
+            load_pawnio_module("LpcIO.bin").expect("LpcIO.bin should load from pawnio_modules/");
         assert!(!bytes.is_empty());
     }
 

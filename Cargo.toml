@@ -2,9 +2,11 @@
 resolver = "2"
 members = [
     "crates/opengear-core",
+    "crates/opengear-platform",
     "crates/opengear-corsair",
     "crates/opengear-asus",
     "crates/opengear-logitech",
+    "crates/opengear-hp",
     "crates/opengear-input",
     "crates/opengear-app",
 ]
@@ -68,6 +70,8 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 opengear-core = { path = "crates/opengear-core" }
+opengear-platform = { path = "crates/opengear-platform" }
+opengear-hp = { path = "crates/opengear-hp" }
 opengear-corsair = { path = "crates/opengear-corsair" }
 opengear-asus = { path = "crates/opengear-asus" }
 opengear-logitech = { path = "crates/opengear-logitech" }

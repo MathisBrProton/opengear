@@ -1,3 +1,4 @@
+use opengear_core::{KeyboardLayout, PollingRate};
 use thiserror::Error;
 
 pub const CORSAIR_VID: u16 = 0x1B1C;
@@ -197,4 +198,61 @@ pub fn format_fw_version(raw: u32) -> String {
     let minor = (raw >> 8) & 0xFF;
     let patch = (raw >> 16) & 0xFF;
     format!("{major}.{minor}.{patch}")
+}
+
+/// Bragi wire value of a polling rate (property 0x01 / 0x96).
+/// Matches ckb-next: 1=8ms (125Hz), 2=4ms (250Hz), 3=2ms (500Hz),
+/// 4=1ms (1000Hz), 5=0.5ms (2000Hz), 6=0.25ms (4000Hz), 7=0.125ms (8000Hz).
+pub fn pollrate_to_wire(rate: PollingRate) -> u16 {
+    match rate {
+        PollingRate::Hz125 => 1,
+        PollingRate::Hz250 => 2,
+        PollingRate::Hz500 => 3,
+        PollingRate::Hz1000 => 4,
+        PollingRate::Hz2000 => 5,
+        PollingRate::Hz4000 => 6,
+        PollingRate::Hz8000 => 7,
+    }
+}
+
+pub fn pollrate_from_wire(v: u32) -> Option<PollingRate> {
+    match v {
+        1 => Some(PollingRate::Hz125),
+        2 => Some(PollingRate::Hz250),
+        3 => Some(PollingRate::Hz500),
+        4 => Some(PollingRate::Hz1000),
+        5 => Some(PollingRate::Hz2000),
+        6 => Some(PollingRate::Hz4000),
+        7 => Some(PollingRate::Hz8000),
+        _ => None,
+    }
+}
+
+/// Bragi physical-layout property value.
+pub fn layout_from_wire(v: u32) -> KeyboardLayout {
+    match v {
+        1 => KeyboardLayout::Ansi,
+        2 => KeyboardLayout::Iso,
+        3 => KeyboardLayout::Abnt,
+        4 => KeyboardLayout::Jis,
+        other => KeyboardLayout::Unknown(other),
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    #[test]
+    fn pollrate_wire_round_trip() {
+        for hz in [125, 250, 500, 1000, 2000, 4000, 8000] {
+            let rate = PollingRate::from_hz(hz).unwrap();
+            assert_eq!(
+                pollrate_from_wire(pollrate_to_wire(rate) as u32),
+                Some(rate)
+            );
+        }
+        assert_eq!(pollrate_from_wire(0), None);
+        assert_eq!(layout_from_wire(2), KeyboardLayout::Iso);
+    }
 }

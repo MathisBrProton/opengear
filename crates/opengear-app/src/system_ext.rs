@@ -99,8 +99,9 @@ pub fn list_visible_apps() -> Vec<String> {
                         && len > 0
                     {
                         let full = String::from_utf16_lossy(&buf[..len as usize]);
-                        if let Some(name) =
-                            std::path::Path::new(&full).file_name().and_then(|s| s.to_str())
+                        if let Some(name) = std::path::Path::new(&full)
+                            .file_name()
+                            .and_then(|s| s.to_str())
                         {
                             let lower = name.to_ascii_lowercase();
                             if !matches!(
@@ -183,17 +184,7 @@ pub fn sample_ambilight_screen(prev: Option<&AmbilightFrame>) -> Option<Ambiligh
         let old = SelectObject(hdc_mem, hbm);
         SetStretchBltMode(hdc_mem, HALFTONE);
         let ok = StretchBlt(
-            hdc_mem,
-            0,
-            0,
-            W as i32,
-            H as i32,
-            hdc_screen,
-            0,
-            0,
-            sw,
-            sh,
-            SRCCOPY,
+            hdc_mem, 0, 0, W as i32, H as i32, hdc_screen, 0, 0, sw, sh, SRCCOPY,
         );
 
         let mut raw = vec![0u8; W * H * 4];

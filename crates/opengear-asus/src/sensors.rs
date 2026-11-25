@@ -76,7 +76,7 @@ pub fn read_hardware_sensors() -> HardwareSensorsSnapshot {
             (r"root\LibreHardwareMonitor", "LibreHardwareMonitor WMI"),
             (r"root\OpenHardwareMonitor", "OpenHardwareMonitor WMI"),
         ] {
-            let Ok(conn) = crate::wmi_com::WmiConn::connect(ns) else {
+            let Ok(conn) = opengear_platform::wmi::WmiConn::connect(ns) else {
                 continue;
             };
             let Ok(rows) = conn.query(
@@ -96,7 +96,11 @@ pub fn read_hardware_sensors() -> HardwareSensorsSnapshot {
 
             for row in &rows {
                 let stype = row.get("SensorType").and_then(|v| v.as_str()).unwrap_or("");
-                let name = row.get("Name").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let name = row
+                    .get("Name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
                 let Some(val) = row.get("Value").and_then(|v| v.as_f64()).map(|v| v as f32) else {
                     continue;
                 };
@@ -106,11 +110,9 @@ pub fn read_hardware_sensors() -> HardwareSensorsSnapshot {
                     if snap.cpu_temp_c.is_none()
                         && (lower.contains("tdie")
                             || lower.contains("tctl")
-                            || lower.contains("cpu package")
+                            || lower.contains("cpu")
                             || lower == "core (tctl/tdie)")
                     {
-                        snap.cpu_temp_c = Some(rounded);
-                    } else if snap.cpu_temp_c.is_none() && lower.contains("cpu") {
                         snap.cpu_temp_c = Some(rounded);
                     } else if snap.motherboard_temp_c.is_none()
                         && (lower.contains("motherboard")
@@ -126,7 +128,8 @@ pub fn read_hardware_sensors() -> HardwareSensorsSnapshot {
                     } else if lower.contains("cpu") {
                         snap.cpu_fan_rpm = Some(rpm);
                     }
-                    if !sio.detected && (rpm > 0 || lower.contains("fan") || lower.contains("pump")) {
+                    if !sio.detected && (rpm > 0 || lower.contains("fan") || lower.contains("pump"))
+                    {
                         snap.fans.push(FanRpmReading {
                             name: name.to_string(),
                             rpm,
@@ -168,7 +171,10 @@ mod tests {
     #[test]
     fn air_cooler_is_not_mislabeled_as_aio_pump() {
         assert_eq!(classify_superio_rpms(&[1100, 850]), (None, Some(1100)));
-        assert_eq!(classify_superio_rpms(&[2850, 1200]), (Some(2850), Some(1200)));
+        assert_eq!(
+            classify_superio_rpms(&[2850, 1200]),
+            (Some(2850), Some(1200))
+        );
         assert_eq!(classify_superio_rpms(&[]), (None, None));
     }
 }

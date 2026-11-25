@@ -241,16 +241,32 @@ mod tests {
 
     fn wasd_pair(mode: SocdMode) -> SocdPair {
         SocdPair {
-            a: SocdKey { vk: 0x51, scan: 0x1E, extended: false },
-            b: SocdKey { vk: 0x44, scan: 0x20, extended: false },
+            a: SocdKey {
+                vk: 0x51,
+                scan: 0x1E,
+                extended: false,
+            },
+            b: SocdKey {
+                vk: 0x44,
+                scan: 0x20,
+                extended: false,
+            },
             mode,
         }
     }
 
     fn arrows_pair(mode: SocdMode) -> SocdPair {
         SocdPair {
-            a: SocdKey { vk: 0x25, scan: 0x4B, extended: true },
-            b: SocdKey { vk: 0x27, scan: 0x4D, extended: true },
+            a: SocdKey {
+                vk: 0x25,
+                scan: 0x4B,
+                extended: true,
+            },
+            b: SocdKey {
+                vk: 0x27,
+                scan: 0x4D,
+                extended: true,
+            },
             mode,
         }
     }

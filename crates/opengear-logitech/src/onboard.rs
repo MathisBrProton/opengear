@@ -172,10 +172,18 @@ impl MouseButtonAction {
             Self::MouseButton(n) => format!("Bouton Souris {n}"),
             Self::KeyboardKey { modifiers, hid_key } => {
                 let mut parts = Vec::new();
-                if (modifiers & 0x01) != 0 { parts.push("Ctrl"); }
-                if (modifiers & 0x02) != 0 { parts.push("Shift"); }
-                if (modifiers & 0x04) != 0 { parts.push("Alt"); }
-                if (modifiers & 0x08) != 0 { parts.push("Win"); }
+                if (modifiers & 0x01) != 0 {
+                    parts.push("Ctrl");
+                }
+                if (modifiers & 0x02) != 0 {
+                    parts.push("Shift");
+                }
+                if (modifiers & 0x04) != 0 {
+                    parts.push("Alt");
+                }
+                if (modifiers & 0x08) != 0 {
+                    parts.push("Win");
+                }
                 let kname = hid_usage_name(hid_key);
                 if parts.is_empty() {
                     format!("Touche {kname}")
@@ -205,7 +213,10 @@ impl MouseButtonAction {
                 format!("Macro Flash (sec 0x{sector:02X}+{offset})")
             }
             Self::Disabled => "Désactivé".into(),
-            Self::Raw(r) => format!("Macro / Brut {:02X}{:02X}{:02X}{:02X}", r[0], r[1], r[2], r[3]),
+            Self::Raw(r) => format!(
+                "Macro / Brut {:02X}{:02X}{:02X}{:02X}",
+                r[0], r[1], r[2], r[3]
+            ),
         }
     }
 
@@ -226,11 +237,41 @@ impl MouseButtonAction {
         ("Média : Volume +", Self::ConsumerControl(0x00E9)),
         ("Média : Volume -", Self::ConsumerControl(0x00EA)),
         ("Média : Muet", Self::ConsumerControl(0x00E2)),
-        ("Touche : Espace", Self::KeyboardKey { modifiers: 0, hid_key: 0x2C }),
-        ("Touche : F13 (Push-to-Talk)", Self::KeyboardKey { modifiers: 0, hid_key: 0x68 }),
-        ("Touche : F14", Self::KeyboardKey { modifiers: 0, hid_key: 0x69 }),
-        ("Touche : Ctrl+C", Self::KeyboardKey { modifiers: 0x01, hid_key: 0x06 }),
-        ("Touche : Ctrl+V", Self::KeyboardKey { modifiers: 0x01, hid_key: 0x19 }),
+        (
+            "Touche : Espace",
+            Self::KeyboardKey {
+                modifiers: 0,
+                hid_key: 0x2C,
+            },
+        ),
+        (
+            "Touche : F13 (Push-to-Talk)",
+            Self::KeyboardKey {
+                modifiers: 0,
+                hid_key: 0x68,
+            },
+        ),
+        (
+            "Touche : F14",
+            Self::KeyboardKey {
+                modifiers: 0,
+                hid_key: 0x69,
+            },
+        ),
+        (
+            "Touche : Ctrl+C",
+            Self::KeyboardKey {
+                modifiers: 0x01,
+                hid_key: 0x06,
+            },
+        ),
+        (
+            "Touche : Ctrl+V",
+            Self::KeyboardKey {
+                modifiers: 0x01,
+                hid_key: 0x19,
+            },
+        ),
         ("Désactivé", Self::Disabled),
     ];
 }
@@ -282,7 +323,11 @@ impl OnboardProfile {
         }
         let raw_sector_size = u16::from_be_bytes([d[7], d[8]]);
         // Note: G PRO X Superlight reports sector_size = 255 (0x00FF) — MUST NOT round up to 256!
-        let sector_size = if raw_sector_size < 64 { 256 } else { raw_sector_size };
+        let sector_size = if raw_sector_size < 64 {
+            256
+        } else {
+            raw_sector_size
+        };
         let mech = d[9];
         Ok(OnboardMemoryDesc {
             memory_model_id: d[0],
@@ -371,7 +416,9 @@ impl OnboardProfile {
     }
 
     /// Read directory sector `0x0000` and all onboard profiles (falling back to ROM `0x0101+` if empty).
-    pub fn read_all(t: &HidppTransport) -> Result<(OnboardMemoryDesc, Vec<OnboardProfile>), HidppError> {
+    pub fn read_all(
+        t: &HidppTransport,
+    ) -> Result<(OnboardMemoryDesc, Vec<OnboardProfile>), HidppError> {
         let desc = Self::read_desc(t)?;
         let dir_raw = Self::read_sector(t, 0x0000, desc.sector_size).ok();
         let dir_crc_ok = dir_raw
@@ -380,20 +427,18 @@ impl OnboardProfile {
             .unwrap_or(false);
 
         let mut dir_entries: Vec<(u16, bool)> = Vec::new();
-        if dir_crc_ok {
-            if let Some(ref d) = dir_raw {
-                for i in 0..desc.profile_count as usize {
-                    let base = i * 4;
-                    if base + 3 >= d.len() {
-                        break;
-                    }
-                    let addr = u16::from_be_bytes([d[base], d[base + 1]]);
-                    if addr == 0xFFFF {
-                        break;
-                    }
-                    let enabled = d[base + 2] != 0;
-                    dir_entries.push((addr, enabled));
+        if dir_crc_ok && let Some(ref d) = dir_raw {
+            for i in 0..desc.profile_count as usize {
+                let base = i * 4;
+                if base + 3 >= d.len() {
+                    break;
                 }
+                let addr = u16::from_be_bytes([d[base], d[base + 1]]);
+                if addr == 0xFFFF {
+                    break;
+                }
+                let enabled = d[base + 2] != 0;
+                dir_entries.push((addr, enabled));
             }
         }
         debug!(
@@ -407,20 +452,41 @@ impl OnboardProfile {
             let (addr, enabled) = dir_entries.get(i).copied().unwrap_or((slot as u16, i == 0));
 
             let mut parsed: Option<OnboardProfile> = None;
-            if dir_crc_ok && addr != 0 && addr < 0x0100 {
-                if let Ok(raw) = Self::read_sector(t, addr, desc.sector_size) {
-                    if Self::verify_crc(&raw) {
-                        parsed = Some(Self::parse_sector(slot, addr, false, enabled, true, &raw, desc.button_count));
-                    }
-                }
+            if dir_crc_ok
+                && addr != 0
+                && addr < 0x0100
+                && let Ok(raw) = Self::read_sector(t, addr, desc.sector_size)
+                && Self::verify_crc(&raw)
+            {
+                parsed = Some(Self::parse_sector(
+                    slot,
+                    addr,
+                    false,
+                    enabled,
+                    true,
+                    &raw,
+                    desc.button_count,
+                ));
             }
 
             if parsed.is_none() {
                 // Fallback to factory ROM profile (0x0101..0x010N)
-                let rom_idx = if (i as u8) < desc.rom_profile_count { i as u16 + 1 } else { 1 };
+                let rom_idx = if (i as u8) < desc.rom_profile_count {
+                    i as u16 + 1
+                } else {
+                    1
+                };
                 let rom_addr = 0x0100 + rom_idx;
                 if let Ok(raw) = Self::read_sector(t, rom_addr, desc.sector_size) {
-                    parsed = Some(Self::parse_sector(slot, rom_addr, true, enabled, true, &raw, desc.button_count));
+                    parsed = Some(Self::parse_sector(
+                        slot,
+                        rom_addr,
+                        true,
+                        enabled,
+                        true,
+                        &raw,
+                        desc.button_count,
+                    ));
                 }
             }
 
@@ -456,12 +522,12 @@ impl OnboardProfile {
         let switched_dpi_idx = raw.get(2).copied().unwrap_or(0).min(4);
 
         let mut dpi_stages = [400, 800, 1600, 3200, 6400];
-        for i in 0..5 {
+        for (i, stage) in dpi_stages.iter_mut().enumerate() {
             let off = 3 + i * 2;
             if off + 1 < raw.len() {
                 let v = u16::from_le_bytes([raw[off], raw[off + 1]]);
                 if (MIN_DPI..=MAX_DPI).contains(&v) {
-                    dpi_stages[i] = v;
+                    *stage = v;
                 }
             }
         }
@@ -571,7 +637,10 @@ impl OnboardProfile {
             )));
         }
         if self.slot_index == 0 || self.slot_index > desc.profile_count {
-            return Err(HidppError::Flash(format!("slot de profil {} invalide", self.slot_index)));
+            return Err(HidppError::Flash(format!(
+                "slot de profil {} invalide",
+                self.slot_index
+            )));
         }
 
         // 1. Directory
@@ -652,25 +721,24 @@ impl OnboardProfile {
             target,
             all_enabled_flags,
             &other_valid,
-        )? {
-            if let Err(e) = write_and_verify(t, 0x0000, &mut new_dir, desc.sector_size) {
-                let dir_rb = if dir_state == DirectoryState::Valid {
-                    let mut old = dir_raw.clone();
-                    match write_and_verify(t, 0x0000, &mut old, desc.sector_size) {
-                        Ok(()) => "répertoire d'origine restauré".to_string(),
-                        Err(re) => format!("restauration du répertoire échouée : {re}"),
-                    }
-                } else {
-                    "répertoire précédemment vide".to_string()
-                };
-                if current_valid {
-                    let mut old_prof = current.clone();
-                    let _ = write_and_verify(t, target, &mut old_prof, desc.sector_size);
+        )? && let Err(e) = write_and_verify(t, 0x0000, &mut new_dir, desc.sector_size)
+        {
+            let dir_rb = if dir_state == DirectoryState::Valid {
+                let mut old = dir_raw.clone();
+                match write_and_verify(t, 0x0000, &mut old, desc.sector_size) {
+                    Ok(()) => "répertoire d'origine restauré".to_string(),
+                    Err(re) => format!("restauration du répertoire échouée : {re}"),
                 }
-                return Err(HidppError::Flash(format!(
-                    "mise à jour du répertoire échouée : {e} — {dir_rb}"
-                )));
+            } else {
+                "répertoire précédemment vide".to_string()
+            };
+            if current_valid {
+                let mut old_prof = current.clone();
+                let _ = write_and_verify(t, target, &mut old_prof, desc.sector_size);
             }
+            return Err(HidppError::Flash(format!(
+                "mise à jour du répertoire échouée : {e} — {dir_rb}"
+            )));
         }
 
         self.raw_sector = new_sector;
@@ -705,10 +773,14 @@ impl OnboardProfile {
             )));
         }
         if sector != 0x0000 && !is_user_sector(sector, desc) {
-            return Err(HidppError::Flash(format!("secteur 0x{sector:04X} hors zone utilisateur")));
+            return Err(HidppError::Flash(format!(
+                "secteur 0x{sector:04X} hors zone utilisateur"
+            )));
         }
         if !Self::verify_crc(bytes) && !is_blank(bytes) {
-            return Err(HidppError::Flash("sauvegarde invalide (CRC incorrect)".into()));
+            return Err(HidppError::Flash(
+                "sauvegarde invalide (CRC incorrect)".into(),
+            ));
         }
         let mut buf = bytes.to_vec();
         if is_blank(&buf) {
@@ -775,7 +847,9 @@ impl OnboardProfile {
 
 /// Validate that `profile_format_id` matches the known Superlight / G PRO v1..v4 binary layout
 /// handled by `parse_sector` / `patch_into`, refusing silent corruption on newer incompatible formats.
-pub(crate) fn validate_supported_profile_format(desc: &OnboardMemoryDesc) -> Result<(), HidppError> {
+pub(crate) fn validate_supported_profile_format(
+    desc: &OnboardMemoryDesc,
+) -> Result<(), HidppError> {
     if !(1..=4).contains(&desc.profile_format_id) {
         return Err(HidppError::Flash(format!(
             "format de profil embarqué non supporté (profile_format_id={}, memory_model_id={}) — écriture refusée par sécurité",
@@ -830,7 +904,7 @@ pub(crate) fn is_blank(raw: &[u8]) -> bool {
 
 /// True for a writable user flash sector (`0x0001..sector_count`, never ROM `0x01xx`).
 pub(crate) fn is_user_sector(sector: u16, desc: &OnboardMemoryDesc) -> bool {
-    sector >= 1 && sector < 0x0100 && sector < desc.sector_count as u16
+    (1..0x0100).contains(&sector) && sector < desc.sector_count as u16
 }
 
 /// Directory entries `(sector, enabled)` in slot order, up to the `0xFFFF` terminator.
@@ -858,10 +932,10 @@ pub(crate) fn choose_profile_sector(
     desc: &OnboardMemoryDesc,
 ) -> Result<u16, HidppError> {
     let i = slot as usize - 1;
-    if let Some(&(addr, _)) = entries.get(i) {
-        if is_user_sector(addr, desc) {
-            return Ok(addr);
-        }
+    if let Some(&(addr, _)) = entries.get(i)
+        && is_user_sector(addr, desc)
+    {
+        return Ok(addr);
     }
     let candidate = slot as u16;
     if !is_user_sector(candidate, desc) {
@@ -1021,7 +1095,7 @@ pub fn list_sector_backups() -> Vec<SectorBackup> {
             })
         })
         .collect();
-    out.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+    out.sort_by_key(|a| std::cmp::Reverse(a.created_ms));
     out
 }
 
@@ -1096,7 +1170,7 @@ fn prune_old_backups(dir: &std::path::Path, sector: u16, keep: usize) {
     if matching.len() <= keep {
         return;
     }
-    matching.sort_by(|a, b| b.0.cmp(&a.0));
+    matching.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (_, old_path) in matching.into_iter().skip(keep) {
         let _ = std::fs::remove_file(old_path);
     }
@@ -1114,10 +1188,11 @@ pub(crate) fn pick_macro_sector(
     own_sector: Option<u16>,
     mut is_blank_sector: impl FnMut(u16) -> Result<bool, HidppError>,
 ) -> Result<(u16, bool), HidppError> {
-    if let Some(s) = own_sector {
-        if (first..end).contains(&s) && referenced.iter().filter(|&&r| r == s).count() == 1 {
-            return Ok((s, true));
-        }
+    if let Some(s) = own_sector
+        && (first..end).contains(&s)
+        && referenced.iter().filter(|&&r| r == s).count() == 1
+    {
+        return Ok((s, true));
     }
     for s in first..end {
         if referenced.contains(&s) {
@@ -1138,7 +1213,9 @@ fn decode_profile_name(raw: &[u8], slot_index: u8) -> String {
     }
     // Check if UTF-16LE (common in G HUB: ASCII char followed by 0x00)
     let u16s: Vec<u16> = raw
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .take_while(|&v| v != 0x0000 && v != 0xFFFF)
         .collect();
@@ -1208,8 +1285,14 @@ mod tests {
 
     #[test]
     fn directory_states() {
-        assert_eq!(DirectoryState::classify(&dir_with(&[(1, true)])), DirectoryState::Valid);
-        assert_eq!(DirectoryState::classify(&vec![0xFF; 255]), DirectoryState::Blank);
+        assert_eq!(
+            DirectoryState::classify(&dir_with(&[(1, true)])),
+            DirectoryState::Valid
+        );
+        assert_eq!(
+            DirectoryState::classify(&vec![0xFF; 255]),
+            DirectoryState::Blank
+        );
         let mut bad = dir_with(&[(1, true)]);
         bad[0] ^= 0x55;
         assert_eq!(DirectoryState::classify(&bad), DirectoryState::Corrupt);
@@ -1245,13 +1328,27 @@ mod tests {
         let raw = dir_with(&[(1, true), (2, false), (3, true)]);
         let d = desc();
         // Already correct -> no write
-        assert!(build_directory(&raw, DirectoryState::Valid, &d, 1, 1, &[], &[]).unwrap().is_none());
+        assert!(
+            build_directory(&raw, DirectoryState::Valid, &d, 1, 1, &[], &[])
+                .unwrap()
+                .is_none()
+        );
         // Enable slot 2
-        let out = build_directory(&raw, DirectoryState::Valid, &d, 2, 2, &[], &[]).unwrap().unwrap();
-        assert_eq!(parse_directory(&out, 5), vec![(1, true), (2, true), (3, true)]);
+        let out = build_directory(&raw, DirectoryState::Valid, &d, 2, 2, &[], &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parse_directory(&out, 5),
+            vec![(1, true), (2, true), (3, true)]
+        );
         // Append slot 4 right after the last entry
-        let out = build_directory(&raw, DirectoryState::Valid, &d, 4, 4, &[], &[]).unwrap().unwrap();
-        assert_eq!(parse_directory(&out, 5), vec![(1, true), (2, false), (3, true), (4, true)]);
+        let out = build_directory(&raw, DirectoryState::Valid, &d, 4, 4, &[], &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parse_directory(&out, 5),
+            vec![(1, true), (2, false), (3, true), (4, true)]
+        );
         // Slot 5 would leave a hole -> refused
         assert!(build_directory(&raw, DirectoryState::Valid, &d, 5, 5, &[], &[]).is_err());
     }
@@ -1286,7 +1383,11 @@ mod tests {
         assert_eq!(p.dpi_stages[0], 44_000);
         let mut out = raw.clone();
         p.patch_into(&mut out);
-        assert_eq!(u16::from_le_bytes([out[3], out[4]]), 44_000, "44k DPI must not be clamped");
+        assert_eq!(
+            u16::from_le_bytes([out[3], out[4]]),
+            44_000,
+            "44k DPI must not be clamped"
+        );
         // LED / metadata area untouched
         assert_eq!(&out[200..250], &raw[200..250]);
     }
@@ -1296,7 +1397,10 @@ mod tests {
         for &(_, act) in MouseButtonAction::PRESET_ACTIONS {
             assert_eq!(MouseButtonAction::decode(act.encode()), act);
         }
-        let m = MouseButtonAction::OnboardMacro { sector: 6, offset: 0 };
+        let m = MouseButtonAction::OnboardMacro {
+            sector: 6,
+            offset: 0,
+        };
         assert_eq!(MouseButtonAction::decode(m.encode()), m);
     }
 

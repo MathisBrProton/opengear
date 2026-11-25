@@ -186,7 +186,7 @@ impl Default for HpOmenStatus {
     fn default() -> Self {
         Self {
             detected: false,
-            is_admin: crate::is_elevated(),
+            is_admin: opengear_platform::is_elevated(),
             wmi_accessible: false,
             model: String::new(),
             board_id: String::new(),
@@ -290,28 +290,31 @@ fn detect_hp_identity() -> (bool, String, String) {
         let mut is_hp_gaming = false;
         let mut model = String::new();
         let mut board_id = String::new();
-        if let Ok(cim) = crate::wmi_com::WmiConn::connect(r"root\cimv2") {
+        if let Ok(cim) = opengear_platform::wmi::WmiConn::connect(r"root\cimv2") {
             let mut mfg = String::new();
-            if let Ok(rows) = cim.query("SELECT Manufacturer, Model FROM Win32_ComputerSystem") {
-                if let Some(row) = rows.first() {
-                    mfg = row
-                        .get("Manufacturer")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    model = row
-                        .get("Model")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                }
+            if let Ok(rows) = cim.query("SELECT Manufacturer, Model FROM Win32_ComputerSystem")
+                && let Some(row) = rows.first()
+            {
+                mfg = row
+                    .get("Manufacturer")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                model = row
+                    .get("Model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
             }
-            if let Ok(rows) = cim.query("SELECT Product FROM Win32_BaseBoard") {
-                if let Some(p) = rows.first().and_then(|r| r.get("Product")).and_then(|v| v.as_str()) {
-                    board_id = p.trim().to_string();
-                }
+            if let Ok(rows) = cim.query("SELECT Product FROM Win32_BaseBoard")
+                && let Some(p) = rows
+                    .first()
+                    .and_then(|r| r.get("Product"))
+                    .and_then(|v| v.as_str())
+            {
+                board_id = p.trim().to_string();
             }
             let ml = model.to_ascii_lowercase();
             let fl = mfg.to_ascii_lowercase();
@@ -321,12 +324,11 @@ fn detect_hp_identity() -> (bool, String, String) {
                 is_hp_gaming = true;
             }
         }
-        if !is_hp_gaming {
-            if let Ok(wmi) = crate::wmi_com::WmiConn::connect(r"root\wmi") {
-                if wmi.first_instance_path("hpqBIntM").ok().flatten().is_some() {
-                    is_hp_gaming = true;
-                }
-            }
+        if !is_hp_gaming
+            && let Ok(wmi) = opengear_platform::wmi::WmiConn::connect(r"root\wmi")
+            && wmi.first_instance_path("hpqBIntM").ok().flatten().is_some()
+        {
+            is_hp_gaming = true;
         }
         (is_hp_gaming, model, board_id)
     }
@@ -336,7 +338,7 @@ fn detect_hp_identity() -> (bool, String, String) {
 
 #[cfg(windows)]
 fn query_hp_wmi(
-    conn: &crate::wmi_com::WmiConn,
+    conn: &opengear_platform::wmi::WmiConn,
     method: &str,
     cmd: u32,
     cmd_type: u32,
@@ -366,7 +368,7 @@ pub fn probe_hp_omen() -> HpOmenStatus {
     st.detected = is_hp;
     st.model = model;
     st.board_id = board_id;
-    st.is_admin = crate::is_elevated();
+    st.is_admin = opengear_platform::is_elevated();
 
     if !is_hp {
         st.diagnostic = "Système non HP OMEN/Victus.".into();
@@ -381,7 +383,7 @@ pub fn probe_hp_omen() -> HpOmenStatus {
             return st;
         }
 
-        let conn = match crate::wmi_com::WmiConn::connect(r"root\wmi") {
+        let conn = match opengear_platform::wmi::WmiConn::connect(r"root\wmi") {
             Ok(c) => c,
             Err(e) => {
                 st.diagnostic = format!("Connexion COM root\\wmi impossible : {e}");
@@ -393,36 +395,53 @@ pub fn probe_hp_omen() -> HpOmenStatus {
         let zero4 = [0u8; 4];
 
         // 1. System Design Data (thermal policy version + board flags)
-        if let Some((rc, bytes)) =
-            query_hp_wmi(&conn, "hpqBIOSInt128", HPWMI_GM, GM_GET_SYSTEM_DESIGN, &zero4, &mut log, "SystemDesign")
+        if let Some((rc, bytes)) = query_hp_wmi(
+            &conn,
+            "hpqBIOSInt128",
+            HPWMI_GM,
+            GM_GET_SYSTEM_DESIGN,
+            &zero4,
+            &mut log,
+            "SystemDesign",
+        ) && rc == 0
         {
-            if rc == 0 {
-                st.wmi_accessible = true;
-                if bytes.len() > 3 {
-                    // Boards like 88D2 use ThermalPolicy V1 (bytes[3] or fallback V1)
-                    st.thermal_version = if bytes[3] == 0 { 0 } else { 1 };
-                }
+            st.wmi_accessible = true;
+            if bytes.len() > 3 {
+                // Boards like 88D2 use ThermalPolicy V1 (bytes[3] or fallback V1)
+                st.thermal_version = if bytes[3] == 0 { 0 } else { 1 };
             }
         }
 
         // 2. Fan count
-        if let Some((rc, bytes)) =
-            query_hp_wmi(&conn, "hpqBIOSInt4", HPWMI_GM, GM_GET_FAN_COUNT, &zero4, &mut log, "FanCount")
+        if let Some((rc, bytes)) = query_hp_wmi(
+            &conn,
+            "hpqBIOSInt4",
+            HPWMI_GM,
+            GM_GET_FAN_COUNT,
+            &zero4,
+            &mut log,
+            "FanCount",
+        ) && rc == 0
+            && !bytes.is_empty()
         {
-            if rc == 0 && !bytes.is_empty() {
-                st.wmi_accessible = true;
-                st.fan_count = bytes[0].min(4);
-            }
+            st.wmi_accessible = true;
+            st.fan_count = bytes[0].min(4);
         }
 
         // 3. Max Fan state
-        if let Some((rc, bytes)) =
-            query_hp_wmi(&conn, "hpqBIOSInt4", HPWMI_GM, GM_GET_MAX_FAN, &zero4, &mut log, "MaxFan")
+        if let Some((rc, bytes)) = query_hp_wmi(
+            &conn,
+            "hpqBIOSInt4",
+            HPWMI_GM,
+            GM_GET_MAX_FAN,
+            &zero4,
+            &mut log,
+            "MaxFan",
+        ) && rc == 0
+            && !bytes.is_empty()
         {
-            if rc == 0 && !bytes.is_empty() {
-                st.wmi_accessible = true;
-                st.max_fan = bytes[0] != 0;
-            }
+            st.wmi_accessible = true;
+            st.max_fan = bytes[0] != 0;
         }
 
         // 4. Fan level (RPM/100) + Fan table fallback
@@ -437,28 +456,40 @@ pub fn probe_hp_omen() -> HpOmenStatus {
         st.fan_max_rpms = max_rpms;
 
         // 5. GPU Dynamic Boost / Power mode ([cTGP, PPAB, dState, peakTemp])
-        if let Some((rc, bytes)) =
-            query_hp_wmi(&conn, "hpqBIOSInt4", HPWMI_GM, GM_GET_GPU_POWER, &zero4, &mut log, "GpuPower")
+        if let Some((rc, bytes)) = query_hp_wmi(
+            &conn,
+            "hpqBIOSInt4",
+            HPWMI_GM,
+            GM_GET_GPU_POWER,
+            &zero4,
+            &mut log,
+            "GpuPower",
+        ) && rc == 0
+            && !bytes.is_empty()
         {
-            if rc == 0 && !bytes.is_empty() {
-                st.gpu_power = OmenGpuPowerLevel::from_gpu_power_bytes(&bytes);
-                if let Some(&peak) = bytes.get(3) {
-                    if (50..=105).contains(&peak) {
-                        st.gpu_peak_temp_c = Some(peak);
-                    }
-                }
+            st.gpu_power = OmenGpuPowerLevel::from_gpu_power_bytes(&bytes);
+            if let Some(&peak) = bytes.get(3)
+                && (50..=105).contains(&peak)
+            {
+                st.gpu_peak_temp_c = Some(peak);
             }
         }
 
         // 6. Keyboard type, backlight state, color table
-        if let Some((rc, bytes)) =
-            query_hp_wmi(&conn, "hpqBIOSInt128", HPWMI_KB, KB_GET_TYPE, &zero4, &mut log, "KbType")
+        if let Some((rc, bytes)) = query_hp_wmi(
+            &conn,
+            "hpqBIOSInt128",
+            HPWMI_KB,
+            KB_GET_TYPE,
+            &zero4,
+            &mut log,
+            "KbType",
+        ) && rc == 0
+            && !bytes.is_empty()
         {
-            if rc == 0 && !bytes.is_empty() {
-                st.wmi_accessible = true;
-                st.keyboard_type = OmenKeyboardType::from_byte(bytes[0]);
-                st.keyboard_label = st.keyboard_type.label().to_string();
-            }
+            st.wmi_accessible = true;
+            st.keyboard_type = OmenKeyboardType::from_byte(bytes[0]);
+            st.keyboard_label = st.keyboard_type.label().to_string();
         }
 
         if let Some((rc, bytes)) = query_hp_wmi(
@@ -469,10 +500,11 @@ pub fn probe_hp_omen() -> HpOmenStatus {
             &zero4,
             &mut log,
             "KbBacklight",
-        ) {
-            if rc == 0 && !bytes.is_empty() {
-                st.backlight_on = bytes[0] == BACKLIGHT_ON || (bytes[0] != BACKLIGHT_OFF && bytes[0] != 0);
-            }
+        ) && rc == 0
+            && !bytes.is_empty()
+        {
+            st.backlight_on =
+                bytes[0] == BACKLIGHT_ON || (bytes[0] != BACKLIGHT_OFF && bytes[0] != 0);
         }
 
         if let Some((rc, bytes)) = query_hp_wmi(
@@ -483,16 +515,16 @@ pub fn probe_hp_omen() -> HpOmenStatus {
             &zero4,
             &mut log,
             "KbColorTable",
-        ) {
-            if rc == 0 {
-                if let Some(zones) = decode_zone_colors(&bytes) {
-                    st.zone_colors = zones;
-                    if matches!(st.keyboard_type, OmenKeyboardType::None | OmenKeyboardType::Unknown(_))
-                    {
-                        st.keyboard_type = OmenKeyboardType::FourZoneRgb;
-                        st.keyboard_label = st.keyboard_type.label().to_string();
-                    }
-                }
+        ) && rc == 0
+            && let Some(zones) = decode_zone_colors(&bytes)
+        {
+            st.zone_colors = zones;
+            if matches!(
+                st.keyboard_type,
+                OmenKeyboardType::None | OmenKeyboardType::Unknown(_)
+            ) {
+                st.keyboard_type = OmenKeyboardType::FourZoneRgb;
+                st.keyboard_label = st.keyboard_type.label().to_string();
             }
         }
 
@@ -522,7 +554,7 @@ pub(crate) fn parse_fan_level_rpms(bytes: &[u8]) -> Vec<u32> {
 
 #[cfg(windows)]
 fn read_fan_rpms_internal(
-    conn: &crate::wmi_com::WmiConn,
+    conn: &opengear_platform::wmi::WmiConn,
     mut log: Option<&mut Vec<String>>,
 ) -> (Vec<u32>, Vec<u32>) {
     let zero4 = [0u8; 4];
@@ -569,27 +601,26 @@ fn read_fan_rpms_internal(
     }
 
     // 3. Query fan table (0x2F, read-only) on full probe to discover max RPM caps
-    if log.is_some() {
-        if let Ok((rc, ref bytes)) =
+    if log.is_some()
+        && let Ok((rc, ref bytes)) =
             conn.exec_hpq_bios_int("hpqBIOSInt128", HPWMI_GM, GM_GET_FAN_TABLE, &zero4)
-        {
-            if let Some(ref mut l) = log {
-                l.push(format!(
-                    "GetFanTable (0x20008/0x2F) -> rc=0x{rc:X} len={} [{}]",
-                    bytes.len(),
-                    format_hex_preview(bytes, 24)
-                ));
-            }
-            if rc == 0 && bytes.len() >= 4 {
-                let cap = bytes
-                    .iter()
-                    .copied()
-                    .filter(|&b| (40..=75).contains(&b))
-                    .max()
-                    .unwrap_or(DEFAULT_MAX_FAN_UNITS) as u32
-                    * 100;
-                max_rpms = vec![cap, cap];
-            }
+    {
+        if let Some(ref mut l) = log {
+            l.push(format!(
+                "GetFanTable (0x20008/0x2F) -> rc=0x{rc:X} len={} [{}]",
+                bytes.len(),
+                format_hex_preview(bytes, 24)
+            ));
+        }
+        if rc == 0 && bytes.len() >= 4 {
+            let cap = bytes
+                .iter()
+                .copied()
+                .filter(|&b| (40..=75).contains(&b))
+                .max()
+                .unwrap_or(DEFAULT_MAX_FAN_UNITS) as u32
+                * 100;
+            max_rpms = vec![cap, cap];
         }
     }
 
@@ -600,10 +631,10 @@ fn read_fan_rpms_internal(
 pub fn read_hp_omen_live_fans() -> Option<(Vec<u32>, bool)> {
     #[cfg(windows)]
     {
-        if !crate::is_elevated() {
+        if !opengear_platform::is_elevated() {
             return None;
         }
-        let conn = crate::wmi_com::WmiConn::connect(r"root\wmi").ok()?;
+        let conn = opengear_platform::wmi::WmiConn::connect(r"root\wmi").ok()?;
         let zero4 = [0u8; 4];
         let (rc_max, b_max) = conn
             .exec_hpq_bios_int("hpqBIOSInt4", HPWMI_GM, GM_GET_MAX_FAN, &zero4)
@@ -621,7 +652,10 @@ pub fn read_hp_omen_live_fans() -> Option<(Vec<u32>, bool)> {
 
 #[cfg(windows)]
 fn check_omen_wmi_rc(action: &str, rc: u32) -> Result<()> {
-    anyhow::ensure!(rc == 0, "HP OMEN BIOS WMI ({action}) a renvoyé le code erreur 0x{rc:X}");
+    anyhow::ensure!(
+        rc == 0,
+        "HP OMEN BIOS WMI ({action}) a renvoyé le code erreur 0x{rc:X}"
+    );
     Ok(())
 }
 
@@ -629,15 +663,23 @@ fn check_omen_wmi_rc(action: &str, rc: u32) -> Result<()> {
 pub fn set_hp_omen_thermal_mode(version: u8, mode: OmenThermalMode) -> Result<()> {
     #[cfg(windows)]
     {
-        anyhow::ensure!(crate::is_elevated(), "Droits administrateur requis pour HP OMEN WMI");
-        let conn = crate::wmi_com::WmiConn::connect(r"root\wmi")?;
+        anyhow::ensure!(
+            opengear_platform::is_elevated(),
+            "Droits administrateur requis pour HP OMEN WMI"
+        );
+        let conn = opengear_platform::wmi::WmiConn::connect(r"root\wmi")?;
         let payload = thermal_policy_payload(version, mode);
-        let (rc, _) = conn.exec_hpq_bios_int("hpqBIOSInt0", HPWMI_GM, GM_SET_PERFORMANCE_MODE, &payload)?;
+        let (rc, _) =
+            conn.exec_hpq_bios_int("hpqBIOSInt0", HPWMI_GM, GM_SET_PERFORMANCE_MODE, &payload)?;
         if rc != 0 && version == 1 {
             // Fallback to V0 payload if a board expects 0x00/0x01/0x02
             let fallback = thermal_policy_payload(0, mode);
-            let (rc2, _) =
-                conn.exec_hpq_bios_int("hpqBIOSInt0", HPWMI_GM, GM_SET_PERFORMANCE_MODE, &fallback)?;
+            let (rc2, _) = conn.exec_hpq_bios_int(
+                "hpqBIOSInt0",
+                HPWMI_GM,
+                GM_SET_PERFORMANCE_MODE,
+                &fallback,
+            )?;
             return check_omen_wmi_rc("SetThermalMode(V0 fallback)", rc2);
         }
         check_omen_wmi_rc("SetThermalMode", rc)
@@ -653,8 +695,11 @@ pub fn set_hp_omen_thermal_mode(version: u8, mode: OmenThermalMode) -> Result<()
 pub fn set_hp_omen_max_fan(enabled: bool) -> Result<()> {
     #[cfg(windows)]
     {
-        anyhow::ensure!(crate::is_elevated(), "Droits administrateur requis pour HP OMEN WMI");
-        let conn = crate::wmi_com::WmiConn::connect(r"root\wmi")?;
+        anyhow::ensure!(
+            opengear_platform::is_elevated(),
+            "Droits administrateur requis pour HP OMEN WMI"
+        );
+        let conn = opengear_platform::wmi::WmiConn::connect(r"root\wmi")?;
         let payload = [u8::from(enabled), 0, 0, 0];
         let (rc, _) = conn.exec_hpq_bios_int("hpqBIOSInt0", HPWMI_GM, GM_SET_MAX_FAN, &payload)?;
         check_omen_wmi_rc("SetMaxFan", rc)
@@ -670,8 +715,11 @@ pub fn set_hp_omen_max_fan(enabled: bool) -> Result<()> {
 pub fn set_hp_omen_fan_level(pct: Option<u8>, max_rpms: &[u32]) -> Result<()> {
     #[cfg(windows)]
     {
-        anyhow::ensure!(crate::is_elevated(), "Droits administrateur requis pour HP OMEN WMI");
-        let conn = crate::wmi_com::WmiConn::connect(r"root\wmi")?;
+        anyhow::ensure!(
+            opengear_platform::is_elevated(),
+            "Droits administrateur requis pour HP OMEN WMI"
+        );
+        let conn = opengear_platform::wmi::WmiConn::connect(r"root\wmi")?;
         let levels = compute_fan_level_bytes(pct, max_rpms);
         let (rc, _) = conn.exec_hpq_bios_int("hpqBIOSInt0", HPWMI_GM, GM_SET_FAN_LEVEL, &levels)?;
         check_omen_wmi_rc("SetFanLevel", rc)
@@ -687,10 +735,14 @@ pub fn set_hp_omen_fan_level(pct: Option<u8>, max_rpms: &[u32]) -> Result<()> {
 pub fn set_hp_omen_gpu_power(level: OmenGpuPowerLevel) -> Result<()> {
     #[cfg(windows)]
     {
-        anyhow::ensure!(crate::is_elevated(), "Droits administrateur requis pour HP OMEN WMI");
-        let conn = crate::wmi_com::WmiConn::connect(r"root\wmi")?;
+        anyhow::ensure!(
+            opengear_platform::is_elevated(),
+            "Droits administrateur requis pour HP OMEN WMI"
+        );
+        let conn = opengear_platform::wmi::WmiConn::connect(r"root\wmi")?;
         let payload = level.payload();
-        let (rc, _) = conn.exec_hpq_bios_int("hpqBIOSInt0", HPWMI_GM, GM_SET_GPU_POWER, &payload)?;
+        let (rc, _) =
+            conn.exec_hpq_bios_int("hpqBIOSInt0", HPWMI_GM, GM_SET_GPU_POWER, &payload)?;
         check_omen_wmi_rc("SetGpuPower", rc)
     }
     #[cfg(not(windows))]
@@ -704,11 +756,15 @@ pub fn set_hp_omen_gpu_power(level: OmenGpuPowerLevel) -> Result<()> {
 pub fn set_hp_omen_kb_backlight(enabled: bool) -> Result<()> {
     #[cfg(windows)]
     {
-        anyhow::ensure!(crate::is_elevated(), "Droits administrateur requis pour HP OMEN WMI");
-        let conn = crate::wmi_com::WmiConn::connect(r"root\wmi")?;
+        anyhow::ensure!(
+            opengear_platform::is_elevated(),
+            "Droits administrateur requis pour HP OMEN WMI"
+        );
+        let conn = opengear_platform::wmi::WmiConn::connect(r"root\wmi")?;
         let b = if enabled { BACKLIGHT_ON } else { BACKLIGHT_OFF };
         let payload4 = [b, 0, 0, 0];
-        let (rc, _) = conn.exec_hpq_bios_int("hpqBIOSInt4", HPWMI_KB, KB_SET_BACKLIGHT, &payload4)?;
+        let (rc, _) =
+            conn.exec_hpq_bios_int("hpqBIOSInt4", HPWMI_KB, KB_SET_BACKLIGHT, &payload4)?;
         if rc != 0 {
             let (rc2, _) =
                 conn.exec_hpq_bios_int("hpqBIOSInt0", HPWMI_KB, KB_SET_BACKLIGHT, &[b])?;
@@ -716,16 +772,15 @@ pub fn set_hp_omen_kb_backlight(enabled: bool) -> Result<()> {
         }
         if let Ok((rc_rb, rb)) =
             conn.exec_hpq_bios_int("hpqBIOSInt4", HPWMI_KB, KB_GET_BACKLIGHT, &[0u8; 4])
+            && rc_rb == 0
+            && !rb.is_empty()
         {
-            if rc_rb == 0 && !rb.is_empty() {
-                let actual_on =
-                    rb[0] == BACKLIGHT_ON || (rb[0] != BACKLIGHT_OFF && rb[0] != 0);
-                anyhow::ensure!(
-                    actual_on == enabled,
-                    "Ce clavier HP OMEN (rétroéclairage blanc seul) est géré matériellement par Fn + F4 : le BIOS ignore la commande logicielle 0x20009 (lu 0x{:02X}).",
-                    rb[0]
-                );
-            }
+            let actual_on = rb[0] == BACKLIGHT_ON || (rb[0] != BACKLIGHT_OFF && rb[0] != 0);
+            anyhow::ensure!(
+                actual_on == enabled,
+                "Ce clavier HP OMEN (rétroéclairage blanc seul) est géré matériellement par Fn + F4 : le BIOS ignore la commande logicielle 0x20009 (lu 0x{:02X}).",
+                rb[0]
+            );
         }
         Ok(())
     }
@@ -740,8 +795,11 @@ pub fn set_hp_omen_kb_backlight(enabled: bool) -> Result<()> {
 pub fn set_hp_omen_kb_zones(colors: [Rgb; 4], cached_table: Option<&[u8]>) -> Result<Vec<u8>> {
     #[cfg(windows)]
     {
-        anyhow::ensure!(crate::is_elevated(), "Droits administrateur requis pour HP OMEN WMI");
-        let conn = crate::wmi_com::WmiConn::connect(r"root\wmi")?;
+        anyhow::ensure!(
+            opengear_platform::is_elevated(),
+            "Droits administrateur requis pour HP OMEN WMI"
+        );
+        let conn = opengear_platform::wmi::WmiConn::connect(r"root\wmi")?;
         let current_owned;
         let base = match cached_table {
             Some(c) if c.len() >= COLOR_TABLE_LEN => Some(c),
@@ -767,18 +825,92 @@ pub fn set_hp_omen_kb_zones(colors: [Rgb; 4], cached_table: Option<&[u8]>) -> Re
     }
 }
 
+/// HP BIOS WMI transport: `hpqBIntM::<method>` called with an `hpqBDataIn` packet.
+#[cfg(windows)]
+trait HpqBiosInt {
+    fn exec_hpq_bios_int(
+        &self,
+        method_name: &str,
+        command: u32,
+        command_type: u32,
+        data: &[u8],
+    ) -> Result<(u32, Vec<u8>)>;
+}
+
+#[cfg(windows)]
+impl HpqBiosInt for opengear_platform::wmi::WmiConn {
+    fn exec_hpq_bios_int(
+        &self,
+        method_name: &str,
+        command: u32,
+        command_type: u32,
+        data: &[u8],
+    ) -> Result<(u32, Vec<u8>)> {
+        use opengear_platform::wmi::WmiVal;
+        let object_path = self
+            .first_instance_path("hpqBIntM")?
+            .context("Instance hpqBIntM introuvable dans root\\wmi")?;
+        let props = self.exec_method_with_object(
+            &object_path,
+            "hpqBIntM",
+            method_name,
+            "InData",
+            "hpqBDataIn",
+            &[
+                ("Sign", WmiVal::Bytes(b"SECU".to_vec())),
+                ("Command", WmiVal::U32(command)),
+                ("CommandType", WmiVal::U32(command_type)),
+                ("Size", WmiVal::U32(data.len() as u32)),
+                ("hpqBData", WmiVal::Bytes(data.to_vec())),
+            ],
+        )?;
+        let out_data = props
+            .get("OutData")
+            .and_then(|v| v.as_object())
+            .context("Propriété OutData absente ou non-objet")?;
+        let rw_rc = out_data
+            .get("rwReturnCode")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u32::MAX as u64) as u32;
+        let bytes = out_data
+            .get("Data")
+            .and_then(|v| v.as_bytes())
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+        Ok((rw_rc, bytes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn thermal_payloads_match_v0_and_v1_specs() {
-        assert_eq!(thermal_policy_payload(0, OmenThermalMode::Default), [0xFF, 0x00]);
-        assert_eq!(thermal_policy_payload(0, OmenThermalMode::Performance), [0xFF, 0x01]);
-        assert_eq!(thermal_policy_payload(0, OmenThermalMode::Cool), [0xFF, 0x02]);
-        assert_eq!(thermal_policy_payload(1, OmenThermalMode::Default), [0xFF, 0x30]);
-        assert_eq!(thermal_policy_payload(1, OmenThermalMode::Performance), [0xFF, 0x31]);
-        assert_eq!(thermal_policy_payload(1, OmenThermalMode::Cool), [0xFF, 0x50]);
+        assert_eq!(
+            thermal_policy_payload(0, OmenThermalMode::Default),
+            [0xFF, 0x00]
+        );
+        assert_eq!(
+            thermal_policy_payload(0, OmenThermalMode::Performance),
+            [0xFF, 0x01]
+        );
+        assert_eq!(
+            thermal_policy_payload(0, OmenThermalMode::Cool),
+            [0xFF, 0x02]
+        );
+        assert_eq!(
+            thermal_policy_payload(1, OmenThermalMode::Default),
+            [0xFF, 0x30]
+        );
+        assert_eq!(
+            thermal_policy_payload(1, OmenThermalMode::Performance),
+            [0xFF, 0x31]
+        );
+        assert_eq!(
+            thermal_policy_payload(1, OmenThermalMode::Cool),
+            [0xFF, 0x50]
+        );
     }
 
     #[test]
@@ -807,7 +939,10 @@ mod tests {
 
     #[test]
     fn keyboard_type_and_gpu_power_round_trip() {
-        assert_eq!(OmenKeyboardType::from_byte(1), OmenKeyboardType::FourZoneRgb);
+        assert_eq!(
+            OmenKeyboardType::from_byte(1),
+            OmenKeyboardType::FourZoneRgb
+        );
         assert_eq!(OmenKeyboardType::from_byte(6), OmenKeyboardType::White);
         assert_eq!(OmenKeyboardType::from_byte(2), OmenKeyboardType::White);
         assert_eq!(
@@ -818,9 +953,18 @@ mod tests {
             OmenGpuPowerLevel::from_gpu_power_bytes(&[0x01, 0x01, 0x01, 0x57]),
             OmenGpuPowerLevel::Maximum
         );
-        assert_eq!(OmenGpuPowerLevel::Minimum.payload(), [0x00, 0x00, 0x01, 0x00]);
-        assert_eq!(OmenGpuPowerLevel::Medium.payload(), [0x00, 0x01, 0x01, 0x00]);
-        assert_eq!(OmenGpuPowerLevel::Maximum.payload(), [0x01, 0x01, 0x01, 0x00]);
+        assert_eq!(
+            OmenGpuPowerLevel::Minimum.payload(),
+            [0x00, 0x00, 0x01, 0x00]
+        );
+        assert_eq!(
+            OmenGpuPowerLevel::Medium.payload(),
+            [0x00, 0x01, 0x01, 0x00]
+        );
+        assert_eq!(
+            OmenGpuPowerLevel::Maximum.payload(),
+            [0x01, 0x01, 0x01, 0x00]
+        );
         assert_eq!(parse_fan_level_rpms(&[0x1B, 0x00]), vec![2700, 0]);
         assert_eq!(BACKLIGHT_ON, 0xE4);
         assert_eq!(BACKLIGHT_OFF, 0x64);

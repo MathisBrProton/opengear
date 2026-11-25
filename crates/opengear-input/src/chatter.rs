@@ -31,11 +31,11 @@ impl ChatterFilter {
         }
 
         if is_down {
-            if let Some(prev_up) = self.last_key_up.get(&vk) {
-                if now.saturating_duration_since(*prev_up).as_millis() < window_ms as u128 {
-                    self.suppressed_key_down.insert(vk);
-                    return true;
-                }
+            if let Some(prev_up) = self.last_key_up.get(&vk)
+                && now.saturating_duration_since(*prev_up).as_millis() < window_ms as u128
+            {
+                self.suppressed_key_down.insert(vk);
+                return true;
             }
             false
         } else if self.suppressed_key_down.remove(&vk) {
@@ -68,11 +68,11 @@ impl ChatterFilter {
         }
 
         if is_down {
-            if let Some(prev_up) = *last_up_slot {
-                if now.saturating_duration_since(prev_up).as_millis() < window_ms as u128 {
-                    *supp_slot = true;
-                    return true;
-                }
+            if let Some(prev_up) = *last_up_slot
+                && now.saturating_duration_since(prev_up).as_millis() < window_ms as u128
+            {
+                *supp_slot = true;
+                return true;
             }
             false
         } else if *supp_slot {

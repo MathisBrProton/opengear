@@ -22,7 +22,7 @@ impl CorsairKeyboard {
         let devices = CorsairDevice::connect_all();
         let chosen = devices
             .into_iter()
-            .find(|d| target_pid.map_or(true, |p| d.info.pid == p))
+            .find(|d| target_pid.is_none_or(|p| d.info.pid == p))
             .ok_or(BragiError::DeviceNotFound)?;
         Ok(Self { inner: chosen })
     }

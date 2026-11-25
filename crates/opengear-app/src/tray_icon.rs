@@ -3,8 +3,8 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tao::event_loop::EventLoopProxy;
 
 #[derive(Debug, Clone)]
@@ -113,7 +113,12 @@ fn sample_logo_pixel(u: f32, v: f32, bolt: &[(f32, f32); 6]) -> (f32, f32, f32, 
     } else {
         1.0
     };
-    (r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0), alpha)
+    (
+        r.clamp(0.0, 1.0),
+        g.clamp(0.0, 1.0),
+        b.clamp(0.0, 1.0),
+        alpha,
+    )
 }
 
 fn point_in_poly(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
@@ -182,7 +187,7 @@ fn encode_multi_ico(sizes: &[u32]) -> Vec<u8> {
 
 fn encode_ico_bmp_entry(size: u32) -> Vec<u8> {
     let rgba = render_opengear_rgba(size);
-    let and_row_bytes = ((size + 31) / 32) * 4;
+    let and_row_bytes = size.div_ceil(32) * 4;
     let and_size = and_row_bytes * size;
     let xor_size = size * size * 4;
 
@@ -247,8 +252,8 @@ mod win_tray {
     const CMD_TOGGLE_SYNC: usize = 103;
     const CMD_QUIT: usize = 109;
 
-    static TRAY_SENDER: OnceLock<std::sync::Mutex<Option<Box<dyn Fn(TrayAction) + Send + Sync>>>> =
-        OnceLock::new();
+    type TraySender = Box<dyn Fn(TrayAction) + Send + Sync>;
+    static TRAY_SENDER: OnceLock<std::sync::Mutex<Option<TraySender>>> = OnceLock::new();
     static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
     static TRAY_HICON: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
     static TRAY_ALIVE: AtomicBool = AtomicBool::new(false);
@@ -342,8 +347,9 @@ mod win_tray {
             )
         };
         if !bits.is_null() {
-            let dst =
-                unsafe { std::slice::from_raw_parts_mut(bits as *mut u8, (size * size * 4) as usize) };
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(bits as *mut u8, (size * size * 4) as usize)
+            };
             for i in (0..rgba.len()).step_by(4) {
                 dst[i] = rgba[i + 2]; // B
                 dst[i + 1] = rgba[i + 1]; // G
@@ -368,12 +374,11 @@ mod win_tray {
     }
 
     fn emit(act: TrayAction) {
-        if let Some(lock) = TRAY_SENDER.get() {
-            if let Ok(guard) = lock.lock() {
-                if let Some(cb) = guard.as_ref() {
-                    cb(act);
-                }
-            }
+        if let Some(lock) = TRAY_SENDER.get()
+            && let Ok(guard) = lock.lock()
+            && let Some(cb) = guard.as_ref()
+        {
+            cb(act);
         }
     }
 
@@ -699,19 +704,17 @@ pub fn is_autostart_enabled() -> bool {
         use windows_sys::Win32::System::Registry::{
             HKEY, HKEY_CURRENT_USER, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
         };
-        let subkey: Vec<u16> =
-            OsStr::new("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
+        let subkey: Vec<u16> = OsStr::new("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
         let val_name: Vec<u16> = OsStr::new("OpenGear")
             .encode_wide()
             .chain(Some(0))
             .collect();
         let mut hkey: HKEY = std::ptr::null_mut();
-        let open_rc = unsafe {
-            RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey)
-        };
+        let open_rc =
+            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey) };
         if open_rc != 0 {
             return false;
         }
@@ -742,19 +745,17 @@ pub fn set_autostart_enabled(enabled: bool, start_minimized: bool) -> Result<()>
             HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_SZ, RegCloseKey, RegDeleteValueW,
             RegOpenKeyExW, RegSetValueExW,
         };
-        let subkey: Vec<u16> =
-            OsStr::new("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
+        let subkey: Vec<u16> = OsStr::new("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
         let val_name: Vec<u16> = OsStr::new("OpenGear")
             .encode_wide()
             .chain(Some(0))
             .collect();
         let mut hkey: HKEY = std::ptr::null_mut();
-        let rc = unsafe {
-            RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_WRITE, &mut hkey)
-        };
+        let rc =
+            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_WRITE, &mut hkey) };
         if rc != 0 {
             anyhow::bail!("Impossible d'ouvrir HKCU\\...\\Run (code {rc})");
         }
@@ -801,8 +802,8 @@ fn known_folder_path(id: &windows::core::GUID) -> Result<PathBuf> {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{KF_FLAG_DEFAULT, SHGetKnownFolderPath};
     unsafe {
-        let pwstr = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None)
-            .context("SHGetKnownFolderPath")?;
+        let pwstr =
+            SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).context("SHGetKnownFolderPath")?;
         let mut len = 0usize;
         while *pwstr.0.add(len) != 0 {
             len += 1;
@@ -896,7 +897,10 @@ pub fn create_shortcuts_for(exe: &Path) -> Result<String> {
                 "OpenGear — Command Center Matériel Unifié",
             )?;
         }
-        Ok("Raccourcis créés sur le Bureau et dans le Menu Démarrer (avec icône OpenGear) !".into())
+        Ok(
+            "Raccourcis créés sur le Bureau et dans le Menu Démarrer (avec icône OpenGear) !"
+                .into(),
+        )
     }
     #[cfg(not(windows))]
     {
@@ -932,9 +936,7 @@ pub fn cleanup_installer_temp_dir(dir: &Path) {
 fn request_running_instances_exit_gracefully() {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, HWND_BROADCAST, PostMessageW,
-    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, HWND_BROADCAST, PostMessageW};
     let msg_id = win_tray::graceful_quit_msg_id();
     unsafe {
         PostMessageW(HWND_BROADCAST, msg_id, 0, 0);
@@ -964,10 +966,10 @@ fn copy_dir_files(src: &Path, dst: &Path) {
     if let Ok(entries) = std::fs::read_dir(src) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_file() {
-                if let Some(name) = p.file_name() {
-                    let _ = std::fs::copy(&p, dst.join(name));
-                }
+            if p.is_file()
+                && let Some(name) = p.file_name()
+            {
+                let _ = std::fs::copy(&p, dst.join(name));
             }
         }
     }
@@ -994,7 +996,9 @@ pub fn install_to_windows(cleanup_dir: Option<&Path>) -> Result<()> {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .context("Variable LOCALAPPDATA introuvable")?;
-        let install_dir = PathBuf::from(&local_app_data).join("Programs").join("OpenGear");
+        let install_dir = PathBuf::from(&local_app_data)
+            .join("Programs")
+            .join("OpenGear");
         std::fs::create_dir_all(&install_dir)
             .with_context(|| format!("Impossible de créer {}", install_dir.display()))?;
 
@@ -1011,16 +1015,14 @@ pub fn install_to_windows(cleanup_dir: Option<&Path>) -> Result<()> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let my_pid = std::process::id();
         let pid_filter = format!("PID ne {my_pid}");
-        if src_exe != dst_exe {
-            if std::fs::copy(&src_exe, &dst_exe).is_err() {
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/F", "/IM", "OpenGear.exe", "/FI", &pid_filter])
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .output();
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                std::fs::copy(&src_exe, &dst_exe)
-                    .with_context(|| format!("Échec copie vers {}", dst_exe.display()))?;
-            }
+        if src_exe != dst_exe && std::fs::copy(&src_exe, &dst_exe).is_err() {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/IM", "OpenGear.exe", "/FI", &pid_filter])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::fs::copy(&src_exe, &dst_exe)
+                .with_context(|| format!("Échec copie vers {}", dst_exe.display()))?;
         }
         let src_dll = src_dir.join("WebView2Loader.dll");
         if src_dll.exists() && src_dll != dst_dll {
@@ -1133,7 +1135,9 @@ pub fn uninstall_from_windows() -> Result<()> {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .context("Variable LOCALAPPDATA introuvable — suppression annulée par sécurité")?;
-        let install_dir = PathBuf::from(&local_app_data).join("Programs").join("OpenGear");
+        let install_dir = PathBuf::from(&local_app_data)
+            .join("Programs")
+            .join("OpenGear");
         let is_expected_target = install_dir.file_name() == Some(OsStr::new("OpenGear"))
             && install_dir.parent().and_then(|p| p.file_name()) == Some(OsStr::new("Programs"))
             && install_dir.is_absolute();

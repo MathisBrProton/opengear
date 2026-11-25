@@ -116,18 +116,19 @@ fn env_filter() -> tracing_subscriber::EnvFilter {
 /// Initialise logging. `to_file`: GUI / watchdog (file), otherwise CLI (stderr).
 /// `rotate`: only the main GUI process rotates, so the watchdog never races it.
 pub fn init(to_file: bool, rotate: bool) {
-    if to_file {
-        if let Ok(writer) = RotatingFileWriter::open(log_dir(), MAX_LOG_BYTES, KEEP_ROTATED, rotate)
-        {
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter())
-                .with_ansi(false)
-                .with_writer(Mutex::new(writer))
-                .init();
-            return;
-        }
+    if to_file
+        && let Ok(writer) = RotatingFileWriter::open(log_dir(), MAX_LOG_BYTES, KEEP_ROTATED, rotate)
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter())
+            .with_ansi(false)
+            .with_writer(Mutex::new(writer))
+            .init();
+        return;
     }
-    tracing_subscriber::fmt().with_env_filter(env_filter()).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter())
+        .init();
 }
 
 /// Last `max_lines` lines of the current log file (for the diagnostic report).
@@ -162,10 +163,8 @@ mod tests {
 
     #[test]
     fn rotating_writer_rotates_at_runtime() {
-        let dir = std::env::temp_dir().join(format!(
-            "opengear_log_rot_test_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("opengear_log_rot_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         {
             let mut w = RotatingFileWriter::open(dir.clone(), 16, 2, true).unwrap();

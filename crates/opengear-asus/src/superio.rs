@@ -1,11 +1,11 @@
 //! Universal Nuvoton SuperIO (`NCT6791D`..`NCT6799D`) live Fan RPM & PWM
 //! controller via Microsoft WHQL-signed **PawnIO** (`LpcIO.bin`).
 
-use crate::cooling::is_elevated;
 use crate::pawnio::{
     NamedMutexGuard, PawnIoAvailability, PawnIoSession, load_pawnio_module, pawnio_availability,
 };
 use anyhow::{Context, Result};
+use opengear_platform::is_elevated;
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
 
@@ -213,18 +213,17 @@ mod win_sio {
                 exit_nuvoton(&sess, reg_port);
 
                 if hwm_base >= 0x100 && hwm_base != 0xFFFF {
-                    if !verify_nuvoton_vendor(&sess, hwm_base) {
-                        if let Some(_ec_lock) = NamedMutexGuard::acquire(r"Global\Access_EC", 500) {
-                            if enter_nuvoton(&sess, reg_port).is_ok() {
-                                let _ = sio_outb(&sess, 0x07, 0x0B);
-                                if let Ok(opt) = sio_inb(&sess, 0x28) {
-                                    if (opt & 0x10) != 0 {
-                                        let _ = sio_outb(&sess, 0x28, opt & !0x10);
-                                    }
-                                }
-                                exit_nuvoton(&sess, reg_port);
-                            }
+                    if !verify_nuvoton_vendor(&sess, hwm_base)
+                        && let Some(_ec_lock) = NamedMutexGuard::acquire(r"Global\Access_EC", 500)
+                        && enter_nuvoton(&sess, reg_port).is_ok()
+                    {
+                        let _ = sio_outb(&sess, 0x07, 0x0B);
+                        if let Ok(opt) = sio_inb(&sess, 0x28)
+                            && (opt & 0x10) != 0
+                        {
+                            let _ = sio_outb(&sess, 0x28, opt & !0x10);
                         }
+                        exit_nuvoton(&sess, reg_port);
                     }
 
                     if verify_nuvoton_vendor(&sess, hwm_base) {
@@ -390,13 +389,13 @@ mod win_sio {
 
             let cur_mode = hwm_read(&sess, chip.hwm_base, mode_reg)?;
             let cur_cmd = hwm_read(&sess, chip.hwm_base, cmd_reg)?;
-            if let Ok(mut guard) = saved_states().lock() {
-                if guard[channel_idx].is_none() {
-                    guard[channel_idx] = Some(SavedFanState {
-                        mode: cur_mode,
-                        cmd: cur_cmd,
-                    });
-                }
+            if let Ok(mut guard) = saved_states().lock()
+                && guard[channel_idx].is_none()
+            {
+                guard[channel_idx] = Some(SavedFanState {
+                    mode: cur_mode,
+                    cmd: cur_cmd,
+                });
             }
 
             let target_raw = ((duty_pct.min(100) as u32 * 255 + 50) / 100).min(255) as u8;
@@ -462,7 +461,12 @@ mod win_sio {
             ));
         };
         let (sess, chip) = detect_and_prepare()?;
-        hwm_write(&sess, chip.hwm_base, FAN_PWM_CMD_REGS[channel_idx], saved.cmd)?;
+        hwm_write(
+            &sess,
+            chip.hwm_base,
+            FAN_PWM_CMD_REGS[channel_idx],
+            saved.cmd,
+        )?;
         hwm_write(
             &sess,
             chip.hwm_base,
@@ -496,13 +500,16 @@ mod win_sio {
             .iter()
             .filter(|s| s.index < chip.fan_count)
             .map(|s| {
-                let r = hwm_write(&sess, chip.hwm_base, FAN_PWM_CMD_REGS[s.index], s.cmd)
-                    .and_then(|_| {
-                        hwm_write(&sess, chip.hwm_base, FAN_CTRL_MODE_REGS[s.index], s.mode)
-                    });
+                let r = hwm_write(&sess, chip.hwm_base, FAN_PWM_CMD_REGS[s.index], s.cmd).and_then(
+                    |_| hwm_write(&sess, chip.hwm_base, FAN_CTRL_MODE_REGS[s.index], s.mode),
+                );
                 match r {
                     Ok(()) => {
-                        format!("SuperIO ch#{} restauré (mode=0x{:02X})", s.index + 1, s.mode)
+                        format!(
+                            "SuperIO ch#{} restauré (mode=0x{:02X})",
+                            s.index + 1,
+                            s.mode
+                        )
                     }
                     Err(e) => format!("SuperIO ch#{} : restauration échouée : {e}", s.index + 1),
                 }

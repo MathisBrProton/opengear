@@ -36,8 +36,12 @@ pub struct ParsedBatteryModel {
 
 impl ParsedBatteryModel {
     pub fn radio_mw_for_hz(&self, hz: u16) -> f32 {
-        let interval_ms = if hz == 0 { 1 } else { (1000 / hz).max(1) };
-        if let Some(&(_, mw)) = self.report_rate_mw.iter().find(|&&(ms, _)| ms == interval_ms) {
+        let interval_ms = 1000u16.checked_div(hz).map_or(1, |v| v.max(1));
+        if let Some(&(_, mw)) = self
+            .report_rate_mw
+            .iter()
+            .find(|&&(ms, _)| ms == interval_ms)
+        {
             return mw;
         }
         // Nearest interval match
@@ -82,9 +86,11 @@ pub struct LocalAssetCatalog {
 
 impl LocalAssetCatalog {
     pub fn discover() -> Self {
-        let mut cat = Self::default();
-        cat.lghub_depot = find_latest_lghub_depot();
-        cat.icue_devices_dir = find_icue_devices_dir();
+        let mut cat = Self {
+            lghub_depot: find_latest_lghub_depot(),
+            icue_devices_dir: find_icue_devices_dir(),
+            ..Self::default()
+        };
 
         if let Some(depot) = cat.lghub_depot.clone() {
             info!("Dépôt local G HUB détecté : {}", depot.display());
@@ -107,21 +113,19 @@ impl LocalAssetCatalog {
             return Some(m);
         }
         let lower = device_name.to_ascii_lowercase();
-        if lower.contains("pro x") && !lower.contains("headset") {
-            if let Some(m) = self
+        if lower.contains("pro x")
+            && !lower.contains("headset")
+            && let Some(m) = self
                 .battery_models
                 .iter()
                 .find(|m| m.folder.contains("pro_x_wireless"))
-            {
-                return Some(m);
-            }
+        {
+            return Some(m);
         }
-        self.battery_models
-            .iter()
-            .find(|m| {
-                let norm = m.folder.replace('_', " ");
-                lower.contains(&norm) || norm.contains(&lower)
-            })
+        self.battery_models.iter().find(|m| {
+            let norm = m.folder.replace('_', " ");
+            lower.contains(&norm) || norm.contains(&lower)
+        })
     }
 
     pub fn summary(&self) -> LocalAssetSummary {
@@ -145,7 +149,11 @@ impl LocalAssetCatalog {
             let variants = [
                 ("black", "Noir (Officiel)", "images/device/front.png"),
                 ("white", "Blanc (Officiel)", "images/device/front_white.png"),
-                ("magenta", "Magenta (Officiel)", "images/device/front_magenta.png"),
+                (
+                    "magenta",
+                    "Magenta (Officiel)",
+                    "images/device/front_magenta.png",
+                ),
             ];
             for (id, label, rel) in variants {
                 let p = mouse_dir.join(rel);
@@ -160,26 +168,25 @@ impl LocalAssetCatalog {
                 }
             }
 
-            if let Ok(meta_str) = std::fs::read_to_string(mouse_dir.join("metadata.json")) {
-                if let Ok(v) = serde_json::from_str::<Value>(&meta_str) {
-                    if let Some(img) = v["images"].as_array().and_then(|a| a.first()) {
-                        let w = img["origin"]["width"].as_f64().unwrap_or(1388.0) as f32;
-                        let h = img["origin"]["height"].as_f64().unwrap_or(2791.0) as f32;
-                        if w > 0.0 && h > 0.0 {
-                            self.mouse_aspect_ratio = Some(w / h);
-                        }
-                        if let Some(assigns) = img["assignments"].as_array() {
-                            for a in assigns {
-                                let slot = a["slotId"].as_str().unwrap_or("").to_string();
-                                let mx = a["marker"]["x"].as_f64().unwrap_or(0.0) as f32;
-                                let my = a["marker"]["y"].as_f64().unwrap_or(0.0) as f32;
-                                self.mouse_markers.push(ButtonMarkerCoord {
-                                    slot_id: slot,
-                                    x_pct: (mx / w) * 100.0,
-                                    y_pct: (my / h) * 100.0,
-                                });
-                            }
-                        }
+            if let Ok(meta_str) = std::fs::read_to_string(mouse_dir.join("metadata.json"))
+                && let Ok(v) = serde_json::from_str::<Value>(&meta_str)
+                && let Some(img) = v["images"].as_array().and_then(|a| a.first())
+            {
+                let w = img["origin"]["width"].as_f64().unwrap_or(1388.0) as f32;
+                let h = img["origin"]["height"].as_f64().unwrap_or(2791.0) as f32;
+                if w > 0.0 && h > 0.0 {
+                    self.mouse_aspect_ratio = Some(w / h);
+                }
+                if let Some(assigns) = img["assignments"].as_array() {
+                    for a in assigns {
+                        let slot = a["slotId"].as_str().unwrap_or("").to_string();
+                        let mx = a["marker"]["x"].as_f64().unwrap_or(0.0) as f32;
+                        let my = a["marker"]["y"].as_f64().unwrap_or(0.0) as f32;
+                        self.mouse_markers.push(ButtonMarkerCoord {
+                            slot_id: slot,
+                            x_pct: (mx / w) * 100.0,
+                            y_pct: (my / h) * 100.0,
+                        });
                     }
                 }
             }
@@ -208,17 +215,13 @@ impl LocalAssetCatalog {
 
             if let Ok(raw) =
                 std::fs::read_to_string(hs_dir.join("pro_x_headset_device_presets.json"))
+                && let Ok(v) = serde_json::from_str::<Value>(&raw)
+                && let Some(arr) = v["presets"].as_array()
             {
-                if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                    if let Some(arr) = v["presets"].as_array() {
-                        for p in arr {
-                            if let Some(n) = p["name"].as_str() {
-                                let pretty = n
-                                    .trim_start_matches("BLUE_VOICE_PRESET_")
-                                    .replace('_', " ");
-                                self.blue_voice_presets.push(pretty);
-                            }
-                        }
+                for p in arr {
+                    if let Some(n) = p["name"].as_str() {
+                        let pretty = n.trim_start_matches("BLUE_VOICE_PRESET_").replace('_', " ");
+                        self.blue_voice_presets.push(pretty);
                     }
                 }
             }
@@ -238,16 +241,15 @@ impl LocalAssetCatalog {
                     dir.join("pro_x_wireless_headset_battery.xml"),
                 ];
                 for xml_path in candidates {
-                    if xml_path.is_file() {
-                        if let Ok(xml) = std::fs::read_to_string(&xml_path) {
-                            if let Some(pm) = parse_battery_xml(&folder, &xml) {
-                                debug!(
-                                    "battery.xml chargé ({}): {:04X}:{:04X}, {:.0} mWh",
-                                    pm.folder, pm.vid, pm.pid, pm.capacity_mwh
-                                );
-                                self.battery_models.push(pm);
-                            }
-                        }
+                    if xml_path.is_file()
+                        && let Ok(xml) = std::fs::read_to_string(&xml_path)
+                        && let Some(pm) = parse_battery_xml(&folder, &xml)
+                    {
+                        debug!(
+                            "battery.xml chargé ({}): {:04X}:{:04X}, {:.0} mWh",
+                            pm.folder, pm.vid, pm.pid, pm.capacity_mwh
+                        );
+                        self.battery_models.push(pm);
                     }
                 }
             }
@@ -256,25 +258,45 @@ impl LocalAssetCatalog {
 
     fn load_icue_assets(&mut self, icue_dir: &Path) {
         let k70_rcc = icue_dir.join("k70_rgb_tkl.rcc");
-        if k70_rcc.is_file() {
-            if let Ok(data) = std::fs::read(&k70_rcc) {
-                let entries = parse_qt_rcc(&data);
-                let picks = [
-                    ("fr", "AZERTY FR (Officiel)", "/k70_rgb_tkl/body/fr.jpg", "image/jpeg"),
-                    ("na", "QWERTY US (Officiel)", "/k70_rgb_tkl/body/na.jpg", "image/jpeg"),
-                    ("uk", "QWERTY UK (Officiel)", "/k70_rgb_tkl/body/uk.jpg", "image/jpeg"),
-                    ("thumb", "Miniature K70 TKL", "/k70_rgb_tkl/thumbnails/thumbnails.png", "image/png"),
-                ];
-                for (id, label, vpath, mime) in picks {
-                    if let Some(bytes) = entries.get(vpath) {
-                        let key = format!("icue/k70_tkl/{id}");
-                        self.blobs.insert(key.clone(), (bytes.clone(), mime));
-                        self.k70_images.push(LocalVariant {
-                            id: id.into(),
-                            label: label.into(),
-                            asset_url: format!("/local-asset/{key}"),
-                        });
-                    }
+        if k70_rcc.is_file()
+            && let Ok(data) = std::fs::read(&k70_rcc)
+        {
+            let entries = parse_qt_rcc(&data);
+            let picks = [
+                (
+                    "fr",
+                    "AZERTY FR (Officiel)",
+                    "/k70_rgb_tkl/body/fr.jpg",
+                    "image/jpeg",
+                ),
+                (
+                    "na",
+                    "QWERTY US (Officiel)",
+                    "/k70_rgb_tkl/body/na.jpg",
+                    "image/jpeg",
+                ),
+                (
+                    "uk",
+                    "QWERTY UK (Officiel)",
+                    "/k70_rgb_tkl/body/uk.jpg",
+                    "image/jpeg",
+                ),
+                (
+                    "thumb",
+                    "Miniature K70 TKL",
+                    "/k70_rgb_tkl/thumbnails/thumbnails.png",
+                    "image/png",
+                ),
+            ];
+            for (id, label, vpath, mime) in picks {
+                if let Some(bytes) = entries.get(vpath) {
+                    let key = format!("icue/k70_tkl/{id}");
+                    self.blobs.insert(key.clone(), (bytes.clone(), mime));
+                    self.k70_images.push(LocalVariant {
+                        id: id.into(),
+                        label: label.into(),
+                        asset_url: format!("/local-asset/{key}"),
+                    });
                 }
             }
         }
@@ -463,7 +485,9 @@ pub fn parse_qt_rcc(data: &[u8]) -> HashMap<String, Vec<u8>> {
         }
     }
 
-    walk(data, tree_off, data_off, names_off, entry_sz, 0, "", &mut out, 0);
+    walk(
+        data, tree_off, data_off, names_off, entry_sz, 0, "", &mut out, 0,
+    );
     out
 }
 
@@ -502,13 +526,13 @@ fn parse_battery_xml(folder: &str, xml: &str) -> Option<ParsedBatteryModel> {
             if let Some(p) = extract_attr(l, "power").and_then(|s| s.parse::<f32>().ok()) {
                 mcu_mw = p;
             }
-        } else if l.starts_with("<interval") {
-            if let (Some(ms), Some(pw)) = (
+        } else if l.starts_with("<interval")
+            && let (Some(ms), Some(pw)) = (
                 extract_attr(l, "milliseconds").and_then(|s| s.parse::<u16>().ok()),
                 extract_attr(l, "power").and_then(|s| s.parse::<f32>().ok()),
-            ) {
-                report_rate_mw.push((ms, pw));
-            }
+            )
+        {
+            report_rate_mw.push((ms, pw));
         }
     }
 
@@ -531,10 +555,8 @@ mod tests {
 
     #[test]
     fn find_latest_depot_in_sorts_numerically() {
-        let dir = std::env::temp_dir().join(format!(
-            "opengear_depot_sort_test_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("opengear_depot_sort_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("99999")).unwrap();
         std::fs::create_dir_all(dir.join("100000")).unwrap();

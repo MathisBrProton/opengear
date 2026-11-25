@@ -1,5 +1,6 @@
 pub(crate) mod backend;
 pub(crate) mod commands;
+pub(crate) mod keyboard_view;
 pub(crate) mod state;
 
 use crate::fan_watchdog;
@@ -110,21 +111,65 @@ pub(crate) fn resolve_static_asset(path: &str) -> Option<(&'static [u8], &'stati
         "/js/ipc.js" => Some((JS_IPC, "application/javascript; charset=utf-8", false)),
         "/js/modals.js" => Some((JS_MODALS, "application/javascript; charset=utf-8", false)),
         "/js/state.js" => Some((JS_STATE, "application/javascript; charset=utf-8", false)),
-        "/js/components.js" => Some((JS_COMPONENTS, "application/javascript; charset=utf-8", false)),
-        "/js/rgb-preview.js" => Some((JS_RGB_PREVIEW, "application/javascript; charset=utf-8", false)),
+        "/js/components.js" => Some((
+            JS_COMPONENTS,
+            "application/javascript; charset=utf-8",
+            false,
+        )),
+        "/js/rgb-preview.js" => Some((
+            JS_RGB_PREVIEW,
+            "application/javascript; charset=utf-8",
+            false,
+        )),
         "/js/views/home.js" => Some((JS_VIEW_HOME, "application/javascript; charset=utf-8", false)),
-        "/js/views/lighting.js" => Some((JS_VIEW_LIGHTING, "application/javascript; charset=utf-8", false)),
-        "/js/views/performance.js" => Some((JS_VIEW_PERFORMANCE, "application/javascript; charset=utf-8", false)),
-        "/js/views/input.js" => Some((JS_VIEW_INPUT, "application/javascript; charset=utf-8", false)),
-        "/js/views/profiles.js" => Some((JS_VIEW_PROFILES, "application/javascript; charset=utf-8", false)),
-        "/js/views/devices.js" => Some((JS_VIEW_DEVICES, "application/javascript; charset=utf-8", false)),
-        "/js/views/system.js" => Some((JS_VIEW_SYSTEM, "application/javascript; charset=utf-8", false)),
-        "/assets/mouse.svg" | "/assets/mouse_superlight.jpg" => Some((IMG_MOUSE, "image/svg+xml", false)),
-        "/assets/mouse_white.svg" | "/assets/mouse_superlight_white.jpg" => Some((IMG_MOUSE_WHITE, "image/svg+xml", false)),
-        "/assets/keyboard.svg" | "/assets/keyboard_k70_tkl.jpg" => Some((IMG_KEYBOARD, "image/svg+xml", false)),
-        "/assets/motherboard.svg" | "/assets/motherboard_b650a.jpg" => Some((IMG_MOTHERBOARD, "image/svg+xml", false)),
-        "/assets/headset.svg" | "/assets/headset_prox.jpg" => Some((IMG_HEADSET, "image/svg+xml", false)),
-        "/assets/aio.svg" | "/assets/aio_silentloop3.jpg" => Some((IMG_AIO, "image/svg+xml", false)),
+        "/js/views/lighting.js" => Some((
+            JS_VIEW_LIGHTING,
+            "application/javascript; charset=utf-8",
+            false,
+        )),
+        "/js/views/performance.js" => Some((
+            JS_VIEW_PERFORMANCE,
+            "application/javascript; charset=utf-8",
+            false,
+        )),
+        "/js/views/input.js" => Some((
+            JS_VIEW_INPUT,
+            "application/javascript; charset=utf-8",
+            false,
+        )),
+        "/js/views/profiles.js" => Some((
+            JS_VIEW_PROFILES,
+            "application/javascript; charset=utf-8",
+            false,
+        )),
+        "/js/views/devices.js" => Some((
+            JS_VIEW_DEVICES,
+            "application/javascript; charset=utf-8",
+            false,
+        )),
+        "/js/views/system.js" => Some((
+            JS_VIEW_SYSTEM,
+            "application/javascript; charset=utf-8",
+            false,
+        )),
+        "/assets/mouse.svg" | "/assets/mouse_superlight.jpg" => {
+            Some((IMG_MOUSE, "image/svg+xml", false))
+        }
+        "/assets/mouse_white.svg" | "/assets/mouse_superlight_white.jpg" => {
+            Some((IMG_MOUSE_WHITE, "image/svg+xml", false))
+        }
+        "/assets/keyboard.svg" | "/assets/keyboard_k70_tkl.jpg" => {
+            Some((IMG_KEYBOARD, "image/svg+xml", false))
+        }
+        "/assets/motherboard.svg" | "/assets/motherboard_b650a.jpg" => {
+            Some((IMG_MOTHERBOARD, "image/svg+xml", false))
+        }
+        "/assets/headset.svg" | "/assets/headset_prox.jpg" => {
+            Some((IMG_HEADSET, "image/svg+xml", false))
+        }
+        "/assets/aio.svg" | "/assets/aio_silentloop3.jpg" => {
+            Some((IMG_AIO, "image/svg+xml", false))
+        }
         "/assets/ram.svg" => Some((IMG_RAM, "image/svg+xml", false)),
         "/assets/laptop.svg" => Some((IMG_LAPTOP, "image/svg+xml", false)),
         "/assets/generic_device.svg" => Some((IMG_GENERIC, "image/svg+xml", false)),
@@ -162,17 +207,17 @@ fn build_webview(
     WebViewBuilder::new()
         .with_custom_protocol("opengear".into(), move |_webview_id, req| {
             let path = req.uri().path();
-            if let Some(key) = path.strip_prefix("/local-asset/") {
-                if let Some((bytes, mime)) = proto_assets.get_blob(key) {
-                    return http::Response::builder()
-                        .header(http::header::CONTENT_TYPE, mime)
-                        .body(std::borrow::Cow::Owned(bytes.to_vec()))
-                        .unwrap();
-                }
+            if let Some(key) = path.strip_prefix("/local-asset/")
+                && let Some((bytes, mime)) = proto_assets.get_blob(key)
+            {
+                return http::Response::builder()
+                    .header(http::header::CONTENT_TYPE, mime)
+                    .body(std::borrow::Cow::Owned(bytes.to_vec()))
+                    .unwrap();
             }
             if let Some((body, mime, is_html)) = resolve_static_asset(path) {
-                let mut builder = http::Response::builder()
-                    .header(http::header::CONTENT_TYPE, mime);
+                let mut builder =
+                    http::Response::builder().header(http::header::CONTENT_TYPE, mime);
                 if is_html {
                     builder = builder.header("Content-Security-Policy", CSP_HEADER);
                 }
@@ -252,7 +297,7 @@ pub fn run_gui(cli_minimized: bool) -> Result<()> {
                     } else {
                         Duration::from_secs(60)
                     };
-                    if last_probe.map_or(true, |t| t.elapsed() >= interval) {
+                    if last_probe.is_none_or(|t| t.elapsed() >= interval) {
                         let snap = read_hardware_sensors();
                         last_available = snap.available;
                         last_probe = Some(Instant::now());
@@ -291,7 +336,7 @@ pub fn run_gui(cli_minimized: bool) -> Result<()> {
             .name("opengear-wake".into())
             .spawn(move || {
                 use windows_sys::Win32::UI::WindowsAndMessaging::{
-                    GetMessageW, MSG, PeekMessageW, PM_NOREMOVE, TranslateMessage,
+                    GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, TranslateMessage,
                 };
                 unsafe {
                     let mut msg: MSG = std::mem::zeroed();
@@ -312,7 +357,11 @@ pub fn run_gui(cli_minimized: bool) -> Result<()> {
     let mut webview = if start_hidden {
         None
     } else {
-        Some(build_webview(&window, Arc::clone(&local_assets), ipc_tx.clone())?)
+        Some(build_webview(
+            &window,
+            Arc::clone(&local_assets),
+            ipc_tx.clone(),
+        )?)
     };
 
     if start_hidden {
@@ -406,10 +455,8 @@ pub fn run_gui(cli_minimized: bool) -> Result<()> {
                 }
             }
             Event::UserEvent(UserEvent::EvalJs(script)) => {
-                if !tray_mode {
-                    if let Some(ref wv) = webview {
-                        let _ = wv.evaluate_script(&script);
-                    }
+                if !tray_mode && let Some(ref wv) = webview {
+                    let _ = wv.evaluate_script(&script);
                 }
             }
             _ => {}
@@ -433,7 +480,11 @@ pub(crate) fn err_reply(msg: &str) -> String {
     json!({ "ok": false, "error": msg }).to_string()
 }
 
-pub(crate) fn send_reply(proxy: &EventLoopProxy<UserEvent>, id: u64, res: std::result::Result<Value, String>) {
+pub(crate) fn send_reply(
+    proxy: &EventLoopProxy<UserEvent>,
+    id: u64,
+    res: std::result::Result<Value, String>,
+) {
     let payload = match res {
         Ok(data) => ok_reply(data),
         Err(e) => err_reply(&e),

@@ -474,19 +474,19 @@ impl HidppTransport {
 
         let mut list = Vec::with_capacity(total);
         for i in 0..total.min(80) {
-            if let Ok(r) = self.request(fset_idx, 0x10, &[i as u8]) {
-                if r.len() >= 3 {
-                    let id = u16::from_be_bytes([r[0], r[1]]);
-                    let flags = r[2];
-                    let version = r.get(3).copied().unwrap_or(0);
-                    list.push(FeatureEntry {
-                        index: i as u8,
-                        id,
-                        flags,
-                        version,
-                        name: feature_name(id).to_string(),
-                    });
-                }
+            if let Ok(r) = self.request(fset_idx, 0x10, &[i as u8])
+                && r.len() >= 3
+            {
+                let id = u16::from_be_bytes([r[0], r[1]]);
+                let flags = r[2];
+                let version = r.get(3).copied().unwrap_or(0);
+                list.push(FeatureEntry {
+                    index: i as u8,
+                    id,
+                    flags,
+                    version,
+                    name: feature_name(id).to_string(),
+                });
             }
         }
         self.features = list;
@@ -534,17 +534,17 @@ impl HidppTransport {
         };
         let count = cnt_resp.first().copied().unwrap_or(0).min(8);
         for entity in 0..count {
-            if let Ok(r) = self.request_feature(FEAT_DEVICE_FW_VERSION, 0x10, &[entity]) {
-                if r.len() >= 8 {
-                    let prefix = String::from_utf8_lossy(&r[1..4])
-                        .trim_end_matches('\0')
-                        .to_string();
-                    let rev = r[4];
-                    let minor = r[5];
-                    let build = u16::from_be_bytes([r[6], r[7]]);
-                    if !prefix.is_empty() {
-                        out.push(format!("{prefix} {rev:02X}.{minor:02X}.B{build:04X}"));
-                    }
+            if let Ok(r) = self.request_feature(FEAT_DEVICE_FW_VERSION, 0x10, &[entity])
+                && r.len() >= 8
+            {
+                let prefix = String::from_utf8_lossy(&r[1..4])
+                    .trim_end_matches('\0')
+                    .to_string();
+                let rev = r[4];
+                let minor = r[5];
+                let build = u16::from_be_bytes([r[6], r[7]]);
+                if !prefix.is_empty() {
+                    out.push(format!("{prefix} {rev:02X}.{minor:02X}.B{build:04X}"));
                 }
             }
         }
@@ -554,42 +554,42 @@ impl HidppTransport {
 
 /// Shared HID++ 2.0 battery reader (`0x1004` Unified Battery -> `0x1000` -> `0x1001` Voltage).
 pub(crate) fn read_battery_info(t: &HidppTransport) -> Option<BatteryInfo> {
-    if let Ok(r) = t.request_feature(FEAT_UNIFIED_BATTERY, 0x10, &[]) {
-        if r.len() >= 3 {
-            let pct = r[0];
-            return Some(BatteryInfo {
-                percent: if pct <= 100 { Some(pct) } else { None },
-                voltage_mv: None,
-                state: parse_unified_battery_status(r[2]),
-            });
-        }
+    if let Ok(r) = t.request_feature(FEAT_UNIFIED_BATTERY, 0x10, &[])
+        && r.len() >= 3
+    {
+        let pct = r[0];
+        return Some(BatteryInfo {
+            percent: if pct <= 100 { Some(pct) } else { None },
+            voltage_mv: None,
+            state: parse_unified_battery_status(r[2]),
+        });
     }
-    if let Ok(r) = t.request_feature(FEAT_BATTERY_STATUS, 0x00, &[]) {
-        if r.len() >= 3 {
-            let pct = r[0];
-            return Some(BatteryInfo {
-                percent: Some(pct.min(100)),
-                voltage_mv: None,
-                state: parse_unified_battery_status(r[2]),
-            });
-        }
+    if let Ok(r) = t.request_feature(FEAT_BATTERY_STATUS, 0x00, &[])
+        && r.len() >= 3
+    {
+        let pct = r[0];
+        return Some(BatteryInfo {
+            percent: Some(pct.min(100)),
+            voltage_mv: None,
+            state: parse_unified_battery_status(r[2]),
+        });
     }
-    if let Ok(r) = t.request_feature(FEAT_BATTERY_VOLTAGE, 0x00, &[]) {
-        if r.len() >= 3 {
-            let mv = u16::from_be_bytes([r[0], r[1]]);
-            let flags = r[2];
-            let state = if (flags & 0x80) != 0 {
-                BatteryState::Charging
-            } else {
-                BatteryState::Discharging
-            };
-            let pct = ((mv.saturating_sub(3500) as f32 / 680.0) * 100.0).clamp(0.0, 100.0) as u8;
-            return Some(BatteryInfo {
-                percent: Some(pct),
-                voltage_mv: Some(mv),
-                state,
-            });
-        }
+    if let Ok(r) = t.request_feature(FEAT_BATTERY_VOLTAGE, 0x00, &[])
+        && r.len() >= 3
+    {
+        let mv = u16::from_be_bytes([r[0], r[1]]);
+        let flags = r[2];
+        let state = if (flags & 0x80) != 0 {
+            BatteryState::Charging
+        } else {
+            BatteryState::Discharging
+        };
+        let pct = ((mv.saturating_sub(3500) as f32 / 680.0) * 100.0).clamp(0.0, 100.0) as u8;
+        return Some(BatteryInfo {
+            percent: Some(pct),
+            voltage_mv: Some(mv),
+            state,
+        });
     }
     None
 }
@@ -616,7 +616,11 @@ mod tests {
         fn write(&self, data: &[u8]) -> Result<usize, hidapi::HidError> {
             Ok(data.len())
         }
-        fn read_timeout(&self, buf: &mut [u8], _timeout_ms: i32) -> Result<usize, hidapi::HidError> {
+        fn read_timeout(
+            &self,
+            buf: &mut [u8],
+            _timeout_ms: i32,
+        ) -> Result<usize, hidapi::HidError> {
             let Some(pkt) = self.reads.lock().unwrap().pop_front() else {
                 return Ok(0);
             };

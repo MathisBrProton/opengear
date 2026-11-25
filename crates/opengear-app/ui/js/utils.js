@@ -12,7 +12,7 @@ export const SWATCHES = [
 ];
 
 export const CONFIG_CMDS = new Set([
-  "set_rgb_config", "set_sync_all", "set_per_key_color", "clear_per_key", "set_azerty",
+  "set_rgb_config", "set_sync_all", "set_per_key_color", "clear_per_key", "set_keyboard_layout",
   "input_set_binding", "input_remove_binding", "input_set_esports", "input_set_winlock",
   "apply_preset", "switch_profile", "create_profile", "profile_set_linked_apps", "profile_import_json",
   "asus_set_led_count", "cooling_sl3_argb",

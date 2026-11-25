@@ -369,10 +369,10 @@ impl AuraMainboardController {
     }
 
     pub fn set_channel_led_count(&mut self, channel_idx: usize, count: usize) {
-        if let Some(ch) = self.info.channels.get_mut(channel_idx) {
-            if ch.kind == AuraChannelKind::AddressableGen2 {
-                ch.led_count = count.clamp(1, 120);
-            }
+        if let Some(ch) = self.info.channels.get_mut(channel_idx)
+            && ch.kind == AuraChannelKind::AddressableGen2
+        {
+            ch.led_count = count.clamp(1, 120);
         }
     }
 
@@ -528,7 +528,12 @@ impl AuraMainboardController {
             .ok_or(AuraError::InvalidChannel(channel_idx))?
             .clone();
 
-        if !self.channel_direct.get(channel_idx).copied().unwrap_or(false) {
+        if !self
+            .channel_direct
+            .get(channel_idx)
+            .copied()
+            .unwrap_or(false)
+        {
             self.send_effect_cmd(ch.effect_channel, AuraHwMode::Direct, false)?;
             if let Some(flag) = self.channel_direct.get_mut(channel_idx) {
                 *flag = true;

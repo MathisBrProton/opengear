@@ -45,10 +45,10 @@ fn emit(ev: SysEvent) {
     };
     if let Some(cb) = cb {
         cb(ev);
-        if let Ok(mut guard) = cell.lock() {
-            if guard.is_none() {
-                *guard = Some(cb);
-            }
+        if let Ok(mut guard) = cell.lock()
+            && guard.is_none()
+        {
+            *guard = Some(cb);
         }
     }
 }
@@ -69,10 +69,10 @@ pub fn start(on_event: impl Fn(SysEvent) + Send + 'static) {
 
 /// Stop the system event listener thread and clear its callback.
 pub fn stop() {
-    if let Some(cell) = CALLBACK.get() {
-        if let Ok(mut g) = cell.lock() {
-            *g = None;
-        }
+    if let Some(cell) = CALLBACK.get()
+        && let Ok(mut g) = cell.lock()
+    {
+        *g = None;
     }
     #[cfg(windows)]
     {
@@ -131,7 +131,12 @@ mod win {
         OsStr::new(s).encode_wide().chain(Some(0)).collect()
     }
 
-    unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe extern "system" fn wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
         match msg {
             WM_POWERBROADCAST => {
                 match wparam {
@@ -139,10 +144,10 @@ mod win {
                         RESUMED.store(false, Ordering::SeqCst);
                         emit(SysEvent::Suspend);
                     }
-                    PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
-                        if !RESUMED.swap(true, Ordering::SeqCst) {
-                            emit(SysEvent::Resume);
-                        }
+                    PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND
+                        if !RESUMED.swap(true, Ordering::SeqCst) =>
+                    {
+                        emit(SysEvent::Resume);
                     }
                     _ => {}
                 }
@@ -157,7 +162,10 @@ mod win {
                 0
             }
             WM_DEVICECHANGE => {
-                if matches!(wparam, DBT_DEVNODES_CHANGED | DBT_DEVICEARRIVAL | DBT_DEVICEREMOVECOMPLETE) {
+                if matches!(
+                    wparam,
+                    DBT_DEVNODES_CHANGED | DBT_DEVICEARRIVAL | DBT_DEVICEREMOVECOMPLETE
+                ) {
                     unsafe { SetTimer(hwnd, DEVICE_DEBOUNCE_TIMER, DEVICE_DEBOUNCE_MS, None) };
                 }
                 1
@@ -207,7 +215,9 @@ mod win {
                 );
                 if hwnd.is_null() {
                     LISTENER_TID.store(0, Ordering::SeqCst);
-                    tracing::error!("Fenêtre d'événements système non créée : veille / verrouillage non suivis");
+                    tracing::error!(
+                        "Fenêtre d'événements système non créée : veille / verrouillage non suivis"
+                    );
                     return;
                 }
                 WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
@@ -239,6 +249,9 @@ mod tests {
             SysEvent::DevicesChanged,
         ];
         let ids: Vec<_> = all.iter().map(|e| e.id()).collect();
-        assert_eq!(ids, ["suspend", "resume", "lock", "unlock", "devices_changed"]);
+        assert_eq!(
+            ids,
+            ["suspend", "resume", "lock", "unlock", "devices_changed"]
+        );
     }
 }

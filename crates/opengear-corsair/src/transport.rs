@@ -195,10 +195,7 @@ impl BragiTransport {
     }
 
     /// Open a specific Corsair Bragi candidate for a given subdevice slot (`0` = direct/wired, `1..=7` = Slipstream subdevice).
-    pub fn open_candidate(
-        cand: &BragiHidCandidate,
-        subdevice_id: u8,
-    ) -> Result<Self, BragiError> {
+    pub fn open_candidate(cand: &BragiHidCandidate, subdevice_id: u8) -> Result<Self, BragiError> {
         let api = HidApi::new()?;
         let caps = query_windows_hid_caps(&cand.path);
         let (out_report_len, in_report_len) = match caps {
@@ -238,7 +235,7 @@ impl BragiTransport {
         let cands = Self::enumerate_candidates()?;
         let chosen = cands
             .into_iter()
-            .find(|c| target_pid.map_or(true, |p| c.pid == p))
+            .find(|c| target_pid.is_none_or(|p| c.pid == p))
             .ok_or(BragiError::DeviceNotFound)?;
         Self::open_candidate(&chosen, 0)
     }
@@ -379,7 +376,11 @@ impl BragiTransport {
     }
 
     /// Reliable ACK-verified handle write (MUST be used for onboard flash / HWP writes).
-    pub fn write_handle_data_reliable(&mut self, handle: u8, data: &[u8]) -> Result<(), BragiError> {
+    pub fn write_handle_data_reliable(
+        &mut self,
+        handle: u8,
+        data: &[u8],
+    ) -> Result<(), BragiError> {
         let max_payload = self.payload_len();
         if max_payload < 8 {
             return Err(BragiError::Protocol(0x01, "Report HID trop court"));
@@ -492,7 +493,10 @@ impl BragiTransport {
 
     pub fn describe_handle(&mut self, handle: u8) -> Result<usize, BragiError> {
         let rx = self.exchange(&[self.magic(), CMD_PROBE_HANDLE, handle])?;
-        debug!("DescribeBuffer(h={handle}) RX: {:02X?}", &rx[..rx.len().min(16)]);
+        debug!(
+            "DescribeBuffer(h={handle}) RX: {:02X?}",
+            &rx[..rx.len().min(16)]
+        );
         let err = rx[2];
         if err != ERR_OK {
             return Err(BragiError::from_code(err));
@@ -506,7 +510,11 @@ impl BragiTransport {
         Ok(sz)
     }
 
-    pub fn read_handle_data(&mut self, handle: u8, expected_len: usize) -> Result<Vec<u8>, BragiError> {
+    pub fn read_handle_data(
+        &mut self,
+        handle: u8,
+        expected_len: usize,
+    ) -> Result<Vec<u8>, BragiError> {
         let mut out = Vec::with_capacity(expected_len);
         let max_iters = (expected_len / 32).max(1) + 8;
         for iter in 0..max_iters {

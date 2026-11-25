@@ -59,7 +59,10 @@ pub(crate) fn compute_battery_watts(
 }
 
 pub(crate) fn normalize_refresh_rates(rates: Vec<u32>) -> Vec<u32> {
-    let mut out: Vec<u32> = rates.into_iter().filter(|&hz| (24..=500).contains(&hz)).collect();
+    let mut out: Vec<u32> = rates
+        .into_iter()
+        .filter(|&hz| (24..=500).contains(&hz))
+        .collect();
     out.sort_unstable();
     out.dedup();
     out
@@ -69,18 +72,21 @@ pub(crate) fn normalize_refresh_rates(rates: Vec<u32>) -> Vec<u32> {
 pub fn is_laptop_chassis() -> bool {
     #[cfg(windows)]
     {
-        if let Ok(conn) = crate::wmi_com::WmiConn::connect(r"root\cimv2") {
-            if let Ok(rows) = conn.query("SELECT BatteryStatus FROM Win32_Battery") {
-                if !rows.is_empty() {
-                    return true;
-                }
+        if let Ok(conn) = crate::wmi::WmiConn::connect(r"root\cimv2") {
+            if let Ok(rows) = conn.query("SELECT BatteryStatus FROM Win32_Battery")
+                && !rows.is_empty()
+            {
+                return true;
             }
             if let Ok(rows) = conn.query("SELECT ChassisTypes FROM Win32_SystemEnclosure") {
                 for row in rows {
                     if let Some(types) = row.get("ChassisTypes").and_then(|v| v.as_ints()) {
                         // SMBIOS portable types: Portable(8), Laptop(9), Notebook(10),
                         // SubNotebook(14), Tablet(30), Convertible(31), Detachable(32).
-                        if types.iter().any(|&t| matches!(t, 8 | 9 | 10 | 14 | 30 | 31 | 32)) {
+                        if types
+                            .iter()
+                            .any(|&t| matches!(t, 8 | 9 | 10 | 14 | 30 | 31 | 32))
+                        {
                             return true;
                         }
                     }
@@ -98,7 +104,7 @@ pub fn read_laptop_battery() -> LaptopBatteryInfo {
     let mut info = LaptopBatteryInfo::default();
     #[cfg(windows)]
     {
-        if let Ok(conn) = crate::wmi_com::WmiConn::connect(r"root\wmi") {
+        if let Ok(conn) = crate::wmi::WmiConn::connect(r"root\wmi") {
             if let Ok(rows) = conn.query("SELECT DesignedCapacity FROM BatteryStaticData") {
                 info.design_capacity_mwh = rows
                     .first()
@@ -107,7 +113,8 @@ pub fn read_laptop_battery() -> LaptopBatteryInfo {
                     .filter(|&v| v > 0)
                     .map(|v| v as u32);
             }
-            if let Ok(rows) = conn.query("SELECT FullChargedCapacity FROM BatteryFullChargedCapacity")
+            if let Ok(rows) =
+                conn.query("SELECT FullChargedCapacity FROM BatteryFullChargedCapacity")
             {
                 info.full_charged_capacity_mwh = rows
                     .first()
@@ -125,8 +132,8 @@ pub fn read_laptop_battery() -> LaptopBatteryInfo {
             }
             if let Ok(rows) = conn.query(
                 "SELECT PowerOnline, Charging, Discharging, RemainingCapacity, ChargeRate, DischargeRate, Voltage FROM BatteryStatus",
-            ) {
-                if let Some(row) = rows.first() {
+            )
+                && let Some(row) = rows.first() {
                     info.present = true;
                     info.ac_online = row
                         .get("PowerOnline")
@@ -165,42 +172,45 @@ pub fn read_laptop_battery() -> LaptopBatteryInfo {
                         discharge_rate,
                     );
                 }
-            }
         }
 
         // Cross-check / fallback via Win32_Battery for percent & AC detection
-        if let Ok(cim) = crate::wmi_com::WmiConn::connect(r"root\cimv2") {
-            if let Ok(rows) =
-                cim.query("SELECT EstimatedChargeRemaining, BatteryStatus, DesignVoltage FROM Win32_Battery")
+        if let Ok(cim) = crate::wmi::WmiConn::connect(r"root\cimv2")
+            && let Ok(rows) = cim.query(
+                "SELECT EstimatedChargeRemaining, BatteryStatus, DesignVoltage FROM Win32_Battery",
+            )
+            && let Some(row) = rows.first()
+        {
+            info.present = true;
+            info.percent = row
+                .get("EstimatedChargeRemaining")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.min(100) as u8);
+            if info.voltage_v.is_none() {
+                info.voltage_v = row
+                    .get("DesignVoltage")
+                    .and_then(|v| v.as_u64())
+                    .filter(|&v| v > 0)
+                    .map(|mv| mv as f32 / 1000.0);
+            }
+            if let Some(st) = row.get("BatteryStatus").and_then(|v| v.as_u64())
+                && !info.ac_online
+                && matches!(st, 2 | 3 | 6 | 7 | 8 | 9)
             {
-                if let Some(row) = rows.first() {
-                    info.present = true;
-                    info.percent = row
-                        .get("EstimatedChargeRemaining")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v.min(100) as u8);
-                    if info.voltage_v.is_none() {
-                        info.voltage_v = row
-                            .get("DesignVoltage")
-                            .and_then(|v| v.as_u64())
-                            .filter(|&v| v > 0)
-                            .map(|mv| mv as f32 / 1000.0);
-                    }
-                    if let Some(st) = row.get("BatteryStatus").and_then(|v| v.as_u64()) {
-                        if !info.ac_online && matches!(st, 2 | 3 | 6 | 7 | 8 | 9) {
-                            info.ac_online = true;
-                        }
-                    }
-                }
+                info.ac_online = true;
             }
         }
 
-        if info.percent.is_none() {
-            if let (Some(rem), Some(full)) = (info.remaining_capacity_mwh, info.full_charged_capacity_mwh) {
-                if full > 0 {
-                    info.percent = Some(((rem as f32 / full as f32) * 100.0).round().clamp(0.0, 100.0) as u8);
-                }
-            }
+        if info.percent.is_none()
+            && let (Some(rem), Some(full)) =
+                (info.remaining_capacity_mwh, info.full_charged_capacity_mwh)
+            && full > 0
+        {
+            info.percent = Some(
+                ((rem as f32 / full as f32) * 100.0)
+                    .round()
+                    .clamp(0.0, 100.0) as u8,
+            );
         }
         info.health_pct =
             compute_battery_health(info.design_capacity_mwh, info.full_charged_capacity_mwh);
@@ -213,17 +223,19 @@ pub fn read_display_info() -> DisplayInfo {
     let mut info = DisplayInfo::default();
     #[cfg(windows)]
     {
-        if let Ok(conn) = crate::wmi_com::WmiConn::connect(r"root\wmi") {
-            if let Ok(rows) = conn.query("SELECT CurrentBrightness FROM WmiMonitorBrightness") {
-                info.brightness_pct = rows
-                    .first()
-                    .and_then(|r| r.get("CurrentBrightness"))
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v.min(100) as u8);
-            }
+        if let Ok(conn) = crate::wmi::WmiConn::connect(r"root\wmi")
+            && let Ok(rows) = conn.query("SELECT CurrentBrightness FROM WmiMonitorBrightness")
+        {
+            info.brightness_pct = rows
+                .first()
+                .and_then(|r| r.get("CurrentBrightness"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v.min(100) as u8);
         }
 
-        use windows_sys::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+        use windows_sys::Win32::Graphics::Gdi::{
+            DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
+        };
         unsafe {
             let mut cur: DEVMODEW = std::mem::zeroed();
             cur.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
@@ -261,7 +273,7 @@ pub fn read_display_info() -> DisplayInfo {
 pub fn set_display_brightness(pct: u8) -> Result<()> {
     #[cfg(windows)]
     {
-        use crate::wmi_com::{WmiConn, WmiVal};
+        use crate::wmi::{WmiConn, WmiVal};
         let pct = pct.min(100);
         let conn = WmiConn::connect(r"root\wmi")?;
         let path = conn
@@ -271,10 +283,7 @@ pub fn set_display_brightness(pct: u8) -> Result<()> {
             &path,
             "WmiMonitorBrightnessMethods",
             "WmiSetBrightness",
-            &[
-                ("Timeout", WmiVal::U32(1)),
-                ("Brightness", WmiVal::U8(pct)),
-            ],
+            &[("Timeout", WmiVal::U32(1)), ("Brightness", WmiVal::U8(pct))],
         )?;
         Ok(())
     }
@@ -336,11 +345,23 @@ mod tests {
 
     #[test]
     fn battery_health_and_watts_calculations() {
-        assert_eq!(compute_battery_health(Some(70000), Some(64680)).map(|v| (v * 10.0).round() / 10.0), Some(92.4));
+        assert_eq!(
+            compute_battery_health(Some(70000), Some(64680)).map(|v| (v * 10.0).round() / 10.0),
+            Some(92.4)
+        );
         assert_eq!(compute_battery_health(Some(0), Some(50000)), None);
-        assert_eq!(compute_battery_watts(true, false, Some(35400), None), Some(35.4));
-        assert_eq!(compute_battery_watts(false, true, None, Some(18250)), Some(-18.25));
-        assert_eq!(compute_battery_watts(false, false, Some(0), Some(0xFFFFFFFF)), None);
+        assert_eq!(
+            compute_battery_watts(true, false, Some(35400), None),
+            Some(35.4)
+        );
+        assert_eq!(
+            compute_battery_watts(false, true, None, Some(18250)),
+            Some(-18.25)
+        );
+        assert_eq!(
+            compute_battery_watts(false, false, Some(0), Some(0xFFFFFFFF)),
+            None
+        );
     }
 
     #[test]
@@ -355,8 +376,11 @@ mod tests {
     #[ignore]
     fn live_wmi_brightness_roundtrip() {
         let info = read_display_info();
-        let cur = info.brightness_pct.expect("WmiMonitorBrightness indisponible");
+        let cur = info
+            .brightness_pct
+            .expect("WmiMonitorBrightness indisponible");
         println!("Current panel brightness: {cur}%");
-        set_display_brightness(cur).unwrap_or_else(|e| panic!("set_display_brightness({cur}) failed: {e:#}"));
+        set_display_brightness(cur)
+            .unwrap_or_else(|e| panic!("set_display_brightness({cur}) failed: {e:#}"));
     }
 }

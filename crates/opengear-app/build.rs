@@ -35,25 +35,25 @@ fn main() {
     if let Ok(out_dir) = std::env::var("OUT_DIR") {
         // OUT_DIR is target/<triple>/<profile>/build/opengear-app-.../out
         let out_path = PathBuf::from(&out_dir);
-        if let Some(build_dir) = out_path.ancestors().nth(2) {
-            if let Some(profile_dir) = build_dir.parent() {
-                if let Some(dll) = find_webview2_loader(build_dir, wv_arch_dir) {
-                    let dest = profile_dir.join("WebView2Loader.dll");
-                    let _ = fs::copy(&dll, &dest);
-                }
+        if let Some(build_dir) = out_path.ancestors().nth(2)
+            && let Some(profile_dir) = build_dir.parent()
+        {
+            if let Some(dll) = find_webview2_loader(build_dir, wv_arch_dir) {
+                let dest = profile_dir.join("WebView2Loader.dll");
+                let _ = fs::copy(&dll, &dest);
+            }
 
-                // Stage LGPL-2.1 PawnIO modules as external replaceable files beside the binary.
-                if pawnio_src.is_dir() {
-                    let pio_dest = profile_dir.join("pawnio_modules");
-                    let _ = fs::create_dir_all(&pio_dest);
-                    if let Ok(entries) = fs::read_dir(pawnio_src) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            if p.is_file() {
-                                if let Some(name) = p.file_name() {
-                                    let _ = fs::copy(&p, pio_dest.join(name));
-                                }
-                            }
+            // Stage LGPL-2.1 PawnIO modules as external replaceable files beside the binary.
+            if pawnio_src.is_dir() {
+                let pio_dest = profile_dir.join("pawnio_modules");
+                let _ = fs::create_dir_all(&pio_dest);
+                if let Ok(entries) = fs::read_dir(pawnio_src) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.is_file()
+                            && let Some(name) = p.file_name()
+                        {
+                            let _ = fs::copy(&p, pio_dest.join(name));
                         }
                     }
                 }

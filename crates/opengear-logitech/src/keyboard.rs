@@ -77,7 +77,9 @@ impl LogitechKeyboard {
 
         let battery = read_battery_info(&transport);
         let supports_rgb_effects = transport.get_feature_index(FEAT_RGB_EFFECTS).is_some()
-            || transport.get_feature_index(FEAT_COLOR_LED_EFFECTS).is_some();
+            || transport
+                .get_feature_index(FEAT_COLOR_LED_EFFECTS)
+                .is_some();
         let rgb_cluster_count = if transport.get_feature_index(FEAT_RGB_EFFECTS).is_some() {
             transport
                 .request_feature(FEAT_RGB_EFFECTS, 0x00, &[])
@@ -88,7 +90,9 @@ impl LogitechKeyboard {
             1
         };
 
-        let supports_brightness = transport.get_feature_index(FEAT_BRIGHTNESS_CONTROL).is_some();
+        let supports_brightness = transport
+            .get_feature_index(FEAT_BRIGHTNESS_CONTROL)
+            .is_some();
         let max_brightness = if supports_brightness {
             transport
                 .request_feature(FEAT_BRIGHTNESS_CONTROL, 0x00, &[])
@@ -112,7 +116,8 @@ impl LogitechKeyboard {
                 .and_then(|r| {
                     if r.len() >= 2 {
                         let raw = u16::from_be_bytes([r[0], r[1]]).min(max_brightness);
-                        let pct = ((raw as u32 * 100 + (max_brightness as u32 / 2)) / max_brightness as u32)
+                        let pct = ((raw as u32 * 100 + (max_brightness as u32 / 2))
+                            / max_brightness as u32)
                             .min(100) as u8;
                         Some(pct)
                     } else {
@@ -171,12 +176,14 @@ impl LogitechKeyboard {
         let sp = speed_ms.to_be_bytes();
         if self.transport.get_feature_index(FEAT_RGB_EFFECTS).is_some() {
             // 0x8071 fn 0x10: setClusterEffect(clusterIdx, effectId, R, G, B, ...)
-            let clusters = self.info.rgb_cluster_count.max(1).min(4);
+            let clusters = self.info.rgb_cluster_count.clamp(1, 4);
             for cluster in 0..clusters {
                 let params: Vec<u8> = match mode {
                     KeyboardRgbMode::Off => vec![cluster, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                     KeyboardRgbMode::Fixed => {
-                        vec![cluster, 0x01, color.r, color.g, color.b, 0, 0, 0, 0, 0, 0, 0]
+                        vec![
+                            cluster, 0x01, color.r, color.g, color.b, 0, 0, 0, 0, 0, 0, 0,
+                        ]
                     }
                     KeyboardRgbMode::Cycle => {
                         vec![cluster, 0x03, 0, 0, 0, 0, 0, sp[0], sp[1], 100, 0, 0]
@@ -200,12 +207,16 @@ impl LogitechKeyboard {
         {
             let params: Vec<u8> = match mode {
                 KeyboardRgbMode::Off => vec![0, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                KeyboardRgbMode::Fixed => vec![0, 0x01, color.r, color.g, color.b, 0, 0, 0, 0, 0, 0, 0],
+                KeyboardRgbMode::Fixed => {
+                    vec![0, 0x01, color.r, color.g, color.b, 0, 0, 0, 0, 0, 0, 0]
+                }
                 KeyboardRgbMode::Cycle | KeyboardRgbMode::Wave => {
                     vec![0, 0x03, 0, 0, 0, 0, 0, sp[0], sp[1], 100, 0, 0]
                 }
                 KeyboardRgbMode::Breathing => {
-                    vec![0, 0x0A, color.r, color.g, color.b, sp[0], sp[1], 0x01, 100, 0, 0, 0]
+                    vec![
+                        0, 0x0A, color.r, color.g, color.b, sp[0], sp[1], 0x01, 100, 0, 0, 0,
+                    ]
                 }
             };
             self.transport

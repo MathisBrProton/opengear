@@ -19,16 +19,46 @@ pub struct EqPreset {
 }
 
 pub const EQ_PRESETS: &[EqPreset] = &[
-    EqPreset { name: "Plat (Défaut)", gains_5: [0, 0, 0, 0, 0] },
-    EqPreset { name: "FPS (Pro G HUB)", gains_5: [2, 2, 0, 4, 1] },
-    EqPreset { name: "MOBA (Pro G HUB)", gains_5: [0, -2, 3, 3, 3] },
-    EqPreset { name: "G2 shox", gains_5: [1, -1, -2, 1, 2] },
-    EqPreset { name: "TSM Bjergsen", gains_5: [2, 2, -1, 4, 4] },
-    EqPreset { name: "TSM Myth", gains_5: [3, 1, 2, 3, 2] },
-    EqPreset { name: "TSM Hamlinz", gains_5: [1, 1, 2, 3, -1] },
-    EqPreset { name: "Spitfire Profit", gains_5: [-2, -1, 1, 2, 3] },
-    EqPreset { name: "Bass Boost", gains_5: [6, 4, 0, 1, 2] },
-    EqPreset { name: "Voix / Discord", gains_5: [-2, 1, 4, 3, -1] },
+    EqPreset {
+        name: "Plat (Défaut)",
+        gains_5: [0, 0, 0, 0, 0],
+    },
+    EqPreset {
+        name: "FPS (Pro G HUB)",
+        gains_5: [2, 2, 0, 4, 1],
+    },
+    EqPreset {
+        name: "MOBA (Pro G HUB)",
+        gains_5: [0, -2, 3, 3, 3],
+    },
+    EqPreset {
+        name: "G2 shox",
+        gains_5: [1, -1, -2, 1, 2],
+    },
+    EqPreset {
+        name: "TSM Bjergsen",
+        gains_5: [2, 2, -1, 4, 4],
+    },
+    EqPreset {
+        name: "TSM Myth",
+        gains_5: [3, 1, 2, 3, 2],
+    },
+    EqPreset {
+        name: "TSM Hamlinz",
+        gains_5: [1, 1, 2, 3, -1],
+    },
+    EqPreset {
+        name: "Spitfire Profit",
+        gains_5: [-2, -1, 1, 2, 3],
+    },
+    EqPreset {
+        name: "Bass Boost",
+        gains_5: [6, 4, 0, 1, 2],
+    },
+    EqPreset {
+        name: "Voix / Discord",
+        gains_5: [-2, 1, 4, 3, -1],
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -73,7 +103,9 @@ impl LogitechHeadset {
         let proto_version = format!("{}.{}", transport.proto_major, transport.proto_minor);
 
         let supports_sidetone = transport.get_feature_index(FEAT_SIDETONE).is_some()
-            || transport.get_feature_index(FEAT_HEADSET_AUDIO_SIDETONE).is_some()
+            || transport
+                .get_feature_index(FEAT_HEADSET_AUDIO_SIDETONE)
+                .is_some()
             || transport.pid == 0x0AAA;
 
         let battery = read_battery_info(&transport);
@@ -119,8 +151,13 @@ impl LogitechHeadset {
     pub fn set_sidetone(&mut self, percent: u8) -> Result<(), HidppError> {
         let pct = percent.min(100);
         if self.transport.get_feature_index(FEAT_SIDETONE).is_some() {
-            self.transport.request_feature(FEAT_SIDETONE, 0x10, &[pct])?;
-        } else if self.transport.get_feature_index(FEAT_HEADSET_AUDIO_SIDETONE).is_some() {
+            self.transport
+                .request_feature(FEAT_SIDETONE, 0x10, &[pct])?;
+        } else if self
+            .transport
+            .get_feature_index(FEAT_HEADSET_AUDIO_SIDETONE)
+            .is_some()
+        {
             self.transport
                 .request_feature(FEAT_HEADSET_AUDIO_SIDETONE, 0x10, &[0x01, pct])?;
         } else if self.info.pid == 0x0AAA {
@@ -158,9 +195,7 @@ impl LogitechHeadset {
     }
 
     fn read_equalizer_inner(t: &HidppTransport) -> Option<EqualizerInfo> {
-        if t.get_feature_index(FEAT_EQUALIZER).is_none() {
-            return None;
-        }
+        t.get_feature_index(FEAT_EQUALIZER)?;
         let info_r = t.request_feature(FEAT_EQUALIZER, 0x00, &[]).ok()?;
         let (count, min_db, max_db) = Self::parse_equalizer_info(&info_r)?;
 
@@ -212,13 +247,22 @@ impl LogitechHeadset {
         let mut payload = Vec::with_capacity(1 + eq.band_count);
         payload.push(0x02); // Solaar write_prefix_bytes = 0x02 (save/apply)
         for i in 0..eq.band_count {
-            let g = gains.get(i).copied().unwrap_or(0).clamp(eq.min_db, eq.max_db);
+            let g = gains
+                .get(i)
+                .copied()
+                .unwrap_or(0)
+                .clamp(eq.min_db, eq.max_db);
             payload.push(g as u8);
         }
-        self.transport.request_feature(FEAT_EQUALIZER, 0x30, &payload)?;
+        self.transport
+            .request_feature(FEAT_EQUALIZER, 0x30, &payload)?;
         if let Some(cur) = self.info.equalizer.as_mut() {
             for i in 0..cur.band_count {
-                cur.gains_db[i] = gains.get(i).copied().unwrap_or(0).clamp(cur.min_db, cur.max_db);
+                cur.gains_db[i] = gains
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0)
+                    .clamp(cur.min_db, cur.max_db);
             }
         }
         Ok(())
@@ -231,10 +275,25 @@ mod tests {
 
     #[test]
     fn parse_equalizer_info_guards_overflow_and_band_limit() {
-        assert_eq!(LogitechHeadset::parse_equalizer_info(&[5, 0x80, 0, 0, 0]), Some((5, 0, 0)));
-        assert_eq!(LogitechHeadset::parse_equalizer_info(&[5, 12, 0, 0, 0]), Some((5, -12, 12)));
-        assert_eq!(LogitechHeadset::parse_equalizer_info(&[5, 6, 0, 10, 2]), Some((5, 2, 10)));
-        assert_eq!(LogitechHeadset::parse_equalizer_info(&[16, 12, 0, 0, 0]), None);
-        assert_eq!(LogitechHeadset::parse_equalizer_info(&[0, 12, 0, 0, 0]), None);
+        assert_eq!(
+            LogitechHeadset::parse_equalizer_info(&[5, 0x80, 0, 0, 0]),
+            Some((5, 0, 0))
+        );
+        assert_eq!(
+            LogitechHeadset::parse_equalizer_info(&[5, 12, 0, 0, 0]),
+            Some((5, -12, 12))
+        );
+        assert_eq!(
+            LogitechHeadset::parse_equalizer_info(&[5, 6, 0, 10, 2]),
+            Some((5, 2, 10))
+        );
+        assert_eq!(
+            LogitechHeadset::parse_equalizer_info(&[16, 12, 0, 0, 0]),
+            None
+        );
+        assert_eq!(
+            LogitechHeadset::parse_equalizer_info(&[0, 12, 0, 0, 0]),
+            None
+        );
     }
 }

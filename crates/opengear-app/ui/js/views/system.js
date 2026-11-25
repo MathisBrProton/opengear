@@ -32,7 +32,7 @@ function sysPrefs() {
           ${seg([["simple", "Simple"], ["expert", "Expert"]], mode, "set-mode-seg")}
         </div>
         <div class="divider"></div>
-        ${sw(!!S.config.use_azerty_labels, "Afficher les touches en AZERTY", "azerty")}
+        <div class="row-between"><span class="muted">Clavier affiché : disposition Windows <strong>${esc((S.keyboard.os_layout || {}).top_row || "?")}</strong>, format réglable dans Touches &amp; macros.</span><button type="button" class="btn btn-sm btn-secondary" data-act="nav" data-tab="input">Ouvrir</button></div>
         <div class="divider"></div>
         <div class="row-between"><span class="muted">Revoir la présentation de démarrage.</span><button type="button" class="btn btn-sm btn-secondary" data-act="wizard-open">Relancer l'assistant</button></div>
       </div>

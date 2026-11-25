@@ -196,11 +196,13 @@ impl HwpLightingLayer {
         out.push(wanted_colors as u8);
 
         for i in 0..wanted_colors {
-            let c = self
-                .colors
-                .get(i)
-                .copied()
-                .unwrap_or_else(|| if i == 0 { Rgb::CYAN } else { Rgb::new(155, 60, 255) });
+            let c = self.colors.get(i).copied().unwrap_or_else(|| {
+                if i == 0 {
+                    Rgb::CYAN
+                } else {
+                    Rgb::new(155, 60, 255)
+                }
+            });
             out.push(0xFF);
             out.push(c.b);
             out.push(c.g);
@@ -285,7 +287,7 @@ pub fn list_corsair_backups() -> Vec<CorsairFlashBackup> {
             })
         })
         .collect();
-    out.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+    out.sort_by_key(|a| std::cmp::Reverse(a.created_ms));
     out
 }
 
@@ -304,32 +306,44 @@ pub(crate) fn save_corsair_backup_to(
     tag: &str,
     bytes: &[u8],
 ) -> Result<PathBuf, BragiError> {
-    std::fs::create_dir_all(dir)
-        .map_err(|_| BragiError::Protocol(0x04, "Impossible de créer le dossier de sauvegarde Corsair"))?;
+    std::fs::create_dir_all(dir).map_err(|_| {
+        BragiError::Protocol(0x04, "Impossible de créer le dossier de sauvegarde Corsair")
+    })?;
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let path = dir.join(format!("file{file_id:04X}_{tag}_{ms}.bin"));
-    std::fs::write(&path, bytes)
-        .map_err(|_| BragiError::Protocol(0x04, "Impossible d'écrire la sauvegarde Flash Corsair"))?;
+    std::fs::write(&path, bytes).map_err(|_| {
+        BragiError::Protocol(0x04, "Impossible d'écrire la sauvegarde Flash Corsair")
+    })?;
     Ok(path)
 }
 
 pub fn restore_corsair_backup(t: &mut BragiTransport, file_name: &str) -> Result<u16, BragiError> {
-    let path = corsair_backup_path_for(file_name)
-        .ok_or(BragiError::Protocol(0x01, "Sauvegarde Corsair introuvable ou invalide"))?;
-    let (file_id, _, _) = parse_corsair_backup_name(file_name)
-        .ok_or(BragiError::Protocol(0x01, "Nom de sauvegarde Corsair invalide"))?;
+    let path = corsair_backup_path_for(file_name).ok_or(BragiError::Protocol(
+        0x01,
+        "Sauvegarde Corsair introuvable ou invalide",
+    ))?;
+    let (file_id, _, _) = parse_corsair_backup_name(file_name).ok_or(BragiError::Protocol(
+        0x01,
+        "Nom de sauvegarde Corsair invalide",
+    ))?;
     let bytes = std::fs::read(&path)
         .map_err(|_| BragiError::Protocol(0x04, "Lecture de la sauvegarde Corsair impossible"))?;
     if bytes.is_empty() || bytes.len() > 65536 {
-        return Err(BragiError::Protocol(0x01, "Taille de sauvegarde Corsair invalide"));
+        return Err(BragiError::Protocol(
+            0x01,
+            "Taille de sauvegarde Corsair invalide",
+        ));
     }
     t.write_file(file_id, &bytes)?;
     let verify = t.read_file(file_id)?;
     if verify != bytes {
-        return Err(BragiError::Protocol(0x04, "Vérification restauration Corsair échouée"));
+        return Err(BragiError::Protocol(
+            0x04,
+            "Vérification restauration Corsair échouée",
+        ));
     }
     Ok(file_id)
 }
@@ -347,9 +361,17 @@ pub(crate) fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &[u8] {
 }
 
 /// Patch the UTF-8 profile name inside a raw `Profile` (`0xF11E`) flash file.
-pub(crate) fn patch_profile_name_bytes(raw_profile: &[u8], new_name: &str) -> Result<Vec<u8>, BragiError> {
-    if raw_profile.len() < 32 || u16::from_le_bytes([raw_profile[0], raw_profile[1]]) != LAYOUT_PROFILE {
-        return Err(BragiError::Protocol(0x01, "En-tête profil Bragi 0xF11E invalide"));
+pub(crate) fn patch_profile_name_bytes(
+    raw_profile: &[u8],
+    new_name: &str,
+) -> Result<Vec<u8>, BragiError> {
+    if raw_profile.len() < 32
+        || u16::from_le_bytes([raw_profile[0], raw_profile[1]]) != LAYOUT_PROFILE
+    {
+        return Err(BragiError::Protocol(
+            0x01,
+            "En-tête profil Bragi 0xF11E invalide",
+        ));
     }
     let old_len = u16::from_le_bytes([raw_profile[30], raw_profile[31]]) as usize;
     let tail_start = (32 + old_len).min(raw_profile.len());
@@ -427,25 +449,24 @@ pub fn read_all_hwp_profiles(t: &mut BragiTransport) -> Result<Vec<HwpProfileInf
         };
 
         let mut lighting = None;
-        if lightings_list_file != 0 {
-            if let Ok(ll) = t.read_file(lightings_list_file) {
-                if ll.len() >= 8 && u16::from_le_bytes([ll[0], ll[1]]) == LAYOUT_LIGHTINGS_LIST {
-                    let layer_cnt = u16::from_le_bytes([ll[2], ll[3]]) as usize;
-                    for li in 0..layer_cnt.min(8) {
-                        let off = 6 + li * 2;
-                        if off + 1 >= ll.len() {
-                            break;
-                        }
-                        let lfid = u16::from_le_bytes([ll[off], ll[off + 1]]);
-                        if lfid != 0 {
-                            if let Ok(lraw) = t.read_file(lfid) {
-                                if let Some(decoded) = HwpLightingLayer::decode(lfid, &lraw) {
-                                    lighting = Some(decoded);
-                                    break;
-                                }
-                            }
-                        }
-                    }
+        if lightings_list_file != 0
+            && let Ok(ll) = t.read_file(lightings_list_file)
+            && ll.len() >= 8
+            && u16::from_le_bytes([ll[0], ll[1]]) == LAYOUT_LIGHTINGS_LIST
+        {
+            let layer_cnt = u16::from_le_bytes([ll[2], ll[3]]) as usize;
+            for li in 0..layer_cnt.min(8) {
+                let off = 6 + li * 2;
+                if off + 1 >= ll.len() {
+                    break;
+                }
+                let lfid = u16::from_le_bytes([ll[off], ll[off + 1]]);
+                if lfid != 0
+                    && let Ok(lraw) = t.read_file(lfid)
+                    && let Some(decoded) = HwpLightingLayer::decode(lfid, &lraw)
+                {
+                    lighting = Some(decoded);
+                    break;
                 }
             }
         }
@@ -471,6 +492,7 @@ pub fn read_all_hwp_profiles(t: &mut BragiTransport) -> Result<Vec<HwpProfileInf
 
 /// Safely flash a Hardware Lighting Effect (and optional profile name) with durable backups,
 /// byte-for-byte read-back verification, and automatic rollback on verification failure.
+#[allow(clippy::too_many_arguments)]
 pub fn flash_hwp_profile_lighting(
     t: &mut BragiTransport,
     profile: &HwpProfileInfo,
@@ -481,10 +503,10 @@ pub fn flash_hwp_profile_lighting(
     direction: u8,
     new_name: Option<&str>,
 ) -> Result<HwpLightingLayer, BragiError> {
-    let existing = profile
-        .lighting
-        .as_ref()
-        .ok_or(BragiError::Protocol(0x01, "Aucun fichier lighting dans ce profil HW"))?;
+    let existing = profile.lighting.as_ref().ok_or(BragiError::Protocol(
+        0x01,
+        "Aucun fichier lighting dans ce profil HW",
+    ))?;
 
     // 1. Durable timestamped backup BEFORE writing anything (abort flash if backup fails!)
     let bdir = corsair_backup_dir();

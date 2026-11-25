@@ -125,9 +125,11 @@ impl AmdAdlReader {
     #[cfg(windows)]
     fn try_init() -> Option<Self> {
         unsafe {
-            let lib = crate::wmi_com::load_system32_library("atiadlxx.dll").ok()?;
-            let fn_create: FnAdl2MainControlCreate = *lib.get(b"ADL2_Main_Control_Create\0").ok()?;
-            let fn_destroy: FnAdl2MainControlDestroy = *lib.get(b"ADL2_Main_Control_Destroy\0").ok()?;
+            let lib = crate::wmi::load_system32_library("atiadlxx.dll").ok()?;
+            let fn_create: FnAdl2MainControlCreate =
+                *lib.get(b"ADL2_Main_Control_Create\0").ok()?;
+            let fn_destroy: FnAdl2MainControlDestroy =
+                *lib.get(b"ADL2_Main_Control_Destroy\0").ok()?;
             let fn_num: FnAdl2AdapterNumberOfAdaptersGet =
                 *lib.get(b"ADL2_Adapter_NumberOfAdapters_Get\0").ok()?;
             let fn_pmlog: FnAdl2NewQueryPmLogDataGet =
@@ -253,7 +255,7 @@ impl NvmlReader {
     #[cfg(windows)]
     fn try_init() -> Option<Self> {
         unsafe {
-            let lib = crate::wmi_com::load_system32_library("nvml.dll").ok()?;
+            let lib = crate::wmi::load_system32_library("nvml.dll").ok()?;
             let fn_init: FnNvmlInit = *lib.get(b"nvmlInit_v2\0").ok()?;
             let fn_shutdown: FnNvmlShutdown = *lib.get(b"nvmlShutdown\0").ok()?;
             let fn_handle: FnNvmlDeviceGetHandleByIndex =
@@ -303,12 +305,12 @@ impl NvmlReader {
         let mut tel = GpuTelemetry::default();
         unsafe {
             let mut temp: c_uint = 0;
-            if (self.fn_temp)(self.device, 0, &mut temp) == 0 {
-                if let Some(t) = sanitize_gpu_temp(temp as f32) {
-                    tel.available = true;
-                    tel.backend = "NVIDIA NVML".to_string();
-                    tel.edge_temp_c = Some(t);
-                }
+            if (self.fn_temp)(self.device, 0, &mut temp) == 0
+                && let Some(t) = sanitize_gpu_temp(temp as f32)
+            {
+                tel.available = true;
+                tel.backend = "NVIDIA NVML".to_string();
+                tel.edge_temp_c = Some(t);
             }
             if let Some(f) = self.fn_util {
                 let mut u = NvmlUtilization { gpu: 0, memory: 0 };
@@ -478,59 +480,56 @@ impl TelemetryCollector {
         info.ram_total_gb = total_gb;
 
         #[cfg(windows)]
-        if let Ok(conn) = crate::wmi_com::WmiConn::connect(r"root\cimv2") {
-            if let Ok(rows) = conn.query("SELECT Manufacturer, Model FROM Win32_ComputerSystem") {
-                if let Some(row) = rows.first() {
-                    if let Some(s) = row
-                        .get("Manufacturer")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                    {
-                        info.manufacturer = s.to_string();
-                    }
-                    if let Some(s) = row
-                        .get("Model")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                    {
-                        info.model = s.to_string();
-                    }
+        if let Ok(conn) = crate::wmi::WmiConn::connect(r"root\cimv2") {
+            if let Ok(rows) = conn.query("SELECT Manufacturer, Model FROM Win32_ComputerSystem")
+                && let Some(row) = rows.first()
+            {
+                if let Some(s) = row
+                    .get("Manufacturer")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    info.manufacturer = s.to_string();
+                }
+                if let Some(s) = row
+                    .get("Model")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    info.model = s.to_string();
                 }
             }
-            if let Ok(rows) = conn.query("SELECT Product FROM Win32_BaseBoard") {
-                if let Some(s) = rows
+            if let Ok(rows) = conn.query("SELECT Product FROM Win32_BaseBoard")
+                && let Some(s) = rows
                     .first()
                     .and_then(|r| r.get("Product"))
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                {
-                    info.motherboard = s.to_string();
-                }
+            {
+                info.motherboard = s.to_string();
             }
-            if let Ok(rows) = conn.query("SELECT SMBIOSBIOSVersion FROM Win32_BIOS") {
-                if let Some(s) = rows
+            if let Ok(rows) = conn.query("SELECT SMBIOSBIOSVersion FROM Win32_BIOS")
+                && let Some(s) = rows
                     .first()
                     .and_then(|r| r.get("SMBIOSBIOSVersion"))
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                {
-                    info.bios_version = s.to_string();
-                }
+            {
+                info.bios_version = s.to_string();
             }
-            if let Ok(rows) = conn.query("SELECT Name FROM Win32_Processor") {
-                if let Some(s) = rows
+            if let Ok(rows) = conn.query("SELECT Name FROM Win32_Processor")
+                && let Some(s) = rows
                     .first()
                     .and_then(|r| r.get("Name"))
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                {
-                    info.cpu_name = s.to_string();
-                }
+            {
+                info.cpu_name = s.to_string();
             }
             if let Ok(rows) = conn.query("SELECT Name FROM Win32_VideoController") {
                 let names: Vec<String> = rows

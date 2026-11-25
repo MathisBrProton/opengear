@@ -4,13 +4,15 @@
 
 use crate::audio_ext::read_audio_state;
 use opengear_asus::{
-    AuraMainboardController, FanHeaderKind, TelemetryCollector, diagnose_smbus_readonly,
-    is_elevated, is_laptop_chassis, pawnio_availability, probe_hp_omen, probe_ram_rgb,
-    read_asus_wmi_channel, read_display_info, read_laptop_battery, read_native_cpu_temp,
-    read_superio_snapshot,
+    AuraMainboardController, FanHeaderKind, diagnose_smbus_readonly, pawnio_availability,
+    probe_ram_rgb, read_asus_wmi_channel, read_native_cpu_temp, read_superio_snapshot,
 };
 use opengear_corsair::CorsairDevice;
+use opengear_hp::probe_hp_omen;
 use opengear_logitech::{LogitechHeadset, LogitechMouse};
+use opengear_platform::{
+    TelemetryCollector, is_elevated, is_laptop_chassis, read_display_info, read_laptop_battery,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -55,7 +57,10 @@ pub fn run_full_selftest() -> SelfTestReport {
                 .unwrap_or_else(|| "—".into());
             let hwp_n = d.info.hwp_profiles.len();
             checks.push(SelfTestCheck {
-                name: format!("Corsair {} ({:04X}:{:04X})", d.info.product_name, d.info.vid, d.info.pid),
+                name: format!(
+                    "Corsair {} ({:04X}:{:04X})",
+                    d.info.product_name, d.info.vid, d.info.pid
+                ),
                 status: "PASS".into(),
                 detail: format!(
                     "FW {} | Polling={} Hz | Debounce={} | Profils Flash HWP={}",
@@ -75,7 +80,12 @@ pub fn run_full_selftest() -> SelfTestReport {
         });
     } else {
         for m in &mice {
-            let crc_ok = m.info.onboard_profiles.iter().filter(|p| p.crc_valid).count();
+            let crc_ok = m
+                .info
+                .onboard_profiles
+                .iter()
+                .filter(|p| p.crc_valid)
+                .count();
             let total = m.info.onboard_profiles.len();
             let bat = m
                 .info
@@ -86,8 +96,16 @@ pub fn run_full_selftest() -> SelfTestReport {
                 .unwrap_or_else(|| "—".into());
             let dpi = m.info.dpi.as_ref().map(|d| d.dpi_x).unwrap_or(0);
             checks.push(SelfTestCheck {
-                name: format!("Logitech {} ({:04X}:{:04X})", m.info.name, m.info.vid, m.info.pid),
-                status: if total == 0 || crc_ok == total { "PASS" } else { "WARN" }.into(),
+                name: format!(
+                    "Logitech {} ({:04X}:{:04X})",
+                    m.info.name, m.info.vid, m.info.pid
+                ),
+                status: if total == 0 || crc_ok == total {
+                    "PASS"
+                } else {
+                    "WARN"
+                }
+                .into(),
                 detail: format!(
                     "Batterie={} | DPI={} | Flash Onboard CRC-16 OK={}/{} | {} features",
                     bat,
@@ -104,7 +122,10 @@ pub fn run_full_selftest() -> SelfTestReport {
     for h in &headsets {
         let eq_n = h.info.equalizer.as_ref().map(|e| e.band_count).unwrap_or(0);
         checks.push(SelfTestCheck {
-            name: format!("Logitech Casque {} ({:04X}:{:04X})", h.info.name, h.info.vid, h.info.pid),
+            name: format!(
+                "Logitech Casque {} ({:04X}:{:04X})",
+                h.info.name, h.info.vid, h.info.pid
+            ),
             status: "PASS".into(),
             detail: format!("Sidetone={}% | EQ DSP={} bandes", h.info.sidetone_pct, eq_n),
         });
@@ -273,7 +294,10 @@ pub fn run_full_selftest() -> SelfTestReport {
                 name: "PawnIO SuperIO (LpcIO)".into(),
                 status: if is_laptop { "WARN" } else { "FAIL" }.into(),
                 detail: if is_laptop {
-                    format!("{} — non applicable sur PC portable (contrôle via EC / WMI constructeur).", sio.diagnostic)
+                    format!(
+                        "{} — non applicable sur PC portable (contrôle via EC / WMI constructeur).",
+                        sio.diagnostic
+                    )
                 } else {
                     sio.diagnostic
                 },
@@ -285,7 +309,12 @@ pub fn run_full_selftest() -> SelfTestReport {
         let ram = probe_ram_rgb();
         checks.push(SelfTestCheck {
             name: "PawnIO SMBus & RAM DDR RGB".into(),
-            status: if !ram.ene_modules.is_empty() { "PASS" } else { "WARN" }.into(),
+            status: if !ram.ene_modules.is_empty() {
+                "PASS"
+            } else {
+                "WARN"
+            }
+            .into(),
             detail: format!("{} || SMBus: {}", ram.message, smbus_diag.join(" ; ")),
         });
 
@@ -327,9 +356,7 @@ pub fn run_full_selftest() -> SelfTestReport {
 
 fn save_report_file(is_admin: bool, checks: &[SelfTestCheck]) -> PathBuf {
     let path = std::env::temp_dir().join("opengear_selftest.txt");
-    let mut txt = format!(
-        "=== OpenGear Hardware Self-Test Report (Admin={is_admin}) ===\n"
-    );
+    let mut txt = format!("=== OpenGear Hardware Self-Test Report (Admin={is_admin}) ===\n");
     for c in checks {
         txt.push_str(&format!("[{:^10}] {} => {}\n", c.status, c.name, c.detail));
     }

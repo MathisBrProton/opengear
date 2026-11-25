@@ -82,34 +82,6 @@ impl PollingRate {
         }
     }
 
-    /// Corsair Bragi wire value (property 0x01 / 0x96).
-    /// Matches ckb-next: 1=8ms (125Hz), 2=4ms (250Hz), 3=2ms (500Hz),
-    /// 4=1ms (1000Hz), 5=0.5ms (2000Hz), 6=0.25ms (4000Hz), 7=0.125ms (8000Hz).
-    pub fn to_bragi_value(self) -> u16 {
-        match self {
-            Self::Hz125 => 1,
-            Self::Hz250 => 2,
-            Self::Hz500 => 3,
-            Self::Hz1000 => 4,
-            Self::Hz2000 => 5,
-            Self::Hz4000 => 6,
-            Self::Hz8000 => 7,
-        }
-    }
-
-    pub fn from_bragi_value(v: u32) -> Option<Self> {
-        match v {
-            1 => Some(Self::Hz125),
-            2 => Some(Self::Hz250),
-            3 => Some(Self::Hz500),
-            4 => Some(Self::Hz1000),
-            5 => Some(Self::Hz2000),
-            6 => Some(Self::Hz4000),
-            7 => Some(Self::Hz8000),
-            _ => None,
-        }
-    }
-
     pub fn latency_label(self) -> &'static str {
         match self {
             Self::Hz125 => "8.0 ms",
@@ -154,16 +126,6 @@ pub enum KeyboardLayout {
 }
 
 impl KeyboardLayout {
-    pub fn from_bragi_value(v: u32) -> Self {
-        match v {
-            1 => Self::Ansi,
-            2 => Self::Iso,
-            3 => Self::Abnt,
-            4 => Self::Jis,
-            other => Self::Unknown(other),
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Ansi => "ANSI (US)",

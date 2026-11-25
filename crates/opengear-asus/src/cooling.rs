@@ -1,4 +1,5 @@
 use anyhow::Result;
+use opengear_platform::is_elevated;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,34 +222,106 @@ impl FanChannelConfig {
         let curve = match header {
             // AIO pump: keep minimum >= 45% for steady coolant flow & zero airlocks
             FanHeaderKind::AioPump => [
-                CurvePoint { temp_c: 30, duty_pct: 55 },
-                CurvePoint { temp_c: 40, duty_pct: 58 },
-                CurvePoint { temp_c: 50, duty_pct: 64 },
-                CurvePoint { temp_c: 60, duty_pct: 72 },
-                CurvePoint { temp_c: 68, duty_pct: 82 },
-                CurvePoint { temp_c: 75, duty_pct: 92 },
-                CurvePoint { temp_c: 82, duty_pct: 100 },
-                CurvePoint { temp_c: 90, duty_pct: 100 },
+                CurvePoint {
+                    temp_c: 30,
+                    duty_pct: 55,
+                },
+                CurvePoint {
+                    temp_c: 40,
+                    duty_pct: 58,
+                },
+                CurvePoint {
+                    temp_c: 50,
+                    duty_pct: 64,
+                },
+                CurvePoint {
+                    temp_c: 60,
+                    duty_pct: 72,
+                },
+                CurvePoint {
+                    temp_c: 68,
+                    duty_pct: 82,
+                },
+                CurvePoint {
+                    temp_c: 75,
+                    duty_pct: 92,
+                },
+                CurvePoint {
+                    temp_c: 82,
+                    duty_pct: 100,
+                },
+                CurvePoint {
+                    temp_c: 90,
+                    duty_pct: 100,
+                },
             ],
             FanHeaderKind::CpuFan => [
-                CurvePoint { temp_c: 30, duty_pct: 25 },
-                CurvePoint { temp_c: 40, duty_pct: 32 },
-                CurvePoint { temp_c: 50, duty_pct: 42 },
-                CurvePoint { temp_c: 60, duty_pct: 55 },
-                CurvePoint { temp_c: 70, duty_pct: 72 },
-                CurvePoint { temp_c: 78, duty_pct: 88 },
-                CurvePoint { temp_c: 85, duty_pct: 100 },
-                CurvePoint { temp_c: 92, duty_pct: 100 },
+                CurvePoint {
+                    temp_c: 30,
+                    duty_pct: 25,
+                },
+                CurvePoint {
+                    temp_c: 40,
+                    duty_pct: 32,
+                },
+                CurvePoint {
+                    temp_c: 50,
+                    duty_pct: 42,
+                },
+                CurvePoint {
+                    temp_c: 60,
+                    duty_pct: 55,
+                },
+                CurvePoint {
+                    temp_c: 70,
+                    duty_pct: 72,
+                },
+                CurvePoint {
+                    temp_c: 78,
+                    duty_pct: 88,
+                },
+                CurvePoint {
+                    temp_c: 85,
+                    duty_pct: 100,
+                },
+                CurvePoint {
+                    temp_c: 92,
+                    duty_pct: 100,
+                },
             ],
             _ => [
-                CurvePoint { temp_c: 30, duty_pct: 25 },
-                CurvePoint { temp_c: 40, duty_pct: 30 },
-                CurvePoint { temp_c: 50, duty_pct: 40 },
-                CurvePoint { temp_c: 60, duty_pct: 50 },
-                CurvePoint { temp_c: 70, duty_pct: 65 },
-                CurvePoint { temp_c: 78, duty_pct: 80 },
-                CurvePoint { temp_c: 85, duty_pct: 95 },
-                CurvePoint { temp_c: 92, duty_pct: 100 },
+                CurvePoint {
+                    temp_c: 30,
+                    duty_pct: 25,
+                },
+                CurvePoint {
+                    temp_c: 40,
+                    duty_pct: 30,
+                },
+                CurvePoint {
+                    temp_c: 50,
+                    duty_pct: 40,
+                },
+                CurvePoint {
+                    temp_c: 60,
+                    duty_pct: 50,
+                },
+                CurvePoint {
+                    temp_c: 70,
+                    duty_pct: 65,
+                },
+                CurvePoint {
+                    temp_c: 78,
+                    duty_pct: 80,
+                },
+                CurvePoint {
+                    temp_c: 85,
+                    duty_pct: 95,
+                },
+                CurvePoint {
+                    temp_c: 92,
+                    duty_pct: 100,
+                },
             ],
         };
         Self {
@@ -264,24 +337,72 @@ impl FanChannelConfig {
     pub fn silent_loop3_preset(preset: &str) -> [CurvePoint; 8] {
         match preset {
             "ultra_silent" => [
-                CurvePoint { temp_c: 30, duty_pct: 45 },
-                CurvePoint { temp_c: 40, duty_pct: 45 },
-                CurvePoint { temp_c: 50, duty_pct: 50 },
-                CurvePoint { temp_c: 60, duty_pct: 58 },
-                CurvePoint { temp_c: 70, duty_pct: 70 },
-                CurvePoint { temp_c: 78, duty_pct: 82 },
-                CurvePoint { temp_c: 85, duty_pct: 95 },
-                CurvePoint { temp_c: 92, duty_pct: 100 },
+                CurvePoint {
+                    temp_c: 30,
+                    duty_pct: 45,
+                },
+                CurvePoint {
+                    temp_c: 40,
+                    duty_pct: 45,
+                },
+                CurvePoint {
+                    temp_c: 50,
+                    duty_pct: 50,
+                },
+                CurvePoint {
+                    temp_c: 60,
+                    duty_pct: 58,
+                },
+                CurvePoint {
+                    temp_c: 70,
+                    duty_pct: 70,
+                },
+                CurvePoint {
+                    temp_c: 78,
+                    duty_pct: 82,
+                },
+                CurvePoint {
+                    temp_c: 85,
+                    duty_pct: 95,
+                },
+                CurvePoint {
+                    temp_c: 92,
+                    duty_pct: 100,
+                },
             ],
             "max_perf" => [
-                CurvePoint { temp_c: 30, duty_pct: 75 },
-                CurvePoint { temp_c: 40, duty_pct: 80 },
-                CurvePoint { temp_c: 50, duty_pct: 85 },
-                CurvePoint { temp_c: 60, duty_pct: 92 },
-                CurvePoint { temp_c: 68, duty_pct: 100 },
-                CurvePoint { temp_c: 75, duty_pct: 100 },
-                CurvePoint { temp_c: 82, duty_pct: 100 },
-                CurvePoint { temp_c: 90, duty_pct: 100 },
+                CurvePoint {
+                    temp_c: 30,
+                    duty_pct: 75,
+                },
+                CurvePoint {
+                    temp_c: 40,
+                    duty_pct: 80,
+                },
+                CurvePoint {
+                    temp_c: 50,
+                    duty_pct: 85,
+                },
+                CurvePoint {
+                    temp_c: 60,
+                    duty_pct: 92,
+                },
+                CurvePoint {
+                    temp_c: 68,
+                    duty_pct: 100,
+                },
+                CurvePoint {
+                    temp_c: 75,
+                    duty_pct: 100,
+                },
+                CurvePoint {
+                    temp_c: 82,
+                    duty_pct: 100,
+                },
+                CurvePoint {
+                    temp_c: 90,
+                    duty_pct: 100,
+                },
             ],
             _ => Self::default_for(FanHeaderKind::AioPump).curve,
         }
@@ -293,72 +414,6 @@ pub struct AsusWmiCoolingStatus {
     pub is_admin: bool,
     pub wmi_available: bool,
     pub message: String,
-}
-
-/// Check whether current process runs with Administrator privileges (native Win32 TokenElevation — 0 subprocesses).
-#[cfg(windows)]
-pub fn is_elevated() -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-    };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    unsafe {
-        let mut token: HANDLE = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 || token.is_null() {
-            return false;
-        }
-        let mut elev = TOKEN_ELEVATION { TokenIsElevated: 0 };
-        let mut ret_len: u32 = 0;
-        let ok = GetTokenInformation(
-            token,
-            TokenElevation,
-            &mut elev as *mut TOKEN_ELEVATION as *mut core::ffi::c_void,
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut ret_len,
-        );
-        CloseHandle(token);
-        ok != 0 && elev.TokenIsElevated != 0
-    }
-}
-
-#[cfg(not(windows))]
-pub fn is_elevated() -> bool {
-    false
-}
-
-/// Relaunch OpenGear elevated via Windows UAC (`ShellExecuteW("runas")`).
-#[cfg(windows)]
-pub fn relaunch_as_admin() -> Result<()> {
-    use anyhow::Context;
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-    let exe = std::env::current_exe().context("Chemin exécutable introuvable")?;
-    let verb: Vec<u16> = OsStr::new("runas").encode_wide().chain(Some(0)).collect();
-    let file: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
-    unsafe {
-        let res = ShellExecuteW(
-            std::ptr::null_mut(),
-            verb.as_ptr(),
-            file.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        );
-        if (res as isize) <= 32 {
-            anyhow::bail!("Élévation UAC refusée ou échouée (code {})", res as isize);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-pub fn relaunch_as_admin() -> Result<()> {
-    anyhow::bail!("Non supporté hors Windows")
 }
 
 /// Probe `root\wmi\ASUSManagement` availability via native COM WMI (requires Admin rights).
@@ -373,14 +428,15 @@ pub fn probe_asus_wmi_cooling() -> AsusWmiCoolingStatus {
     }
 
     #[cfg(windows)]
-    if let Ok(conn) = crate::wmi_com::WmiConn::connect(r"root\wmi") {
-        if matches!(conn.first_instance_path("ASUSManagement"), Ok(Some(_))) {
-            return AsusWmiCoolingStatus {
-                is_admin: true,
-                wmi_available: true,
-                message: "Interface BIOS/EC ASUSManagement WMI active (prête pour les courbes PWM).".into(),
-            };
-        }
+    if let Ok(conn) = opengear_platform::wmi::WmiConn::connect(r"root\wmi")
+        && matches!(conn.first_instance_path("ASUSManagement"), Ok(Some(_)))
+    {
+        return AsusWmiCoolingStatus {
+            is_admin: true,
+            wmi_available: true,
+            message: "Interface BIOS/EC ASUSManagement WMI active (prête pour les courbes PWM)."
+                .into(),
+        };
     }
 
     AsusWmiCoolingStatus {
@@ -417,13 +473,15 @@ pub(crate) fn check_wmi_error_codes(stdout: &str, expect_curve: bool) -> Result<
 /// Apply an 8-point PWM fan/pump curve to the ASUS motherboard via native COM `ASUSManagement`.
 pub fn apply_asus_wmi_curve(cfg: &FanChannelConfig) -> Result<String> {
     if !is_elevated() {
-        anyhow::bail!("Lance OpenGear en Administrateur pour appliquer les courbes PWM sur la carte mère ASUS.");
+        anyhow::bail!(
+            "Lance OpenGear en Administrateur pour appliquer les courbes PWM sur la carte mère ASUS."
+        );
     }
 
     #[cfg(windows)]
     {
         use anyhow::Context;
-        use crate::wmi_com::{WmiConn, WmiVal};
+        use opengear_platform::wmi::{WmiConn, WmiVal};
 
         let conn = WmiConn::connect(r"root\wmi")?;
         let obj_path = conn
@@ -541,7 +599,7 @@ pub fn read_asus_wmi_channel(header: FanHeaderKind) -> Option<FanChannelConfig> 
     }
     #[cfg(windows)]
     {
-        use crate::wmi_com::{WmiConn, WmiVal};
+        use opengear_platform::wmi::{WmiConn, WmiVal};
 
         let conn = WmiConn::connect(r"root\wmi").ok()?;
         let obj_path = conn.first_instance_path("ASUSManagement").ok()??;
@@ -615,7 +673,10 @@ mod safety_tests {
     fn cfg_with(header: FanHeaderKind, pts: [(u8, u8); 8]) -> FanChannelConfig {
         let mut c = FanChannelConfig::default_for(header);
         for (i, (t, d)) in pts.into_iter().enumerate() {
-            c.curve[i] = CurvePoint { temp_c: t, duty_pct: d };
+            c.curve[i] = CurvePoint {
+                temp_c: t,
+                duty_pct: d,
+            };
         }
         c
     }
@@ -631,7 +692,10 @@ mod safety_tests {
     #[test]
     fn interpolate_enforces_floor_and_nan_failsafe() {
         let mut c = cfg_with(FanHeaderKind::CpuFan, [(30, 0); 8]);
-        c.curve[0] = CurvePoint { temp_c: 30, duty_pct: 5 };
+        c.curve[0] = CurvePoint {
+            temp_c: 30,
+            duty_pct: 5,
+        };
         assert!(c.interpolate_duty(25.0) >= 20);
         assert_eq!(c.interpolate_duty(f32::NAN), 100);
         assert_eq!(c.interpolate_duty(f32::INFINITY), 100);
@@ -649,12 +713,27 @@ mod safety_tests {
     fn curve_is_sorted_strictly_increasing_even_at_100c() {
         let c = cfg_with(
             FanHeaderKind::ChassisFan1,
-            [(100, 10), (100, 20), (100, 30), (100, 40), (100, 50), (100, 60), (100, 70), (100, 80)],
+            [
+                (100, 10),
+                (100, 20),
+                (100, 30),
+                (100, 40),
+                (100, 50),
+                (100, 60),
+                (100, 70),
+                (100, 80),
+            ],
         );
         let s = c.sanitized_curve();
         for w in s.windows(2) {
-            assert!(w[1].temp_c > w[0].temp_c, "temps must strictly increase: {s:?}");
-            assert!(w[1].duty_pct >= w[0].duty_pct, "duty must not decrease: {s:?}");
+            assert!(
+                w[1].temp_c > w[0].temp_c,
+                "temps must strictly increase: {s:?}"
+            );
+            assert!(
+                w[1].duty_pct >= w[0].duty_pct,
+                "duty must not decrease: {s:?}"
+            );
         }
         assert_eq!(s[7].temp_c, 100);
     }
@@ -663,14 +742,32 @@ mod safety_tests {
     fn curve_is_sorted_strictly_increasing_and_monotonic() {
         let c = cfg_with(
             FanHeaderKind::ChassisFan1,
-            [(90, 100), (30, 40), (60, 20), (60, 70), (10, 10), (200, 50), (45, 30), (75, 90)],
+            [
+                (90, 100),
+                (30, 40),
+                (60, 20),
+                (60, 70),
+                (10, 10),
+                (200, 50),
+                (45, 30),
+                (75, 90),
+            ],
         );
         let s = c.sanitized_curve();
         for w in s.windows(2) {
-            assert!(w[1].temp_c > w[0].temp_c, "temps must strictly increase: {s:?}");
-            assert!(w[1].duty_pct >= w[0].duty_pct, "duty must not decrease: {s:?}");
+            assert!(
+                w[1].temp_c > w[0].temp_c,
+                "temps must strictly increase: {s:?}"
+            );
+            assert!(
+                w[1].duty_pct >= w[0].duty_pct,
+                "duty must not decrease: {s:?}"
+            );
         }
-        assert!(s.iter().all(|p| (20..=100).contains(&p.temp_c) && p.duty_pct <= 100));
+        assert!(
+            s.iter()
+                .all(|p| (20..=100).contains(&p.temp_c) && p.duty_pct <= 100)
+        );
     }
 
     #[test]

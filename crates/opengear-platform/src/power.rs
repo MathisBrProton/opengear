@@ -17,7 +17,9 @@ pub(crate) fn parse_guid_parts(input: &str) -> Result<(u32, u16, u16, [u8; 8])> 
         || parts[2].len() != 4
         || parts[3].len() != 4
         || parts[4].len() != 12
-        || !parts.iter().all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
+        || !parts
+            .iter()
+            .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
     {
         anyhow::bail!("GUID de mode d'alimentation invalide : {input:?}");
     }
@@ -70,9 +72,7 @@ mod win_power {
 
     fn read_friendly_name(scheme: &GUID) -> String {
         let mut size: u32 = 0;
-        let rc = unsafe {
-            PowerReadFriendlyName(None, Some(scheme), None, None, None, &mut size)
-        };
+        let rc = unsafe { PowerReadFriendlyName(None, Some(scheme), None, None, None, &mut size) };
         if (rc != ERROR_SUCCESS && rc != ERROR_MORE_DATA) || size == 0 {
             return format_win_guid(scheme);
         }
@@ -91,7 +91,9 @@ mod win_power {
             return format_win_guid(scheme);
         }
         let units: Vec<u16> = buf[..(size as usize).min(buf.len())]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .take_while(|&u| u != 0)
             .collect();
