@@ -103,6 +103,15 @@ cargo test --workspace
 cargo test --workspace -- --ignored   # tests qui nécessitent du vrai matériel
 ```
 
+Compiler puis lancer la version du dépôt en un clic : `tools/build-and-run.ps1` (`-Admin` pour la
+lancer en administrateur, `-BuildOnly` pour seulement compiler). Le script remplace l'instance
+OpenGear en cours et exécute la nouvelle version depuis `target\dev-run`, ce qui laisse le
+dossier de build libre pour la compilation suivante.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-and-run.ps1
+```
+
 ### Architecture
 
 | Crate | Rôle |
