@@ -69,7 +69,7 @@ OpenGear touche à du matériel réel. Garde-fous en place :
   (`%APPDATA%\OpenGear\backups`), vérification octet par octet, retour automatique à l'ancien
   contenu en cas d'échec, restauration en un clic (Système → Sauvegardes).
 - **Ventilateurs et pompe** : planchers de sécurité (pompe ≥ 45 %, CPU ≥ 20 %, PWM direct
-  ≥ 30 %), température de repli élevée si un capteur manque, et **retour au BIOS** à la
+  ≥ 30 %, vitesse manuelle des PC portables ≥ 30 %), température de repli élevée si un capteur manque, et **retour au BIOS** à la
   fermeture — y compris après un plantage, grâce à un processus de surveillance.
 - **Bus SMBus (RAM RGB)** : aucune écriture sans empreinte ENE vérifiée, adresses SPD jamais
   sondées, verrou partagé avec HWiNFO / OpenRGB / LibreHardwareMonitor.
@@ -117,7 +117,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-and-run.ps1
 | Crate | Rôle |
 |---|---|
 | `opengear-core` | Types partagés sans marque : modèle d'appareil (`Driver` / `Device` / réglages), couleurs et moteur d'effets, profils TOML, modèle de ventilation, géométrie clavier |
-| `opengear-platform` | Services Windows sans marque : client WMI COM, pilote PawnIO, élévation, plans d'alimentation, télémétrie, batterie / écran, disposition clavier |
+| `opengear-platform` | Services Windows sans marque : client WMI COM, pilote PawnIO, élévation, plans d'alimentation, télémétrie, batterie, écran intégré (appareil partagé), disposition clavier |
 | `opengear-mainboard` | Puces de carte mère sans marque : SMBus, RGB de RAM ENE (multi-transport), SuperIO Nuvoton, température CPU, capteurs |
 | `opengear-corsair` | Driver Corsair Bragi v2 (RGB par touche, polling, profils flash HWP) |
 | `opengear-logitech` | HID++ 2.0 (DPI, batterie, profils et macros embarqués, égaliseur) |

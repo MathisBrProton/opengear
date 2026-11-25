@@ -1,7 +1,8 @@
 //! Fan safety net for crashes and forced kills.
 //!
-//! While OpenGear overrides a fan (Smart Cooling flat curves through ASUS WMI, or direct SuperIO
-//! PWM), it keeps a marker file describing how to give control back to the BIOS:
+//! While OpenGear overrides a fan (Smart Cooling flat curves through ASUS WMI, direct SuperIO
+//! PWM, or a device's `Cooling` capability such as a laptop embedded controller), it keeps a
+//! marker file describing how to give control back to the BIOS:
 //! `%APPDATA%\OpenGear\fan_override.json`. A clean exit restores the fans itself and deletes the
 //! marker. If the process dies instead (crash, `taskkill /F`, installer update):
 //! - a hidden watchdog process (`opengear --fan-watchdog <pid>`) waiting on the main process
@@ -9,7 +10,9 @@
 //! - and, as a last resort, the next GUI launch applies any marker left behind.
 
 use opengear_asus::apply_asus_wmi_curve;
+use opengear_core::AppConfig;
 use opengear_core::cooling::FanChannelConfig;
+use opengear_core::driver::{Device, Driver};
 use opengear_mainboard::{SuperIoSavedState, restore_superio_saved_states};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -25,12 +28,71 @@ pub struct FanOverrideMarker {
     /// Original SuperIO channel states to write back.
     #[serde(default)]
     pub superio_restore: Vec<SuperIoSavedState>,
+    /// Ids of shared-model devices whose `Cooling` is overridden (manual speed, max fan…):
+    /// rediscovered and given back to the firmware with `restore_firmware_control()`.
+    #[serde(default)]
+    pub cooling_devices: Vec<String>,
 }
 
 impl FanOverrideMarker {
     pub fn is_empty(&self) -> bool {
-        self.wmi_restore.is_empty() && self.superio_restore.is_empty()
+        self.wmi_restore.is_empty()
+            && self.superio_restore.is_empty()
+            && self.cooling_devices.is_empty()
     }
+}
+
+/// Result of restoring one device: `Ok` when given back, `Err` with the reason otherwise.
+pub(crate) type CoolingRestore = (String, Result<(), String>);
+
+/// Give firmware control back on each device of `devices` whose id is in `ids`. Ids without a
+/// matching device (unplugged, driver disabled) are reported as not found.
+pub(crate) fn restore_cooling_devices(
+    devices: &mut [Box<dyn Device>],
+    ids: &[String],
+) -> Vec<CoolingRestore> {
+    ids.iter()
+        .map(|id| {
+            let res = match devices.iter_mut().find(|d| &d.info().id == id) {
+                None => Err("appareil introuvable".to_string()),
+                Some(dev) => match dev.cooling() {
+                    None => Err("ventilateurs indisponibles".to_string()),
+                    Some(c) => c.restore_firmware_control().map_err(|e| e.to_string()),
+                },
+            };
+            (id.clone(), res)
+        })
+        .collect()
+}
+
+/// Drivers that may own one of `ids` (a device id starts with `<driver name>:`), respecting the
+/// user's experimental-driver opt-in.
+pub(crate) fn drivers_for_ids<'a>(
+    drivers: &'a [Box<dyn Driver>],
+    enabled_experimental: &std::collections::BTreeSet<String>,
+    ids: &[String],
+) -> Vec<&'a dyn Driver> {
+    drivers
+        .iter()
+        .filter(|d| !d.experimental() || enabled_experimental.contains(d.name()))
+        .filter(|d| ids.iter().any(|id| id.split(':').next() == Some(d.name())))
+        .map(|d| d.as_ref())
+        .collect()
+}
+
+/// Rediscover the devices listed in the marker (only their drivers are probed) and restore them.
+fn rediscover_and_restore(ids: &[String]) -> Vec<CoolingRestore> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let config = AppConfig::load(&AppConfig::default_config_path()).unwrap_or_default();
+    let drivers = crate::drivers::device_drivers();
+    let mut devices: Vec<Box<dyn Device>> =
+        drivers_for_ids(&drivers, &config.experimental_drivers, ids)
+            .into_iter()
+            .flat_map(|d| d.discover())
+            .collect();
+    restore_cooling_devices(&mut devices, ids)
 }
 
 pub fn marker_path() -> PathBuf {
@@ -74,12 +136,14 @@ pub fn clear_marker() {
 
 /// Give fan control back to the BIOS as described by the marker. Returns `(logs, remaining)`
 /// where `remaining` keeps only items whose restoration failed so callers can retry later.
-pub(crate) fn restore_from_marker_with<F>(
+pub(crate) fn restore_from_marker_with<F, C>(
     marker: &FanOverrideMarker,
     mut apply_wmi: F,
+    restore_cooling: C,
 ) -> (Vec<String>, Option<FanOverrideMarker>)
 where
     F: FnMut(&FanChannelConfig) -> Result<(), String>,
+    C: FnOnce(&[String]) -> Vec<CoolingRestore>,
 {
     let mut log = Vec::new();
     let mut remaining_wmi = Vec::new();
@@ -105,6 +169,18 @@ where
         low.contains("échou") || low.contains("erreur") || low.contains("impossible")
     });
     log.extend(superio_logs);
+    let mut remaining_cooling = Vec::new();
+    if !marker.cooling_devices.is_empty() {
+        for (id, res) in restore_cooling(&marker.cooling_devices) {
+            match res {
+                Ok(()) => log.push(format!("Ventilateurs de {id} rendus au firmware")),
+                Err(e) => {
+                    log.push(format!("Ventilateurs de {id} : restauration échouée : {e}"));
+                    remaining_cooling.push(id);
+                }
+            }
+        }
+    }
     let rem = FanOverrideMarker {
         pid: marker.pid,
         wmi_restore: remaining_wmi,
@@ -113,6 +189,7 @@ where
         } else {
             Vec::new()
         },
+        cooling_devices: remaining_cooling,
     };
     let remaining = if rem.is_empty() { None } else { Some(rem) };
     (log, remaining)
@@ -135,11 +212,15 @@ pub fn recover_stale_marker() {
         return;
     }
     warn!("Ventilateurs laissés en mode manuel par une session précédente — restauration BIOS.");
-    let (logs, remaining) = restore_from_marker_with(&marker, |cfg| {
-        apply_asus_wmi_curve(cfg)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    });
+    let (logs, remaining) = restore_from_marker_with(
+        &marker,
+        |cfg| {
+            apply_asus_wmi_curve(cfg)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        },
+        rediscover_and_restore,
+    );
     for line in logs {
         info!("{line}");
     }
@@ -172,11 +253,15 @@ pub fn run_watchdog(parent_pid: u32) -> anyhow::Result<()> {
     if let Some(marker) = read_marker()
         && marker.pid == parent_pid
     {
-        let (logs, remaining) = restore_from_marker_with(&marker, |cfg| {
-            apply_asus_wmi_curve(cfg)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        });
+        let (logs, remaining) = restore_from_marker_with(
+            &marker,
+            |cfg| {
+                apply_asus_wmi_curve(cfg)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            },
+            rediscover_and_restore,
+        );
         for line in logs {
             info!("{line}");
         }
@@ -226,12 +311,14 @@ mod tests {
                 mode: 0x40,
                 cmd: 128,
             }],
+            cooling_devices: vec!["hp_omen:keyboard".into()],
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: FanOverrideMarker = serde_json::from_str(&json).unwrap();
         assert_eq!(back.pid, 42);
         assert_eq!(back.superio_restore, m.superio_restore);
         assert_eq!(back.wmi_restore.len(), 1);
+        assert_eq!(back.cooling_devices, ["hp_omen:keyboard"]);
         assert!(!back.is_empty());
         assert!(FanOverrideMarker::default().is_empty());
     }
@@ -246,20 +333,183 @@ mod tests {
                 FanChannelConfig::default_for(FanHeaderKind::AioPump),
             ],
             superio_restore: Vec::new(),
+            cooling_devices: Vec::new(),
         };
-        let (logs, remaining) = restore_from_marker_with(&m, |cfg| {
-            if cfg.header == FanHeaderKind::CpuFan {
-                Ok(())
-            } else {
-                Err("WMI busy".into())
-            }
-        });
+        let no_cooling = |_: &[String]| -> Vec<CoolingRestore> { panic!("no cooling device") };
+        let (logs, remaining) = restore_from_marker_with(
+            &m,
+            |cfg| {
+                if cfg.header == FanHeaderKind::CpuFan {
+                    Ok(())
+                } else {
+                    Err("WMI busy".into())
+                }
+            },
+            no_cooling,
+        );
         assert_eq!(logs.len(), 2);
         let rem = remaining.expect("failed entry should be retained");
         assert_eq!(rem.wmi_restore.len(), 1);
         assert_eq!(rem.wmi_restore[0].header, FanHeaderKind::AioPump);
 
-        let (_, none_left) = restore_from_marker_with(&m, |_| Ok(()));
+        let (_, none_left) = restore_from_marker_with(&m, |_| Ok(()), no_cooling);
         assert!(none_left.is_none());
+    }
+
+    #[test]
+    fn old_markers_without_cooling_devices_still_load() {
+        let json =
+            r#"{"pid":7,"wmi_restore":[],"superio_restore":[{"index":0,"mode":64,"cmd":100}]}"#;
+        let m: FanOverrideMarker = serde_json::from_str(json).unwrap();
+        assert_eq!(m.pid, 7);
+        assert!(m.cooling_devices.is_empty());
+        assert!(!m.is_empty());
+        let only_cooling = FanOverrideMarker {
+            pid: 1,
+            cooling_devices: vec!["x:1".into()],
+            ..Default::default()
+        };
+        assert!(
+            !only_cooling.is_empty(),
+            "a cooling override alone needs the marker"
+        );
+    }
+
+    use opengear_core::driver::{Connection, DeviceInfo, DeviceKind};
+    use opengear_core::fans::{Cooling, FanInfo, FanTarget};
+    use std::sync::{Arc, Mutex};
+
+    struct FakeFans {
+        id: &'static str,
+        restored: Arc<Mutex<Vec<String>>>,
+        fail: bool,
+    }
+
+    impl Cooling for FakeFans {
+        fn fans(&self) -> Vec<FanInfo> {
+            Vec::new()
+        }
+        fn set_fan(&mut self, _fan: Option<&str>, _target: FanTarget) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn overridden(&self) -> bool {
+            true
+        }
+        fn restore_firmware_control(&mut self) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.fail, "EC busy");
+            self.restored.lock().unwrap().push(self.id.to_string());
+            Ok(())
+        }
+    }
+
+    impl Device for FakeFans {
+        fn info(&self) -> DeviceInfo {
+            DeviceInfo {
+                id: self.id.into(),
+                vendor: "Fake".into(),
+                model: "Fake".into(),
+                kind: DeviceKind::Laptop,
+                connection: Connection::Internal,
+                firmware: None,
+            }
+        }
+        fn cooling(&mut self) -> Option<&mut dyn Cooling> {
+            Some(self)
+        }
+    }
+
+    struct NoFans;
+
+    impl Device for NoFans {
+        fn info(&self) -> DeviceInfo {
+            DeviceInfo {
+                id: "plain:1".into(),
+                vendor: "Fake".into(),
+                model: "Plain".into(),
+                kind: DeviceKind::Mouse,
+                connection: Connection::Usb,
+                firmware: None,
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_listed_devices_are_restored() {
+        let restored = Arc::new(Mutex::new(Vec::new()));
+        let fake = |id: &'static str, fail: bool| -> Box<dyn Device> {
+            Box::new(FakeFans {
+                id,
+                restored: restored.clone(),
+                fail,
+            })
+        };
+        let mut devices = vec![
+            fake("a:1", false),
+            fake("b:1", false),
+            fake("c:1", true),
+            Box::new(NoFans),
+        ];
+        let ids: Vec<String> = ["b:1", "c:1", "gone:1", "plain:1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let res = restore_cooling_devices(&mut devices, &ids);
+        assert_eq!(*restored.lock().unwrap(), ["b:1"], "a:1 was not listed");
+        assert!(res[0].1.is_ok());
+        assert!(res[1].1.is_err());
+        assert!(res[2].1.is_err());
+        assert!(res[3].1.is_err());
+
+        // Failed restorations stay in the marker for a later retry.
+        let marker = FanOverrideMarker {
+            pid: 3,
+            cooling_devices: ids.clone(),
+            ..Default::default()
+        };
+        let (logs, rem) = restore_from_marker_with(
+            &marker,
+            |_| Ok(()),
+            |ids| restore_cooling_devices(&mut devices, ids),
+        );
+        assert_eq!(logs.len(), 4);
+        assert_eq!(rem.unwrap().cooling_devices, ["c:1", "gone:1", "plain:1"]);
+    }
+
+    struct NamedDriver(&'static str, bool);
+
+    impl Driver for NamedDriver {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn experimental(&self) -> bool {
+            self.1
+        }
+        fn discover(&self) -> Vec<Box<dyn Device>> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn only_drivers_owning_a_listed_id_are_probed() {
+        let drivers: Vec<Box<dyn Driver>> = vec![
+            Box::new(NamedDriver("corsair", false)),
+            Box::new(NamedDriver("hp_omen", false)),
+            Box::new(NamedDriver("razer", true)),
+        ];
+        let ids = vec![
+            "hp_omen:keyboard".to_string(),
+            "razer:1532:0001".to_string(),
+        ];
+        let mut enabled = std::collections::BTreeSet::new();
+        let names = |v: Vec<&dyn Driver>| v.iter().map(|d| d.name()).collect::<Vec<_>>();
+        assert_eq!(
+            names(drivers_for_ids(&drivers, &enabled, &ids)),
+            ["hp_omen"]
+        );
+        enabled.insert("razer".to_string());
+        assert_eq!(
+            names(drivers_for_ids(&drivers, &enabled, &ids)),
+            ["hp_omen", "razer"]
+        );
     }
 }

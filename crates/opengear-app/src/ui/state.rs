@@ -1,6 +1,7 @@
 use super::backend::BackendEngine;
 use crate::tray_icon::is_autostart_enabled;
 use opengear_core::cooling::FanHeaderKind;
+use opengear_core::driver::DeviceKind;
 use opengear_core::{EffectKind, OperatingMode};
 use opengear_corsair::CorsairDevice;
 use opengear_input::ALL_BINDABLE_KEYS;
@@ -79,31 +80,45 @@ impl BackendEngine {
         }
     }
 
-    pub(crate) fn telemetry_json(&self) -> Value {
-        let mut sensors = self.latest_sensors();
-        if sensors.fans.is_empty() && !self.hp_omen.fan_rpms.is_empty() {
-            let names = ["Ventilo CPU (OMEN)", "Ventilo GPU (OMEN)"];
-            sensors.fans = self
-                .hp_omen
-                .fan_rpms
-                .iter()
-                .enumerate()
-                .map(|(idx, &rpm)| FanRpmReading {
-                    name: names.get(idx).copied().unwrap_or("Ventilo").to_string(),
-                    rpm,
-                })
-                .collect();
-            if sensors.cpu_fan_rpm.is_none() {
-                sensors.cpu_fan_rpm = self.hp_omen.fan_rpms.first().copied();
+    /// Live fans of every device with `Cooling`, keyed by device id, plus the RPM readings of
+    /// laptop fans (used when no motherboard sensor reports fans).
+    fn device_fans(&mut self) -> (serde_json::Map<String, Value>, Vec<FanRpmReading>) {
+        let mut by_device = serde_json::Map::new();
+        let mut laptop_fans = Vec::new();
+        for d in &mut self.driver_devices {
+            let info = d.info();
+            let Some(c) = d.cooling() else {
+                continue;
+            };
+            if info.kind == DeviceKind::Laptop {
+                laptop_fans.extend(c.fans().into_iter().filter_map(|f| {
+                    Some(FanRpmReading {
+                        name: f.name,
+                        rpm: f.rpm?,
+                    })
+                }));
             }
-            if !sensors.available && self.hp_omen.fan_rpms.iter().any(|&r| r > 0) {
+            by_device.insert(info.id, super::devices::cooling_json(c));
+        }
+        (by_device, laptop_fans)
+    }
+
+    pub(crate) fn telemetry_json(&mut self) -> Value {
+        let mut sensors = self.latest_sensors();
+        let (device_fans, laptop_fans) = self.device_fans();
+        if sensors.fans.is_empty() && !laptop_fans.is_empty() {
+            if sensors.cpu_fan_rpm.is_none() {
+                sensors.cpu_fan_rpm = laptop_fans.first().map(|f| f.rpm);
+            }
+            if !sensors.available && laptop_fans.iter().any(|f| f.rpm > 0) {
                 sensors.available = true;
                 if sensors.source.is_empty() {
-                    sensors.source = "HP OMEN BIOS WMI".into();
+                    sensors.source = "Ventilateurs du portable".into();
                 } else {
-                    sensors.source = format!("{} + HP OMEN WMI", sensors.source);
+                    sensors.source = format!("{} + ventilateurs du portable", sensors.source);
                 }
             }
+            sensors.fans = laptop_fans;
         }
         let logi_mice = self.typed_devices::<LogitechMouse>();
         let logi_bat = logi_mice.first().and_then(|m| {
@@ -136,41 +151,7 @@ impl BackendEngine {
             "audio": crate::audio_ext::read_audio_state(),
             "logi_battery": logi_bat,
             "laptop_battery": &self.laptop_battery,
-            "hp_omen": {
-                "fan_rpms": &self.hp_omen.fan_rpms,
-                "max_fan": self.hp_omen.max_fan,
-                "manual_fan_pct": self.hp_omen.manual_fan_pct,
-                "thermal_mode": self.hp_omen.thermal_mode.id(),
-            },
-        })
-    }
-
-    pub(crate) fn hp_omen_json(&self) -> Value {
-        let o = &self.hp_omen;
-        let zones: Vec<String> = o.zone_colors.iter().map(|c| c.to_hex()).collect();
-        json!({
-            "detected": o.detected,
-            "is_admin": o.is_admin,
-            "wmi_accessible": o.wmi_accessible,
-            "model": o.model,
-            "board_id": o.board_id,
-            "thermal_version": o.thermal_version,
-            "thermal_mode": o.thermal_mode.id(),
-            "thermal_mode_label": o.thermal_mode.label(),
-            "max_fan": o.max_fan,
-            "manual_fan_pct": o.manual_fan_pct,
-            "fan_count": o.fan_count,
-            "fan_rpms": o.fan_rpms,
-            "fan_max_rpms": o.fan_max_rpms,
-            "gpu_power": o.gpu_power.id(),
-            "gpu_peak_temp_c": o.gpu_peak_temp_c,
-            "keyboard_type": format!("{:?}", o.keyboard_type),
-            "keyboard_label": o.keyboard_label,
-            "backlight_on": o.backlight_on,
-            "zone_colors": zones,
-            "sync_rgb": self.config.omen_sync_rgb,
-            "saved_zones": self.config.omen_zone_colors,
-            "diagnostic": o.diagnostic,
+            "device_fans": device_fans,
         })
     }
 
@@ -454,9 +435,9 @@ impl BackendEngine {
 
         let mut fw_inventory: Vec<Value> = vec![json!({
             "device": self.telemetry.static_info.motherboard,
-            "vendor": if self.hp_omen.detected { "HP OMEN" } else { "Carte mère" },
+            "vendor": if self.is_laptop { "PC portable" } else { "Carte mère" },
             "version": format!("BIOS {}", self.telemetry.static_info.bios_version),
-            "official_url": if self.hp_omen.detected { "https://support.hp.com/" } else { "https://rog.asus.com/support/" },
+            "official_url": if self.is_laptop { "" } else { "https://rog.asus.com/support/" },
             "status": "Lecture BIOS directe"
         })];
         for dev in &self.driver_devices {
@@ -576,8 +557,6 @@ impl BackendEngine {
         });
         root["is_laptop"] = json!(self.is_laptop);
         root["laptop_battery"] = json!(&self.laptop_battery);
-        root["laptop_display"] = json!(&self.laptop_display);
-        root["hp_omen"] = self.hp_omen_json();
         root
     }
 }

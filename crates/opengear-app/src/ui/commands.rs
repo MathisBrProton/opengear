@@ -13,7 +13,8 @@ use crate::tray_icon::{
 };
 use opengear_asus::{apply_asus_wmi_curve, read_asus_wmi_channel};
 use opengear_core::cooling::{CurvePoint, FanPolicyMode, FanTempSource};
-use opengear_core::driver::Value as DriverValue;
+use opengear_core::driver::{Value as DriverValue, setting_ids};
+use opengear_core::fans::FanTarget;
 use opengear_core::lighting::{EffectRequest, LightingOverride, Placement};
 use opengear_core::{
     EffectKind, KeyAction, KeyboardProfile, MacroStep, Rgb, RgbEffectConfig, SocdPair,
@@ -26,10 +27,6 @@ use opengear_corsair::proto::{
 use opengear_corsair::{
     CorsairDevice, key_code_for_led_index, list_corsair_backups, restore_corsair_backup,
 };
-use opengear_hp::{
-    OmenGpuPowerLevel, OmenThermalMode, probe_hp_omen, set_hp_omen_fan_level,
-    set_hp_omen_gpu_power, set_hp_omen_max_fan, set_hp_omen_thermal_mode,
-};
 use opengear_input::movement_keys_effective;
 use opengear_logitech::{
     LodLevel, LogitechHeadset, LogitechMouse, MouseButtonAction, OnboardMacroStep, backup_path_for,
@@ -37,10 +34,7 @@ use opengear_logitech::{
 };
 use opengear_mainboard::{read_superio_snapshot, restore_superio_fan_auto, set_superio_fan_pwm};
 use opengear_platform::pawnio::install_official_pawnio;
-use opengear_platform::{
-    is_elevated, list_power_plans, read_display_info, read_laptop_battery, relaunch_as_admin,
-    set_active_power_plan, set_display_brightness, set_display_refresh_rate,
-};
+use opengear_platform::{is_elevated, list_power_plans, relaunch_as_admin, set_active_power_plan};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -296,23 +290,34 @@ impl BackendEngine {
         self.last_device_frame_at.clear();
         summary.push(format!("Éclairage : {}", kind.label()));
 
+        // Devices with a performance profile (laptop BIOS modes…) follow the preset.
+        let profile_devices: Vec<(String, String, String)> = self
+            .driver_devices
+            .iter()
+            .filter_map(|d| {
+                let setting = d
+                    .settings()
+                    .into_iter()
+                    .find(|s| s.id == setting_ids::PERFORMANCE_PROFILE)?;
+                Some((d.info().id, d.info().model, setting.label))
+            })
+            .collect();
         if let Some(policy) = fan_policy {
-            if self.hp_omen.detected {
-                if self.hp_omen.wmi_accessible {
-                    let target = match preset {
-                        "silent" => OmenThermalMode::Cool,
-                        "gaming" => OmenThermalMode::Performance,
-                        _ => OmenThermalMode::Default,
-                    };
-                    match set_hp_omen_thermal_mode(self.hp_omen.thermal_version, target) {
-                        Ok(_) => {
-                            self.hp_omen.thermal_mode = target;
-                            summary.push(format!("OMEN Thermique : {}", target.label()));
-                        }
-                        Err(e) => summary.push(format!("OMEN Thermique inchangé ({e})")),
+            if !profile_devices.is_empty() {
+                let target = match preset {
+                    "silent" => setting_ids::PROFILE_QUIET,
+                    "gaming" => setting_ids::PROFILE_PERFORMANCE,
+                    _ => setting_ids::PROFILE_BALANCED,
+                };
+                for (id, model, label) in profile_devices {
+                    match self.set_device_setting(
+                        &id,
+                        setting_ids::PERFORMANCE_PROFILE,
+                        &DriverValue::Text(target.into()),
+                    ) {
+                        Ok(_) => summary.push(format!("{label} ({model}) : {target}")),
+                        Err(e) => summary.push(format!("{label} ({model}) inchangé ({e})")),
                     }
-                } else {
-                    summary.push("OMEN Thermique inchangé (droits administrateur requis)".into());
                 }
             } else if self.cooling_status.wmi_available && is_elevated() {
                 let mut applied = 0usize;
@@ -365,12 +370,21 @@ impl BackendEngine {
                 None => summary.push("Alimentation inchangée (plan absent de ce PC)".into()),
             }
         }
-        if preset == "lights_off"
-            && let Some(d) = self.device_mut("hp_omen:keyboard")
-            && d.apply_setting("hp.kb_backlight", &DriverValue::Bool(false))
-                .is_ok()
-        {
-            self.hp_omen.backlight_on = false;
+        if preset == "lights_off" {
+            let lit: Vec<String> = self
+                .driver_devices
+                .iter()
+                .filter(|d| {
+                    d.settings().iter().any(|s| {
+                        s.id == setting_ids::BACKLIGHT && s.value == DriverValue::Bool(true)
+                    })
+                })
+                .map(|d| d.info().id)
+                .collect();
+            for id in lit {
+                let _ =
+                    self.set_device_setting(&id, setting_ids::BACKLIGHT, &DriverValue::Bool(false));
+            }
         }
         self.persist_config();
         Ok(summary)
@@ -414,23 +428,13 @@ impl BackendEngine {
         };
         push("pawnio", "Pilote matériel PawnIO", st, detail, action);
 
-        if self.hp_omen.detected {
+        if let Some(model) = super::backend::device_cooling_owner(&mut self.driver_devices) {
             push(
-                "hp_omen",
-                "HP OMEN BIOS WMI",
-                if !admin {
-                    "warn"
-                } else if self.hp_omen.wmi_accessible {
-                    "ok"
-                } else {
-                    "warn"
-                },
-                self.hp_omen.diagnostic.clone(),
-                if !admin {
-                    json!({ "label": "Relancer en administrateur", "cmd": "cooling_relaunch_admin", "payload": {} })
-                } else {
-                    Value::Null
-                },
+                "device_cooling",
+                "Ventilateurs de l'appareil",
+                "ok",
+                format!("Ventilateurs pilotés par « {model} »."),
+                Value::Null,
             );
         } else {
             push(
@@ -473,7 +477,6 @@ impl BackendEngine {
         );
 
         if !self.is_laptop
-            && !self.hp_omen.detected
             && self
                 .typed_devices::<opengear_asus::AuraMainboardController>()
                 .is_empty()
@@ -587,41 +590,16 @@ impl BackendEngine {
                     c.info.out_report_len, c.info.flashtap_probe
                 );
             }
-        }
-        if self.hp_omen.detected {
-            let _ = writeln!(
-                r,
-                "HP OMEN {} ({}) wmi={} thermal_v={} mode={:?} max_fan={} fans={} rpms={:?} kbd={} backlight={}",
-                self.hp_omen.model,
-                self.hp_omen.board_id,
-                self.hp_omen.wmi_accessible,
-                self.hp_omen.thermal_version,
-                self.hp_omen.thermal_mode,
-                self.hp_omen.max_fan,
-                self.hp_omen.fan_count,
-                self.hp_omen.fan_rpms,
-                self.hp_omen.keyboard_label,
-                self.hp_omen.backlight_on,
-            );
-            for line in &self.hp_omen.probe_log {
-                let _ = writeln!(r, "  [hpqBIntM] {line}");
+            for line in dev.diagnostic_lines() {
+                let _ = writeln!(r, "  {line}");
             }
         }
         if self.laptop_battery.present {
             let b = &self.laptop_battery;
-            let d = &self.laptop_display;
             let _ = writeln!(
                 r,
-                "Portable : Bat={:?}% (Santé={:?}%, Cycles={:?}, Secteur={}) | Écran={}x{}@{:?}Hz (supportés={:?}, lum={:?}%)",
-                b.percent,
-                b.health_pct,
-                b.cycle_count,
-                b.ac_online,
-                d.width,
-                d.height,
-                d.current_hz,
-                d.supported_hz,
-                d.brightness_pct
+                "Portable : Bat={:?}% (Santé={:?}%, Cycles={:?}, Secteur={})",
+                b.percent, b.health_pct, b.cycle_count, b.ac_online,
             );
         }
         let (socd_n, inj_ok, inj_fail) = self.input_engine.injection_stats();
@@ -1517,62 +1495,13 @@ impl BackendEngine {
                 self.persist_config();
                 Ok(self.full_state_json())
             }
-            "omen_refresh" => {
-                self.hp_omen = probe_hp_omen();
-                if self.is_laptop || self.laptop_battery.present {
-                    self.laptop_battery = read_laptop_battery();
-                    self.laptop_display = read_display_info();
-                }
+            "device_fan_set" => {
+                let device = p["device"].as_str().ok_or("device manquant")?;
+                let fan = p["fan"].as_str();
+                let target: FanTarget =
+                    serde_json::from_value(p["target"].clone()).map_err(|e| e.to_string())?;
+                self.set_device_fan(device, fan, target)?;
                 Ok(self.full_state_json())
-            }
-            "omen_set_thermal_mode" => {
-                let mode = OmenThermalMode::from_id(p["mode"].as_str().unwrap_or("default"));
-                set_hp_omen_thermal_mode(self.hp_omen.thermal_version, mode)
-                    .map_err(|e| e.to_string())?;
-                self.hp_omen.thermal_mode = mode;
-                self.hp_omen.manual_fan_pct = None;
-                Ok(self.full_state_json())
-            }
-            "omen_set_max_fan" => {
-                let on = p["enabled"].as_bool().unwrap_or(false);
-                set_hp_omen_max_fan(on).map_err(|e| e.to_string())?;
-                self.hp_omen.max_fan = on;
-                if on {
-                    self.hp_omen.manual_fan_pct = None;
-                    self.omen_fan_modified = true;
-                }
-                Ok(self.full_state_json())
-            }
-            "omen_set_manual_fan" => {
-                let pct = p["pct"].as_u64().map(|v| (v as u8).clamp(30, 100));
-                set_hp_omen_fan_level(pct, &self.hp_omen.fan_max_rpms)
-                    .map_err(|e| e.to_string())?;
-                self.hp_omen.manual_fan_pct = pct;
-                self.omen_last_fan_keepalive = std::time::Instant::now();
-                if pct.is_some() {
-                    self.omen_fan_modified = true;
-                }
-                Ok(self.full_state_json())
-            }
-            "omen_set_gpu_power" => {
-                let lvl = OmenGpuPowerLevel::from_id(p["level"].as_str().unwrap_or("min"));
-                set_hp_omen_gpu_power(lvl).map_err(|e| e.to_string())?;
-                self.hp_omen.gpu_power = lvl;
-                Ok(self.full_state_json())
-            }
-            "laptop_set_brightness" => {
-                let pct = p["percent"].as_u64().ok_or("percent manquant")?.min(100) as u8;
-                set_display_brightness(pct).map_err(|e| format!("{e:#}"))?;
-                self.laptop_display.brightness_pct = Some(pct);
-                Ok(self.full_state_json())
-            }
-            "laptop_set_refresh_rate" => {
-                let hz = p["hz"].as_u64().ok_or("hz manquant")? as u32;
-                let applied = set_display_refresh_rate(hz).map_err(|e| e.to_string())?;
-                self.laptop_display = read_display_info();
-                let mut st = self.full_state_json();
-                st["last_action_msg"] = json!(format!("Écran basculé sur {applied} Hz"));
-                Ok(st)
             }
             "laptop_set_auto_battery" => {
                 let on = p["enabled"].as_bool().unwrap_or(false);

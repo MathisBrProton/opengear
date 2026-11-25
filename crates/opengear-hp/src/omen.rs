@@ -9,8 +9,10 @@
 use anyhow::{Context, Result};
 use opengear_core::Rgb;
 use opengear_core::driver::{
-    Connection, Device, DeviceInfo, DeviceKind, DeviceStatus, Driver, Section, Setting, Value,
+    ChoiceOption, Connection, Device, DeviceInfo, DeviceKind, DeviceStatus, Driver, Section,
+    Setting, Value, setting_ids,
 };
+use opengear_core::fans::{Cooling, FanInfo, FanTarget};
 use opengear_core::lighting::{EffectParams, EffectRequest, HardwareEffect, Lighting, Zone};
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +71,24 @@ impl OmenThermalMode {
         }
     }
 
+    /// Shared [`setting_ids::PERFORMANCE_PROFILE`] choice id.
+    pub fn profile_id(self) -> &'static str {
+        match self {
+            Self::Cool => setting_ids::PROFILE_QUIET,
+            Self::Default => setting_ids::PROFILE_BALANCED,
+            Self::Performance => setting_ids::PROFILE_PERFORMANCE,
+        }
+    }
+
+    pub fn from_profile_id(s: &str) -> Option<Self> {
+        match s {
+            setting_ids::PROFILE_QUIET => Some(Self::Cool),
+            setting_ids::PROFILE_BALANCED => Some(Self::Default),
+            setting_ids::PROFILE_PERFORMANCE => Some(Self::Performance),
+            _ => None,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Default => "Équilibré",
@@ -109,6 +129,14 @@ impl OmenGpuPowerLevel {
             Self::Minimum => [0x00, 0x00, 0x01, 0x00],
             Self::Medium => [0x00, 0x01, 0x01, 0x00],
             Self::Maximum => [0x01, 0x01, 0x01, 0x00],
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Minimum => "Minimum",
+            Self::Medium => "Équilibré",
+            Self::Maximum => "Maximum",
         }
     }
 
@@ -887,6 +915,7 @@ impl Driver for HpOmenDriver {
         {
             vec![Box::new(HpOmenDevice::new(
                 Box::new(WindowsOmenKbIo),
+                Box::new(WindowsOmenGmIo),
                 status,
             ))]
         }
@@ -898,39 +927,102 @@ impl Driver for HpOmenDriver {
     }
 }
 
-/// HP OMEN / Victus keyboard as a shared [`Device`] and optional 4-zone [`Lighting`].
-pub struct HpOmenDevice {
-    io: Box<dyn OmenKbIo>,
-    pub status: HpOmenStatus,
-    cached_color_table: Option<Vec<u8>>,
-    last_zones: Option<[Rgb; 4]>,
+/// Game-mode (`0x20008`) writes and live reads used by [`HpOmenDevice`]. The Windows
+/// implementation calls the public `set_hp_omen_*` functions unchanged; tests use a recorder.
+pub(crate) trait OmenGmIo: Send {
+    fn set_thermal_mode(&self, version: u8, mode: OmenThermalMode) -> Result<()>;
+    fn set_max_fan(&self, enabled: bool) -> Result<()>;
+    fn set_fan_level(&self, pct: Option<u8>, max_rpms: &[u32]) -> Result<()>;
+    fn set_gpu_power(&self, level: OmenGpuPowerLevel) -> Result<()>;
+    fn read_live_fans(&self) -> Option<(Vec<u32>, bool)>;
 }
 
-impl HpOmenDevice {
-    pub(crate) fn new(io: Box<dyn OmenKbIo>, status: HpOmenStatus) -> Self {
-        Self {
-            io,
-            status,
-            cached_color_table: None,
-            last_zones: None,
-        }
+#[cfg(windows)]
+struct WindowsOmenGmIo;
+
+#[cfg(windows)]
+impl OmenGmIo for WindowsOmenGmIo {
+    fn set_thermal_mode(&self, version: u8, mode: OmenThermalMode) -> Result<()> {
+        set_hp_omen_thermal_mode(version, mode)
+    }
+    fn set_max_fan(&self, enabled: bool) -> Result<()> {
+        set_hp_omen_max_fan(enabled)
+    }
+    fn set_fan_level(&self, pct: Option<u8>, max_rpms: &[u32]) -> Result<()> {
+        set_hp_omen_fan_level(pct, max_rpms)
+    }
+    fn set_gpu_power(&self, level: OmenGpuPowerLevel) -> Result<()> {
+        set_hp_omen_gpu_power(level)
+    }
+    fn read_live_fans(&self) -> Option<(Vec<u32>, bool)> {
+        read_hp_omen_live_fans()
     }
 }
 
-const HP_BACKLIGHT_SETTING_ID: &str = "hp.kb_backlight";
+/// HP OMEN / Victus laptop as a shared [`Device`]: performance profile, GPU power, Max Fan and
+/// keyboard backlight as settings, its fans as [`Cooling`] and the 4-zone keyboard as
+/// [`Lighting`].
+pub struct HpOmenDevice {
+    io: Box<dyn OmenKbIo>,
+    gm: Box<dyn OmenGmIo>,
+    pub status: HpOmenStatus,
+    cached_color_table: Option<Vec<u8>>,
+    last_zones: Option<[Rgb; 4]>,
+    /// Max Fan was switched on by OpenGear (one enabled in HP's own software is left alone).
+    max_fan_forced: bool,
+}
+
+impl HpOmenDevice {
+    pub(crate) fn new(io: Box<dyn OmenKbIo>, gm: Box<dyn OmenGmIo>, status: HpOmenStatus) -> Self {
+        Self {
+            io,
+            gm,
+            status,
+            cached_color_table: None,
+            last_zones: None,
+            max_fan_forced: false,
+        }
+    }
+
+    fn fan_count(&self) -> usize {
+        usize::from(self.status.fan_count)
+            .max(self.status.fan_rpms.len())
+            .min(4)
+    }
+}
+
+/// Max Fan boost (vendor-specific toggle).
+pub const HP_MAX_FAN_SETTING_ID: &str = "hp.omen.max_fan";
+/// NVIDIA Dynamic Boost / GPU power envelope (vendor-specific choice).
+pub const HP_GPU_POWER_SETTING_ID: &str = "hp.omen.gpu_power";
+/// The EC reverts a manual fan level after ~30-60 s: it is re-sent at this interval.
+const FAN_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(12);
+
+const THERMAL_MODES: [OmenThermalMode; 3] = [
+    OmenThermalMode::Cool,
+    OmenThermalMode::Default,
+    OmenThermalMode::Performance,
+];
+const GPU_LEVELS: [OmenGpuPowerLevel; 3] = [
+    OmenGpuPowerLevel::Minimum,
+    OmenGpuPowerLevel::Medium,
+    OmenGpuPowerLevel::Maximum,
+];
 
 impl Device for HpOmenDevice {
     fn info(&self) -> DeviceInfo {
         let model = if self.status.model.is_empty() {
-            "Clavier HP OMEN".into()
+            "PC portable HP OMEN".into()
         } else {
-            format!("{} ({})", self.status.model, self.status.keyboard_label)
+            self.status.model.clone()
         };
         DeviceInfo {
+            // Historical id (this used to be a keyboard-only device): kept so saved lighting
+            // settings and placements still apply.
             id: "hp_omen:keyboard".into(),
             vendor: "HP".into(),
             model,
-            kind: DeviceKind::Keyboard,
+            kind: DeviceKind::Laptop,
             connection: Connection::Internal,
             firmware: (!self.status.board_id.is_empty()).then(|| self.status.board_id.clone()),
         }
@@ -944,12 +1036,42 @@ impl Device for HpOmenDevice {
         if !self.status.wmi_accessible {
             return Vec::new();
         }
-        vec![Setting::toggle(
-            HP_BACKLIGHT_SETTING_ID,
-            "Rétroéclairage clavier",
-            Section::Lighting,
-            self.status.backlight_on,
-        )]
+        vec![
+            Setting::choice(
+                setting_ids::PERFORMANCE_PROFILE,
+                "Mode thermique",
+                Section::Performance,
+                THERMAL_MODES
+                    .iter()
+                    .map(|m| ChoiceOption::new(m.profile_id(), m.label()))
+                    .collect(),
+                self.status.thermal_mode.profile_id(),
+            )
+            .help("Profil de performances du BIOS HP. Rend les ventilateurs au BIOS."),
+            Setting::choice(
+                HP_GPU_POWER_SETTING_ID,
+                "Puissance GPU (Dynamic Boost)",
+                Section::Performance,
+                GPU_LEVELS
+                    .iter()
+                    .map(|l| ChoiceOption::new(l.id(), l.label()))
+                    .collect(),
+                self.status.gpu_power.id(),
+            )
+            .help("Limite de puissance partagée entre le processeur et la carte graphique dédiée."),
+            Setting::toggle(
+                HP_MAX_FAN_SETTING_ID,
+                "Ventilateurs au maximum (Max Fan)",
+                Section::Performance,
+                self.status.max_fan,
+            ),
+            Setting::toggle(
+                setting_ids::BACKLIGHT,
+                "Rétroéclairage clavier",
+                Section::Lighting,
+                self.status.backlight_on,
+            ),
+        ]
     }
 
     fn lighting(&mut self) -> Option<&mut dyn Lighting> {
@@ -957,17 +1079,64 @@ impl Device for HpOmenDevice {
             .then_some(self as &mut dyn Lighting)
     }
 
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
+    fn cooling(&mut self) -> Option<&mut dyn Cooling> {
+        self.status
+            .wmi_accessible
+            .then_some(self as &mut dyn Cooling)
     }
 
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        Some(self)
+    fn diagnostic_lines(&self) -> Vec<String> {
+        let o = &self.status;
+        let mut out = vec![format!(
+            "HP OMEN {} ({}) wmi={} thermal_v={} mode={:?} max_fan={} manual={:?} fans={} rpms={:?} gpu={:?} kbd={} backlight={}",
+            o.model,
+            o.board_id,
+            o.wmi_accessible,
+            o.thermal_version,
+            o.thermal_mode,
+            o.max_fan,
+            o.manual_fan_pct,
+            o.fan_count,
+            o.fan_rpms,
+            o.gpu_power,
+            o.keyboard_label,
+            o.backlight_on,
+        )];
+        out.extend(o.probe_log.iter().map(|l| format!("[hpqBIntM] {l}")));
+        out
     }
 
     fn apply_setting(&mut self, id: &str, value: &Value) -> Result<()> {
         match id {
-            HP_BACKLIGHT_SETTING_ID => {
+            setting_ids::PERFORMANCE_PROFILE => {
+                let mode = value
+                    .as_str()
+                    .and_then(OmenThermalMode::from_profile_id)
+                    .context("mode thermique attendu")?;
+                self.gm
+                    .set_thermal_mode(self.status.thermal_version, mode)?;
+                self.status.thermal_mode = mode;
+                // The BIOS applies the fan curve of the new mode.
+                self.status.manual_fan_pct = None;
+                Ok(())
+            }
+            HP_GPU_POWER_SETTING_ID => {
+                let level = OmenGpuPowerLevel::from_id(value.as_str().context("texte attendu")?);
+                self.gm.set_gpu_power(level)?;
+                self.status.gpu_power = level;
+                Ok(())
+            }
+            HP_MAX_FAN_SETTING_ID => {
+                let on = value.as_bool().context("booléen attendu")?;
+                self.gm.set_max_fan(on)?;
+                self.status.max_fan = on;
+                self.max_fan_forced = on;
+                if on {
+                    self.status.manual_fan_pct = None;
+                }
+                Ok(())
+            }
+            setting_ids::BACKLIGHT => {
                 let on = value.as_bool().context("booléen attendu")?;
                 self.io.set_backlight(on)?;
                 self.status.backlight_on = on;
@@ -975,6 +1144,86 @@ impl Device for HpOmenDevice {
             }
             other => anyhow::bail!("Réglage HP OMEN inconnu : {other}"),
         }
+    }
+}
+
+const OMEN_FAN_NAMES: [(&str, &str); 2] = [("cpu", "Ventilateur CPU"), ("gpu", "Ventilateur GPU")];
+
+impl Cooling for HpOmenDevice {
+    fn fans(&self) -> Vec<FanInfo> {
+        (0..self.fan_count())
+            .map(|i| {
+                let (id, name) = OMEN_FAN_NAMES
+                    .get(i)
+                    .map(|&(id, name)| (id.to_string(), name.to_string()))
+                    .unwrap_or_else(|| (format!("fan_{i}"), format!("Ventilateur {}", i + 1)));
+                FanInfo {
+                    id,
+                    name,
+                    rpm: self.status.fan_rpms.get(i).copied(),
+                    max_rpm: self.status.fan_max_rpms.get(i).copied().filter(|&r| r > 0),
+                    min_pct: MANUAL_FAN_MIN_PCT,
+                    manual_pct: self.status.manual_fan_pct,
+                }
+            })
+            .collect()
+    }
+
+    /// The EC takes one level for both fans: naming one fan drives them all.
+    fn set_fan(&mut self, fan: Option<&str>, target: FanTarget) -> Result<()> {
+        if let Some(id) = fan {
+            anyhow::ensure!(
+                self.fans().iter().any(|f| f.id == id),
+                "Ventilateur inconnu : {id}"
+            );
+        }
+        let pct = match target {
+            FanTarget::Auto => None,
+            FanTarget::Fixed(p) => Some(p.clamp(MANUAL_FAN_MIN_PCT, 100)),
+        };
+        self.gm.set_fan_level(pct, &self.status.fan_max_rpms)?;
+        self.status.manual_fan_pct = pct;
+        Ok(())
+    }
+
+    fn refresh(&mut self) {
+        if let Some((rpms, max_fan)) = self.gm.read_live_fans() {
+            self.status.fan_rpms = rpms;
+            self.status.max_fan = max_fan;
+            // Switched off elsewhere (HP software, Fn key): no longer ours to restore.
+            self.max_fan_forced &= max_fan;
+        }
+    }
+
+    fn keep_alive_interval(&self) -> Option<std::time::Duration> {
+        Some(FAN_KEEPALIVE)
+    }
+
+    fn keep_alive(&mut self) -> Result<()> {
+        match self.status.manual_fan_pct {
+            Some(pct) => self.gm.set_fan_level(Some(pct), &self.status.fan_max_rpms),
+            None => Ok(()),
+        }
+    }
+
+    /// Only what OpenGear forced: a Max Fan enabled in HP's software is not ours to undo.
+    fn overridden(&self) -> bool {
+        self.status.manual_fan_pct.is_some() || self.max_fan_forced
+    }
+
+    /// Max Fan off, then the fan level back to the BIOS. Both are always sent: the device may
+    /// have been rediscovered by the crash watchdog with no memory of the override.
+    fn restore_firmware_control(&mut self) -> Result<()> {
+        let max_fan = self.gm.set_max_fan(false);
+        if max_fan.is_ok() {
+            self.status.max_fan = false;
+            self.max_fan_forced = false;
+        }
+        let level = self.gm.set_fan_level(None, &self.status.fan_max_rpms);
+        if level.is_ok() {
+            self.status.manual_fan_pct = None;
+        }
+        max_fan.and(level)
     }
 }
 
@@ -1261,7 +1510,11 @@ mod tests {
         ];
 
         write_kb_zones_via_io(&io_old, cols, None).unwrap();
-        let mut dev = HpOmenDevice::new(Box::new(io_new.clone()), status);
+        let mut dev = HpOmenDevice::new(
+            Box::new(io_new.clone()),
+            Box::new(GmRecorder::default()),
+            status,
+        );
         dev.set_frame(&cols).unwrap();
         // Repeat identical frame -> skipped cleanly
         dev.set_frame(&cols).unwrap();
@@ -1270,5 +1523,217 @@ mod tests {
             *io_old.writes.lock().unwrap(),
             *io_new.writes.lock().unwrap()
         );
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum GmCall {
+        Thermal(u8, OmenThermalMode),
+        MaxFan(bool),
+        FanLevel(Option<u8>),
+        Gpu(OmenGpuPowerLevel),
+    }
+
+    #[derive(Clone, Default)]
+    struct GmRecorder {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<GmCall>>>,
+        live: Option<(Vec<u32>, bool)>,
+    }
+
+    impl GmRecorder {
+        fn take(&self) -> Vec<GmCall> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+
+    impl OmenGmIo for GmRecorder {
+        fn set_thermal_mode(&self, version: u8, mode: OmenThermalMode) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(GmCall::Thermal(version, mode));
+            Ok(())
+        }
+        fn set_max_fan(&self, enabled: bool) -> Result<()> {
+            self.calls.lock().unwrap().push(GmCall::MaxFan(enabled));
+            Ok(())
+        }
+        fn set_fan_level(&self, pct: Option<u8>, _max_rpms: &[u32]) -> Result<()> {
+            self.calls.lock().unwrap().push(GmCall::FanLevel(pct));
+            Ok(())
+        }
+        fn set_gpu_power(&self, level: OmenGpuPowerLevel) -> Result<()> {
+            self.calls.lock().unwrap().push(GmCall::Gpu(level));
+            Ok(())
+        }
+        fn read_live_fans(&self) -> Option<(Vec<u32>, bool)> {
+            self.live.clone()
+        }
+    }
+
+    struct NoKbIo;
+
+    impl OmenKbIo for NoKbIo {
+        fn get_color_table(&self) -> Result<Vec<u8>> {
+            Ok(vec![0; COLOR_TABLE_LEN])
+        }
+        fn set_color_table(&self, _table: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn set_backlight(&self, _enabled: bool) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn omen(gm: &GmRecorder) -> HpOmenDevice {
+        let status = HpOmenStatus {
+            detected: true,
+            wmi_accessible: true,
+            model: "OMEN 15".into(),
+            board_id: "88D2".into(),
+            thermal_version: 1,
+            fan_count: 2,
+            fan_rpms: vec![2700, 2900],
+            fan_max_rpms: vec![5500, 5500],
+            ..Default::default()
+        };
+        HpOmenDevice::new(Box::new(NoKbIo), Box::new(gm.clone()), status)
+    }
+
+    #[test]
+    fn thermal_modes_map_to_shared_performance_profiles() {
+        for m in THERMAL_MODES {
+            assert_eq!(OmenThermalMode::from_profile_id(m.profile_id()), Some(m));
+        }
+        assert_eq!(OmenThermalMode::Cool.profile_id(), "quiet");
+        assert_eq!(OmenThermalMode::Default.profile_id(), "balanced");
+        assert_eq!(OmenThermalMode::Performance.profile_id(), "performance");
+        assert_eq!(OmenThermalMode::from_profile_id("turbo"), None);
+
+        let gm = GmRecorder::default();
+        let dev = omen(&gm);
+        let settings = dev.settings();
+        let ids: Vec<&str> = settings.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                setting_ids::PERFORMANCE_PROFILE,
+                HP_GPU_POWER_SETTING_ID,
+                HP_MAX_FAN_SETTING_ID,
+                setting_ids::BACKLIGHT
+            ]
+        );
+        assert_eq!(settings[0].value, Value::Text("balanced".into()));
+        assert_eq!(settings[1].value, Value::Text("min".into()));
+        assert_eq!(dev.info().kind, DeviceKind::Laptop);
+        assert_eq!(dev.info().id, "hp_omen:keyboard");
+    }
+
+    #[test]
+    fn settings_send_the_existing_payloads_and_profile_clears_manual_fans() {
+        let gm = GmRecorder::default();
+        let mut dev = omen(&gm);
+        dev.set_fan(None, FanTarget::Fixed(70)).unwrap();
+        assert!(dev.overridden());
+        gm.take();
+
+        let v = opengear_core::driver::validate_setting(
+            &dev,
+            setting_ids::PERFORMANCE_PROFILE,
+            &Value::Text("performance".into()),
+        )
+        .unwrap();
+        dev.apply_setting(setting_ids::PERFORMANCE_PROFILE, &v)
+            .unwrap();
+        assert_eq!(
+            gm.take(),
+            [GmCall::Thermal(1, OmenThermalMode::Performance)]
+        );
+        assert_eq!(dev.status.manual_fan_pct, None);
+        assert!(!dev.overridden());
+
+        dev.apply_setting(HP_GPU_POWER_SETTING_ID, &Value::Text("max".into()))
+            .unwrap();
+        assert_eq!(gm.take(), [GmCall::Gpu(OmenGpuPowerLevel::Maximum)]);
+        assert!(
+            dev.apply_setting(setting_ids::PERFORMANCE_PROFILE, &Value::Text("x".into()))
+                .is_err()
+        );
+        assert!(gm.take().is_empty());
+    }
+
+    #[test]
+    fn fan_overrides_keep_alive_and_restore() {
+        let gm = GmRecorder::default();
+        let mut dev = omen(&gm);
+        assert!(!dev.overridden());
+        let fans = dev.fans();
+        assert_eq!(fans.len(), 2);
+        assert_eq!(fans[0].id, "cpu");
+        assert_eq!(fans[0].min_pct, 30);
+        assert_eq!(fans[1].rpm, Some(2900));
+
+        // Nothing to keep alive while the BIOS is in control.
+        dev.keep_alive().unwrap();
+        assert!(gm.take().is_empty());
+
+        // Values below the floor never reach the EC.
+        dev.set_fan(Some("gpu"), FanTarget::Fixed(10)).unwrap();
+        assert_eq!(gm.take(), [GmCall::FanLevel(Some(30))]);
+        assert!(dev.overridden());
+        assert_eq!(dev.fans()[0].manual_pct, Some(30));
+        assert!(dev.set_fan(Some("nope"), FanTarget::Auto).is_err());
+
+        dev.keep_alive().unwrap();
+        assert_eq!(gm.take(), [GmCall::FanLevel(Some(30))]);
+        assert_eq!(dev.keep_alive_interval(), Some(FAN_KEEPALIVE));
+
+        // Max Fan on replaces the manual level and still counts as an override.
+        dev.apply_setting(HP_MAX_FAN_SETTING_ID, &Value::Bool(true))
+            .unwrap();
+        assert_eq!(gm.take(), [GmCall::MaxFan(true)]);
+        assert_eq!(dev.status.manual_fan_pct, None);
+        assert!(dev.overridden());
+
+        dev.restore_firmware_control().unwrap();
+        assert_eq!(gm.take(), [GmCall::MaxFan(false), GmCall::FanLevel(None)]);
+        assert!(!dev.overridden());
+
+        // A freshly discovered device (crash watchdog) still sends both commands.
+        let gm2 = GmRecorder::default();
+        let mut fresh = omen(&gm2);
+        fresh.restore_firmware_control().unwrap();
+        assert_eq!(gm2.take(), [GmCall::MaxFan(false), GmCall::FanLevel(None)]);
+    }
+
+    #[test]
+    fn refresh_reads_live_rpm_and_max_fan() {
+        let gm = GmRecorder {
+            live: Some((vec![4100, 4200], true)),
+            ..Default::default()
+        };
+        let mut dev = omen(&gm);
+        dev.refresh();
+        assert_eq!(dev.fans()[1].rpm, Some(4200));
+        assert!(dev.status.max_fan);
+        assert!(
+            !dev.overridden(),
+            "a Max Fan enabled outside OpenGear is not an OpenGear override"
+        );
+        assert!(gm.take().is_empty(), "refresh must only read");
+    }
+
+    #[test]
+    fn only_a_max_fan_forced_by_opengear_is_restored() {
+        // The live reading reports Max Fan off (as if switched off with HP's software).
+        let gm = GmRecorder {
+            live: Some((vec![3000, 3000], false)),
+            ..Default::default()
+        };
+        let mut dev = omen(&gm);
+        dev.apply_setting(HP_MAX_FAN_SETTING_ID, &Value::Bool(true))
+            .unwrap();
+        assert!(dev.overridden());
+        dev.refresh();
+        assert!(!dev.overridden());
     }
 }

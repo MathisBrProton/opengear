@@ -7,11 +7,13 @@ modification est mal placée, pas que le test est à assouplir.
 ## 1. Architecture des crates
 
 ```
-opengear-core        types partagés, sans marque : modèle d'appareil (`driver`), couleurs/effets,
-                     profils TOML, modèle de ventilation (`cooling`), géométrie clavier
+opengear-core        types partagés, sans marque : modèle d'appareil (`driver`), capacités
+                     `Lighting` (`lighting`) et `Cooling` (`fans`), couleurs/effets, profils TOML,
+                     courbes de ventilation carte mère (`cooling`), géométrie clavier
 opengear-platform    services Windows sans marque : client WMI COM, pilote PawnIO, mutex
                      inter-applications, élévation UAC, plans d'alimentation, télémétrie,
-                     batterie/écran portable, disposition clavier OS
+                     batterie portable, écran intégré (appareil `laptop_display`), disposition
+                     clavier OS
 opengear-mainboard   puces de carte mère sans marque : SMBus (trait `SmbusBus`), contrôleurs RGB
                      de RAM ENE, SuperIO Nuvoton, température CPU, capteurs
 opengear-input       hook clavier/souris : remap, macros, SOCD, anti-rebond
@@ -121,10 +123,17 @@ La CI exécute exactement ces commandes. Si `cargo fmt` ou `cargo clippy` est in
 
 - Tous les pilotes d'éclairage (Corsair, Logitech, ASUS Aura, RAM ENE, clavier HP OMEN 4 zones)
   passent désormais par `device_drivers()` et le trait commun `Lighting` (`crates/opengear-core/src/lighting.rs`).
+- Le PC portable HP OMEN (mode thermique → `PERFORMANCE_PROFILE`, puissance GPU, Max Fan,
+  rétroéclairage → `BACKLIGHT`, ventilateurs via le trait `Cooling` de
+  `crates/opengear-core/src/fans.rs`) et l'écran intégré (`LaptopDisplayDevice` :
+  `DISPLAY_BRIGHTNESS`, `DISPLAY_REFRESH_RATE`) passent par le modèle commun : commande IPC
+  générique `device_fan_set`, ventilateurs rendus au firmware à la fermeture et par le processus
+  de surveillance (`cooling_devices` du marqueur `fan_override.json`). Les préréglages et
+  l'économie sur batterie n'utilisent que les ids partagés.
 - Réglages/capacités encore propres à une marque, à remplacer par des traits dédiés : couleurs de
   voyants Corsair (écriture seule), paliers DPI, égaliseur, mémoire embarquée Logitech
-  (profils/boutons/macros), ventilateurs (ASUS, SuperIO, OMEN), réglages OMEN (mode thermique,
-  puissance GPU) et écran du portable.
+  (profils/boutons/macros), ventilateurs carte mère (ASUS WMI, SuperIO : courbes et Smart
+  Cooling encore servis par `cooling_channels` / `superio_*`, pas encore par `Cooling`).
 - `opengear-core::profile` conserve quelques champs hérités (`sync_asus_aura`, `asus_argb_led_counts`,
   `silent_loop3_*`, `omen_sync_rgb`) uniquement pour la rétro-compatibilité au chargement des anciens
   fichiers ; la configuration active vit dans `device_lighting` et `device_placements`.
@@ -132,7 +141,7 @@ La CI exécute exactement ces commandes. Si `cargo fmt` ou `cargo clippy` est in
   direct par LED RAM ENE (seul le registre uniforme `REG_DIRECT = 0` est utilisé sans fiche ENE
   détaillée) restent à compléter.
 - L'app accède encore aux types d'un pilote par `Device::as_any()` + `downcast_ref` (Corsair pour
-  la carte clavier, les paliers DPI et les profils HWP ; HP OMEN pour les ventilateurs) : chaque
+  la carte clavier, les paliers DPI et les profils HWP) : chaque
   accès disparaît quand la capacité correspondante devient un trait. N'en ajouter aucun nouveau.
 - Pilote Razer (`opengear-razer`, **expérimental**, jamais testé sur matériel) : protocole générique
   90 octets uniquement (177 appareils). Non pris en charge : casques Kraken, contrôleur ARGB, AIO

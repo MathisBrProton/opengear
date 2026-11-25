@@ -1,6 +1,6 @@
 import { ICONS, arr, esc, fmtHz, num, plural, safeHex } from "../utils.js";
 import { S, deviceById, devicesList, getEq, headsetImage, isExpert, local } from "../state.js";
-import { advancedHint, batteryBadge, deviceSettings, deviceVisual, emptyState, expertTag, pageHeader, sensorChips } from "../components.js";
+import { advancedHint, batteryBadge, deviceFans, deviceSettings, deviceVisual, emptyState, expertTag, pageHeader, sensorChips, sliderRow } from "../components.js";
 import { cardCorsairMouse, cardLogiDpi } from "./performance.js";
 import { cardLogiOnboard } from "./input.js";
 
@@ -93,30 +93,6 @@ function fiche(d) {
       ])}</div>
       <div class="card"><div class="card-head"><h2 class="card-title">Capteurs en direct</h2></div><div class="sensor-chip-row" id="cool-live">${sensorChips(S.telemetry)}</div></div>`;
   }
-  if (kind === "hp-omen") {
-    const o = S.hp_omen || {};
-    const b = S.laptop_battery || {};
-    const disp = S.laptop_display || {};
-    const omenDev = deviceById("hp_omen:keyboard");
-    const omenRgb = !!(omenDev && omenDev.lighting);
-    return `
-      ${ficheHead(d)}
-      ${deviceSettings("hp_omen:keyboard", { title: "Clavier" })}
-      ${omenRgb ? linkCard("Couleurs et synchronisation du clavier se règlent dans Éclairage.", "lighting", "devices", "Éclairage") : ""}
-      ${linkCard("Ventilateurs, mode thermique et puissance GPU se règlent dans Performances.", "performance", "cooling", "Ventilation & OMEN")}
-      ${linkCard("Batterie, luminosité et fréquence d'écran se règlent dans Performances › Alimentation.", "performance", "power", "Alimentation")}
-      <div class="card"><div class="card-head"><h2 class="card-title">Informations</h2></div>${infoTable([
-        ["Modèle", o.model || S.static_info.model],
-        ["Carte mère / BIOS", `${o.board_id || S.static_info.motherboard} · ${S.static_info.bios_version}`],
-        ["Processeur", S.static_info.cpu_name],
-        ["Carte graphique", S.static_info.gpu_name],
-        ["Clavier", o.keyboard_type === "White" ? "Blanc (contrôle matériel Fn + F4)" : o.keyboard_label],
-        disp.width ? ["Écran", `${num(disp.width)}×${num(disp.height)} @ ${num(disp.current_hz)} Hz`] : null,
-        b.present && b.health_pct != null ? ["Batterie", `${num(b.percent)} % · Santé ${num(b.health_pct).toFixed(0)} % (${num(b.cycle_count)} cycles)`] : null,
-        ex ? ["Contrôleur WMI", `${o.wmi_accessible ? "hpqBIntM actif" : o.diagnostic} (v${num(o.thermal_version, 1)})`, true] : null,
-      ])}</div>
-      <div class="card"><div class="card-head"><h2 class="card-title">Capteurs en direct</h2></div><div class="sensor-chip-row" id="cool-live">${sensorChips(S.telemetry)}</div></div>`;
-  }
   return ficheHead(d);
 }
 
@@ -129,9 +105,11 @@ function ficheGeneric(d) {
     ${ficheHead(d)}
     ${dev.lighting ? linkCard("Effets logiciels, effets matériels et placement bureau se règlent dans Éclairage.", "lighting", "devices", "Éclairage") : ""}
     ${deviceSettings(d.deviceId)}
+    ${deviceFans(d.deviceId)}
     <div class="card"><div class="card-head"><h2 class="card-title">Informations</h2></div>${infoTable([
       ["Fabricant", dev.info.vendor], ["Connexion", conn], ["Firmware", dev.info.firmware, true], isExpert() ? ["Identifiant", dev.info.id, true] : null,
-    ])}</div>`;
+    ])}</div>
+    ${dev.cooling ? `<div class="card"><div class="card-head"><h2 class="card-title">Capteurs en direct</h2></div><div class="sensor-chip-row" id="cool-live">${sensorChips(S.telemetry)}</div></div>` : ""}`;
 }
 
 function ficheCorsair(d, dev, i) {

@@ -8,7 +8,37 @@ use opengear_core::PollingRate;
 use opengear_core::driver::{
     Connection, Device, DeviceKind, Driver, Value, setting_ids, validate_setting,
 };
+use opengear_core::fans::{Cooling, FanTarget, clamp_target};
 use serde_json::{Value as Json, json};
+
+/// `{ fans, overridden }` of a device's `Cooling`, as sent to the UI.
+pub(crate) fn cooling_json(c: &dyn Cooling) -> Json {
+    json!({ "fans": c.fans(), "overridden": c.overridden() })
+}
+
+/// Clamp `target` to the floor of the addressed fan (`None` = the strictest floor of the device).
+pub(crate) fn clamp_for(
+    c: &dyn Cooling,
+    fan: Option<&str>,
+    target: FanTarget,
+) -> Result<FanTarget, String> {
+    let fans = c.fans();
+    match fan {
+        Some(id) => fans
+            .iter()
+            .find(|f| f.id == id)
+            .map(|f| clamp_target(f, target))
+            .ok_or_else(|| format!("Ventilateur introuvable : {id}")),
+        None => Ok(fans
+            .iter()
+            .map(|f| clamp_target(f, target))
+            .max_by_key(|t| match t {
+                FanTarget::Auto => 0,
+                FanTarget::Fixed(p) => u16::from(*p) + 1,
+            })
+            .unwrap_or(target)),
+    }
+}
 
 /// Re-discover the devices of every registered driver (start-up, rescan).
 /// Discover the devices of every registered driver; experimental drivers only when the user
@@ -118,6 +148,7 @@ impl BackendEngine {
             let placement = placements.get(&info.id).cloned().unwrap_or_default();
             let status = d.status();
             let settings = d.settings();
+            let cooling = d.cooling().map(|c| cooling_json(c));
             let lighting = d.lighting().map(|l| {
                 json!({
                     "zones": l.zones(),
@@ -131,6 +162,7 @@ impl BackendEngine {
                 "status": status,
                 "settings": settings,
                 "lighting": lighting,
+                "cooling": cooling,
             }));
         }
         Json::Array(out)
@@ -152,7 +184,31 @@ impl BackendEngine {
             .apply_setting(setting_id, &value)
             .map_err(|e| e.to_string())?;
         let kind = device.info().kind;
+        // Some settings change fan control (Max Fan, thermal profile): keep the crash marker in sync.
+        self.sync_cooling_marker();
         Ok(self.after_setting(kind, setting_id, &value))
+    }
+
+    /// Set one fan (or every fan, `fan = None`) of a device, clamped to its safety floor.
+    pub(crate) fn set_device_fan(
+        &mut self,
+        device_id: &str,
+        fan: Option<&str>,
+        target: FanTarget,
+    ) -> Result<(), String> {
+        let device = self
+            .device_mut(device_id)
+            .ok_or_else(|| format!("Appareil introuvable : {device_id}"))?;
+        let cooling = device
+            .cooling()
+            .ok_or_else(|| format!("Ventilateurs non pilotables sur {device_id}"))?;
+        let target = clamp_for(cooling, fan, target)?;
+        let res = cooling.set_fan(fan, target).map_err(|e| e.to_string());
+        // The manual level was just sent: the next keep-alive is due one interval from now.
+        self.cooling_keepalive
+            .insert(device_id.to_string(), std::time::Instant::now());
+        self.sync_cooling_marker();
+        res
     }
 
     /// App-wide consequences of shared settings.

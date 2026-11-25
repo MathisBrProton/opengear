@@ -10,6 +10,7 @@ use opengear_hp::HpOmenDriver;
 use opengear_logitech::LogitechDriver;
 use opengear_mainboard::{PawnIoRamBackend, RamRgb, RamRgbDriver};
 use opengear_openrgb::OpenRgbRamBackend;
+use opengear_platform::LaptopDisplayDriver;
 use opengear_razer::RazerDriver;
 
 /// Device drivers discovered through the shared model (`opengear_core::driver`).
@@ -24,6 +25,7 @@ pub fn device_drivers() -> Vec<Box<dyn Driver>> {
         Box::new(AsusAuraDriver),
         Box::new(RamRgbDriver::new(ram_rgb())),
         Box::new(HpOmenDriver),
+        Box::new(LaptopDisplayDriver),
         Box::new(RazerDriver),
     ]
 }

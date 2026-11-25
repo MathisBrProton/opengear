@@ -75,9 +75,7 @@ export function normalizeState() {
   S.static_info = S.static_info || {};
   S.system_prefs = S.system_prefs || {};
   S.local_assets = S.local_assets || {};
-  S.hp_omen = S.hp_omen || {};
   S.laptop_battery = S.laptop_battery || {};
-  S.laptop_display = S.laptop_display || {};
   S.config = S.config || {};
   S.config.profiles = arr(S.config.profiles);
   S.config.device_placements = S.config.device_placements || {};
@@ -176,9 +174,9 @@ export function settingOf(id, settingId) {
 
 const KIND_LABEL = {
   keyboard: "Clavier", mouse: "Souris", headset: "Casque", mousepad: "Tapis", controller: "Manette", motherboard: "Carte mère",
-  memory: "Mémoire", cooler: "Refroidissement", led_controller: "Contrôleur LED", laptop: "PC portable", other: "Appareil",
+  memory: "Mémoire", cooler: "Refroidissement", led_controller: "Contrôleur LED", laptop: "PC portable", display: "Écran", other: "Appareil",
 };
-const KIND_ICON = { keyboard: "keyboard", mouse: "mouse", headset: "headset", cooler: "fan", motherboard: "board" };
+const KIND_ICON = { keyboard: "keyboard", mouse: "mouse", headset: "headset", cooler: "fan", motherboard: "board", laptop: "laptop", display: "laptop" };
 
 export function k70Image() {
   const imgs = arr(S && S.local_assets.k70_images);
@@ -260,32 +258,6 @@ export function devicesList() {
       status: { label: "Connecté", cls: "purple" }, quick,
     });
   });
-  if (S.hp_omen && S.hp_omen.detected) {
-    const o = S.hp_omen;
-    const bat = S.laptop_battery || {};
-    const quick = o.wmi_accessible
-      ? [
-          qa("Éco", "omen-thermal", { mode: "cool" }),
-          qa("Équilibré", "omen-thermal", { mode: "default" }),
-          qa("Perf", "omen-thermal", { mode: "performance" }),
-        ]
-      : o.is_admin ? [] : [qa("Relancer en admin", "relaunch-admin", {})];
-    out.push({
-      key: "hp-omen",
-      vendor: "HP OMEN",
-      kind: "Laptop",
-      name: o.model || "HP OMEN",
-      type: `PC portable · ${o.board_id || "BIOS WMI"}`,
-      img: "/assets/laptop.svg",
-      icon: "laptop",
-      battery: bat.present ? bat.percent : null,
-      charging: !!(bat && bat.charging),
-      status: o.wmi_accessible
-        ? { label: o.max_fan ? "Max Fan" : (o.thermal_mode_label || "Connecté"), cls: o.max_fan ? "amber" : "emerald" }
-        : { label: o.is_admin ? "WMI indisponible" : "Admin requis", cls: "amber" },
-      quick,
-    });
-  }
   if (!S.is_laptop && S.cooling.channels.length) {
     const c = S.cooling;
     out.push({
@@ -297,19 +269,29 @@ export function devicesList() {
   }
   // Devices discovered through the shared driver registry appear automatically.
   const known = new Set(out.map((x) => x.deviceId).filter(Boolean));
-  if (S.hp_omen && S.hp_omen.detected) known.add("hp_omen:keyboard");
   arr(S.device_list).filter((d) => !known.has(d.info.id)).forEach((d) => {
     const bat = d.status.battery_pct;
     const icon = KIND_ICON[d.info.kind] || (d.info.kind === "memory" ? "ram" : "chip");
     const img = d.info.kind === "memory" ? "/assets/ram.svg"
       : d.info.kind === "motherboard" ? "/assets/motherboard.svg"
       : d.info.kind === "keyboard" ? "/assets/keyboard.svg"
+      : d.info.kind === "laptop" ? "/assets/laptop.svg"
       : undefined;
+    // A laptop reports the system battery; other devices their own.
+    const sysBat = d.info.kind === "laptop" && S.laptop_battery && S.laptop_battery.present ? S.laptop_battery : null;
+    // Performance profile (shared setting id) as quick actions.
+    const prof = arr(d.settings).find((s) => s.id === "performance_profile");
+    const quick = prof && prof.control && prof.control.type === "choice"
+      ? arr(prof.control.options).map((o) => qa(o.label, "dev-set", { device: d.info.id, setting: prof.id, json: JSON.stringify(o.id) }))
+      : [];
+    const forced = d.cooling && d.cooling.overridden;
+    const curProf = prof && arr(prof.control.options).find((o) => o.id === prof.value);
     out.push({
       key: `dev:${d.info.id}`, deviceId: d.info.id, vendor: d.info.vendor, kind: d.info.kind, name: d.info.model,
       type: KIND_LABEL[d.info.kind] || "Appareil", icon, img,
-      battery: bat != null ? bat : null, charging: !!d.status.charging,
-      status: { label: "Connecté", cls: "emerald" }, quick: [],
+      battery: sysBat ? sysBat.percent : bat != null ? bat : null, charging: sysBat ? !!sysBat.charging : !!d.status.charging,
+      status: forced ? { label: "Ventilation forcée", cls: "amber" } : { label: curProf ? curProf.label : "Connecté", cls: "emerald" },
+      quick,
     });
   });
   return out;

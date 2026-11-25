@@ -456,16 +456,12 @@ const ACT = {
   "pawnio-install": (el) => call("pawnio_install", {}, { btn: el }),
   "power-plan": (el) => call("set_power_plan", { guid: el.dataset.guid }, { btn: el, ok: "Mode d'alimentation activé" }),
 
-  // HP OMEN & Laptop
-  "omen-refresh": (el) => call("omen_refresh", {}, { btn: el, ok: "État HP OMEN actualisé" }),
-  "omen-thermal": (el) => call("omen_set_thermal_mode", { mode: el.dataset.mode || el.dataset.val }, { btn: el, ok: `Mode thermique : ${el.textContent.trim()}` }),
-  "omen-gpupow": (el) => call("omen_set_gpu_power", { level: el.dataset.val }, { btn: el, ok: `Puissance GPU : ${el.textContent.trim()}` }),
-  "omen-fan-apply": (el) => {
-    const pct = Number(inputVal("omen-fan-pct") ?? 65);
-    call("omen_set_manual_fan", { pct }, { btn: el, ok: `Ventilateurs forcés à ${pct} %` });
+  // Shared Cooling capability (device fans)
+  "dev-fan-apply": (el) => {
+    const pct = Number(inputVal(el.dataset.target) ?? 65);
+    call("device_fan_set", { device: el.dataset.device, target: pct }, { btn: el, ok: `Ventilateurs forcés à ${pct} %` });
   },
-  "omen-fan-auto": (el) => call("omen_set_manual_fan", { pct: null }, { btn: el, ok: "Ventilateurs rendus au BIOS" }),
-  "laptop-hz": (el) => call("laptop_set_refresh_rate", { hz: Number(el.dataset.val) }, { btn: el, ok: `Écran réglé sur ${el.dataset.val} Hz` }),
+  "dev-fan-auto": (el) => call("device_fan_set", { device: el.dataset.device, target: "auto" }, { btn: el, ok: "Ventilateurs rendus au BIOS" }),
 
   // Input / Macros
   "input-engine-on": (el) => call("input_set_enabled", { enabled: true }, { btn: el, ok: "Moteur d'entrée démarré" }),
@@ -729,8 +725,6 @@ const CHANGE = {
   },
   "bk-mouse": (el) => { local.backups.mouse = Number(el.value); },
   "bk-corsair": (el) => { local.backups.corsairDev = Number(el.value); },
-  "omen-maxfan": (el) => call("omen_set_max_fan", { enabled: el.checked }, { ok: el.checked ? "Max Fan activé" : "Max Fan désactivé" }),
-  "laptop-bright": (el) => call("laptop_set_brightness", { percent: Number(el.value) }, { rerender: false, ok: `Luminosité écran : ${el.value} %` }),
   "laptop-auto-bat": (el) => call("laptop_set_auto_battery", { enabled: el.checked }, { ok: el.checked ? "Mode économie sur batterie activé" : "Mode économie sur batterie désactivé" }),
 };
 
@@ -877,10 +871,7 @@ document.addEventListener("pointerup", () => {
 // ==================== BACKEND PUSHES ====================
 const deviceSignature = () => {
   if (!S) return "";
-  return [
-    ...arr(S.device_list).map((d) => d.info.id),
-    S.hp_omen && S.hp_omen.detected ? "omen" : "",
-  ].join("|");
+  return arr(S.device_list).map((d) => d.info.id).join("|");
 };
 
 window.__ogTelemetry = (tel) => {

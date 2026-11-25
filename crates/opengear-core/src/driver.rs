@@ -28,6 +28,7 @@ pub enum DeviceKind {
     Memory,
     Cooler,
     LedController,
+    Display,
     Laptop,
     Other,
 }
@@ -302,6 +303,19 @@ pub mod setting_ids {
     pub const SIDETONE: &str = "sidetone";
     /// Angle snapping on a mouse sensor (toggle).
     pub const ANGLE_SNAPPING: &str = "angle_snapping";
+    /// Performance / thermal profile of the machine (choice). Shared choice ids are in
+    /// [`PROFILE_QUIET`], [`PROFILE_BALANCED`] and [`PROFILE_PERFORMANCE`]; devices may add
+    /// their own extra options. The app's presets and battery saver use it.
+    pub const PERFORMANCE_PROFILE: &str = "performance_profile";
+    pub const PROFILE_QUIET: &str = "quiet";
+    pub const PROFILE_BALANCED: &str = "balanced";
+    pub const PROFILE_PERFORMANCE: &str = "performance";
+    /// Built-in display brightness in % (slider).
+    pub const DISPLAY_BRIGHTNESS: &str = "display_brightness";
+    /// Built-in display refresh rate (choice of Hz strings, `"60"`, `"144"`…).
+    pub const DISPLAY_REFRESH_RATE: &str = "display_refresh_rate";
+    /// Keyboard backlight on/off (toggle). The battery saver and "lights off" preset turn it off.
+    pub const BACKLIGHT: &str = "backlight";
 }
 
 /// One physical device handled by a driver crate.
@@ -320,6 +334,16 @@ pub trait Device: Send {
     /// Lighting of the device, if it has LEDs (see [`crate::lighting`]).
     fn lighting(&mut self) -> Option<&mut dyn crate::lighting::Lighting> {
         None
+    }
+
+    /// Fans of the device, if OpenGear can drive them (see [`crate::fans`]).
+    fn cooling(&mut self) -> Option<&mut dyn crate::fans::Cooling> {
+        None
+    }
+
+    /// Extra lines for the diagnostic report (probe details, firmware state…).
+    fn diagnostic_lines(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Refresh live telemetry/status (battery, etc.) if needed.

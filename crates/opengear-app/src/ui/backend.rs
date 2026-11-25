@@ -17,22 +17,17 @@ use opengear_asus::{
     read_asus_wmi_channel,
 };
 use opengear_core::cooling::{FanChannelConfig, FanHeaderKind, FanPolicyMode, FanTempSource};
-use opengear_core::driver::{Device, Value};
+use opengear_core::driver::{Control, Device, DeviceKind, Setting, Value, setting_ids};
 use opengear_core::lighting::{
     DeviceLightingConfig, EffectRequest, LightingOverride, Zone, frame_len, render_frame,
-};
-use opengear_hp::{
-    HpOmenDevice, HpOmenStatus, OmenThermalMode, probe_hp_omen, read_hp_omen_live_fans,
-    set_hp_omen_fan_level, set_hp_omen_max_fan, set_hp_omen_thermal_mode,
 };
 use opengear_mainboard::{
     HardwareSensorsSnapshot, RamRgbDevice, SuperIoSnapshot, read_superio_snapshot,
     restore_all_superio_fans_auto,
 };
 use opengear_platform::{
-    DisplayInfo, LaptopBatteryInfo, PowerPlan, SystemTelemetry, TelemetryCollector, is_elevated,
-    is_laptop_chassis, list_power_plans, read_display_info, read_laptop_battery,
-    set_display_refresh_rate,
+    LaptopBatteryInfo, PowerPlan, SystemTelemetry, TelemetryCollector, is_elevated,
+    is_laptop_chassis, list_power_plans, read_laptop_battery,
 };
 
 const SMART_FAN_FAILSAFE_TEMP_C: f32 = 100.0;
@@ -94,15 +89,59 @@ pub(crate) struct BackendEngine {
     pub is_laptop: bool,
     /// Key editor geometry + active Windows layout, rebuilt every few seconds (see `keyboard_view`).
     pub keyboard_view_cache: Option<(Instant, KeyboardView)>,
-    pub hp_omen: HpOmenStatus,
     pub laptop_battery: LaptopBatteryInfo,
-    pub laptop_display: DisplayInfo,
-    pub omen_last_fan_keepalive: Instant,
-    pub omen_fan_modified: bool,
+    /// Last keep-alive sent to each device whose `Cooling` needs one.
+    pub cooling_keepalive: HashMap<String, Instant>,
+    /// Overridden cooling devices last written to the crash marker.
+    pub cooling_marker_ids: Vec<String>,
     pub last_ac_online: Option<bool>,
-    pub ac_saved_hz: Option<u32>,
-    pub ac_saved_thermal: Option<OmenThermalMode>,
-    pub ac_saved_kb_backlight: Option<bool>,
+    /// `(device, setting, previous value)` changed by the battery saver, restored on AC.
+    pub ac_saved_settings: Vec<(String, String, Value)>,
+}
+
+/// One change made by the battery saver: `(setting, new value, previous value)`.
+pub(crate) type SaverChange = (String, Value, Value);
+
+/// What the battery saver changes on a device, from its settings: lowest profile, 60 Hz panel,
+/// keyboard backlight off. Only settings that actually change are returned.
+pub(crate) fn battery_saver_changes(settings: &[Setting]) -> Vec<SaverChange> {
+    let mut out = Vec::new();
+    for s in settings {
+        let target = match (s.id.as_str(), &s.control) {
+            (setting_ids::PERFORMANCE_PROFILE, Control::Choice { options })
+                if options.iter().any(|o| o.id == setting_ids::PROFILE_QUIET) =>
+            {
+                Value::Text(setting_ids::PROFILE_QUIET.into())
+            }
+            (setting_ids::DISPLAY_REFRESH_RATE, Control::Choice { options })
+                if options.iter().any(|o| o.id == "60") =>
+            {
+                Value::Text("60".into())
+            }
+            (setting_ids::BACKLIGHT, Control::Toggle) => Value::Bool(false),
+            _ => continue,
+        };
+        if s.value != target {
+            out.push((s.id.clone(), target, s.value.clone()));
+        }
+    }
+    out
+}
+
+/// Highest refresh rate offered by a `DISPLAY_REFRESH_RATE` setting (restored on AC when the
+/// previous rate is unknown).
+pub(crate) fn highest_refresh_rate(settings: &[Setting]) -> Option<Value> {
+    settings
+        .iter()
+        .find(|s| s.id == setting_ids::DISPLAY_REFRESH_RATE)
+        .and_then(|s| match &s.control {
+            Control::Choice { options } => options
+                .iter()
+                .filter_map(|o| o.id.parse::<u32>().ok())
+                .max()
+                .map(|hz| Value::Text(hz.to_string())),
+            _ => None,
+        })
 }
 
 pub(crate) fn compute_hid_signature() -> Vec<(u16, u16, u16)> {
@@ -177,39 +216,22 @@ impl BackendEngine {
 
         let mut telemetry = TelemetryCollector::new();
         let last_tel = telemetry.sample();
-        let hp_omen = driver_devices
-            .iter()
-            .find_map(|d| {
-                d.as_any()?
-                    .downcast_ref::<HpOmenDevice>()
-                    .map(|o| o.status.clone())
-            })
-            .unwrap_or_else(probe_hp_omen);
-        let is_laptop = is_laptop_chassis() || hp_omen.detected;
+        let is_laptop = is_laptop_chassis()
+            || driver_devices
+                .iter()
+                .any(|d| d.info().kind == DeviceKind::Laptop);
         let laptop_battery = if is_laptop {
             read_laptop_battery()
         } else {
             LaptopBatteryInfo::default()
-        };
-        let laptop_display = if is_laptop {
-            read_display_info()
-        } else {
-            DisplayInfo::default()
         };
         let last_ac_online = if laptop_battery.present {
             Some(laptop_battery.ac_online)
         } else {
             None
         };
-        let cooling_status = if hp_omen.detected {
-            AsusWmiCoolingStatus {
-                is_admin: is_elevated(),
-                wmi_available: false,
-                message: "PC portable HP OMEN détecté : contrôle ventilateurs via HP BIOS WMI (hpqBIntM).".into(),
-            }
-        } else {
-            probe_asus_wmi_cooling()
-        };
+        let device_fans = device_cooling_owner(&mut driver_devices);
+        let cooling_status = mainboard_cooling_status(device_fans.as_deref());
         let initial_cooling_channels: Vec<Option<FanChannelConfig>> = FanHeaderKind::ALL
             .iter()
             .map(|&h| {
@@ -220,18 +242,21 @@ impl BackendEngine {
                 }
             })
             .collect();
-        let cooling_channels: Vec<FanChannelConfig> = if hp_omen.detected {
-            Vec::new()
-        } else {
-            FanHeaderKind::ALL
-                .iter()
-                .zip(&initial_cooling_channels)
-                .map(|(&h, read)| {
-                    read.clone()
-                        .unwrap_or_else(|| FanChannelConfig::default_for(h))
-                })
-                .collect()
-        };
+        // Laptop fans belong to the embedded controller (driven through a device's `Cooling`),
+        // never to motherboard fan headers.
+        let cooling_channels: Vec<FanChannelConfig> =
+            if device_fans.is_some() || (is_laptop && !cooling_status.wmi_available) {
+                Vec::new()
+            } else {
+                FanHeaderKind::ALL
+                    .iter()
+                    .zip(&initial_cooling_channels)
+                    .map(|(&h, read)| {
+                        read.clone()
+                            .unwrap_or_else(|| FanChannelConfig::default_for(h))
+                    })
+                    .collect()
+            };
         let superio = if is_laptop {
             SuperIoSnapshot::default()
         } else {
@@ -278,16 +303,14 @@ impl BackendEngine {
             battery_alerted: HashMap::new(),
             is_laptop,
             keyboard_view_cache: None,
-            hp_omen,
             laptop_battery,
-            laptop_display,
-            omen_last_fan_keepalive: Instant::now(),
-            omen_fan_modified: false,
+            cooling_keepalive: HashMap::new(),
+            cooling_marker_ids: Vec::new(),
             last_ac_online,
-            ac_saved_hz: None,
-            ac_saved_thermal: None,
-            ac_saved_kb_backlight: None,
+            ac_saved_settings: Vec::new(),
         };
+        // A device may already be overridden (e.g. Max Fan left on): arm the crash safety net.
+        eng.sync_cooling_marker();
         eng.manual_profile_name = eng.config.active_profile.clone();
         eng.sync_input_rules();
         let p0 = eng.config.active_profile_mut().clone();
@@ -348,11 +371,62 @@ impl BackendEngine {
                 .filter_map(|i| self.wmi_restore_config(i))
                 .collect(),
             superio_restore: opengear_mainboard::saved_superio_states(),
+            cooling_devices: self.overridden_cooling_ids(),
         };
+        self.cooling_marker_ids = marker.cooling_devices.clone();
         fan_watchdog::write_marker(&marker);
         if !marker.is_empty() && !self.watchdog_spawned {
             self.watchdog_spawned = fan_watchdog::spawn_watchdog().is_ok();
         }
+    }
+
+    /// Ids of the devices whose fans are currently not under firmware control.
+    pub(crate) fn overridden_cooling_ids(&mut self) -> Vec<String> {
+        self.driver_devices
+            .iter_mut()
+            .filter_map(|d| {
+                let id = d.info().id;
+                d.cooling().filter(|c| c.overridden()).map(|_| id)
+            })
+            .collect()
+    }
+
+    /// Rewrite the crash marker when the set of overridden cooling devices changed.
+    pub(crate) fn sync_cooling_marker(&mut self) {
+        if self.overridden_cooling_ids() != self.cooling_marker_ids {
+            self.sync_fan_marker();
+        }
+    }
+
+    /// Refresh live fan speeds and send due keep-alives (generic over every `Cooling`).
+    fn poll_cooling(&mut self, refresh: bool) {
+        for dev in &mut self.driver_devices {
+            let id = dev.info().id;
+            let Some(c) = dev.cooling() else {
+                continue;
+            };
+            if refresh {
+                c.refresh();
+            }
+            let Some(every) = c.keep_alive_interval() else {
+                continue;
+            };
+            if !c.overridden() {
+                self.cooling_keepalive.remove(&id);
+                continue;
+            }
+            let due = self
+                .cooling_keepalive
+                .get(&id)
+                .is_none_or(|at| at.elapsed() >= every);
+            if due {
+                if let Err(e) = c.keep_alive() {
+                    error!("Maintien des ventilateurs de {id} impossible : {e}");
+                }
+                self.cooling_keepalive.insert(id, Instant::now());
+            }
+        }
+        self.sync_cooling_marker();
     }
 
     pub(crate) fn restore_hardware_on_exit(&mut self) {
@@ -364,9 +438,16 @@ impl BackendEngine {
                 let _ = lighting.release();
             }
         }
-        if self.omen_fan_modified && self.hp_omen.wmi_accessible {
-            let _ = set_hp_omen_max_fan(false);
-            let _ = set_hp_omen_fan_level(None, &self.hp_omen.fan_max_rpms);
+        let mut remaining_cooling = Vec::new();
+        for dev in &mut self.driver_devices {
+            let id = dev.info().id;
+            if let Some(c) = dev.cooling()
+                && c.overridden()
+                && let Err(e) = c.restore_firmware_control()
+            {
+                error!("Ventilateurs de {id} non rendus au firmware à la fermeture : {e}");
+                remaining_cooling.push(id);
+            }
         }
 
         let mut remaining_wmi = Vec::new();
@@ -392,13 +473,15 @@ impl BackendEngine {
         } else {
             Vec::new()
         };
-        if remaining_wmi.is_empty() && remaining_superio.is_empty() {
+        if remaining_wmi.is_empty() && remaining_superio.is_empty() && remaining_cooling.is_empty()
+        {
             fan_watchdog::clear_marker();
         } else {
             fan_watchdog::write_marker(&fan_watchdog::FanOverrideMarker {
                 pid: std::process::id(),
                 wmi_restore: remaining_wmi,
                 superio_restore: remaining_superio,
+                cooling_devices: remaining_cooling,
             });
         }
     }
@@ -417,7 +500,8 @@ impl BackendEngine {
         let mut last_logi_poll = Instant::now();
         let mut last_idle_check = Instant::now();
         let mut last_laptop_poll = Instant::now();
-        let mut last_omen_fan_poll = Instant::now();
+        let mut last_cooling_poll = Instant::now();
+        let mut last_cooling_refresh = Instant::now();
 
         loop {
             if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
@@ -644,7 +728,7 @@ impl BackendEngine {
                 last_hotplug_check = Instant::now();
             }
 
-            // 3. Battery refresh + Laptop/OMEN polls
+            // 3. Battery refresh + laptop polls
             let status_interval = if ui_open {
                 Duration::from_secs(30)
             } else {
@@ -670,33 +754,26 @@ impl BackendEngine {
             {
                 self.laptop_battery = read_laptop_battery();
                 if ui_open {
-                    self.laptop_display = read_display_info();
+                    // The built-in panel can change behind our back (Fn keys, Windows settings).
+                    for dev in &mut self.driver_devices {
+                        if dev.info().kind == DeviceKind::Display {
+                            dev.refresh_status();
+                        }
+                    }
                 }
                 self.handle_laptop_ac_transition(&proxy);
                 last_laptop_poll = Instant::now();
             }
 
-            if !self.suspended
-                && self.hp_omen.wmi_accessible
-                && ui_open
-                && last_omen_fan_poll.elapsed() >= Duration::from_secs(2)
-            {
-                if let Some((rpms, max_fan)) = read_hp_omen_live_fans() {
-                    self.hp_omen.fan_rpms = rpms;
-                    self.hp_omen.max_fan = max_fan;
+            // 3a. Device fans: live speeds while the UI is open, keep-alives whenever a device
+            // needs them (e.g. an EC that reverts a manual speed after ~30-60 s).
+            if !self.suspended && last_cooling_poll.elapsed() >= Duration::from_secs(1) {
+                let refresh = ui_open && last_cooling_refresh.elapsed() >= Duration::from_secs(3);
+                self.poll_cooling(refresh);
+                if refresh {
+                    last_cooling_refresh = Instant::now();
                 }
-                last_omen_fan_poll = Instant::now();
-            }
-
-            // HP OMEN EC watchdog keep-alive (BIOS reverts manual fan speed after ~30-60s otherwise)
-            if !self.suspended
-                && self.hp_omen.wmi_accessible
-                && self.omen_last_fan_keepalive.elapsed() >= Duration::from_secs(12)
-            {
-                if let Some(pct) = self.hp_omen.manual_fan_pct {
-                    let _ = set_hp_omen_fan_level(Some(pct), &self.hp_omen.fan_max_rpms);
-                }
-                self.omen_last_fan_keepalive = Instant::now();
+                last_cooling_poll = Instant::now();
             }
 
             // 3b. Inactivity lights-off
@@ -1078,20 +1155,10 @@ impl BackendEngine {
         self.live_active_devices.clear();
         self.invalidate_keyboard_view();
 
-        self.hp_omen = self
-            .typed_devices::<HpOmenDevice>()
-            .first()
-            .map(|o| o.status.clone())
-            .unwrap_or_else(probe_hp_omen);
-        self.cooling_status = if self.hp_omen.detected {
-            AsusWmiCoolingStatus {
-                is_admin: is_elevated(),
-                wmi_available: false,
-                message: "PC portable HP OMEN détecté : contrôle ventilateurs via HP BIOS WMI (hpqBIntM).".into(),
-            }
-        } else {
-            probe_asus_wmi_cooling()
-        };
+        self.cooling_keepalive.clear();
+        let device_fans = device_cooling_owner(&mut self.driver_devices);
+        self.cooling_status = mainboard_cooling_status(device_fans.as_deref());
+        self.sync_cooling_marker();
         self.power_plans = list_power_plans();
         self.scanned_devices = scan_hid_devices(false).unwrap_or_default();
         self.last_hid_sig = compute_hid_signature();
@@ -1223,60 +1290,63 @@ impl BackendEngine {
             return;
         }
         if !ac {
-            info!("Passage sur batterie — activation du profil autonomie (60 Hz + Cool)");
-            self.ac_saved_hz = self.laptop_display.current_hz;
-            self.ac_saved_thermal = Some(self.hp_omen.thermal_mode);
-            self.ac_saved_kb_backlight = if self.hp_omen.keyboard_type.is_software_rgb() {
-                Some(self.hp_omen.backlight_on)
-            } else {
-                None
-            };
-            if self.laptop_display.supported_hz.contains(&60)
-                && self.laptop_display.current_hz != Some(60)
-                && set_display_refresh_rate(60).is_ok()
-            {
-                self.laptop_display = read_display_info();
-            }
-            if self.hp_omen.wmi_accessible {
-                if set_hp_omen_thermal_mode(self.hp_omen.thermal_version, OmenThermalMode::Cool)
-                    .is_ok()
-                {
-                    self.hp_omen.thermal_mode = OmenThermalMode::Cool;
-                }
-                if self.hp_omen.keyboard_type.is_software_rgb()
-                    && self.hp_omen.backlight_on
-                    && let Some(d) = self.device_mut("hp_omen:keyboard")
-                    && d.apply_setting("hp.kb_backlight", &Value::Bool(false))
-                        .is_ok()
-                {
-                    self.hp_omen.backlight_on = false;
+            info!(
+                "Passage sur batterie — activation du profil autonomie (60 Hz + profil silencieux)"
+            );
+            self.ac_saved_settings.clear();
+            let plan: Vec<(String, Vec<SaverChange>)> = self
+                .driver_devices
+                .iter()
+                .map(|d| (d.info().id, battery_saver_changes(&d.settings())))
+                .filter(|(_, changes)| !changes.is_empty())
+                .collect();
+            for (device, changes) in plan {
+                for (setting, target, previous) in changes {
+                    match self.set_device_setting(&device, &setting, &target) {
+                        Ok(_) => self
+                            .ac_saved_settings
+                            .push((device.clone(), setting, previous)),
+                        Err(e) => {
+                            info!("Économie batterie : {setting} inchangé sur {device} ({e})")
+                        }
+                    }
                 }
             }
         } else {
             info!("Passage sur secteur — restauration performances & fréquence d'écran");
-            let restore_hz = self
-                .ac_saved_hz
-                .take()
-                .or_else(|| self.laptop_display.supported_hz.iter().copied().max());
-            if let Some(hz) = restore_hz
-                && self.laptop_display.current_hz != Some(hz)
-                && set_display_refresh_rate(hz).is_ok()
-            {
-                self.laptop_display = read_display_info();
-            }
-            if self.hp_omen.wmi_accessible {
-                if let Some(mode) = self.ac_saved_thermal.take()
-                    && set_hp_omen_thermal_mode(self.hp_omen.thermal_version, mode).is_ok()
-                {
-                    self.hp_omen.thermal_mode = mode;
+            let saved = std::mem::take(&mut self.ac_saved_settings);
+            // Without a saved rate (started on battery), the panel goes back to its fastest rate.
+            let fallback_hz: Vec<(String, Value)> = self
+                .driver_devices
+                .iter()
+                .filter_map(|d| {
+                    let id = d.info().id;
+                    let has_saved = saved.iter().any(|(dev, setting, _)| {
+                        dev == &id && setting == setting_ids::DISPLAY_REFRESH_RATE
+                    });
+                    (!has_saved)
+                        .then(|| highest_refresh_rate(&d.settings()))
+                        .flatten()
+                        .map(|v| (id, v))
+                })
+                .collect();
+            let restores = saved.into_iter().chain(
+                fallback_hz
+                    .into_iter()
+                    .map(|(d, v)| (d, setting_ids::DISPLAY_REFRESH_RATE.to_string(), v)),
+            );
+            for (device, setting, value) in restores {
+                let current = self.device_mut(&device).and_then(|d| {
+                    d.settings()
+                        .into_iter()
+                        .find(|s| s.id == setting)
+                        .map(|s| s.value)
+                });
+                if current.as_ref() == Some(&value) {
+                    continue;
                 }
-                if self.hp_omen.keyboard_type.is_software_rgb()
-                    && self.ac_saved_kb_backlight.take() == Some(true)
-                    && let Some(d) = self.device_mut("hp_omen:keyboard")
-                    && d.apply_setting("hp.kb_backlight", &Value::Bool(true))
-                        .is_ok()
-                {
-                    self.hp_omen.backlight_on = true;
+                if let Err(e) = self.set_device_setting(&device, &setting, &value) {
+                    info!("Retour secteur : {setting} non restauré sur {device} ({e})");
                 }
             }
         }
@@ -1339,6 +1409,27 @@ impl BackendEngine {
     }
 }
 
+/// Model of the first device whose fans OpenGear drives through `Cooling`, if any.
+pub(crate) fn device_cooling_owner(devices: &mut [Box<dyn Device>]) -> Option<String> {
+    devices.iter_mut().find_map(|d| {
+        let model = d.info().model;
+        d.cooling().map(|_| model)
+    })
+}
+
+/// Motherboard fan interface status. When a device already drives the fans (laptop embedded
+/// controller), the ASUS WMI fan interface is not probed.
+pub(crate) fn mainboard_cooling_status(device_fans: Option<&str>) -> AsusWmiCoolingStatus {
+    match device_fans {
+        Some(model) => AsusWmiCoolingStatus {
+            is_admin: is_elevated(),
+            wmi_available: false,
+            message: format!("Ventilateurs pilotés par l'appareil « {model} »."),
+        },
+        None => probe_asus_wmi_cooling(),
+    }
+}
+
 pub(crate) fn migrate_legacy_profiles(config: &mut AppConfig) {
     for prof in &mut config.profiles {
         if prof.lighting_migrated {
@@ -1362,7 +1453,9 @@ pub(crate) fn seed_and_resize_device_lighting(
             let is_asus = d
                 .as_any()
                 .is_some_and(|a| a.is::<AuraMainboardController>());
-            let is_omen = d.as_any().is_some_and(|a| a.is::<HpOmenDevice>());
+            // Legacy `omen_sync_rgb` only seeds the first lighting config of the HP OMEN
+            // keyboard (matched by its device id, no downcast).
+            let is_omen = id.starts_with("hp_omen:");
             let _is_ram = d.as_any().is_some_and(|a| a.is::<RamRgbDevice>());
             if d.lighting().is_none() {
                 continue;
@@ -1522,5 +1615,80 @@ pub(crate) fn thermal_rgb(temp_c: f32) -> Rgb {
     } else {
         let f = (t - 66.0) / 19.0;
         Rgb::new(255, (185.0 - f * 155.0) as u8, (30.0 + f * 40.0) as u8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opengear_core::driver::{ChoiceOption, Section};
+
+    fn profile(current: &str) -> Setting {
+        Setting::choice(
+            setting_ids::PERFORMANCE_PROFILE,
+            "Mode",
+            Section::Performance,
+            ["quiet", "balanced", "performance"]
+                .iter()
+                .map(|id| ChoiceOption::new(*id, *id))
+                .collect(),
+            current,
+        )
+    }
+
+    fn refresh(current: &str, rates: &[&str]) -> Setting {
+        Setting::choice(
+            setting_ids::DISPLAY_REFRESH_RATE,
+            "Hz",
+            Section::Power,
+            rates.iter().map(|r| ChoiceOption::new(*r, *r)).collect(),
+            current,
+        )
+    }
+
+    #[test]
+    fn battery_saver_lowers_profile_rate_and_backlight_and_remembers_them() {
+        let settings = vec![
+            profile("performance"),
+            refresh("144", &["60", "144"]),
+            Setting::toggle(setting_ids::BACKLIGHT, "Clavier", Section::Lighting, true),
+            Setting::toggle("vendor.other", "Autre", Section::General, true),
+        ];
+        let changes = battery_saver_changes(&settings);
+        assert_eq!(
+            changes,
+            vec![
+                (
+                    setting_ids::PERFORMANCE_PROFILE.to_string(),
+                    Value::Text("quiet".into()),
+                    Value::Text("performance".into())
+                ),
+                (
+                    setting_ids::DISPLAY_REFRESH_RATE.to_string(),
+                    Value::Text("60".into()),
+                    Value::Text("144".into())
+                ),
+                (
+                    setting_ids::BACKLIGHT.to_string(),
+                    Value::Bool(false),
+                    Value::Bool(true)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn battery_saver_skips_settings_already_low_or_unsupported() {
+        let settings = vec![
+            profile("quiet"),
+            refresh("120", &["120", "165"]),
+            Setting::toggle(setting_ids::BACKLIGHT, "Clavier", Section::Lighting, false),
+        ];
+        assert!(battery_saver_changes(&settings).is_empty());
+        assert_eq!(
+            highest_refresh_rate(&settings),
+            Some(Value::Text("165".into()))
+        );
+        assert_eq!(highest_refresh_rate(&[profile("quiet")]), None);
     }
 }

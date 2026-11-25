@@ -114,6 +114,7 @@ export function sensorChips(tel) {
 
 export function updateTelemetryDom(tel) {
   if (!tel) return;
+  updateDeviceFansDom(tel);
   const sensors = tel.sensors || {};
   const gpu = tel.gpu || {};
   const cpuPct = num(tel.cpu_usage_pct);
@@ -286,4 +287,57 @@ export function deviceSettings(deviceId, { sections = null, title = "Réglages",
   if (!list.length) return "";
   const body = `<div class="stack" style="gap:12px">${list.map((s) => settingControl(deviceId, s)).join("")}</div>`;
   return bare ? body : `<div class="card"><div class="card-head"><h2 class="card-title">${esc(title)}</h2></div>${body}</div>`;
+}
+
+/**
+ * Fans of a device with the shared `Cooling` capability (`S.device_list[].cooling`), refreshed
+ * live from `S.telemetry.device_fans`. Manual speed starts at the device's safety floor.
+ */
+export function deviceFans(deviceId, { title = "Ventilateurs", bare = false } = {}) {
+  const d = deviceById(deviceId);
+  const live = S && S.telemetry && S.telemetry.device_fans && S.telemetry.device_fans[deviceId];
+  const c = live || (d && d.cooling);
+  if (!c) return "";
+  const fans = arr(c.fans);
+  const floor = fans.reduce((m, f) => Math.max(m, num(f.min_pct, 30)), 0) || 30;
+  const manual = fans.map((f) => f.manual_pct).find((p) => p != null);
+  const value = clamp(manual != null ? num(manual) : Math.max(65, floor), floor, 100);
+  const domId = fanDomId(deviceId);
+  const chips = fanChips(fans);
+  const body = `
+    <div class="row mb-16" id="${domId}-live">${chips || `<span class="muted small">Vitesse non communiquée par l'appareil.</span>`}</div>
+    ${c.overridden ? `<div class="row mb-16"><span class="pill amber"><span class="dot"></span>Ventilation forcée : le BIOS ne pilote plus les ventilateurs</span></div>` : ""}
+    ${isExpert() ? `
+      <div class="stack" style="gap:10px">
+        ${sliderRow(`Vitesse manuelle ${expertTag()}`, { id: domId, min: floor, max: 100, value, input: "label", data: { fmt: "pct100" }, display: `${value} %` })}
+        <div class="row">
+          <button type="button" class="btn btn-primary btn-sm" data-act="dev-fan-apply" data-device="${esc(deviceId)}" data-target="${domId}">Forcer la vitesse</button>
+          <button type="button" class="btn btn-secondary btn-sm" data-act="dev-fan-auto" data-device="${esc(deviceId)}">Automatique</button>
+        </div>
+        <div class="muted small">Plancher de sécurité à ${floor} %. OpenGear rend les ventilateurs au BIOS à la fermeture, même après un plantage.</div>
+      </div>` : `
+      ${c.overridden ? `<div class="row"><button type="button" class="btn btn-secondary btn-sm" data-act="dev-fan-auto" data-device="${esc(deviceId)}">Automatique</button></div>` : ""}
+      ${advancedHint("Le forçage manuel des ventilateurs est disponible en mode Expert.")}`}`;
+  return bare ? body : `<div class="card accent-amber"><div class="card-head"><h2 class="card-title">${esc(title)}</h2></div>${body}</div>`;
+}
+
+const fanDomId = (deviceId) => `fan-${deviceId}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+
+function fanChips(fans) {
+  return arr(fans).map((f) => `<span class="pill ${num(f.rpm) > 0 ? "amber" : ""}">${esc(f.name)} ${f.rpm != null ? `${num(f.rpm)} tr/min` : "—"}${f.manual_pct != null ? ` · ${num(f.manual_pct)} %` : ""}</span>`).join("");
+}
+
+/** Live update of the fan chips rendered by `deviceFans` (telemetry push). */
+function updateDeviceFansDom(tel) {
+  const all = (tel && tel.device_fans) || {};
+  Object.keys(all).forEach((id) => {
+    const el = document.getElementById(`${fanDomId(id)}-live`);
+    const chips = fanChips(all[id].fans);
+    if (el && chips) el.innerHTML = chips;
+  });
+}
+
+/** Ids of the devices whose fans OpenGear drives. */
+export function coolingDeviceIds() {
+  return arr(S && S.device_list).filter((d) => d.cooling).map((d) => d.info.id);
 }

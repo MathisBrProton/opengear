@@ -2,6 +2,7 @@ pub mod color;
 pub mod cooling;
 pub mod device;
 pub mod driver;
+pub mod fans;
 pub mod keyboard;
 pub mod lighting;
 pub mod profile;

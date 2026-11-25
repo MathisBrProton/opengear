@@ -1,6 +1,6 @@
 import { ICONS, POLICIES, arr, clamp, esc, fmtHz, num } from "../utils.js";
-import { S, isExpert, local } from "../state.js";
-import { advancedHint, deviceSettings, emptyState, expertTag, pageHeader, seg, sensorChips, sliderRow, subtabs, sw } from "../components.js";
+import { S, deviceById, isExpert, local } from "../state.js";
+import { advancedHint, coolingDeviceIds, deviceFans, deviceSettings, emptyState, expertTag, pageHeader, seg, sensorChips, sliderRow, subtabs, sw } from "../components.js";
 
 export function viewPerformance() {
   const items = [
@@ -120,13 +120,12 @@ function cardPowerPlans() {
 
 function cardLaptopPower() {
   const b = S.laptop_battery || {};
-  const d = S.laptop_display || {};
-  const rates = arr(d.supported_hz);
   const pwrText = b.power_watts != null ? `${b.power_watts > 0 ? "+" : ""}${num(b.power_watts).toFixed(1)} W` : b.ac_online ? "Sur secteur" : "Sur batterie";
-  const hasOmenRgb = !!(S.hp_omen && (S.hp_omen.keyboard_type === "FourZoneRgb" || S.hp_omen.keyboard_type === "PerKeyRgb"));
-  const autoBatLabel = hasOmenRgb
-    ? "Économie auto sur batterie (60 Hz + mode Éco + clavier éteint, restauré sur secteur)"
-    : "Économie auto sur batterie (60 Hz + mode Éco, restauré sur secteur)";
+  // Built-in panel and other devices with power settings (brightness, refresh rate…).
+  const powerSettings = arr(S.device_list)
+    .map((d) => deviceSettings(d.info.id, { sections: ["power"], bare: true }))
+    .filter(Boolean)
+    .join("");
   return `
     <div class="card accent-cyan mb-16">
       <div class="card-head">
@@ -136,68 +135,27 @@ function cardLaptopPower() {
         </div>
         ${b.present ? `<span class="pill ${b.ac_online ? "emerald" : "amber"}"><span class="dot"></span>${b.ac_online ? "Secteur" : "Batterie"}</span>` : ""}
       </div>
-      ${d.brightness_pct != null ? `<div class="stack mb-16">${sliderRow("Luminosité écran", { id: "laptop-bright", min: 0, max: 100, value: num(d.brightness_pct, 80), input: "label", change: "laptop-bright", data: { fmt: "pct100" }, display: `${num(d.brightness_pct, 80)} %` })}</div>` : ""}
-      ${rates.length ? `
-        <div class="row-between mb-16">
-          <div><div class="field-label">Fréquence de l'écran</div><div class="muted small">${num(d.width)}×${num(d.height)}</div></div>
-          ${seg(rates.map((hz) => [hz, `${hz} Hz`]), d.current_hz, "laptop-hz")}
-        </div>` : ""}
-      ${b.present ? `<div>${sw(!!S.system_prefs.laptop_auto_battery_saver, autoBatLabel, "laptop-auto-bat")}</div>` : ""}
+      ${powerSettings ? `<div class="mb-16">${powerSettings}</div>` : ""}
+      ${b.present ? `<div>${sw(!!S.system_prefs.laptop_auto_battery_saver, "Économie auto sur batterie (écran à 60 Hz, profil silencieux et clavier éteint quand c'est possible ; restauré sur secteur)", "laptop-auto-bat")}</div>` : ""}
     </div>`;
 }
 
-function viewOmenCooling() {
-  const o = S.hp_omen || {};
-  const ex = isExpert();
-  const rpms = arr(S.telemetry.hp_omen && S.telemetry.hp_omen.fan_rpms).length
-    ? arr(S.telemetry.hp_omen.fan_rpms)
-    : arr(o.fan_rpms);
-  const manualPct = o.manual_fan_pct != null ? num(o.manual_fan_pct) : 65;
+/** Fans driven through a device's `Cooling` (laptop embedded controller…), with its performance settings. */
+function viewDeviceCooling(ids) {
   return `
-    ${!o.is_admin ? `
-      <div class="alert warn">
-        <span class="alert-icon">${ICONS.lock}</span>
-        <div class="grow"><div class="alert-title">Droits administrateur requis pour piloter HP OMEN</div><div class="muted">L'interface BIOS WMI (hpqBIntM) exige une élévation administrateur pour contrôler les ventilateurs et la puissance GPU.</div></div>
-        <button type="button" class="btn btn-warn btn-sm" data-act="relaunch-admin">Relancer en administrateur</button>
-      </div>` : ""}
     <div class="card mb-16">
-      <div class="card-head">
-        <div><h2 class="card-title">Capteurs en direct · ${esc(o.model || "HP OMEN")}</h2><div class="card-desc">${esc(o.diagnostic || "")}</div></div>
-        <button type="button" class="btn btn-sm btn-secondary" data-act="omen-refresh">Actualiser</button>
-      </div>
+      <div class="card-head"><div><h2 class="card-title">Capteurs en direct</h2>${isExpert() ? `<div class="card-desc">${esc((S.telemetry.sensors && S.telemetry.sensors.source) || "")}</div>` : ""}</div></div>
       <div class="sensor-chip-row" id="cool-live">${sensorChips(S.telemetry)}</div>
     </div>
-    <div class="grid-2">
-      <div class="card accent-amber">
-        <div class="card-head">
-          <div><h2 class="card-title">Profil thermique & Ventilateurs</h2><div class="card-desc">Pilotage natif sans OMEN Gaming Hub</div></div>
-          <div class="row">${rpms.map((r, idx) => `<span class="pill ${num(r) > 0 ? "amber" : ""}">${idx === 0 ? "CPU" : "GPU"} ${num(r)} tr/min</span>`).join("")}</div>
-        </div>
-        <div class="row-between mb-16">
-          <span class="field-label">Mode thermique</span>
-          ${seg([["cool", "Éco / Frais"], ["default", "Équilibré"], ["performance", "Performance"]], o.thermal_mode || "default", "omen-thermal", {}, "amber")}
-        </div>
-        <div class="mb-16">${sw(!!o.max_fan, "Ventilateurs au maximum (Max Fan)", "omen-maxfan")}</div>
-        ${ex ? `
-          <div class="divider"></div>
-          <div class="stack" style="gap:10px">
-            ${sliderRow(`Vitesse manuelle ${expertTag()}`, { id: "omen-fan-pct", min: 30, max: 100, value: manualPct, input: "label", data: { fmt: "pct100" }, display: `${manualPct} %` })}
-            <div class="row">
-              <button type="button" class="btn btn-primary btn-sm" data-act="omen-fan-apply">Forcer la vitesse</button>
-              <button type="button" class="btn btn-secondary btn-sm" data-act="omen-fan-auto">Auto BIOS</button>
-            </div>
-            <div class="muted small">Plancher de sécurité à 30 %. OpenGear rafraîchit le watchdog EC automatiquement toutes les 12 s tant qu'une vitesse fixe est active.</div>
-          </div>` : advancedHint("Le forçage manuel des ventilateurs est disponible en mode Expert.")}
-      </div>
-      <div class="card accent-rog">
-        <div class="card-head"><div><h2 class="card-title">Puissance GPU (Dynamic Boost)</h2><div class="card-desc">${esc(S.static_info.gpu_name || "Carte graphique dédiée")}</div></div></div>
-        <div class="row-between mb-16">
-          <span class="field-label">Enveloppe TGP</span>
-          ${seg([["min", "Minimum"], ["med", "Équilibré"], ["max", "Maximum"]], o.gpu_power || "min", "omen-gpupow")}
-        </div>
-        <div class="note">Règle la limite de puissance partagée entre CPU et dGPU RTX via le BIOS HP OMEN (sans service OMEN en arrière-plan).</div>
-      </div>
-    </div>`;
+    ${ids.map((id) => {
+      const d = deviceById(id);
+      const name = d ? d.info.model : id;
+      return `
+        <div class="grid-2 mb-16">
+          ${deviceFans(id, { title: `Ventilateurs · ${name}` })}
+          ${deviceSettings(id, { sections: ["performance"], title: `Performances · ${name}` })}
+        </div>`;
+    }).join("")}`;
 }
 
 function normTempSource(src) {
@@ -208,9 +166,8 @@ function normTempSource(src) {
 
 function viewCooling() {
   const c = S.cooling;
-  if (S.hp_omen && S.hp_omen.detected && !c.wmi_available && !(c.superio && c.superio.detected)) {
-    return viewOmenCooling();
-  }
+  const deviceIds = coolingDeviceIds();
+  if (deviceIds.length && !c.channels.length) return viewDeviceCooling(deviceIds);
   const ex = isExpert();
   if (!c.channels.length) return emptyState("Ventilation non pilotable", c.message || "Aucun canal de ventilation n'a été trouvé sur cette carte mère.");
   const ch = c.channels[local.selectedCoolingIdx] || c.channels[0];
