@@ -2,7 +2,7 @@ import { arr, clamp, esc, num, plural, safeHex } from "../utils.js";
 import { S, isExpert, local } from "../state.js";
 import {
   advancedHint, deviceSettings, emptyState, expertTag, pageHeader, renderKeyboard, seg, sliderRow,
-  sw, swatches,
+  subtabs, sw, swatches,
 } from "../components.js";
 
 function lightingDevices() {
