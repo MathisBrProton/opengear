@@ -643,6 +643,7 @@ function setDeviceSetting(el, value, btn = null) {
 }
 
 const CHANGE = {
+  "exp-driver": (el) => call("set_experimental_driver", { name: el.dataset.name, enabled: el.checked }, { ok: el.checked ? "Pilote expérimental activé" : "Pilote expérimental désactivé" }).then((r) => { if (r === null) el.checked = !el.checked; }),
   "dev-set": (el) => setDeviceSetting(el, el.type === "checkbox" ? el.checked : el.type === "range" ? Number(el.value) : el.value),
   "switch-profile": (el) => call("switch_profile", { name: el.value }, { ok: `Profil « ${el.value} » activé` }),
   "rgb-commit": (el) => {

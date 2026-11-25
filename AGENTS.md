@@ -52,12 +52,18 @@ Interdits absolus :
 
 ### Ajouter un appareil ou une marque (ex. Razer)
 
+Protocoles d'autres projets : jamais leur code. On travaille à partir des fiches de
+`docs/protocols/` (rédigées en « salle blanche ») ; les tables d'appareils sont **générées** depuis
+la fiche (ex. `python -I tools/protocol-lab/gen_razer_tables.py` → `opengear-razer/src/tables.rs`).
+
 1. Crate `opengear-razer` : le protocole, et `impl Driver` + `impl Device` (`opengear_core::driver`).
 2. `Device::settings()` décrit chaque réglage comme **donnée** (`Setting::toggle/slider/choice/color`,
    `.expert()`, `.stored_in_device()`, `.help()`). Réglage partagé → id de `setting_ids`
    (polling, luminosité, verrou Windows, SOCD matériel…) ; réglage propre à la marque → id préfixé
    (`"razer.hyperpolling"`). `apply_setting` ne reçoit que des valeurs déjà validées.
-3. Une ligne dans `device_drivers()` de `crates/opengear-app/src/drivers.rs`.
+3. Une ligne dans `device_drivers()` de `crates/opengear-app/src/drivers.rs`. Un pilote qui n'a
+   pas été testé sur du vrai matériel renvoie `experimental() = true` : il n'est découvert que si
+   l'utilisateur l'active (Système → Préférences → Pilotes expérimentaux).
 4. C'est tout : l'appareil apparaît dans Appareils, ses réglages dans chaque onglet (filtrés par
    section et par mode Simple / Expert), sa batterie dans les alertes. **Aucune commande IPC ni
    aucun écran par marque à écrire** : la commande générique est `device_set`.
@@ -125,4 +131,11 @@ La CI exécute exactement ces commandes. Si `cargo fmt` ou `cargo clippy` est in
 - Souris/casques Corsair sans carte de LEDs connue (`Device::lighting()` renvoie `None`) et mode
   direct par LED RAM ENE (seul le registre uniforme `REG_DIRECT = 0` est utilisé sans fiche ENE
   détaillée) restent à compléter.
+- L'app accède encore aux types d'un pilote par `Device::as_any()` + `downcast_ref` (Corsair pour
+  la carte clavier, les paliers DPI et les profils HWP ; HP OMEN pour les ventilateurs) : chaque
+  accès disparaît quand la capacité correspondante devient un trait. N'en ajouter aucun nouveau.
+- Pilote Razer (`opengear-razer`, **expérimental**, jamais testé sur matériel) : protocole générique
+  90 octets uniquement (177 appareils). Non pris en charge : casques Kraken, contrôleur ARGB, AIO
+  Hanbo, modèles « custom », appareils relayés par un récepteur sans fil, maintien d'éclairage des
+  Blade 14 (0270, 028C). Aucune écriture en mémoire de l'appareil.
 - JIS / ABNT utilisent la géométrie ISO dans `physical_layout`.

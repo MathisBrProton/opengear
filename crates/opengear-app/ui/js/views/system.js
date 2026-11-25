@@ -65,6 +65,21 @@ function sysPrefs() {
           ${sp.lights_blackout ? `<div class="muted">Éclairage actuellement coupé (verrouillage ou inactivité).</div>` : ""}
         </div>
       </div>
+    </div>
+    ${cardExperimentalDrivers()}`;
+}
+
+/** Drivers written from protocol notes but never tested on real hardware: opt-in only. */
+function cardExperimentalDrivers() {
+  const list = arr(S.experimental_drivers);
+  if (!list.length) return "";
+  return `
+    <div class="card mt-16">
+      <div class="card-head"><div><h2 class="card-title">Pilotes expérimentaux <span class="pill amber">Non testés</span></h2>
+        <div class="card-desc">Écrits à partir de fiches de protocole, sans avoir pu être essayés sur un vrai appareil. Ils ne pilotent que l'éclairage, sans rien enregistrer dans l'appareil. Active-les seulement si tu possèdes ce matériel, et signale tout comportement anormal.</div></div></div>
+      <div class="stack" style="gap:10px">
+        ${list.map((d) => sw(!!d.enabled, esc(d.label), "exp-driver", { name: d.name })).join("")}
+      </div>
     </div>`;
 }
 

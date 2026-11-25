@@ -10,11 +10,13 @@ use opengear_hp::HpOmenDriver;
 use opengear_logitech::LogitechDriver;
 use opengear_mainboard::{PawnIoRamBackend, RamRgb, RamRgbDriver};
 use opengear_openrgb::OpenRgbRamBackend;
+use opengear_razer::RazerDriver;
 
 /// Device drivers discovered through the shared model (`opengear_core::driver`).
 ///
 /// A new vendor plugs in here: its crate implements `Driver` + `Device`, and one line below makes
-/// its devices appear with their status, settings and lighting in every view.
+/// its devices appear with their status, settings and lighting in every view. Drivers marked
+/// `experimental()` are only discovered when the user enables them.
 pub fn device_drivers() -> Vec<Box<dyn Driver>> {
     vec![
         Box::new(CorsairDriver),
@@ -22,6 +24,7 @@ pub fn device_drivers() -> Vec<Box<dyn Driver>> {
         Box::new(AsusAuraDriver),
         Box::new(RamRgbDriver::new(ram_rgb())),
         Box::new(HpOmenDriver),
+        Box::new(RazerDriver),
     ]
 }
 

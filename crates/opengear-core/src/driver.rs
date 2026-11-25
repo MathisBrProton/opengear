@@ -350,6 +350,15 @@ pub trait Driver: Send + Sync {
     fn usb_vendor_ids(&self) -> &'static [u16] {
         &[]
     }
+    /// Name shown to the user (defaults to [`Driver::name`]).
+    fn display_name(&self) -> &'static str {
+        self.name()
+    }
+    /// Untested on real hardware: only discovered when the user enables it
+    /// (`AppConfig::experimental_drivers`).
+    fn experimental(&self) -> bool {
+        false
+    }
     /// Open every device currently connected. Called at start-up and on hot-plug.
     fn discover(&self) -> Vec<Box<dyn Device>>;
 }

@@ -572,6 +572,7 @@ impl BackendEngine {
             "selftest": self.last_selftest,
             "devices": devices,
             "device_list": device_list,
+            "experimental_drivers": self.experimental_drivers_json(),
         });
         root["is_laptop"] = json!(self.is_laptop);
         root["laptop_battery"] = json!(&self.laptop_battery);

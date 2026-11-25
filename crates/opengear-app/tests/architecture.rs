@@ -22,6 +22,7 @@ const VENDOR_MARKERS: &[(&str, &[&str])] = &[
     ("opengear-corsair", &["bragi"]),
     ("opengear-logitech", &["hidpp", "hid++"]),
     ("opengear-openrgb", &["orgb"]),
+    ("opengear-razer", &["rzreport"]),
 ];
 
 /// Low-level I/O that only driver crates may perform.

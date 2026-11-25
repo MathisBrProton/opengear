@@ -1495,6 +1495,7 @@ dependencies = [
  "opengear-mainboard",
  "opengear-openrgb",
  "opengear-platform",
+ "opengear-razer",
  "serde",
  "serde_json",
  "tao",
@@ -1609,6 +1610,19 @@ dependencies = [
  "tracing",
  "windows",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "opengear-razer"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "hidapi",
+ "opengear-core",
+ "opengear-platform",
+ "serde",
+ "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]

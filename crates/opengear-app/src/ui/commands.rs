@@ -764,6 +764,12 @@ impl BackendEngine {
                 }
                 Ok(st)
             }
+            "set_experimental_driver" => {
+                let name = p["name"].as_str().ok_or("name manquant")?;
+                let enabled = p["enabled"].as_bool().ok_or("enabled manquant")?;
+                self.set_experimental_driver(name, enabled)?;
+                Ok(self.full_state_json())
+            }
             "reconnect_all" => {
                 self.reconnect_all();
                 Ok(self.full_state_json())

@@ -45,3 +45,11 @@ par un chemin en lecture seule et respecter les garde-fous d'écriture d'AGENTS.
 | [hyperx.md](hyperx.md) | HyperX : claviers Alloy/Origins, souris Pulsefire, tapis, micros QuadCast ; tables d'emplacements des claviers |
 
 Fiches à venir (autres lots) : voir la colonne « OpenGear » du catalogue.
+
+## Implémentations
+
+| Fiche | Crate | État |
+|---|---|---|
+| `razer.md` | `opengear-razer` (tables générées par `tools/protocol-lab/gen_razer_tables.py`) | protocole générique 90 octets, expérimental, non testé sur matériel |
+| `steelseries.md` | — | à faire |
+| `hyperx.md` | — | à faire |

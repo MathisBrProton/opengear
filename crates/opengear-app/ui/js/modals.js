@@ -93,6 +93,14 @@ export function confirmDialog(r) {
 
 export function riskOf(cmd, p = {}) {
   switch (cmd) {
+    case "set_experimental_driver":
+      if (!p.enabled) return null;
+      return {
+        title: "Activer un pilote expérimental ?",
+        body: "Ce pilote n'a jamais été testé sur du vrai matériel. Il n'écrit rien dans la mémoire de l'appareil (éclairage seulement, état non conservé), mais un appareil peut mal réagir ou ignorer les commandes.",
+        details: ["Les appareils concernés sont recherchés immédiatement après l'activation.", "Tu peux le désactiver à tout moment ici."],
+        confirm: "Activer",
+      };
     case "logi_flash_profile":
       return {
         title: "Écrire ce profil dans la souris ?",

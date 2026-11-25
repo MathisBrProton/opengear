@@ -11,8 +11,17 @@ use opengear_core::driver::{
 use serde_json::{Value as Json, json};
 
 /// Re-discover the devices of every registered driver (start-up, rescan).
-pub(crate) fn discover_all(drivers: &[Box<dyn Driver>]) -> Vec<Box<dyn Device>> {
-    drivers.iter().flat_map(|d| d.discover()).collect()
+/// Discover the devices of every registered driver; experimental drivers only when the user
+/// enabled them (`enabled_experimental` = `AppConfig::experimental_drivers`).
+pub(crate) fn discover_all(
+    drivers: &[Box<dyn Driver>],
+    enabled_experimental: &std::collections::BTreeSet<String>,
+) -> Vec<Box<dyn Device>> {
+    drivers
+        .iter()
+        .filter(|d| !d.experimental() || enabled_experimental.contains(d.name()))
+        .flat_map(|d| d.discover())
+        .collect()
 }
 
 impl BackendEngine {
@@ -51,12 +60,54 @@ impl BackendEngine {
             .drain(..)
             .filter(|d| d.info().connection == Connection::Internal)
             .collect();
+        let enabled = &self.config.experimental_drivers;
         for drv in &self.drivers {
-            if !drv.usb_vendor_ids().is_empty() {
+            let allowed = !drv.experimental() || enabled.contains(drv.name());
+            if allowed && !drv.usb_vendor_ids().is_empty() {
                 rebuilt.extend(drv.discover());
             }
         }
         self.driver_devices = rebuilt;
+    }
+
+    /// Experimental drivers and whether the user enabled them (Système → Pilotes expérimentaux).
+    pub(crate) fn experimental_drivers_json(&self) -> Json {
+        Json::Array(
+            self.drivers
+                .iter()
+                .filter(|d| d.experimental())
+                .map(|d| {
+                    serde_json::json!({
+                        "name": d.name(),
+                        "label": d.display_name(),
+                        "enabled": self.config.experimental_drivers.contains(d.name()),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Enable or disable an experimental driver, then rediscover devices.
+    pub(crate) fn set_experimental_driver(
+        &mut self,
+        name: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        if !self
+            .drivers
+            .iter()
+            .any(|d| d.experimental() && d.name() == name)
+        {
+            return Err(format!("Pilote expérimental inconnu : {name}"));
+        }
+        if enabled {
+            self.config.experimental_drivers.insert(name.to_string());
+        } else {
+            self.config.experimental_drivers.remove(name);
+        }
+        self.persist_config();
+        self.reconnect_all();
+        Ok(())
     }
 
     pub(crate) fn device_list_json(&mut self) -> Json {
@@ -180,6 +231,31 @@ mod tests {
     #[test]
     fn registered_drivers_are_all_discovered() {
         let drivers: Vec<Box<dyn Driver>> = vec![Box::new(FakeDriver), Box::new(FakeDriver)];
-        assert_eq!(discover_all(&drivers).len(), 4);
+        let none = std::collections::BTreeSet::new();
+        assert_eq!(discover_all(&drivers, &none).len(), 4);
+    }
+
+    struct ExperimentalDriver;
+
+    impl Driver for ExperimentalDriver {
+        fn name(&self) -> &'static str {
+            "exp"
+        }
+        fn experimental(&self) -> bool {
+            true
+        }
+        fn discover(&self) -> Vec<Box<dyn Device>> {
+            vec![Box::new(FakeDevice)]
+        }
+    }
+
+    #[test]
+    fn experimental_drivers_need_an_explicit_opt_in() {
+        let drivers: Vec<Box<dyn Driver>> =
+            vec![Box::new(FakeDriver), Box::new(ExperimentalDriver)];
+        let mut enabled = std::collections::BTreeSet::new();
+        assert_eq!(discover_all(&drivers, &enabled).len(), 2);
+        enabled.insert("exp".to_string());
+        assert_eq!(discover_all(&drivers, &enabled).len(), 3);
     }
 }

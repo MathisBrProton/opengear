@@ -4,7 +4,7 @@ use crate::keyboard::FormFactor;
 use crate::lighting::{DeviceLightingConfig, Placement};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -201,6 +201,9 @@ pub struct AppConfig {
     /// Placement of each lighting device on the shared desk canvas (`device_id -> Placement`).
     #[serde(default)]
     pub device_placements: BTreeMap<String, Placement>,
+    /// Experimental drivers explicitly enabled by the user (all disabled by default).
+    #[serde(default)]
+    pub experimental_drivers: BTreeSet<String>,
     pub profiles: Vec<KeyboardProfile>,
 }
 
@@ -226,6 +229,7 @@ impl Default for AppConfig {
             omen_zone_colors: default_omen_zones(),
             laptop_auto_battery_saver: false,
             device_placements: BTreeMap::new(),
+            experimental_drivers: BTreeSet::new(),
             profiles: vec![KeyboardProfile::default()],
         }
     }
@@ -584,6 +588,7 @@ CAPS = { type = "Remap", target = "F13" }
         let (cfg, warning) = AppConfig::load_or_recover(&dir.join(CONFIG_FILE_NAME));
         assert!(warning.is_none());
         assert_eq!(cfg.profiles.len(), 1);
+        assert!(cfg.experimental_drivers.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 }

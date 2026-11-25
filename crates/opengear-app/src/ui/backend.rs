@@ -158,7 +158,8 @@ impl BackendEngine {
         let power_plans = list_power_plans();
 
         let drivers = crate::drivers::device_drivers();
-        let mut driver_devices = super::devices::discover_all(&drivers);
+        let mut driver_devices =
+            super::devices::discover_all(&drivers, &config.experimental_drivers);
         seed_and_resize_device_lighting(&mut config, &mut driver_devices);
 
         if let Some(kb) = driver_devices.iter().find_map(|d| {
@@ -780,7 +781,10 @@ impl BackendEngine {
             } => {
                 if refresh_hw {
                     self.superio = read_superio_snapshot();
-                    self.driver_devices = super::devices::discover_all(&self.drivers);
+                    self.driver_devices = super::devices::discover_all(
+                        &self.drivers,
+                        &self.config.experimental_drivers,
+                    );
                     seed_and_resize_device_lighting(&mut self.config, &mut self.driver_devices);
                 }
                 if let Some(rep) = selftest {
@@ -1067,7 +1071,8 @@ impl BackendEngine {
     }
 
     pub(crate) fn reconnect_all(&mut self) {
-        self.driver_devices = super::devices::discover_all(&self.drivers);
+        self.driver_devices =
+            super::devices::discover_all(&self.drivers, &self.config.experimental_drivers);
         seed_and_resize_device_lighting(&mut self.config, &mut self.driver_devices);
         self.last_device_frame_at.clear();
         self.live_active_devices.clear();
