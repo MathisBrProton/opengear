@@ -288,18 +288,17 @@ pub fn probe_and_refresh(
                 st.status.charging = Some(resp[6] == 1 || resp[6] == 2);
             }
         }
-        ProtocolFamily::CloudStingerCoreWireless => {
+        ProtocolFamily::CloudStingerCoreWireless
             if io
                 .send_feature(&cloud_stinger_core_wireless_battery_req())
-                .is_ok()
+                .is_ok() =>
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if let Ok(n) = io.get_feature(&mut buf)
+                && let Some((pct, chg)) = parse_cloud_stinger_core_wireless_battery(&buf[..n])
             {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                if let Ok(n) = io.get_feature(&mut buf)
-                    && let Some((pct, chg)) = parse_cloud_stinger_core_wireless_battery(&buf[..n])
-                {
-                    st.status.battery_pct = Some(pct);
-                    st.status.charging = chg;
-                }
+                st.status.battery_pct = Some(pct);
+                st.status.charging = chg;
             }
         }
         _ => {}
