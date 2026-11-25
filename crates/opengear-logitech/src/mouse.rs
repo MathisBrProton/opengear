@@ -1,34 +1,10 @@
 use crate::features::*;
-use crate::hidpp::{HidppError, HidppTransport};
-use crate::onboard::{MouseButtonAction, OnboardMemoryDesc, OnboardProfile};
+pub use crate::hidpp::{BatteryInfo, BatteryState};
+use crate::hidpp::{HidppError, HidppTransport, read_battery_info};
+use crate::onboard::{OnboardMemoryDesc, OnboardProfile};
 use opengear_core::Rgb;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BatteryState {
-    Discharging,
-    Charging,
-    AlmostFull,
-    Full,
-    SlowCharging,
-    Error,
-    Unknown(u8),
-}
-
-impl BatteryState {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Discharging => "Sur batterie",
-            Self::Charging => "En charge",
-            Self::AlmostFull => "Presque pleine",
-            Self::Full => "Chargée (100%)",
-            Self::SlowCharging => "Charge lente",
-            Self::Error => "Erreur charge",
-            Self::Unknown(_) => "Inconnu",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatteryPowerModel {
@@ -72,13 +48,6 @@ impl BatteryPowerModel {
         };
         Self::from_params(battery_pct, 874.0, 1.5456, 2.3064, radio_mw)
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BatteryInfo {
-    pub percent: Option<u8>,
-    pub voltage_mv: Option<u16>,
-    pub state: BatteryState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,11 +191,10 @@ impl LogitechMouse {
 
     /// Connect to the first Logitech LIGHTSPEED / Unifying / Wired mouse on Usage Page `0xFF00`.
     pub fn connect() -> Result<Self, HidppError> {
-        let transport = HidppTransport::open_matching(None, 0xFF00, Some(0x0002))?;
-        if transport.proto_major == 0 {
-            return Err(HidppError::DeviceNotFound);
-        }
-        Ok(Self::from_transport(transport))
+        Self::connect_all()
+            .into_iter()
+            .next()
+            .ok_or(HidppError::DeviceNotFound)
     }
 
     fn from_transport(transport: HidppTransport) -> Self {
@@ -301,20 +269,15 @@ impl LogitechMouse {
         if button_idx >= prof.buttons.len() {
             return Err(HidppError::Protocol(0x02, "Index bouton hors limites"));
         }
-        let own_sector = match prof.buttons[button_idx] {
-            MouseButtonAction::OnboardMacro { sector, .. } => Some(sector as u16),
-            _ => None,
-        };
+        let own_sector = prof.buttons[button_idx].referenced_macro_sector();
+        let old_action = prof.buttons[button_idx].clone();
         // Every macro sector referenced by any loaded profile (incl. G HUB's) is off-limits.
         let referenced: Vec<u16> = self
             .info
             .onboard_profiles
             .iter()
             .flat_map(|p| p.buttons.iter().chain(p.gshift_buttons.iter()))
-            .filter_map(|b| match b {
-                MouseButtonAction::OnboardMacro { sector, .. } => Some(*sector as u16),
-                _ => None,
-            })
+            .filter_map(|b| b.referenced_macro_sector())
             .collect();
         let first = desc.profile_count as u16 + 1;
         let end = (desc.sector_count as u16).min(0x0100);
@@ -332,7 +295,14 @@ impl LogitechMouse {
             replace_existing,
         )?;
         self.info.onboard_profiles[profile_idx].buttons[button_idx] = action;
-        self.flash_onboard_profile(profile_idx)?;
+        if let Err(e) = self.flash_onboard_profile(profile_idx) {
+            self.info.onboard_profiles[profile_idx].buttons[button_idx] = old_action;
+            if !replace_existing {
+                let mut blank = vec![0xFFu8; desc.sector_size as usize];
+                let _ = OnboardProfile::write_sector(&self.transport, macro_sector, &mut blank);
+            }
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -368,65 +338,7 @@ impl LogitechMouse {
     }
 
     fn read_battery_inner(t: &HidppTransport) -> Option<BatteryInfo> {
-        // 1. Prefer 0x1004 Unified Battery
-        if let Ok(r) = t.request_feature(FEAT_UNIFIED_BATTERY, 0x10, &[]) {
-            if r.len() >= 3 {
-                let pct = r[0];
-                let status = match r[2] {
-                    0 => BatteryState::Discharging,
-                    1 => BatteryState::Charging,
-                    2 => BatteryState::SlowCharging,
-                    3 => BatteryState::Full,
-                    4 => BatteryState::AlmostFull,
-                    other => BatteryState::Unknown(other),
-                };
-                return Some(BatteryInfo {
-                    percent: if pct <= 100 { Some(pct) } else { None },
-                    voltage_mv: None,
-                    state: status,
-                });
-            }
-        }
-        // 2. Fallback 0x1000 Battery Status
-        if let Ok(r) = t.request_feature(FEAT_BATTERY_STATUS, 0x00, &[]) {
-            if r.len() >= 3 {
-                let pct = r[0];
-                let status = match r[2] {
-                    0 => BatteryState::Discharging,
-                    1 => BatteryState::Charging,
-                    2 => BatteryState::AlmostFull,
-                    3 => BatteryState::Full,
-                    4 => BatteryState::SlowCharging,
-                    5..=7 => BatteryState::Error,
-                    other => BatteryState::Unknown(other),
-                };
-                return Some(BatteryInfo {
-                    percent: Some(pct.min(100)),
-                    voltage_mv: None,
-                    state: status,
-                });
-            }
-        }
-        // 3. Fallback 0x1001 Battery Voltage
-        if let Ok(r) = t.request_feature(FEAT_BATTERY_VOLTAGE, 0x00, &[]) {
-            if r.len() >= 3 {
-                let mv = u16::from_be_bytes([r[0], r[1]]);
-                let flags = r[2];
-                let state = if (flags & 0x80) != 0 {
-                    BatteryState::Charging
-                } else {
-                    BatteryState::Discharging
-                };
-                // Rough Li-Po estimation 3500..4180 mV
-                let pct = ((mv.saturating_sub(3500) as f32 / 680.0) * 100.0).clamp(0.0, 100.0) as u8;
-                return Some(BatteryInfo {
-                    percent: Some(pct),
-                    voltage_mv: Some(mv),
-                    state,
-                });
-            }
-        }
-        None
+        read_battery_info(t)
     }
 
     fn parse_dpi_list(bytes: &[u8]) -> (u16, u16, u16) {
@@ -459,47 +371,50 @@ impl LogitechMouse {
     fn read_dpi_inner(t: &HidppTransport) -> Option<DpiSensorInfo> {
         // 1. Try 0x2202 Extended Adjustable DPI (HERO 2: X/Y + LOD!)
         if t.get_feature_index(FEAT_EXTENDED_ADJUSTABLE_DPI).is_some() {
-            let caps = t.request_feature(FEAT_EXTENDED_ADJUSTABLE_DPI, 0x10, &[0x00]).ok()?;
-            let has_y = caps.get(2).map_or(false, |&b| (b & 0x01) != 0);
-            let has_lod = caps.get(2).map_or(false, |&b| (b & 0x02) != 0);
+            if let Ok(caps) = t.request_feature(FEAT_EXTENDED_ADJUSTABLE_DPI, 0x10, &[0x00]) {
+                let has_y = caps.get(2).map_or(false, |&b| (b & 0x01) != 0);
+                let has_lod = caps.get(2).map_or(false, |&b| (b & 0x02) != 0);
 
-            let list_resp = t
-                .request_feature(FEAT_EXTENDED_ADJUSTABLE_DPI, 0x20, &[0x00, 0x00])
-                .unwrap_or_default();
-            let (min_dpi, max_dpi, step_dpi) = if list_resp.len() >= 5 {
-                Self::parse_dpi_list(&list_resp[3..])
-            } else {
-                (100, 32000, 50)
-            };
+                let list_resp = t
+                    .request_feature(FEAT_EXTENDED_ADJUSTABLE_DPI, 0x20, &[0x00, 0x00])
+                    .unwrap_or_default();
+                let (min_dpi, max_dpi, step_dpi) = if list_resp.len() >= 5 {
+                    Self::parse_dpi_list(&list_resp[3..])
+                } else {
+                    (100, 32000, 50)
+                };
 
-            let cur = t.request_feature(FEAT_EXTENDED_ADJUSTABLE_DPI, 0x50, &[0x00]).ok()?;
-            debug!("0x2202 getDpi raw: {:02X?}", cur);
-            if cur.len() >= 3 {
-                // Byte 0 = sensor index, bytes 1..3 = X DPI, bytes 3..5 = Y DPI (if supported), byte 5 = LOD
-                let dpi_x = u16::from_be_bytes([cur[1], cur[2]]);
-                let dpi_y = if has_y && cur.len() >= 5 {
-                    let y = u16::from_be_bytes([cur[3], cur[4]]);
-                    if y > 0 { y } else { dpi_x }
-                } else {
-                    dpi_x
-                };
-                let lod = if has_lod && cur.len() >= 6 {
-                    Some(LodLevel::from_u8(cur[5]))
-                } else {
-                    None
-                };
-                return Some(DpiSensorInfo {
-                    extended: true,
-                    dpi_x,
-                    dpi_y,
-                    default_dpi: 800,
-                    min_dpi,
-                    max_dpi,
-                    step_dpi,
-                    supports_independent_xy: has_y,
-                    supports_lod: has_lod,
-                    lod,
-                });
+                if let Ok(cur) = t.request_feature(FEAT_EXTENDED_ADJUSTABLE_DPI, 0x50, &[0x00]) {
+                    debug!("0x2202 getDpi raw: {:02X?}", cur);
+                    if cur.len() >= 3 {
+                        // Byte 0 = sensor index, bytes 1..3 = X DPI, bytes 3..5 = Y DPI (if supported), followed by LOD
+                        let dpi_x = u16::from_be_bytes([cur[1], cur[2]]);
+                        let dpi_y = if has_y && cur.len() >= 5 {
+                            let y = u16::from_be_bytes([cur[3], cur[4]]);
+                            if y > 0 { y } else { dpi_x }
+                        } else {
+                            dpi_x
+                        };
+                        let lod_idx = if has_y { 5 } else { 3 };
+                        let lod = if has_lod && cur.len() > lod_idx {
+                            Some(LodLevel::from_u8(cur[lod_idx]))
+                        } else {
+                            None
+                        };
+                        return Some(DpiSensorInfo {
+                            extended: true,
+                            dpi_x,
+                            dpi_y,
+                            default_dpi: 800,
+                            min_dpi,
+                            max_dpi,
+                            step_dpi,
+                            supports_independent_xy: has_y,
+                            supports_lod: has_lod,
+                            lod,
+                        });
+                    }
+                }
             }
         }
 
@@ -771,9 +686,9 @@ impl LogitechMouse {
             &desc,
             &enabled_flags,
         )?;
-        // Re-select active profile so firmware reloads the newly flashed parameters immediately
-        let slot = self.info.onboard_profiles[profile_idx_0based].slot_index as u16;
-        let _ = self.set_active_profile(slot);
+        // Re-select active profile (by sector address) so firmware reloads the newly flashed parameters immediately
+        let sector = self.info.onboard_profiles[profile_idx_0based].sector_addr;
+        let _ = self.set_active_profile(sector);
         self.refresh_telemetry();
         Ok(())
     }
@@ -817,15 +732,27 @@ impl LogitechMouse {
                     }
                 }
             }
+        } else if t.get_feature_index(FEAT_RGB_EFFECTS).is_some() {
+            if let Ok(info_r) = t.request_feature(FEAT_RGB_EFFECTS, 0x00, &[]) {
+                let count = info_r.first().copied().unwrap_or(0).max(1).min(8);
+                for z in 0..count {
+                    zones.push(LedZoneInfo {
+                        index: z,
+                        location: if count == 1 {
+                            "Zone RGB".to_string()
+                        } else {
+                            format!("Zone RGB {}", z + 1)
+                        },
+                        num_effects: 4,
+                    });
+                }
+            }
         }
         zones
     }
 
-    /// Set Color LED effect on a zone via `0x8070` (`fn 0x30` setZoneEffect).
+    /// Set Color LED effect on a zone via `0x8070` (`fn 0x30`) or fallback `0x8071` (`fn 0x10`).
     pub fn set_led_zone(&mut self, zone_idx: u8, mode: MouseLedMode, color: Rgb, speed_ms: u16) -> Result<(), HidppError> {
-        if self.transport.get_feature_index(FEAT_COLOR_LED_EFFECTS).is_none() {
-            return Err(HidppError::UnsupportedFeature(FEAT_COLOR_LED_EFFECTS));
-        }
         let sp = speed_ms.to_be_bytes();
         let params: Vec<u8> = match mode {
             MouseLedMode::Off => vec![zone_idx, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -833,8 +760,143 @@ impl LogitechMouse {
             MouseLedMode::Cycle => vec![zone_idx, 0x03, 0, 0, 0, 0, 0, sp[0], sp[1], 100, 0, 0],
             MouseLedMode::Breathing => vec![zone_idx, 0x0A, color.r, color.g, color.b, sp[0], sp[1], 0x01, 100, 0, 0, 0],
         };
-        self.transport
-            .request_feature(FEAT_COLOR_LED_EFFECTS, 0x30, &params)?;
-        Ok(())
+        if self.transport.get_feature_index(FEAT_COLOR_LED_EFFECTS).is_some() {
+            self.transport
+                .request_feature(FEAT_COLOR_LED_EFFECTS, 0x30, &params)?;
+            return Ok(());
+        }
+        if self.transport.get_feature_index(FEAT_RGB_EFFECTS).is_some() {
+            self.transport
+                .request_feature(FEAT_RGB_EFFECTS, 0x10, &params)?;
+            return Ok(());
+        }
+        Err(HidppError::UnsupportedFeature(FEAT_COLOR_LED_EFFECTS))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hidpp::HidIo;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct ScriptedHid {
+        writes: Mutex<Vec<Vec<u8>>>,
+        reads: Mutex<VecDeque<Vec<u8>>>,
+    }
+
+    impl ScriptedHid {
+        fn new(responses: Vec<Vec<u8>>) -> Self {
+            Self {
+                writes: Mutex::new(Vec::new()),
+                reads: Mutex::new(responses.into()),
+            }
+        }
+    }
+
+    impl HidIo for ScriptedHid {
+        fn write(&self, data: &[u8]) -> Result<usize, hidapi::HidError> {
+            self.writes.lock().unwrap().push(data.to_vec());
+            Ok(data.len())
+        }
+        fn read_timeout(
+            &self,
+            buf: &mut [u8],
+            _timeout_ms: i32,
+        ) -> Result<usize, hidapi::HidError> {
+            match self.reads.lock().unwrap().pop_front() {
+                Some(r) => {
+                    let n = r.len().min(buf.len());
+                    buf[..n].copy_from_slice(&r[..n]);
+                    Ok(n)
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    fn resp(feat_idx: u8, sw: u8, payload: &[u8]) -> Vec<u8> {
+        let mut r = vec![0x11, 0xFF, feat_idx, sw];
+        r.extend_from_slice(payload);
+        r.resize(20, 0);
+        r
+    }
+
+    #[test]
+    fn battery_1004_slow_charging_vs_almost_full() {
+        let io = ScriptedHid::new(vec![
+            resp(1, 0x10 | 0x0A, &[92, 0, 2]),
+            resp(1, 0x10 | 0x0A, &[55, 0, 4]),
+        ]);
+        let mut t = HidppTransport::from_io(Box::new(io), 0xFF, true);
+        t.features = vec![FeatureEntry {
+            index: 1,
+            id: FEAT_UNIFIED_BATTERY,
+            flags: 0,
+            version: 0,
+            name: "Unified Battery".into(),
+        }];
+        let almost = LogitechMouse::read_battery_inner(&t).unwrap();
+        assert_eq!(almost.percent, Some(92));
+        assert_eq!(almost.state, BatteryState::AlmostFull);
+
+        let slow = LogitechMouse::read_battery_inner(&t).unwrap();
+        assert_eq!(slow.percent, Some(55));
+        assert_eq!(slow.state, BatteryState::SlowCharging);
+    }
+
+    #[test]
+    fn dpi_2202_lod_without_independent_xy_and_fallback_to_2201() {
+        // Case 1: 0x2202 with has_lod=true, has_y=false -> LOD at byte 3
+        let mut caps = [0u8; 16];
+        caps[2] = 0x02; // has_lod only
+        let io = ScriptedHid::new(vec![
+            resp(1, 0x1A, &caps),
+            resp(1, 0x2A, &[0, 0, 0, 0x03, 0x20, 0x0C, 0x80]), // min 800..3200
+            resp(1, 0x5A, &[0x00, 0x06, 0x40, 0x02]),          // 1600 DPI, LOD=High(2) at byte 3
+        ]);
+        let mut t = HidppTransport::from_io(Box::new(io), 0xFF, true);
+        t.features = vec![FeatureEntry {
+            index: 1,
+            id: FEAT_EXTENDED_ADJUSTABLE_DPI,
+            flags: 0,
+            version: 0,
+            name: "Ext DPI".into(),
+        }];
+        let dpi = LogitechMouse::read_dpi_inner(&t).unwrap();
+        assert!(dpi.extended);
+        assert_eq!(dpi.dpi_x, 1600);
+        assert_eq!(dpi.dpi_y, 1600);
+        assert_eq!(dpi.lod, Some(LodLevel::High));
+
+        // Case 2: 0x2202 error response -> falls back cleanly to 0x2201
+        let err_2202 = vec![0x11, 0xFF, 0xFF, 0x01, 0x1A, 0x05]; // HID++ 2.0 error
+        let io2 = ScriptedHid::new(vec![
+            err_2202,
+            resp(2, 0x1A, &[0, 0x03, 0x20]),
+            resp(2, 0x2A, &[0, 0x06, 0x40, 0x03, 0x20]), // 1600 DPI, default 800
+        ]);
+        let mut t2 = HidppTransport::from_io(Box::new(io2), 0xFF, true);
+        t2.features = vec![
+            FeatureEntry {
+                index: 1,
+                id: FEAT_EXTENDED_ADJUSTABLE_DPI,
+                flags: 0,
+                version: 0,
+                name: "Ext DPI".into(),
+            },
+            FeatureEntry {
+                index: 2,
+                id: FEAT_ADJUSTABLE_DPI,
+                flags: 0,
+                version: 0,
+                name: "DPI".into(),
+            },
+        ];
+        let dpi2 = LogitechMouse::read_dpi_inner(&t2).unwrap();
+        assert!(!dpi2.extended);
+        assert_eq!(dpi2.dpi_x, 1600);
+        assert_eq!(dpi2.default_dpi, 800);
     }
 }

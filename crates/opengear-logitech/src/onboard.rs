@@ -98,6 +98,17 @@ impl OnboardMacroStep {
 }
 
 impl MouseButtonAction {
+    pub fn referenced_macro_sector(self) -> Option<u16> {
+        match self {
+            Self::OnboardMacro { sector, .. } => Some(sector as u16),
+            // Repeat (0x01) / Toggle (0x02) onboard macros use the same sector byte at [1].
+            Self::Raw([0x00..=0x02, sector, _, _]) if sector > 0 && sector < 0x80 => {
+                Some(sector as u16)
+            }
+            _ => None,
+        }
+    }
+
     pub fn decode(raw: [u8; 4]) -> Self {
         match raw[0] {
             0x80 => match raw[1] {
@@ -117,7 +128,8 @@ impl MouseButtonAction {
                 0x03 => Self::ConsumerControl(u16::from_be_bytes([raw[2], raw[3]])),
                 _ => Self::Raw(raw),
             },
-            0x90 => Self::Special(raw[1]),
+            0x90 if raw[2] == 0 && raw[3] == 0 => Self::Special(raw[1]),
+            0x90 => Self::Raw(raw),
             0x00 if raw[1] > 0 && raw[1] < 0x80 => Self::OnboardMacro {
                 sector: raw[1],
                 offset: u16::from_be_bytes([raw[2], raw[3]]),
@@ -293,6 +305,11 @@ impl OnboardProfile {
         sector_size: u16,
     ) -> Result<Vec<u8>, HidppError> {
         let sz = sector_size as usize;
+        if sz < 16 {
+            return Err(HidppError::Flash(format!(
+                "taille de secteur invalide ({sz} octets < 16)"
+            )));
+        }
         let mut data = vec![0u8; sz];
         let sec_be = sector.to_be_bytes();
         let mut offset = 0usize;
@@ -317,6 +334,7 @@ impl OnboardProfile {
     }
 
     /// Write a full sector with CRC-16 CCITT to onboard flash (`0x60` -> `0x70` x N -> `0x80`).
+    /// Always issues `0x80` (`MEMORY_WRITE_END`) if `0x70` fails mid-sector so flash state stays clean.
     pub fn write_sector(
         t: &HidppTransport,
         sector: u16,
@@ -333,21 +351,21 @@ impl OnboardProfile {
 
         let sec_be = sector.to_be_bytes();
         let cnt_be = (sz as u16).to_be_bytes();
-        // 0x60 MEMORY_ADDR_WRITE: [sector_hi, sector_lo, sub_hi=0, sub_lo=0, count_hi, count_lo]
         t.request_feature(
             FEAT_ONBOARD_PROFILES,
             0x60,
             &[sec_be[0], sec_be[1], 0x00, 0x00, cnt_be[0], cnt_be[1]],
         )?;
 
-        // 0x70 MEMORY_WRITE: 16 bytes per packet
         for chunk in data.chunks(16) {
             let mut pkt = [0xFFu8; 16];
             pkt[..chunk.len()].copy_from_slice(chunk);
-            t.request_feature(FEAT_ONBOARD_PROFILES, 0x70, &pkt)?;
+            if let Err(e) = t.request_feature(FEAT_ONBOARD_PROFILES, 0x70, &pkt) {
+                let _ = t.request_feature(FEAT_ONBOARD_PROFILES, 0x80, &[]);
+                return Err(e);
+            }
         }
 
-        // 0x80 MEMORY_WRITE_END
         t.request_feature(FEAT_ONBOARD_PROFILES, 0x80, &[])?;
         Ok(())
     }
@@ -545,6 +563,7 @@ impl OnboardProfile {
         desc: &OnboardMemoryDesc,
         all_enabled_flags: &[bool],
     ) -> Result<(), HidppError> {
+        validate_supported_profile_format(desc)?;
         let sz = desc.sector_size as usize;
         if sz < 112 {
             return Err(HidppError::Flash(format!(
@@ -635,7 +654,7 @@ impl OnboardProfile {
             &other_valid,
         )? {
             if let Err(e) = write_and_verify(t, 0x0000, &mut new_dir, desc.sector_size) {
-                let rollback = if dir_state == DirectoryState::Valid {
+                let dir_rb = if dir_state == DirectoryState::Valid {
                     let mut old = dir_raw.clone();
                     match write_and_verify(t, 0x0000, &mut old, desc.sector_size) {
                         Ok(()) => "répertoire d'origine restauré".to_string(),
@@ -644,8 +663,12 @@ impl OnboardProfile {
                 } else {
                     "répertoire précédemment vide".to_string()
                 };
+                if current_valid {
+                    let mut old_prof = current.clone();
+                    let _ = write_and_verify(t, target, &mut old_prof, desc.sector_size);
+                }
                 return Err(HidppError::Flash(format!(
-                    "profil écrit mais mise à jour du répertoire échouée : {e} — {rollback}"
+                    "mise à jour du répertoire échouée : {e} — {dir_rb}"
                 )));
             }
         }
@@ -684,19 +707,17 @@ impl OnboardProfile {
         if sector != 0x0000 && !is_user_sector(sector, desc) {
             return Err(HidppError::Flash(format!("secteur 0x{sector:04X} hors zone utilisateur")));
         }
-        if !Self::verify_crc(bytes) {
+        if !Self::verify_crc(bytes) && !is_blank(bytes) {
             return Err(HidppError::Flash("sauvegarde invalide (CRC incorrect)".into()));
         }
         let mut buf = bytes.to_vec();
-        write_and_verify(t, sector, &mut buf, desc.sector_size)
+        if is_blank(&buf) {
+            Self::write_sector(t, sector, &mut buf)
+        } else {
+            write_and_verify(t, sector, &mut buf, desc.sector_size)
+        }
     }
 
-    /// Flash an onboard hardware macro sequence into a free flash sector (e.g. `profile_count + 1`,
-    /// such as `0x0006` on G PRO X Superlight) with CRC-16 CCITT + read-back verification.
-    /// Returns the `MouseButtonAction::OnboardMacro` binding that triggers this macro!
-    ///
-    /// `replace_existing` must only be `true` when `macro_sector` is the macro currently bound to
-    /// the very button being reassigned (and to nothing else): otherwise the sector has to be blank.
     pub fn write_macro_sector(
         t: &HidppTransport,
         desc: &OnboardMemoryDesc,
@@ -704,6 +725,7 @@ impl OnboardProfile {
         steps: &[OnboardMacroStep],
         replace_existing: bool,
     ) -> Result<MouseButtonAction, HidppError> {
+        validate_supported_macro_format(desc)?;
         let sz = desc.sector_size as usize;
         if macro_sector <= desc.profile_count as u16 || macro_sector >= desc.sector_count as u16 {
             return Err(HidppError::Protocol(
@@ -749,6 +771,29 @@ impl OnboardProfile {
             offset: 0,
         })
     }
+}
+
+/// Validate that `profile_format_id` matches the known Superlight / G PRO v1..v4 binary layout
+/// handled by `parse_sector` / `patch_into`, refusing silent corruption on newer incompatible formats.
+pub(crate) fn validate_supported_profile_format(desc: &OnboardMemoryDesc) -> Result<(), HidppError> {
+    if !(1..=4).contains(&desc.profile_format_id) {
+        return Err(HidppError::Flash(format!(
+            "format de profil embarqué non supporté (profile_format_id={}, memory_model_id={}) — écriture refusée par sécurité",
+            desc.profile_format_id, desc.memory_model_id
+        )));
+    }
+    Ok(())
+}
+
+/// Validate that `macro_format_id` matches the supported HID++ 2.0 `0x8100` macro bytecode format.
+pub(crate) fn validate_supported_macro_format(desc: &OnboardMemoryDesc) -> Result<(), HidppError> {
+    if !(1..=2).contains(&desc.macro_format_id) {
+        return Err(HidppError::Flash(format!(
+            "format de macro embarquée non supporté (macro_format_id={}) — écriture refusée par sécurité",
+            desc.macro_format_id
+        )));
+    }
+    Ok(())
 }
 
 /// DPI bounds accepted when reading and re-writing a profile (HERO 2 sensors reach 44 000 DPI).
@@ -1032,7 +1077,29 @@ pub(crate) fn save_sector_backup(
     std::fs::write(&path, bytes).map_err(|e| {
         HidppError::Flash(format!("sauvegarde impossible ({}) : {e}", path.display()))
     })?;
+    prune_old_backups(&dir, sector, 20);
     Ok(path)
+}
+
+fn prune_old_backups(dir: &std::path::Path, sector: u16, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut matching: Vec<(u64, std::path::PathBuf)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let (s, _, ms) = parse_backup_file_name(&name)?;
+            (s == sector).then_some((ms, e.path()))
+        })
+        .collect();
+    if matching.len() <= keep {
+        return;
+    }
+    matching.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, old_path) in matching.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(old_path);
+    }
 }
 
 /// Choose the flash sector for an onboard macro bound to one button.

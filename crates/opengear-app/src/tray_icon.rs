@@ -237,7 +237,7 @@ mod win_tray {
         HICON, HWND_BROADCAST, ICONINFO, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
         PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
         TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND,
-        WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+        WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
     };
 
     const WM_TRAY_CALLBACK: u32 = WM_APP + 42;
@@ -250,8 +250,51 @@ mod win_tray {
     static TRAY_SENDER: OnceLock<std::sync::Mutex<Option<Box<dyn Fn(TrayAction) + Send + Sync>>>> =
         OnceLock::new();
     static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+    static TRAY_HICON: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
     static TRAY_ALIVE: AtomicBool = AtomicBool::new(false);
     static WAKE_MSG_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static TASKBAR_CREATED_MSG_ID: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+    static GRACEFUL_QUIT_MSG_ID: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+
+    pub fn taskbar_created_msg_id() -> u32 {
+        let id = TASKBAR_CREATED_MSG_ID.load(Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+        let w = to_wide("TaskbarCreated");
+        let reg = unsafe { RegisterWindowMessageW(w.as_ptr()) };
+        TASKBAR_CREATED_MSG_ID.store(reg, Ordering::Relaxed);
+        reg
+    }
+
+    pub fn graceful_quit_msg_id() -> u32 {
+        let id = GRACEFUL_QUIT_MSG_ID.load(Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+        let w = to_wide("OpenGearCommandCenterGracefulQuit");
+        let reg = unsafe { RegisterWindowMessageW(w.as_ptr()) };
+        GRACEFUL_QUIT_MSG_ID.store(reg, Ordering::Relaxed);
+        reg
+    }
+
+    unsafe fn register_tray_icon(hwnd: HWND, hicon: HICON) {
+        unsafe {
+            let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = hwnd;
+            nid.uID = TRAY_UID;
+            nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+            nid.uCallbackMessage = WM_TRAY_CALLBACK;
+            nid.hIcon = hicon;
+            let tip = to_wide("OpenGear — Command Center");
+            let copy_len = tip.len().min(nid.szTip.len());
+            nid.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
+            Shell_NotifyIconW(NIM_ADD, &nid);
+        }
+    }
 
     pub fn wake_message_id() -> u32 {
         let cur = WAKE_MSG_ID.load(Ordering::Relaxed);
@@ -371,6 +414,7 @@ mod win_tray {
                                 hwnd,
                                 std::ptr::null(),
                             );
+                            PostMessageW(hwnd, WM_NULL, 0, 0);
                             DestroyMenu(hmenu);
                         }
                     }
@@ -393,6 +437,17 @@ mod win_tray {
             }
             other if other != 0 && other == wake_message_id() => {
                 emit(TrayAction::ShowWindow);
+                0
+            }
+            other if other != 0 && other == graceful_quit_msg_id() => {
+                emit(TrayAction::Quit);
+                0
+            }
+            other if other != 0 && other == taskbar_created_msg_id() => {
+                let hicon = TRAY_HICON.load(Ordering::SeqCst) as HICON;
+                if !hicon.is_null() {
+                    unsafe { register_tray_icon(hwnd, hicon) };
+                }
                 0
             }
             _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -451,26 +506,24 @@ mod win_tray {
                 TRAY_HWND.store(hwnd as isize, Ordering::SeqCst);
 
                 let hicon = create_hicon_from_rgba(32);
-                let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-                nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-                nid.hWnd = hwnd;
-                nid.uID = TRAY_UID;
-                nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-                nid.uCallbackMessage = WM_TRAY_CALLBACK;
-                nid.hIcon = hicon;
-                let tip = to_wide("OpenGear — Command Center");
-                let copy_len = tip.len().min(nid.szTip.len());
-                nid.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
-                Shell_NotifyIconW(NIM_ADD, &nid);
-
+                TRAY_HICON.store(hicon as isize, Ordering::SeqCst);
+                let _ = taskbar_created_msg_id();
+                let _ = graceful_quit_msg_id();
                 let _ = wake_message_id();
+                register_tray_icon(hwnd, hicon);
+
                 let mut msg: MSG = std::mem::zeroed();
                 while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
 
+                let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+                nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+                nid.hWnd = hwnd;
+                nid.uID = TRAY_UID;
                 Shell_NotifyIconW(NIM_DELETE, &nid);
+                TRAY_HICON.store(0, Ordering::SeqCst);
                 if !hicon.is_null() {
                     DestroyIcon(hicon);
                 }
@@ -533,6 +586,17 @@ pub fn stop_system_tray() {
     win_tray::stop();
 }
 
+pub fn wake_message_id() -> u32 {
+    #[cfg(windows)]
+    {
+        win_tray::wake_message_id()
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
 /// Windows notification from the tray icon. Returns `false` if the tray is not running.
 pub fn tray_notify(title: &str, body: &str) -> bool {
     #[cfg(windows)]
@@ -558,16 +622,41 @@ pub fn acquire_single_instance() -> bool {
     unsafe {
         use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+        use windows::Win32::Security::{
+            InitializeSecurityDescriptor, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+            SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl,
+        };
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError,
+        };
         use windows_sys::Win32::System::Threading::CreateMutexW;
+
+        let mut sd = SECURITY_DESCRIPTOR::default();
+        let mut sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: false.into(),
+        };
+        let psd = PSECURITY_DESCRIPTOR(&mut sd as *mut _ as *mut _);
+        let sa_ptr = if InitializeSecurityDescriptor(psd, 1).is_ok()
+            && SetSecurityDescriptorDacl(psd, true, None, false).is_ok()
+        {
+            sa.lpSecurityDescriptor = &mut sd as *mut _ as *mut _;
+            &sa as *const SECURITY_ATTRIBUTES as *const _
+        } else {
+            std::ptr::null()
+        };
 
         let name: Vec<u16> = OsStr::new("Local\\OpenGearCommandCenterSingleInstance")
             .encode_wide()
             .chain(Some(0))
             .collect();
-        let h = CreateMutexW(std::ptr::null(), 1, name.as_ptr());
-        if !h.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
-            CloseHandle(h);
+        let h = CreateMutexW(sa_ptr, 1, name.as_ptr());
+        let err = GetLastError();
+        if err == ERROR_ALREADY_EXISTS || err == ERROR_ACCESS_DENIED {
+            if !h.is_null() {
+                CloseHandle(h);
+            }
             win_tray::broadcast_wakeup();
             return false;
         }
@@ -707,6 +796,77 @@ pub fn set_autostart_enabled(enabled: bool, start_minimized: bool) -> Result<()>
 }
 
 /// Create crisp `.lnk` shortcuts with the custom OpenGear `.ico` on Desktop & Start Menu.
+#[cfg(windows)]
+fn known_folder_path(id: &windows::core::GUID) -> Result<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    unsafe {
+        let pwstr = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None)
+            .context("SHGetKnownFolderPath")?;
+        let mut len = 0usize;
+        while *pwstr.0.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(pwstr.0, len);
+        let os = String::from_utf16_lossy(slice);
+        CoTaskMemFree(Some(pwstr.0 as *const _));
+        Ok(PathBuf::from(os))
+    }
+}
+
+#[cfg(windows)]
+fn create_shortcut_com(
+    lnk_path: &Path,
+    target_exe: &Path,
+    work_dir: &Path,
+    ico_path: &Path,
+    description: &str,
+) -> Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize, IPersistFile,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    use windows::core::{Interface, PCWSTR};
+
+    fn wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(Some(0)).collect()
+    }
+
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let should_uninit = hr.is_ok();
+        let res = (|| -> Result<()> {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
+                .context("CoCreateInstance(ShellLink)")?;
+            let w_exe = wide(target_exe.as_os_str());
+            let w_dir = wide(work_dir.as_os_str());
+            let w_ico = wide(ico_path.as_os_str());
+            let w_desc = wide(OsStr::new(description));
+            let w_lnk = wide(lnk_path.as_os_str());
+
+            link.SetPath(PCWSTR(w_exe.as_ptr())).context("SetPath")?;
+            link.SetWorkingDirectory(PCWSTR(w_dir.as_ptr()))
+                .context("SetWorkingDirectory")?;
+            link.SetIconLocation(PCWSTR(w_ico.as_ptr()), 0)
+                .context("SetIconLocation")?;
+            link.SetDescription(PCWSTR(w_desc.as_ptr()))
+                .context("SetDescription")?;
+
+            let pf: IPersistFile = link.cast().context("QueryInterface(IPersistFile)")?;
+            pf.Save(PCWSTR(w_lnk.as_ptr()), true)
+                .context("IPersistFile::Save")?;
+            Ok(())
+        })();
+        if should_uninit {
+            CoUninitialize();
+        }
+        res
+    }
+}
+
 pub fn create_windows_shortcuts() -> Result<String> {
     let exe = std::env::current_exe().context("current_exe")?;
     create_shortcuts_for(&exe)
@@ -715,42 +875,26 @@ pub fn create_windows_shortcuts() -> Result<String> {
 pub fn create_shortcuts_for(exe: &Path) -> Result<String> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Programs};
+
         let dir = exe.parent().unwrap_or_else(|| Path::new("."));
         let ico = dir.join("opengear.ico");
         if !ico.exists() {
             let _ = std::fs::write(&ico, encode_multi_ico(&[32, 64]));
         }
-        let script = format!(
-            r#"
-$ws = New-Object -ComObject WScript.Shell
-$desktop = [Environment]::GetFolderPath('Desktop')
-$startMenu = Join-Path ([Environment]::GetFolderPath('Programs')) 'OpenGear.lnk'
-foreach ($dest in @((Join-Path $desktop 'OpenGear.lnk'), $startMenu)) {{
-    $sc = $ws.CreateShortcut($dest)
-    $sc.TargetPath = '{exe}'
-    $sc.WorkingDirectory = '{dir}'
-    $sc.IconLocation = '{ico},0'
-    $sc.Description = 'OpenGear — Command Center Matériel Unifié'
-    $sc.Save()
-}}
-'OK'
-"#,
-            exe = exe.display().to_string().replace('\'', "''"),
-            dir = dir.display().to_string().replace('\'', "''"),
-            ico = ico.display().to_string().replace('\'', "''"),
-        );
-        let out = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .context("Échec création raccourcis Windows")?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "Erreur raccourcis : {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        let desktop = known_folder_path(&FOLDERID_Desktop)?.join("OpenGear.lnk");
+        let start_menu = known_folder_path(&FOLDERID_Programs)?.join("OpenGear.lnk");
+        for dest in [&desktop, &start_menu] {
+            if let Some(parent) = dest.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            create_shortcut_com(
+                dest,
+                exe,
+                dir,
+                &ico,
+                "OpenGear — Command Center Matériel Unifié",
+            )?;
         }
         Ok("Raccourcis créés sur le Bureau et dans le Menu Démarrer (avec icône OpenGear) !".into())
     }
@@ -761,12 +905,81 @@ foreach ($dest in @((Join-Path $desktop 'OpenGear.lnk'), $startMenu)) {{
     }
 }
 
+/// Remove a temporary installer extraction folder only if it resolves cleanly inside `temp_dir`
+/// and begins with `opengear_setup_`.
+pub fn cleanup_installer_temp_dir(dir: &Path) {
+    let Ok(base) = std::env::temp_dir().canonicalize() else {
+        return;
+    };
+    let Ok(target) = dir.canonicalize() else {
+        return;
+    };
+    let Some(name) = target.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    if !target.starts_with(&base) || !name.starts_with("opengear_setup_") {
+        return;
+    }
+    for _ in 0..10 {
+        if std::fs::remove_dir_all(&target).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+#[cfg(windows)]
+fn request_running_instances_exit_gracefully() {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, HWND_BROADCAST, PostMessageW,
+    };
+    let msg_id = win_tray::graceful_quit_msg_id();
+    unsafe {
+        PostMessageW(HWND_BROADCAST, msg_id, 0, 0);
+    }
+    let class_name: Vec<u16> = OsStr::new("OpenGearTrayWindowClass")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let hwnd = unsafe { FindWindowW(class_name.as_ptr(), std::ptr::null()) };
+        if hwnd.is_null() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(windows)]
+fn copy_dir_files(src: &Path, dst: &Path) {
+    if !src.is_dir() {
+        return;
+    }
+    if std::fs::create_dir_all(dst).is_err() {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(src) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                if let Some(name) = p.file_name() {
+                    let _ = std::fs::copy(&p, dst.join(name));
+                }
+            }
+        }
+    }
+}
+
 /// Self-install OpenGear cleanly into `%LOCALAPPDATA%\Programs\OpenGear\`:
-/// - Copies `OpenGear.exe`, `WebView2Loader.dll`, and `opengear.ico`
+/// - Signals any running instance to quit gracefully (waiting up to 2 s before fallback)
+/// - Copies `OpenGear.exe`, `WebView2Loader.dll`, `pawnio_modules/`, and `opengear.ico`
 /// - Registers OpenGear in Windows Installed Apps (HKCU Uninstall key)
-/// - Creates Desktop & Start Menu shortcuts with custom OpenGear icon
-/// - Launches the installed `OpenGear.exe` with zero console window!
-pub fn install_to_windows() -> Result<()> {
+/// - Creates Desktop & Start Menu shortcuts via native COM `IShellLinkW`
+/// - Launches the installed `OpenGear.exe` (passing `--cleanup-dir` when invoked from setup)
+pub fn install_to_windows(cleanup_dir: Option<&Path>) -> Result<()> {
     #[cfg(windows)]
     {
         use std::ffi::OsStr;
@@ -777,8 +990,10 @@ pub fn install_to_windows() -> Result<()> {
             RegSetValueExW,
         };
 
-        let local_app_data =
-            std::env::var("LOCALAPPDATA").context("Variable LOCALAPPDATA introuvable")?;
+        let local_app_data = std::env::var("LOCALAPPDATA")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .context("Variable LOCALAPPDATA introuvable")?;
         let install_dir = PathBuf::from(&local_app_data).join("Programs").join("OpenGear");
         std::fs::create_dir_all(&install_dir)
             .with_context(|| format!("Impossible de créer {}", install_dir.display()))?;
@@ -789,24 +1004,32 @@ pub fn install_to_windows() -> Result<()> {
         let dst_dll = install_dir.join("WebView2Loader.dll");
         let dst_ico = install_dir.join("opengear.ico");
 
-        // Close any OTHER running OpenGear instance (excluding our own PID!) so files can be updated cleanly
+        // Ask any existing OpenGear instance to quit gracefully first so fans/RGB restore cleanly.
+        request_running_instances_exit_gracefully();
+
+        // Fallback termination only if the previous process did not exit or still locks dst_exe.
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let my_pid = std::process::id();
         let pid_filter = format!("PID ne {my_pid}");
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/IM", "OpenGear.exe", "/FI", &pid_filter])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        std::thread::sleep(std::time::Duration::from_millis(250));
-
         if src_exe != dst_exe {
-            std::fs::copy(&src_exe, &dst_exe)
-                .with_context(|| format!("Échec copie vers {}", dst_exe.display()))?;
+            if std::fs::copy(&src_exe, &dst_exe).is_err() {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/IM", "OpenGear.exe", "/FI", &pid_filter])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::copy(&src_exe, &dst_exe)
+                    .with_context(|| format!("Échec copie vers {}", dst_exe.display()))?;
+            }
         }
         let src_dll = src_dir.join("WebView2Loader.dll");
         if src_dll.exists() && src_dll != dst_dll {
             let _ = std::fs::copy(&src_dll, &dst_dll);
         }
+        copy_dir_files(
+            &src_dir.join("pawnio_modules"),
+            &install_dir.join("pawnio_modules"),
+        );
         std::fs::write(&dst_ico, encode_multi_ico(&[32, 64]))?;
 
         // Create Desktop & Start Menu shortcuts pointing to installed OpenGear.exe
@@ -862,13 +1085,19 @@ pub fn install_to_windows() -> Result<()> {
         }
 
         // Launch installed OpenGear GUI cleanly (zero console window!)
-        let _ = std::process::Command::new(&dst_exe)
-            .current_dir(&install_dir)
-            .spawn();
+        let mut launch = std::process::Command::new(&dst_exe);
+        launch.current_dir(&install_dir);
+        if let Some(dir) = cleanup_dir {
+            launch.arg("--cleanup-dir").arg(dir);
+        }
+        let _ = launch.spawn();
         Ok(())
     }
     #[cfg(not(windows))]
-    anyhow::bail!("Non supporté hors Windows")
+    {
+        let _ = cleanup_dir;
+        anyhow::bail!("Non supporté hors Windows")
+    }
 }
 
 /// Cleanly uninstall OpenGear shortcuts, autostart entry, uninstall registry key, and install folder.
@@ -878,6 +1107,7 @@ pub fn uninstall_from_windows() -> Result<()> {
         use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
         use std::os::windows::process::CommandExt;
+        use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Programs};
         use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteTreeW};
 
         let _ = set_autostart_enabled(false, false);
@@ -891,21 +1121,36 @@ pub fn uninstall_from_windows() -> Result<()> {
             let _ = RegDeleteTreeW(HKEY_CURRENT_USER, subkey.as_ptr());
         }
 
+        if let Ok(desktop) = known_folder_path(&FOLDERID_Desktop) {
+            let _ = std::fs::remove_file(desktop.join("OpenGear.lnk"));
+        }
+        if let Ok(programs) = known_folder_path(&FOLDERID_Programs) {
+            let _ = std::fs::remove_file(programs.join("OpenGear.lnk"));
+        }
+
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let local_app_data = std::env::var("LOCALAPPDATA")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .context("Variable LOCALAPPDATA introuvable — suppression annulée par sécurité")?;
         let install_dir = PathBuf::from(&local_app_data).join("Programs").join("OpenGear");
-        let script = format!(
-            r#"
-$desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'OpenGear.lnk'
-$startMenu = Join-Path ([Environment]::GetFolderPath('Programs')) 'OpenGear.lnk'
-Remove-Item -Force -ErrorAction SilentlyContinue $desktop, $startMenu
-Start-Sleep -Milliseconds 600
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '{dir}'
-"#,
-            dir = install_dir.display().to_string().replace('\'', "''"),
+        let is_expected_target = install_dir.file_name() == Some(OsStr::new("OpenGear"))
+            && install_dir.parent().and_then(|p| p.file_name()) == Some(OsStr::new("Programs"))
+            && install_dir.is_absolute();
+        anyhow::ensure!(
+            is_expected_target,
+            "Chemin d'installation inattendu refusé : {}",
+            install_dir.display()
         );
-        let _ = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
+
+        let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let cmd_exe = PathBuf::from(sys_root).join("System32").join("cmd.exe");
+        let rm_cmd = format!(
+            "timeout /T 1 /NOBREAK > nul & rmdir /S /Q \"{}\"",
+            install_dir.display()
+        );
+        let _ = std::process::Command::new(cmd_exe)
+            .args(["/C", &rm_cmd])
             .creation_flags(CREATE_NO_WINDOW)
             .spawn();
         Ok(())

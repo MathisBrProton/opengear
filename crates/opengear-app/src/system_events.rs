@@ -5,6 +5,7 @@
 //! - session lock / unlock (`WM_WTSSESSION_CHANGE`): optional lights-off while locked;
 //! - device arrival / removal (`WM_DEVICECHANGE`), debounced: instant hot-plug without polling.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +18,7 @@ pub enum SysEvent {
 }
 
 impl SysEvent {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn id(self) -> &'static str {
         match self {
             SysEvent::Suspend => "suspend",
@@ -30,12 +32,22 @@ impl SysEvent {
 
 type Callback = Box<dyn Fn(SysEvent) + Send>;
 static CALLBACK: OnceLock<Mutex<Option<Callback>>> = OnceLock::new();
+static LISTENER_TID: AtomicU32 = AtomicU32::new(0);
 
 fn emit(ev: SysEvent) {
-    if let Some(cell) = CALLBACK.get() {
-        if let Ok(guard) = cell.lock() {
-            if let Some(cb) = guard.as_ref() {
-                cb(ev);
+    let Some(cell) = CALLBACK.get() else {
+        return;
+    };
+    // Move the callback out while holding the mutex, invoke it unlocked, then put it back.
+    let cb = match cell.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => return,
+    };
+    if let Some(cb) = cb {
+        cb(ev);
+        if let Ok(mut guard) = cell.lock() {
+            if guard.is_none() {
+                *guard = Some(cb);
             }
         }
     }
@@ -55,21 +67,46 @@ pub fn start(on_event: impl Fn(SysEvent) + Send + 'static) {
     win::spawn_listener();
 }
 
+/// Stop the system event listener thread and clear its callback.
+pub fn stop() {
+    if let Some(cell) = CALLBACK.get() {
+        if let Ok(mut g) = cell.lock() {
+            *g = None;
+        }
+    }
+    #[cfg(windows)]
+    {
+        let tid = LISTENER_TID.swap(0, Ordering::SeqCst);
+        if tid != 0 {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                    tid,
+                    windows_sys::Win32::UI::WindowsAndMessaging::WM_QUIT,
+                    0,
+                    0,
+                );
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 mod win {
-    use super::{SysEvent, emit};
+    use super::{LISTENER_TID, SysEvent, emit};
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
+    use std::sync::atomic::Ordering;
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Power::RegisterSuspendResumeNotification;
     use windows_sys::Win32::System::RemoteDesktop::{
-        NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification,
+        NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
     };
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, DispatchMessageW,
-        GetMessageW, KillTimer, MSG, RegisterClassW, SetTimer, TranslateMessage, WNDCLASSW,
-        WS_OVERLAPPED,
+        CreateWindowExW, DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, DestroyWindow,
+        DispatchMessageW, GetMessageW, KillTimer, MSG, RegisterClassW, SetTimer, TranslateMessage,
+        WNDCLASSW, WS_OVERLAPPED,
     };
 
     const WM_POWERBROADCAST: u32 = 0x0218;
@@ -95,7 +132,6 @@ mod win {
     }
 
     unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        use std::sync::atomic::Ordering;
         match msg {
             WM_POWERBROADCAST => {
                 match wparam {
@@ -103,7 +139,6 @@ mod win {
                         RESUMED.store(false, Ordering::SeqCst);
                         emit(SysEvent::Suspend);
                     }
-                    // Both may be sent for one wake-up: report it once.
                     PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
                         if !RESUMED.swap(true, Ordering::SeqCst) {
                             emit(SysEvent::Resume);
@@ -123,7 +158,6 @@ mod win {
             }
             WM_DEVICECHANGE => {
                 if matches!(wparam, DBT_DEVNODES_CHANGED | DBT_DEVICEARRIVAL | DBT_DEVICEREMOVECOMPLETE) {
-                    // (Re)start the debounce timer.
                     unsafe { SetTimer(hwnd, DEVICE_DEBOUNCE_TIMER, DEVICE_DEBOUNCE_MS, None) };
                 }
                 1
@@ -141,6 +175,7 @@ mod win {
         let _ = std::thread::Builder::new()
             .name("opengear-sysevents".into())
             .spawn(|| unsafe {
+                LISTENER_TID.store(GetCurrentThreadId(), Ordering::SeqCst);
                 let hinst = GetModuleHandleW(std::ptr::null());
                 let class_name = to_wide("OpenGearSystemEvents");
                 let wc = WNDCLASSW {
@@ -156,8 +191,6 @@ mod win {
                     lpszClassName: class_name.as_ptr(),
                 };
                 RegisterClassW(&wc);
-                // A hidden TOP-LEVEL window (not message-only): power and device broadcasts are
-                // only delivered to top-level windows.
                 let hwnd = CreateWindowExW(
                     0,
                     class_name.as_ptr(),
@@ -173,11 +206,11 @@ mod win {
                     std::ptr::null(),
                 );
                 if hwnd.is_null() {
+                    LISTENER_TID.store(0, Ordering::SeqCst);
                     tracing::error!("Fenêtre d'événements système non créée : veille / verrouillage non suivis");
                     return;
                 }
                 WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
-                // Needed for Modern Standby (S0ix) laptops, harmless elsewhere.
                 RegisterSuspendResumeNotification(hwnd as _, DEVICE_NOTIFY_WINDOW_HANDLE);
 
                 let mut msg: MSG = std::mem::zeroed();
@@ -185,6 +218,9 @@ mod win {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
+                let _ = WTSUnRegisterSessionNotification(hwnd);
+                DestroyWindow(hwnd);
+                LISTENER_TID.store(0, Ordering::SeqCst);
             });
     }
 }

@@ -1,7 +1,10 @@
+use crate::chatter::ChatterFilter;
 use crate::keys::{key_name_to_vk, vk_to_key_name};
+use crate::socd::{SocdDecision, SocdKey, SocdMode, SocdPair, SocdResolver};
 use opengear_core::{KeyAction, MacroStep, SocdConfig};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -13,16 +16,14 @@ use windows_sys::Win32::Foundation::{GetLastError, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
-    GetKeyboardLayout, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyExW,
-    SendInput,
+    GetKeyboardLayout, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MapVirtualKeyExW, SendInput,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-    HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG,
-    MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx,
+    HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE,
+    PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
@@ -31,6 +32,8 @@ const OPENGEAR_INJECTED_TAG: usize = 0x4F47_4541;
 const LLMHF_INJECTED: u32 = 0x0000_0001;
 #[cfg(windows)]
 const WM_SYNC_MOUSE_HOOK: u32 = WM_APP + 77;
+#[cfg(windows)]
+const MAPVK_VK_TO_VSC_EX: u32 = 4;
 
 /// Longest pause a single macro step may request (longer values are clamped).
 const MAX_MACRO_STEP_DELAY_MS: u32 = 10_000;
@@ -43,15 +46,15 @@ const MACRO_CANCEL_POLL: Duration = Duration::from_millis(20);
 const START_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Lock-free per-virtual-key bookkeeping, safe to use from inside the low-level hook
-/// (which must never block): physical held state and active remaps.
+/// (which must never block): physical held state, active remaps, and suppressed keys.
 pub(crate) struct KeyTracker {
     /// Physically held keys as seen by the hook (non-injected events only).
     held: [AtomicBool; 256],
     /// For a source key currently remapped: the target VK OpenGear pressed (0 = none).
     remapped_to: [AtomicU16; 256],
+    /// Keys whose `DOWN` event was swallowed by `win_lock` or `KeyAction::Disable`.
+    suppressed_down: [AtomicBool; 256],
     /// Last hardware scan code seen for each VK (bit 15 = extended key), 0 = never seen.
-    /// Re-injecting a key with the scan code the user's keyboard really produced keeps the
-    /// physical key identity right whatever the keyboard layout (AZERTY vs QWERTY...).
     scan: [AtomicU16; 256],
 }
 
@@ -60,6 +63,7 @@ impl KeyTracker {
         Self {
             held: [const { AtomicBool::new(false) }; 256],
             remapped_to: [const { AtomicU16::new(0) }; 256],
+            suppressed_down: [const { AtomicBool::new(false) }; 256],
             scan: [const { AtomicU16::new(0) }; 256],
         }
     }
@@ -99,11 +103,27 @@ impl KeyTracker {
         }
     }
 
-    /// Forget every held key (events are not observed while the engine is stopped).
+    /// Forget every held key and suppressed state (events are not observed while stopped).
     pub(crate) fn clear_held(&self) {
         for h in &self.held {
             h.store(false, Ordering::SeqCst);
         }
+        for s in &self.suppressed_down {
+            s.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn mark_suppressed(&self, vk: u16, suppressed: bool) {
+        if let Some(i) = Self::slot(vk) {
+            self.suppressed_down[i].store(suppressed, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn take_suppressed(&self, vk: u16) -> bool {
+        let Some(i) = Self::slot(vk) else {
+            return false;
+        };
+        self.suppressed_down[i].swap(false, Ordering::SeqCst)
     }
 
     /// Remember that pressing `src` made OpenGear press `target`.
@@ -170,69 +190,63 @@ fn sleep_unless_cancelled(total: Duration, generation: u32) -> bool {
     }
 }
 
-#[derive(Debug, Clone)]
-struct SocdPairRuntime {
-    vk_a: u16,
-    vk_b: u16,
-    /// Physical keys (scan codes) of the pair. Snap Tap is about physical positions
-    /// (left/right, forward/back): matching on scan codes works whatever the keyboard layout
-    /// and whatever virtual-key code Windows reports to the hook.
-    scan_a: u16,
-    scan_b: u16,
+/// True only for the standard WASD/ZQSD horizontal and vertical movement preset pairs.
+/// Non-WASD custom pairs (e.g. `Q+E` or `Left+Right`) must NOT be overridden to movement scans.
+pub(crate) fn is_movement_preset_pair(key_a: &str, key_b: &str) -> bool {
+    let a = key_a.trim().to_ascii_uppercase();
+    let b = key_b.trim().to_ascii_uppercase();
+    matches!(
+        (a.as_str(), b.as_str()),
+        ("Q", "D")
+            | ("D", "Q")
+            | ("A", "D")
+            | ("D", "A")
+            | ("Z", "S")
+            | ("S", "Z")
+            | ("W", "S")
+            | ("S", "W")
+    )
 }
 
-impl SocdPairRuntime {
-    /// Which side of the pair a key event belongs to: `Some(true)` = A, `Some(false)` = B.
-    /// Scan code first (physical position), virtual-key code as a fallback.
-    fn side_of(&self, vk: u16, scan: u16) -> Option<bool> {
-        if scan != 0 {
-            if scan == self.scan_a {
-                return Some(true);
-            }
-            if scan == self.scan_b {
-                return Some(false);
-            }
-        }
-        if vk == self.vk_a {
-            Some(true)
-        } else if vk == self.vk_b {
-            Some(false)
-        } else {
-            None
-        }
-    }
-}
-
-/// Physical scan code for a Snap Tap key name.
-///
-/// The Snap Tap presets always target the movement cluster (the WASD positions), named by
-/// their AZERTY (Q D Z S) or QWERTY (A D W S) letters: those map to fixed set-1 scan codes,
-/// independent of the layout Windows applies. Other keys use the active layout.
-pub(crate) fn scan_for_name(name: &str, vk: u16) -> u16 {
+/// Physical scan code for a Snap Tap movement preset key name (`Q`/`A`, `D`, `Z`/`W`, `S`).
+pub(crate) fn movement_preset_scan(name: &str) -> Option<(u16, bool)> {
     match name.trim().to_ascii_uppercase().as_str() {
-        "Q" | "A" => 0x1E, // left
-        "D" => 0x20,       // right
-        "Z" | "W" => 0x11, // forward
-        "S" => 0x1F,       // back
-        _ => layout_scan(vk),
+        "Q" | "A" => Some((0x1E, false)),
+        "D" => Some((0x20, false)),
+        "Z" | "W" => Some((0x11, false)),
+        "S" => Some((0x1F, false)),
+        _ => None,
     }
 }
 
-#[cfg(windows)]
-fn layout_scan(vk: u16) -> u16 {
-    scan_for_foreground_layout(vk)
+/// Resolve physical `(scan, extended)` for a Snap Tap pair endpoint.
+pub(crate) fn resolve_pair_scan(name: &str, vk: u16, use_movement_presets: bool) -> (u16, bool) {
+    if use_movement_presets {
+        if let Some(m) = movement_preset_scan(name) {
+            return m;
+        }
+    }
+    #[cfg(windows)]
+    {
+        layout_scan_ex(vk)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = vk;
+        (0, false)
+    }
 }
 
-#[cfg(not(windows))]
-fn layout_scan(_vk: u16) -> u16 {
-    0
+/// Decode the Windows `MAPVK_VK_TO_VSC_EX` return value into `(scan, extended)`.
+pub(crate) fn decode_vsc_ex(raw: u32) -> (u16, bool) {
+    let hi = (raw >> 8) & 0xFF;
+    let lo = (raw & 0xFF) as u16;
+    let extended = hi == 0xE0 || hi == 0xE1;
+    (lo, extended)
 }
 
 /// Movement-cluster physical keys tracked for the live Snap Tap view: left, right, forward, back.
 pub const MOVEMENT_SCANS: [u16; 4] = [0x1E, 0x20, 0x11, 0x1F];
-/// Key state as delivered DOWNSTREAM to applications (after OpenGear's Snap Tap): updated from
-/// every event that leaves the hook chain at our level — physical ones we let through and the
-/// releases / presses Snap Tap injects.
 static EFFECTIVE_DOWN: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
 
 fn note_effective(scan: u32, down: bool) {
@@ -251,19 +265,15 @@ struct RuntimeRules {
     win_lock: bool,
     by_vk: HashMap<u16, KeyAction>,
     socd_enabled: bool,
-    socd_pairs: Vec<SocdPairRuntime>,
+    socd_pairs: Vec<SocdPair>,
     key_chatter_ms: u16,
     mouse_debounce_ms: u16,
 }
 
 #[derive(Debug, Default)]
-struct SocdState {
-    /// Physical held state per pair: (a_held, b_held, active_vk)
-    pair_state: HashMap<(u16, u16), (bool, bool, Option<u16>)>,
-    /// Last key release timestamp per VK for anti-chatter filtering
-    last_key_up: HashMap<u16, Instant>,
-    /// Last mouse button release timestamp (0 = LMB, 1 = RMB)
-    last_mouse_up: [Option<Instant>; 2],
+struct EngineState {
+    socd: SocdResolver,
+    chatter: ChatterFilter,
 }
 
 #[derive(Debug, Default)]
@@ -274,14 +284,13 @@ struct MacroRecorderState {
 }
 
 static GLOBAL_RULES: OnceLock<RwLock<RuntimeRules>> = OnceLock::new();
-static RUNTIME_STATE: OnceLock<Mutex<SocdState>> = OnceLock::new();
+static RUNTIME_STATE: OnceLock<Mutex<EngineState>> = OnceLock::new();
 static MACRO_RECORDER: OnceLock<Mutex<MacroRecorderState>> = OnceLock::new();
-static REACTIVE_RIPPLES: OnceLock<Mutex<VecDeque<(String, Instant)>>> = OnceLock::new();
+static REACTIVE_RIPPLES: OnceLock<Mutex<VecDeque<(&'static str, Instant)>>> = OnceLock::new();
 
 static HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SOCD_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static CHATTER_BLOCKED_COUNT: AtomicU32 = AtomicU32::new(0);
-/// Diagnostics: Snap Tap resolutions performed, and key injections accepted / refused by Windows.
 static SOCD_RESOLVED_COUNT: AtomicU32 = AtomicU32::new(0);
 static INJECTED_OK_COUNT: AtomicU32 = AtomicU32::new(0);
 static INJECTED_FAILED_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -291,15 +300,15 @@ fn rules_store() -> &'static RwLock<RuntimeRules> {
     GLOBAL_RULES.get_or_init(|| RwLock::new(RuntimeRules::default()))
 }
 
-fn state_store() -> &'static Mutex<SocdState> {
-    RUNTIME_STATE.get_or_init(|| Mutex::new(SocdState::default()))
+fn state_store() -> &'static Mutex<EngineState> {
+    RUNTIME_STATE.get_or_init(|| Mutex::new(EngineState::default()))
 }
 
 fn recorder_store() -> &'static Mutex<MacroRecorderState> {
     MACRO_RECORDER.get_or_init(|| Mutex::new(MacroRecorderState::default()))
 }
 
-fn ripples_store() -> &'static Mutex<VecDeque<(String, Instant)>> {
+fn ripples_store() -> &'static Mutex<VecDeque<(&'static str, Instant)>> {
     REACTIVE_RIPPLES.get_or_init(|| Mutex::new(VecDeque::with_capacity(32)))
 }
 
@@ -320,19 +329,31 @@ fn is_extended_vk(vk: u16) -> bool {
     )
 }
 
-/// Inject a virtual key. Returns `false` if Windows refused the injection (e.g. UIPI: the
-/// foreground window runs elevated while OpenGear does not).
+#[cfg(windows)]
+fn layout_scan_ex(vk: u16) -> (u16, bool) {
+    unsafe {
+        let fg = GetForegroundWindow();
+        let tid = if fg.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(fg, std::ptr::null_mut())
+        };
+        let hkl = GetKeyboardLayout(tid);
+        let raw = MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC_EX, hkl);
+        decode_vsc_ex(raw)
+    }
+}
+
+/// Inject a virtual key. Returns `false` if Windows refused the injection (e.g. UIPI).
 #[cfg(windows)]
 fn send_vk(vk: u16, down: bool) -> bool {
     let mut flags = if down { 0 } else { KEYEVENTF_KEYUP };
-    // Fill the hardware scan code too: apps that read physical keys (Chromium/WebView2 `code`,
-    // Raw Input / DirectInput games) identify a key by its scan code. Prefer the scan code the
-    // user's keyboard actually produced for this VK (always known for Snap Tap: the opposing key
-    // was physically pressed); otherwise translate with the FOREGROUND window's layout — the
-    // hook thread's own layout may differ (e.g. US on an AZERTY desktop) and give the wrong key.
     let (scan, extended) = match KEYS.observed_scan(vk) {
         Some(s) => s,
-        None => (scan_for_foreground_layout(vk), is_extended_vk(vk)),
+        None => {
+            let (s, ext) = layout_scan_ex(vk);
+            (s, ext || is_extended_vk(vk))
+        }
     };
     if extended {
         flags |= KEYEVENTF_EXTENDEDKEY;
@@ -358,15 +379,17 @@ fn send_vk(vk: u16, down: bool) -> bool {
     ok
 }
 
-/// Inject a Snap Tap key by its physical scan code (`KEYEVENTF_SCANCODE`): Windows derives the
-/// virtual key with the receiving window's layout, games reading scan codes see the right key.
-/// Falls back to the virtual key when no scan code is known.
+/// Inject a Snap Tap key by its physical scan code (`KEYEVENTF_SCANCODE`), including
+/// `KEYEVENTF_EXTENDEDKEY` for arrow/nav keys, falling back to `send_vk` if scan == 0.
 #[cfg(windows)]
-fn send_pair_key(scan: u16, vk: u16, down: bool) -> bool {
-    if scan == 0 {
-        return send_vk(vk, down);
+fn send_pair_key(key: SocdKey, down: bool) -> bool {
+    if key.scan == 0 {
+        return send_vk(key.vk, down);
     }
     let mut flags = KEYEVENTF_SCANCODE;
+    if key.extended {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
     if !down {
         flags |= KEYEVENTF_KEYUP;
     }
@@ -375,7 +398,7 @@ fn send_pair_key(scan: u16, vk: u16, down: bool) -> bool {
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: 0,
-                wScan: scan,
+                wScan: key.scan,
                 dwFlags: flags,
                 time: 0,
                 dwExtraInfo: OPENGEAR_INJECTED_TAG,
@@ -391,23 +414,21 @@ fn send_pair_key(scan: u16, vk: u16, down: bool) -> bool {
     ok
 }
 
-/// VK -> scan code using the keyboard layout of the window that will receive the key.
-#[cfg(windows)]
-fn scan_for_foreground_layout(vk: u16) -> u16 {
-    unsafe {
-        let fg = GetForegroundWindow();
-        let tid = if fg.is_null() {
-            0
-        } else {
-            GetWindowThreadProcessId(fg, std::ptr::null_mut())
-        };
-        let hkl = GetKeyboardLayout(tid);
-        MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, hkl) as u16
-    }
-}
-
 #[cfg(windows)]
 fn send_unicode_char(ch: char) {
+    match ch {
+        '\n' | '\r' => {
+            send_vk(0x0D, true);
+            send_vk(0x0D, false);
+            return;
+        }
+        '\t' => {
+            send_vk(0x09, true);
+            send_vk(0x09, false);
+            return;
+        }
+        _ => {}
+    }
     let mut buf = [0u16; 2];
     let encoded = ch.encode_utf16(&mut buf);
     for &unit in encoded.iter() {
@@ -443,56 +464,93 @@ fn send_unicode_char(ch: char) {
     }
 }
 
-/// Play a macro on a worker thread. It stops early when the engine stops, and always releases
-/// every key it pressed but did not release (cancelled run, or a recording truncated between a
-/// key-down and its key-up), so a macro can never leave a key stuck down.
+#[cfg(windows)]
+enum MacroJob {
+    Steps {
+        steps: Vec<MacroStep>,
+        generation: u32,
+    },
+    Text {
+        text: String,
+        delay_ms: u32,
+        generation: u32,
+    },
+}
+
+#[cfg(windows)]
+fn macro_worker_tx() -> &'static Sender<MacroJob> {
+    static TX: OnceLock<Sender<MacroJob>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<MacroJob>();
+        let _ = thread::Builder::new()
+            .name("opengear-macro-runner".to_string())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    match job {
+                        MacroJob::Steps { steps, generation } => {
+                            let mut pressed: Vec<u16> = Vec::new();
+                            for step in steps {
+                                if MACRO_GENERATION.load(Ordering::SeqCst) != generation {
+                                    break;
+                                }
+                                if let Some(vk) = key_name_to_vk(&step.key) {
+                                    if send_vk(vk, step.down) {
+                                        track_pressed(&mut pressed, vk, step.down);
+                                    }
+                                }
+                                if step.delay_ms > 0
+                                    && !sleep_unless_cancelled(
+                                        capped_delay(step.delay_ms, MAX_MACRO_STEP_DELAY_MS),
+                                        generation,
+                                    )
+                                {
+                                    break;
+                                }
+                            }
+                            for vk in pressed {
+                                send_vk(vk, false);
+                            }
+                        }
+                        MacroJob::Text {
+                            text,
+                            delay_ms,
+                            generation,
+                        } => {
+                            for ch in text.chars() {
+                                if MACRO_GENERATION.load(Ordering::SeqCst) != generation {
+                                    break;
+                                }
+                                send_unicode_char(ch);
+                                if delay_ms > 0
+                                    && !sleep_unless_cancelled(
+                                        capped_delay(delay_ms, MAX_TEXT_CHAR_DELAY_MS),
+                                        generation,
+                                    )
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        tx
+    })
+}
+
 #[cfg(windows)]
 fn run_macro_steps(steps: Vec<MacroStep>) {
     let generation = MACRO_GENERATION.load(Ordering::SeqCst);
-    thread::spawn(move || {
-        let mut pressed: Vec<u16> = Vec::new();
-        for step in steps {
-            if MACRO_GENERATION.load(Ordering::SeqCst) != generation {
-                break;
-            }
-            if let Some(vk) = key_name_to_vk(&step.key) {
-                if send_vk(vk, step.down) {
-                    track_pressed(&mut pressed, vk, step.down);
-                }
-            }
-            if step.delay_ms > 0
-                && !sleep_unless_cancelled(
-                    capped_delay(step.delay_ms, MAX_MACRO_STEP_DELAY_MS),
-                    generation,
-                )
-            {
-                break;
-            }
-        }
-        for vk in pressed {
-            send_vk(vk, false);
-        }
-    });
+    let _ = macro_worker_tx().send(MacroJob::Steps { steps, generation });
 }
 
 #[cfg(windows)]
 fn run_text_macro(text: String, delay_ms: u32) {
     let generation = MACRO_GENERATION.load(Ordering::SeqCst);
-    thread::spawn(move || {
-        for ch in text.chars() {
-            if MACRO_GENERATION.load(Ordering::SeqCst) != generation {
-                break;
-            }
-            send_unicode_char(ch);
-            if delay_ms > 0
-                && !sleep_unless_cancelled(
-                    capped_delay(delay_ms, MAX_TEXT_CHAR_DELAY_MS),
-                    generation,
-                )
-            {
-                break;
-            }
-        }
+    let _ = macro_worker_tx().send(MacroJob::Text {
+        text,
+        delay_ms,
+        generation,
     });
 }
 
@@ -505,63 +563,116 @@ fn release_all_injected_keys() {
     }
 }
 
+/// Release held remaps, clear tracked physical/SOCD/chatter/suppressed states, and cancel macros.
+pub fn reset_held_state() {
+    #[cfg(windows)]
+    release_all_injected_keys();
+    #[cfg(not(windows))]
+    MACRO_GENERATION.fetch_add(1, Ordering::SeqCst);
+
+    KEYS.clear_held();
+    for slot in &EFFECTIVE_DOWN {
+        slot.store(false, Ordering::Relaxed);
+    }
+    if let Ok(mut st) = state_store().lock() {
+        st.socd.clear();
+        st.chatter.clear();
+    }
+}
+
 #[cfg(windows)]
-unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && HOOK_ACTIVE.load(Ordering::Relaxed) {
         let info = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
         let is_injected =
             (info.flags & LLKHF_INJECTED) != 0 || info.dwExtraInfo == OPENGEAR_INJECTED_TAG;
         if is_injected {
-            // Injected keys (incl. Snap Tap's own) are what applications receive: track them for
-            // the live tester, but never process them again.
             note_effective(
                 info.scanCode,
                 wparam == WM_KEYDOWN as usize || wparam == WM_SYSKEYDOWN as usize,
             );
+            return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
         }
 
-        if !is_injected {
-            let vk = info.vkCode as u16;
-            let is_down = wparam == WM_KEYDOWN as usize || wparam == WM_SYSKEYDOWN as usize;
-            let is_up = wparam == WM_KEYUP as usize || wparam == WM_SYSKEYUP as usize;
+        let vk = info.vkCode as u16;
+        let is_down = wparam == WM_KEYDOWN as usize || wparam == WM_SYSKEYDOWN as usize;
+        let is_up = wparam == WM_KEYUP as usize || wparam == WM_SYSKEYUP as usize;
 
-            if is_down || is_up {
-                let now = Instant::now();
-                let is_repeat = KEYS.note_physical(vk, is_down);
-                KEYS.note_scan(vk, info.scanCode, (info.flags & LLKHF_EXTENDED) != 0);
+        if is_down || is_up {
+            let now = Instant::now();
+            let scan = info.scanCode as u16;
 
-                // 0. Active remap: undo / repeat exactly what was pressed on key-down, whatever the
-                //    rules are now (they may have changed mid-press, or be write-locked right now).
-                //    This is what guarantees a remapped target can never stay stuck down.
-                if is_up {
-                    if let Some(target_vk) = KEYS.end_remap(vk) {
-                        send_vk(target_vk, false);
-                        return 1;
-                    }
-                } else if let Some(target_vk) = KEYS.remap_target(vk) {
-                    send_vk(target_vk, true);
+            // Snapshot rules under a short read lock, then drop before any state lock or SendInput.
+            let (key_chatter_ms, win_lock, matched_pair, action) =
+                if let Ok(rules) = rules_store().try_read() {
+                    let pair = if rules.socd_enabled && !SOCD_SUSPENDED.load(Ordering::Relaxed) {
+                        rules
+                            .socd_pairs
+                            .iter()
+                            .find_map(|p| p.side_of(vk, scan).map(|side| (*p, side)))
+                    } else {
+                        None
+                    };
+                    (
+                        rules.key_chatter_ms,
+                        rules.win_lock,
+                        pair,
+                        rules.by_vk.get(&vk).cloned(),
+                    )
+                } else {
+                    (0, false, None, None)
+                };
+
+            // 0. Software Anti-Chatter BEFORE note_physical, ripples, or macro recorder so
+            //    bounced switches never pollute repeat detection, RGB ripples, or recordings.
+            if key_chatter_ms > 0 {
+                let blocked = state_store()
+                    .try_lock()
+                    .map(|mut st| st.chatter.check_key(vk, is_down, key_chatter_ms, now))
+                    .unwrap_or(false);
+                if blocked {
+                    CHATTER_BLOCKED_COUNT.fetch_add(1, Ordering::Relaxed);
                     return 1;
                 }
+            }
 
-                // 1. Reactive typing RGB ripple feed (non-blocking, fresh presses only)
-                if is_down && !is_repeat {
-                    if let Some(kname) = vk_to_key_name(vk) {
-                        if let Ok(mut q) = ripples_store().try_lock() {
-                            if q.len() >= 24 {
-                                q.pop_front();
-                            }
-                            q.push_back((kname.to_string(), now));
+            let is_repeat = KEYS.note_physical(vk, is_down);
+            KEYS.note_scan(vk, info.scanCode, (info.flags & LLKHF_EXTENDED) != 0);
+
+            // 1. Active remap release / repeat (guarantees remaps never stick if rules change mid-hold).
+            if is_up {
+                if let Some(target_vk) = KEYS.end_remap(vk) {
+                    send_vk(target_vk, false);
+                    return 1;
+                }
+            } else if let Some(target_vk) = KEYS.remap_target(vk) {
+                send_vk(target_vk, true);
+                return 1;
+            }
+
+            // 2. Reactive typing RGB ripple feed (fresh presses only, &'static str -> 0 allocs).
+            if is_down && !is_repeat {
+                if let Some(kname) = vk_to_key_name(vk) {
+                    if let Ok(mut q) = ripples_store().try_lock() {
+                        if q.len() >= 24 {
+                            q.pop_front();
                         }
+                        q.push_back((kname, now));
                     }
                 }
+            }
 
-                // 2. Live Macro Recorder capture (never swallows keys so user can stop cleanly)
-                if let Ok(mut rec) = recorder_store().try_lock() {
-                    if rec.recording {
+            // 3. Live Macro Recorder capture (ignore OS key-repeat; drop lock before CallNextHookEx).
+            let recording_active = if let Ok(mut rec) = recorder_store().try_lock() {
+                if rec.recording {
+                    if !(is_down && is_repeat) {
                         if let Some(kname) = vk_to_key_name(vk) {
                             let delay_ms = rec
                                 .last_event
-                                .map(|prev| now.saturating_duration_since(prev).as_millis().min(2000) as u32)
+                                .map(|prev| {
+                                    now.saturating_duration_since(prev).as_millis().min(2000)
+                                        as u32
+                                })
                                 .unwrap_or(0);
                             if let Some(prev_step) = rec.steps.last_mut() {
                                 prev_step.delay_ms = delay_ms.max(5);
@@ -575,138 +686,150 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                             }
                             rec.last_event = Some(now);
                         }
-                        // While recording, don't execute conflicting remaps
-                        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
                     }
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+            if recording_active {
+                note_effective(info.scanCode, is_down);
+                return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+            }
 
-                if let Ok(rules) = rules_store().try_read() {
-                    // 3. Software Anti-Chatter / Key Debounce Shield (only when configured > 0 ms)
-                    if rules.key_chatter_ms > 0 {
-                        if let Ok(mut st) = state_store().try_lock() {
-                            if is_down {
-                                if let Some(prev_up) = st.last_key_up.get(&vk) {
-                                    if now.saturating_duration_since(*prev_up).as_millis()
-                                        < rules.key_chatter_ms as u128
-                                    {
-                                        CHATTER_BLOCKED_COUNT.fetch_add(1, Ordering::Relaxed);
-                                        return 1;
-                                    }
-                                }
-                            } else if is_up {
-                                st.last_key_up.insert(vk, now);
-                            }
-                        }
+            // 4. WinLock check (track suppressed DOWN so UP is only swallowed when DOWN was)
+            if win_lock && (vk == 0x5B || vk == 0x5C) {
+                if is_down {
+                    KEYS.mark_suppressed(vk, true);
+                    return 1;
+                } else if KEYS.take_suppressed(vk) {
+                    return 1;
+                }
+            }
+
+            // 5. SOCD / Snap Tap (state lock dropped BEFORE SendInput and CallNextHookEx)
+            let mut post_inject: Option<(SocdKey, bool)> = None;
+            if let Some((pair, is_a)) = matched_pair {
+                let decision: Option<SocdDecision> = state_store()
+                    .try_lock()
+                    .ok()
+                    .map(|mut st| st.socd.handle_event(&pair, is_a, is_down));
+                if let Some(dec) = decision {
+                    if dec.resolved_conflict {
+                        SOCD_RESOLVED_COUNT.fetch_add(1, Ordering::Relaxed);
                     }
-
-                    // 4. WinLock check
-                    if rules.win_lock && (vk == 0x5B || vk == 0x5C) {
+                    if let Some((pre_key, pre_down)) = dec.pre_inject {
+                        send_pair_key(pre_key, pre_down);
+                    }
+                    if !dec.pass_current {
                         return 1;
                     }
+                    post_inject = dec.post_inject;
+                }
+            }
 
-                    // 5. SOCD / Snap Tap (Last-Input Priority) — automatically bypassed if suspended (e.g. cs2.exe)
-                    //    Keys are matched by PHYSICAL position (scan code), VK as a fallback.
-                    let scan = info.scanCode as u16;
-                    note_effective(info.scanCode, is_down);
-                    if rules.socd_enabled && !SOCD_SUSPENDED.load(Ordering::Relaxed) {
-                        if let Some((pair, is_a)) = rules
-                            .socd_pairs
-                            .iter()
-                            .find_map(|p| p.side_of(vk, scan).map(|side| (p, side)))
-                        {
-                            let key = (pair.vk_a, pair.vk_b);
-                            // The opposing key is re-injected by its physical scan code.
-                            let opp_scan = if is_a { pair.scan_b } else { pair.scan_a };
-                            let opp_vk = if is_a { pair.vk_b } else { pair.vk_a };
-                            // Identify sides by the pair's own VKs, not by the VK the hook
-                            // reported (which may differ from the configured one).
-                            let self_vk = if is_a { pair.vk_a } else { pair.vk_b };
-
-                            if let Ok(mut st) = state_store().try_lock() {
-                                let entry = st.pair_state.entry(key).or_insert((false, false, None));
-                                if is_down {
-                                    let was_held = if is_a { entry.0 } else { entry.1 };
-                                    if is_a {
-                                        entry.0 = true;
-                                    } else {
-                                        entry.1 = true;
-                                    }
-                                    // Ignore OS key-repeat if already active
-                                    if !was_held {
-                                        if entry.2 == Some(opp_vk) {
-                                            // Release opposing key before letting new key pass
-                                            send_pair_key(opp_scan, opp_vk, false);
-                                            SOCD_RESOLVED_COUNT.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        entry.2 = Some(self_vk);
-                                    } else if entry.2 != Some(self_vk) {
-                                        // Suppress OS auto-repeat of suppressed key while opponent owns priority
-                                        return 1;
-                                    }
-                                } else if is_up {
-                                    if is_a {
-                                        entry.0 = false;
-                                    } else {
-                                        entry.1 = false;
-                                    }
-                                    let opp_held = if is_a { entry.1 } else { entry.0 };
-                                    if entry.2 == Some(self_vk) {
-                                        if opp_held {
-                                            // Re-engage held opposing key immediately!
-                                            entry.2 = Some(opp_vk);
-                                            // Let this key's UP pass, then press opponent
-                                            let res = unsafe {
-                                                CallNextHookEx(
-                                                    std::ptr::null_mut(),
-                                                    code,
-                                                    wparam,
-                                                    lparam,
-                                                )
-                                            };
-                                            send_pair_key(opp_scan, opp_vk, true);
-                                            return res;
-                                        } else {
-                                            entry.2 = None;
-                                        }
-                                    }
+            // 6. Custom key remaps, macros & text actions
+            if let Some(action) = action {
+                match action {
+                    KeyAction::Disable => {
+                        if is_down {
+                            KEYS.mark_suppressed(vk, true);
+                            return 1;
+                        } else if KEYS.take_suppressed(vk) {
+                            return 1;
+                        }
+                    }
+                    KeyAction::Remap { target } => {
+                        if is_down {
+                            if let Some(target_vk) = key_name_to_vk(&target) {
+                                if send_vk(target_vk, true) {
+                                    KEYS.begin_remap(vk, target_vk);
+                                    return 1;
                                 }
                             }
                         }
                     }
-
-                    // 6. Custom key remaps, macros & text actions
-                    if let Some(action) = rules.by_vk.get(&vk) {
-                        match action {
-                            KeyAction::Disable => return 1,
-                            KeyAction::Remap { target } => {
-                                // Key-up of a tracked remap was already handled in step 0. An
-                                // untracked key-up means the original key-down went through
-                                // unchanged: let its key-up through too so it can't stay stuck.
-                                if is_down {
-                                    if let Some(target_vk) = key_name_to_vk(target) {
-                                        if send_vk(target_vk, true) {
-                                            KEYS.begin_remap(vk, target_vk);
-                                            return 1;
-                                        }
-                                        // Injection refused (e.g. elevated foreground window):
-                                        // pass the original key rather than swallowing it.
-                                    }
-                                }
-                            }
-                            KeyAction::Macro { steps, .. } => {
-                                // One run per physical press: OS auto-repeat must not relaunch it.
-                                if is_down && !is_repeat {
-                                    run_macro_steps(steps.clone());
-                                }
-                                return 1;
-                            }
-                            KeyAction::Text { text, delay_ms } => {
-                                if is_down && !is_repeat {
-                                    run_text_macro(text.clone(), *delay_ms);
-                                }
-                                return 1;
-                            }
+                    KeyAction::Macro { steps, .. } => {
+                        if is_down && !is_repeat {
+                            run_macro_steps(steps);
                         }
+                        if is_down {
+                            KEYS.mark_suppressed(vk, true);
+                            return 1;
+                        } else if KEYS.take_suppressed(vk) {
+                            return 1;
+                        }
+                    }
+                    KeyAction::Text { text, delay_ms } => {
+                        if is_down && !is_repeat {
+                            run_text_macro(text, delay_ms);
+                        }
+                        if is_down {
+                            KEYS.mark_suppressed(vk, true);
+                            return 1;
+                        } else if KEYS.take_suppressed(vk) {
+                            return 1;
+                        }
+                    }
+                }
+            }
+
+            if is_down {
+                KEYS.mark_suppressed(vk, false);
+            } else {
+                let _ = KEYS.take_suppressed(vk);
+            }
+
+            note_effective(info.scanCode, is_down);
+            let res = unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+            if let Some((pk, pd)) = post_inject {
+                send_pair_key(pk, pd);
+            }
+            return res;
+        }
+    }
+
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        keyboard_hook_inner(code, wparam, lparam)
+    }))
+    .unwrap_or_else(|_| unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) })
+}
+
+#[cfg(windows)]
+fn mouse_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 && HOOK_ACTIVE.load(Ordering::Relaxed) {
+        let wp = wparam as u32;
+        if wp == WM_LBUTTONDOWN || wp == WM_LBUTTONUP || wp == WM_RBUTTONDOWN || wp == WM_RBUTTONUP {
+            let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+            let is_injected =
+                (info.flags & LLMHF_INJECTED) != 0 || info.dwExtraInfo == OPENGEAR_INJECTED_TAG;
+            if !is_injected {
+                let debounce_ms = rules_store()
+                    .try_read()
+                    .map(|r| r.mouse_debounce_ms)
+                    .unwrap_or(0);
+                if debounce_ms > 0 {
+                    let btn_idx = if wp == WM_LBUTTONDOWN || wp == WM_LBUTTONUP {
+                        0
+                    } else {
+                        1
+                    };
+                    let is_down = wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN;
+                    let now = Instant::now();
+                    let blocked = state_store()
+                        .try_lock()
+                        .map(|mut st| st.chatter.check_mouse(btn_idx, is_down, debounce_ms, now))
+                        .unwrap_or(false);
+                    if blocked {
+                        MOUSE_DBLCLICK_BLOCKED_COUNT.fetch_add(1, Ordering::Relaxed);
+                        return 1;
                     }
                 }
             }
@@ -720,41 +843,10 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
 /// NEVER inspects or modifies `WM_MOUSEMOVE` deltas (100% raw-input & anti-cheat safe).
 #[cfg(windows)]
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 && HOOK_ACTIVE.load(Ordering::Relaxed) {
-        let wp = wparam as u32;
-        if wp == WM_LBUTTONDOWN || wp == WM_LBUTTONUP || wp == WM_RBUTTONDOWN || wp == WM_RBUTTONUP {
-            let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
-            let is_injected =
-                (info.flags & LLMHF_INJECTED) != 0 || info.dwExtraInfo == OPENGEAR_INJECTED_TAG;
-            if !is_injected {
-                let debounce_ms = rules_store()
-                    .try_read()
-                    .map(|r| r.mouse_debounce_ms)
-                    .unwrap_or(0);
-                if debounce_ms > 0 {
-                    let btn_idx = if wp == WM_LBUTTONDOWN || wp == WM_LBUTTONUP { 0 } else { 1 };
-                    let is_down = wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN;
-                    let now = Instant::now();
-                    if let Ok(mut st) = state_store().try_lock() {
-                        if is_down {
-                            if let Some(prev_up) = st.last_mouse_up[btn_idx] {
-                                if now.saturating_duration_since(prev_up).as_millis()
-                                    < debounce_ms as u128
-                                {
-                                    MOUSE_DBLCLICK_BLOCKED_COUNT.fetch_add(1, Ordering::Relaxed);
-                                    return 1;
-                                }
-                            }
-                        } else {
-                            st.last_mouse_up[btn_idx] = Some(now);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        mouse_hook_inner(code, wparam, lparam)
+    }))
+    .unwrap_or_else(|_| unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) })
 }
 
 /// Manages the background Windows low-level keyboard & optional mouse-debounce hooks
@@ -795,7 +887,7 @@ impl InputEngine {
         let prev = SOCD_SUSPENDED.swap(suspended, Ordering::SeqCst);
         if prev != suspended {
             if let Ok(mut st) = state_store().lock() {
-                st.pair_state.clear();
+                st.socd.clear();
             }
         }
     }
@@ -834,13 +926,21 @@ impl InputEngine {
         for p in &socd.pairs {
             if let (Some(va), Some(vb)) = (key_name_to_vk(&p.key_a), key_name_to_vk(&p.key_b)) {
                 if va != vb {
-                    // Physical positions of the named keys in the user's active layout
-                    // (AZERTY "Q" = the key at scan 0x1E, QWERTY "A" = same physical key).
-                    socd_pairs.push(SocdPairRuntime {
-                        vk_a: va,
-                        vk_b: vb,
-                        scan_a: scan_for_name(&p.key_a, va),
-                        scan_b: scan_for_name(&p.key_b, vb),
+                    let preset = is_movement_preset_pair(&p.key_a, &p.key_b);
+                    let (scan_a, ext_a) = resolve_pair_scan(&p.key_a, va, preset);
+                    let (scan_b, ext_b) = resolve_pair_scan(&p.key_b, vb, preset);
+                    socd_pairs.push(SocdPair {
+                        a: SocdKey {
+                            vk: va,
+                            scan: scan_a,
+                            extended: ext_a,
+                        },
+                        b: SocdKey {
+                            vk: vb,
+                            scan: scan_b,
+                            extended: ext_b,
+                        },
+                        mode: SocdMode::LastInputWins,
                     });
                 }
             }
@@ -854,9 +954,9 @@ impl InputEngine {
             guard.mouse_debounce_ms = mouse_debounce_ms.min(100);
         }
         if let Ok(mut st) = state_store().lock() {
-            st.pair_state.clear();
+            st.socd.clear();
         }
-        // Dynamically attach/detach WH_MOUSE_LL so 1000-8000 Hz mice have ZERO hook overhead when mouse_debounce_ms == 0!
+        // Dynamically attach/detach WH_MOUSE_LL so high-polling mice have ZERO overhead when disabled.
         #[cfg(windows)]
         {
             let tid = self.thread_id.load(Ordering::SeqCst);
@@ -914,7 +1014,7 @@ impl InputEngine {
             for (k, ts) in q.iter() {
                 let age = now.saturating_duration_since(*ts).as_secs_f32();
                 if age <= max_age_secs {
-                    out.push((k.clone(), age));
+                    out.push(((*k).to_string(), age));
                 }
             }
         }
@@ -922,8 +1022,7 @@ impl InputEngine {
     }
 
     /// Install the low-level hooks on a dedicated thread and wait until the keyboard hook is
-    /// actually in place: returns an error (instead of a false "running" state) if Windows
-    /// refuses it. Failed attempts are not retried more often than every few seconds.
+    /// actually in place.
     #[cfg(windows)]
     pub fn start(&mut self) -> anyhow::Result<()> {
         if let Some(h) = self.worker.as_ref() {
@@ -931,7 +1030,6 @@ impl InputEngine {
                 HOOK_ACTIVE.store(true, Ordering::SeqCst);
                 return Ok(());
             }
-            // The previous hook thread exited (hook failure or WM_QUIT): reap it and restart.
             if let Some(h) = self.worker.take() {
                 let _ = h.join();
             }
@@ -944,16 +1042,13 @@ impl InputEngine {
 
         let tid_slot = self.thread_id.clone();
         tid_slot.store(0, Ordering::SeqCst);
-        // Key-ups that happened while stopped were never seen: start from a clean slate.
         KEYS.clear_held();
         HOOK_ACTIVE.store(true, Ordering::SeqCst);
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
 
         let handle = thread::Builder::new()
             .name("opengear-input-hook".to_string())
             .spawn(move || unsafe {
-                // Create this thread's message queue BEFORE publishing its id, so that
-                // PostThreadMessageW from stop()/update_rules() can never be lost.
                 let mut msg: MSG = std::mem::zeroed();
                 PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
                 let tid = GetCurrentThreadId();
@@ -1036,9 +1131,9 @@ impl InputEngine {
                 anyhow::bail!(err)
             }
             Err(_) => {
-                // Keep the handle so stop() can still clean the thread up.
                 self.worker = Some(handle);
-                let err = "Le hook clavier n'a pas confirmé son installation (délai dépassé)".to_string();
+                let err =
+                    "Le hook clavier n'a pas confirmé son installation (délai dépassé)".to_string();
                 self.last_start_failure = Some((Instant::now(), err.clone()));
                 anyhow::bail!(err)
             }
@@ -1050,13 +1145,12 @@ impl InputEngine {
         anyhow::bail!("InputEngine requiert Windows");
     }
 
-    /// Stop the hooks: cancel running macros, release every key OpenGear holds down, then ask the
-    /// hook thread to quit. Never blocks forever: if the thread does not exit in time it is
-    /// detached (its hook is already inert since `HOOK_ACTIVE` is false).
+    /// Stop the hooks: cancel running macros, release held/suppressed keys, and ask the hook
+    /// thread to quit.
     #[cfg(windows)]
     pub fn stop(&mut self) {
         HOOK_ACTIVE.store(false, Ordering::SeqCst);
-        release_all_injected_keys();
+        reset_held_state();
         if let Some(handle) = self.worker.take() {
             let deadline = Instant::now() + Duration::from_secs(2);
             while !handle.is_finished() && Instant::now() < deadline {
@@ -1078,7 +1172,9 @@ impl InputEngine {
     }
 
     #[cfg(not(windows))]
-    pub fn stop(&mut self) {}
+    pub fn stop(&mut self) {
+        reset_held_state();
+    }
 }
 
 impl Drop for InputEngine {
@@ -1095,28 +1191,53 @@ mod tests {
     fn effective_state_tracks_movement_keys_only() {
         note_effective(0x1E, true);
         note_effective(0x20, true);
-        note_effective(0x1E, false); // Snap Tap released "left"
-        note_effective(0x10, true); // unrelated key ignored
+        note_effective(0x1E, false);
+        note_effective(0x10, true);
         let k = movement_keys_effective();
         assert!(!k[0] && k[1] && !k[2] && !k[3]);
         note_effective(0x20, false);
     }
 
     #[test]
+    fn movement_preset_overrides_apply_only_to_movement_pairs() {
+        assert!(is_movement_preset_pair("Q", "D"));
+        assert!(is_movement_preset_pair("a", "d"));
+        assert!(is_movement_preset_pair("Z", "S"));
+        assert!(is_movement_preset_pair("w", "s"));
+        assert!(!is_movement_preset_pair("Q", "E"));
+        assert!(!is_movement_preset_pair("LEFT", "RIGHT"));
+
+        assert_eq!(movement_preset_scan("Q"), Some((0x1E, false)));
+        assert_eq!(movement_preset_scan("A"), Some((0x1E, false)));
+        assert_eq!(movement_preset_scan("d"), Some((0x20, false)));
+        assert_eq!(movement_preset_scan("Z"), Some((0x11, false)));
+        assert_eq!(movement_preset_scan("W"), Some((0x11, false)));
+    }
+
+    #[test]
+    fn decode_vsc_ex_extracts_extended_arrows() {
+        assert_eq!(decode_vsc_ex(0xE04B), (0x4B, true));
+        assert_eq!(decode_vsc_ex(0x001E), (0x1E, false));
+    }
+
+    #[test]
     fn snap_tap_pairs_match_physical_keys_whatever_the_layout() {
-        // AZERTY preset "Q+D" and QWERTY preset "A+D" are the same physical keys.
-        assert_eq!(scan_for_name("Q", 0x51), 0x1E);
-        assert_eq!(scan_for_name("A", 0x41), 0x1E);
-        assert_eq!(scan_for_name("d", 0x44), 0x20);
-        assert_eq!(scan_for_name("Z", 0x5A), 0x11);
-        assert_eq!(scan_for_name("W", 0x57), 0x11);
-        let pair = SocdPairRuntime { vk_a: 0x51, vk_b: 0x44, scan_a: 0x1E, scan_b: 0x20 };
-        // Physical left key reported with an unexpected VK (e.g. 0x41) is still "A side"
+        let pair = SocdPair {
+            a: SocdKey {
+                vk: 0x51,
+                scan: 0x1E,
+                extended: false,
+            },
+            b: SocdKey {
+                vk: 0x44,
+                scan: 0x20,
+                extended: false,
+            },
+            mode: SocdMode::LastInputWins,
+        };
         assert_eq!(pair.side_of(0x41, 0x1E), Some(true));
         assert_eq!(pair.side_of(0x00, 0x20), Some(false));
-        // VK fallback when no scan code
         assert_eq!(pair.side_of(0x51, 0), Some(true));
-        // Unrelated key
         assert_eq!(pair.side_of(0x45, 0x12), None);
     }
 
@@ -1124,32 +1245,41 @@ mod tests {
     fn observed_scan_code_is_reused_with_its_extended_flag() {
         let k = KeyTracker::new();
         assert_eq!(k.observed_scan(0x51), None);
-        // AZERTY: VK_Q is produced by the physical key at scan 0x1E
         k.note_scan(0x51, 0x1E, false);
         assert_eq!(k.observed_scan(0x51), Some((0x1E, false)));
-        // A zero scan code never overwrites a real one
         k.note_scan(0x51, 0, false);
         assert_eq!(k.observed_scan(0x51), Some((0x1E, false)));
-        k.note_scan(0x25, 0x4B, true); // left arrow (extended)
+        k.note_scan(0x25, 0x4B, true);
         assert_eq!(k.observed_scan(0x25), Some((0x4B, true)));
+    }
+
+    #[test]
+    fn suppressed_keys_release_only_when_down_was_swallowed() {
+        let k = KeyTracker::new();
+        assert!(!k.take_suppressed(0x5B));
+        k.mark_suppressed(0x5B, true);
+        assert!(k.take_suppressed(0x5B));
+        assert!(!k.take_suppressed(0x5B));
     }
 
     #[test]
     fn auto_repeat_is_detected_only_while_held() {
         let k = KeyTracker::new();
-        assert!(!k.note_physical(0x41, true), "first press is not a repeat");
-        assert!(k.note_physical(0x41, true), "second down while held is OS auto-repeat");
+        assert!(!k.note_physical(0x41, true));
+        assert!(k.note_physical(0x41, true));
         assert!(k.note_physical(0x41, true));
         assert!(!k.note_physical(0x41, false));
-        assert!(!k.note_physical(0x41, true), "new press after release");
+        assert!(!k.note_physical(0x41, true));
     }
 
     #[test]
     fn clear_held_forgets_keys_released_while_stopped() {
         let k = KeyTracker::new();
         k.note_physical(0x20, true);
+        k.mark_suppressed(0x5B, true);
         k.clear_held();
         assert!(!k.note_physical(0x20, true));
+        assert!(!k.take_suppressed(0x5B));
     }
 
     #[test]
@@ -1164,11 +1294,10 @@ mod tests {
     #[test]
     fn remap_release_returns_the_target_pressed_at_keydown() {
         let k = KeyTracker::new();
-        k.begin_remap(0x14, 0x7C); // CAPS -> F13
+        k.begin_remap(0x14, 0x7C);
         assert_eq!(k.remap_target(0x14), Some(0x7C));
-        // Even if the rules changed meanwhile, the release undoes what was pressed.
         assert_eq!(k.end_remap(0x14), Some(0x7C));
-        assert_eq!(k.end_remap(0x14), None, "released only once");
+        assert_eq!(k.end_remap(0x14), None);
         assert_eq!(k.remap_target(0x14), None);
     }
 
@@ -1186,11 +1315,10 @@ mod tests {
     #[test]
     fn macro_tracks_keys_left_down() {
         let mut pressed = Vec::new();
-        track_pressed(&mut pressed, 0xA2, true); // LCTRL down
-        track_pressed(&mut pressed, 0x43, true); // C down
-        track_pressed(&mut pressed, 0x43, true); // duplicate down
-        track_pressed(&mut pressed, 0x43, false); // C up
-        // Truncated recording: LCTRL never released -> must be released at the end.
+        track_pressed(&mut pressed, 0xA2, true);
+        track_pressed(&mut pressed, 0x43, true);
+        track_pressed(&mut pressed, 0x43, true);
+        track_pressed(&mut pressed, 0x43, false);
         assert_eq!(pressed, vec![0xA2]);
     }
 

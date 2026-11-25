@@ -6,17 +6,40 @@ use tracing::{debug, trace, warn};
 
 const READ_TIMEOUT_MS: i32 = 150;
 const SHORT_TIMEOUT_MS: i32 = 15;
-/// Total time `exchange` waits for the matching reply while skipping unrelated reports.
 const EXCHANGE_DEADLINE_MS: u64 = 300;
+const HIDP_STATUS_SUCCESS: i32 = 0x0011_0000;
 
-/// Locate the Bragi reply to `expected_cmd` in a raw input report: `[magic, cmd, err, ...]`, or
-/// the same prefixed by a `0x00` report ID. Returns the reply starting at its first byte, or
-/// `None` for any unrelated report (stale reply, notification, other command).
-pub(crate) fn match_reply(rx: &[u8], expected_cmd: u8) -> Option<&[u8]> {
-    if rx.len() >= 3 && rx[1] == expected_cmd {
+/// Abstraction over raw HID device I/O so BragiTransport can be unit-tested with mock transports.
+pub trait HidIo: Send {
+    fn write(&self, data: &[u8]) -> Result<usize, hidapi::HidError>;
+    fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> Result<usize, hidapi::HidError>;
+}
+
+struct HidApiIo(HidDevice);
+
+impl HidIo for HidApiIo {
+    fn write(&self, data: &[u8]) -> Result<usize, hidapi::HidError> {
+        self.0.write(data)
+    }
+
+    fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> Result<usize, hidapi::HidError> {
+        self.0.read_timeout(buf, timeout_ms)
+    }
+}
+
+/// Locate the Bragi reply to `expected_cmd` in a raw input report: `[0x00|magic, cmd, err, ...]`,
+/// or the same prefixed by a `0x00` report ID (`[0x00, magic, cmd, err, ...]`).
+/// Validates the magic byte when unwrapping a Report ID prefix so an error response from an
+/// unrelated command (e.g. `err == expected_cmd`) is never misinterpreted as a match.
+pub(crate) fn match_reply(rx: &[u8], expected_magic: u8, expected_cmd: u8) -> Option<&[u8]> {
+    if rx.len() >= 3 && (rx[0] == 0x00 || rx[0] == expected_magic) && rx[1] == expected_cmd {
         return Some(rx);
     }
-    if rx.len() >= 4 && rx[0] == 0x00 && rx[2] == expected_cmd {
+    if rx.len() >= 4
+        && rx[0] == 0x00
+        && (rx[1] == expected_magic || (rx[1] & 0xF8) == BRAGI_MAGIC)
+        && rx[2] == expected_cmd
+    {
         return Some(&rx[1..]);
     }
     None
@@ -38,7 +61,6 @@ pub struct BragiHidCandidate {
     pub path_cstr: CString,
 }
 
-/// Query exact Windows HID Input/Output report byte lengths so we match 65-byte vs 1025-byte firmwares.
 #[cfg(windows)]
 fn query_windows_hid_caps(path: &str) -> Option<HidCapsInfo> {
     use std::ffi::OsStr;
@@ -76,7 +98,7 @@ fn query_windows_hid_caps(path: &str) -> Option<HidCapsInfo> {
         HidD_FreePreparsedData(preparsed);
         CloseHandle(handle);
 
-        if status == 0x0011_0000 {
+        if status == HIDP_STATUS_SUCCESS {
             Some(HidCapsInfo {
                 out_report_len: caps.OutputReportByteLength as usize,
                 in_report_len: caps.InputReportByteLength as usize,
@@ -93,7 +115,7 @@ fn query_windows_hid_caps(_path: &str) -> Option<HidCapsInfo> {
 }
 
 pub struct BragiTransport {
-    dev: HidDevice,
+    dev: Box<dyn HidIo>,
     pub vid: u16,
     pub pid: u16,
     /// `0` = host / wired device (`0x08`); `1..=7` = wireless Slipstream subdevice (`0x08 | id`).
@@ -102,12 +124,46 @@ pub struct BragiTransport {
     pub serial: String,
     pub path: String,
     /// Full HID write report length including Report ID byte 0 (usually 65 or 1025).
-    pub out_report_len: usize,
+    out_report_len: usize,
     /// Full HID read report length including Report ID byte 0 (usually 65 or 1025).
-    pub in_report_len: usize,
+    in_report_len: usize,
+    tx_buf: Vec<u8>,
+    rx_buf: Vec<u8>,
 }
 
 impl BragiTransport {
+    #[cfg(test)]
+    pub(crate) fn from_io(
+        dev: Box<dyn HidIo>,
+        subdevice_id: u8,
+        out_report_len: usize,
+        in_report_len: usize,
+    ) -> Self {
+        let out_len = out_report_len.max(16);
+        let in_len = in_report_len.max(16);
+        Self {
+            dev,
+            vid: CORSAIR_VID,
+            pid: PID_K70_RGB_TKL,
+            subdevice_id: subdevice_id & 0x07,
+            product_name: "Mock Corsair".into(),
+            serial: "MOCK".into(),
+            path: "mock://0".into(),
+            out_report_len: out_len,
+            in_report_len: in_len,
+            tx_buf: vec![0u8; out_len],
+            rx_buf: vec![0u8; in_len],
+        }
+    }
+
+    pub fn out_report_len(&self) -> usize {
+        self.out_report_len
+    }
+
+    pub fn in_report_len(&self) -> usize {
+        self.in_report_len
+    }
+
     /// Enumerate ALL Corsair Bragi command HID interfaces (`VID 1B1C`, `UsagePage 0xFF42`, `Usage 0x0001`).
     pub fn enumerate_candidates() -> Result<Vec<BragiHidCandidate>, BragiError> {
         let api = HidApi::new()?;
@@ -162,7 +218,7 @@ impl BragiTransport {
         let dev = api.open_path(&cand.path_cstr)?;
 
         let mut transport = Self {
-            dev,
+            dev: Box::new(HidApiIo(dev)),
             vid: cand.vid,
             pid: cand.pid,
             subdevice_id: subdevice_id & 0x07,
@@ -171,12 +227,13 @@ impl BragiTransport {
             path: cand.path.clone(),
             out_report_len,
             in_report_len,
+            tx_buf: vec![0u8; out_report_len],
+            rx_buf: vec![0u8; in_report_len],
         };
         transport.drain_input();
         Ok(transport)
     }
 
-    /// Open the first Corsair Bragi command HID interface (optionally filtered by PID).
     pub fn open_first(target_pid: Option<u16>) -> Result<Self, BragiError> {
         let cands = Self::enumerate_candidates()?;
         let chosen = cands
@@ -191,50 +248,45 @@ impl BragiTransport {
         BRAGI_MAGIC | (self.subdevice_id & 0x07)
     }
 
-    /// Payload length excluding the Windows HID Report ID byte (e.g. 64 or 1024).
     pub fn payload_len(&self) -> usize {
         self.out_report_len.saturating_sub(1)
     }
 
     pub fn drain_input(&mut self) {
-        let mut buf = vec![0u8; self.in_report_len];
         for _ in 0..8 {
-            match self.dev.read_timeout(&mut buf, 2) {
+            match self.dev.read_timeout(&mut self.rx_buf, 2) {
                 Ok(n) if n > 0 => continue,
                 _ => break,
             }
         }
     }
 
-    /// Discard every input report already queued (late replies of a previous command, ACKs of
-    /// fire-and-forget RGB chunks, device notifications) without waiting.
     pub fn drain_pending(&mut self) {
-        let mut buf = vec![0u8; self.in_report_len];
         for _ in 0..64 {
-            match self.dev.read_timeout(&mut buf, 0) {
+            match self.dev.read_timeout(&mut self.rx_buf, 0) {
                 Ok(n) if n > 0 => continue,
                 _ => break,
             }
         }
     }
 
-    /// Send a Bragi packet and read **its** response.
-    ///
-    /// Stale reports are drained before sending, and any report that does not echo the command
-    /// byte is skipped until the deadline: a foreign packet is never returned as the answer
-    /// (it used to be after 4 mismatches, making callers decode garbage).
+    /// Send a Bragi packet and wait for its matching response.
     pub fn exchange(&mut self, payload: &[u8]) -> Result<Vec<u8>, BragiError> {
-        let mut tx = vec![0u8; self.out_report_len];
         let copy_n = payload.len().min(self.payload_len());
-        tx[0] = 0x00; // Report ID 0
-        tx[1..1 + copy_n].copy_from_slice(&payload[..copy_n]);
+        self.tx_buf.fill(0);
+        self.tx_buf[0] = 0x00;
+        self.tx_buf[1..1 + copy_n].copy_from_slice(&payload[..copy_n]);
 
         self.drain_pending();
-        trace!("TX ({} bytes): {:02X?}", tx.len(), &tx[..tx.len().min(16)]);
-        self.dev.write(&tx)?;
+        trace!(
+            "TX ({} bytes): {:02X?}",
+            self.tx_buf.len(),
+            &self.tx_buf[..self.tx_buf.len().min(16)]
+        );
+        self.dev.write(&self.tx_buf)?;
 
+        let expected_magic = self.magic();
         let expected_cmd = payload.get(1).copied().unwrap_or(0);
-        let mut rx = vec![0u8; self.in_report_len];
         let deadline = std::time::Instant::now() + Duration::from_millis(EXCHANGE_DEADLINE_MS);
 
         loop {
@@ -243,14 +295,14 @@ impl BragiTransport {
                 return Err(BragiError::Timeout);
             }
             let wait = (remaining.as_millis() as i32).clamp(1, READ_TIMEOUT_MS);
-            let n = self.dev.read_timeout(&mut rx, wait)?;
+            let n = self.dev.read_timeout(&mut self.rx_buf, wait)?;
             if n == 0 {
                 continue;
             }
-            trace!("RX ({} bytes): {:02X?}", n, &rx[..n.min(16)]);
-            if let Some(reply) = match_reply(&rx[..n.max(3).min(rx.len())], expected_cmd) {
+            let n = n.min(self.rx_buf.len());
+            trace!("RX ({} bytes): {:02X?}", n, &self.rx_buf[..n.min(16)]);
+            if let Some(reply) = match_reply(&self.rx_buf[..n], expected_magic, expected_cmd) {
                 let mut out = reply.to_vec();
-                // Callers index fixed offsets: keep the historical full-report length.
                 out.resize(self.in_report_len.max(out.len()), 0);
                 return Ok(out);
             }
@@ -258,31 +310,114 @@ impl BragiTransport {
         }
     }
 
-    /// Fire-and-forget write with short optional response read (used for high-speed RGB chunks).
+    /// Fire-and-forget write for high-speed live RGB streaming.
     pub fn write_chunk(&mut self, payload: &[u8], wait_reply: bool) -> Result<(), BragiError> {
-        let mut tx = vec![0u8; self.out_report_len];
         let copy_n = payload.len().min(self.payload_len());
-        tx[0] = 0x00;
-        tx[1..1 + copy_n].copy_from_slice(&payload[..copy_n]);
+        self.tx_buf.fill(0);
+        self.tx_buf[0] = 0x00;
+        self.tx_buf[1..1 + copy_n].copy_from_slice(&payload[..copy_n]);
 
-        self.dev.write(&tx)?;
+        self.dev.write(&self.tx_buf)?;
 
         if wait_reply {
-            // Short wait for the ACK of the first chunk: a missing ACK is tolerated (fast path),
-            // but an explicit error code from the device is reported instead of ignored.
+            let expected_magic = self.magic();
             let expected_cmd = payload.get(1).copied().unwrap_or(0);
-            let mut rx = vec![0u8; self.in_report_len];
-            let n = self.dev.read_timeout(&mut rx, SHORT_TIMEOUT_MS)?;
+            let n = self.dev.read_timeout(&mut self.rx_buf, SHORT_TIMEOUT_MS)?;
             if n == 0 {
                 std::thread::sleep(Duration::from_millis(2));
-            } else if let Some(reply) = match_reply(&rx[..n.max(3).min(rx.len())], expected_cmd) {
-                let err = reply[2];
-                if err != ERR_OK {
-                    return Err(BragiError::from_code(err));
+            } else {
+                let n = n.min(self.rx_buf.len());
+                if let Some(reply) = match_reply(&self.rx_buf[..n], expected_magic, expected_cmd) {
+                    let err = reply[2];
+                    if err != ERR_OK {
+                        return Err(BragiError::from_code(err));
+                    }
                 }
             }
         } else {
             std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
+    /// Fast fire-and-forget handle write (used for real-time RGB frames).
+    pub fn write_handle_data(&mut self, handle: u8, data: &[u8]) -> Result<(), BragiError> {
+        self.drain_pending();
+        let max_payload = self.payload_len();
+        if max_payload < 8 {
+            return Err(BragiError::Protocol(0x01, "Report HID trop court"));
+        }
+        let data_len = data.len() as u32;
+        let len_bytes = data_len.to_le_bytes();
+
+        let first_hdr = 7usize;
+        let first_cap = max_payload - first_hdr;
+        let first_chunk = data.len().min(first_cap);
+
+        let mut pkt = vec![0u8; max_payload];
+        pkt[0] = self.magic();
+        pkt[1] = CMD_WRITE_DATA;
+        pkt[2] = handle;
+        pkt[3..7].copy_from_slice(&len_bytes);
+        pkt[first_hdr..first_hdr + first_chunk].copy_from_slice(&data[..first_chunk]);
+        self.write_chunk(&pkt, true)?;
+
+        let mut offset = first_chunk;
+        let cont_hdr = 3usize;
+        let cont_cap = max_payload - cont_hdr;
+        while offset < data.len() {
+            let take = (data.len() - offset).min(cont_cap);
+            pkt.fill(0);
+            pkt[0] = self.magic();
+            pkt[1] = CMD_CONTINUE_WRITE;
+            pkt[2] = handle;
+            pkt[cont_hdr..cont_hdr + take].copy_from_slice(&data[offset..offset + take]);
+            self.write_chunk(&pkt, false)?;
+            offset += take;
+        }
+        Ok(())
+    }
+
+    /// Reliable ACK-verified handle write (MUST be used for onboard flash / HWP writes).
+    pub fn write_handle_data_reliable(&mut self, handle: u8, data: &[u8]) -> Result<(), BragiError> {
+        let max_payload = self.payload_len();
+        if max_payload < 8 {
+            return Err(BragiError::Protocol(0x01, "Report HID trop court"));
+        }
+        let data_len = data.len() as u32;
+        let len_bytes = data_len.to_le_bytes();
+
+        let first_hdr = 7usize;
+        let first_cap = max_payload - first_hdr;
+        let first_chunk = data.len().min(first_cap);
+
+        let mut pkt = vec![0u8; max_payload];
+        pkt[0] = self.magic();
+        pkt[1] = CMD_WRITE_DATA;
+        pkt[2] = handle;
+        pkt[3..7].copy_from_slice(&len_bytes);
+        pkt[first_hdr..first_hdr + first_chunk].copy_from_slice(&data[..first_chunk]);
+
+        let rx = self.exchange(&pkt)?;
+        if rx[2] != ERR_OK {
+            return Err(BragiError::from_code(rx[2]));
+        }
+
+        let mut offset = first_chunk;
+        let cont_hdr = 3usize;
+        let cont_cap = max_payload - cont_hdr;
+        while offset < data.len() {
+            let take = (data.len() - offset).min(cont_cap);
+            pkt.fill(0);
+            pkt[0] = self.magic();
+            pkt[1] = CMD_CONTINUE_WRITE;
+            pkt[2] = handle;
+            pkt[cont_hdr..cont_hdr + take].copy_from_slice(&data[offset..offset + take]);
+            let rx_c = self.exchange(&pkt)?;
+            if rx_c[2] != ERR_OK {
+                return Err(BragiError::from_code(rx_c[2]));
+            }
+            offset += take;
         }
         Ok(())
     }
@@ -350,51 +485,11 @@ impl BragiTransport {
         Ok(())
     }
 
-    /// Write an arbitrary byte buffer to an opened Bragi handle using WRITE_DATA + CONTINUE_WRITE.
-    pub fn write_handle_data(&mut self, handle: u8, data: &[u8]) -> Result<(), BragiError> {
-        // ACKs of the previous frame's continuation packets must not be read as this frame's ACK.
-        self.drain_pending();
-        let max_payload = self.payload_len();
-        let data_len = data.len() as u32;
-        let len_bytes = data_len.to_le_bytes();
-
-        let first_hdr = 7usize;
-        let first_cap = max_payload.saturating_sub(first_hdr);
-        let first_chunk = data.len().min(first_cap);
-
-        let mut pkt = vec![0u8; max_payload];
-        pkt[0] = self.magic();
-        pkt[1] = CMD_WRITE_DATA;
-        pkt[2] = handle;
-        pkt[3..7].copy_from_slice(&len_bytes);
-        pkt[first_hdr..first_hdr + first_chunk].copy_from_slice(&data[..first_chunk]);
-
-        self.write_chunk(&pkt, true)?;
-
-        let mut offset = first_chunk;
-        let cont_hdr = 3usize;
-        let cont_cap = max_payload.saturating_sub(cont_hdr);
-        while offset < data.len() {
-            let take = (data.len() - offset).min(cont_cap);
-            let mut cont = vec![0u8; max_payload];
-            cont[0] = self.magic();
-            cont[1] = CMD_CONTINUE_WRITE;
-            cont[2] = handle;
-            cont[cont_hdr..cont_hdr + take].copy_from_slice(&data[offset..offset + take]);
-            self.write_chunk(&cont, false)?;
-            offset += take;
-        }
-        Ok(())
-    }
-
-    /// Send Bragi keepalive ping (every ~45s in Software mode).
     pub fn send_keepalive(&mut self) -> Result<(), BragiError> {
         let _ = self.exchange(&[self.magic(), CMD_KEEPALIVE])?;
         Ok(())
     }
 
-    /// Query the byte size of an opened Bragi file handle (`CMD_PROBE_HANDLE` / `DescribeBuffer = 0x09`).
-    /// Verified live on K70 RGB TKL: `[00, 09, err, flags, mode, size_u32_le[4], ...]`
     pub fn describe_handle(&mut self, handle: u8) -> Result<usize, BragiError> {
         let rx = self.exchange(&[self.magic(), CMD_PROBE_HANDLE, handle])?;
         debug!("DescribeBuffer(h={handle}) RX: {:02X?}", &rx[..rx.len().min(16)]);
@@ -411,7 +506,6 @@ impl BragiTransport {
         Ok(sz)
     }
 
-    /// Read raw file contents from an opened handle (`CMD_READ_DATA` / `ReadBuffer = 0x08`).
     pub fn read_handle_data(&mut self, handle: u8, expected_len: usize) -> Result<Vec<u8>, BragiError> {
         let mut out = Vec::with_capacity(expected_len);
         let max_iters = (expected_len / 32).max(1) + 8;
@@ -421,16 +515,15 @@ impl BragiTransport {
             }
             let rx = self.exchange(&[self.magic(), CMD_READ_DATA, handle])?;
             if iter == 0 {
-                debug!("ReadBuffer(h={handle}) RX[0..24]: {:02X?}", &rx[..rx.len().min(24)]);
+                debug!(
+                    "ReadBuffer(h={handle}) RX[0..24]: {:02X?}",
+                    &rx[..rx.len().min(24)]
+                );
             }
             let err = rx[2];
             if err != ERR_OK {
-                if out.is_empty() {
-                    return Err(BragiError::from_code(err));
-                }
-                break;
+                return Err(BragiError::from_code(err));
             }
-            // Payload starts at rx[3..] (up to payload_len - 3 bytes per USB packet)
             let max_chunk = self.in_report_len.saturating_sub(1).saturating_sub(3);
             let avail = rx.len().saturating_sub(3).min(max_chunk);
             if avail == 0 {
@@ -446,10 +539,12 @@ impl BragiTransport {
                 break;
             }
         }
+        if expected_len > 0 && out.len() < expected_len {
+            return Err(BragiError::Protocol(0x04, "Lecture Bragi tronquée"));
+        }
         Ok(out)
     }
 
-    /// Open, describe, read, and cleanly close a Bragi onboard flash file by `FileId`.
     pub fn read_file(&mut self, file_id: u16) -> Result<Vec<u8>, BragiError> {
         let handle = 0x00u8;
         let _ = self.close_handle(handle);
@@ -471,7 +566,6 @@ impl BragiTransport {
         res
     }
 
-    /// Create a new free-use Bragi flash file (`0x6D60..=0x7FFF`) via `CMD_CREATE_FILE (0x0B)`.
     pub fn create_file(&mut self, file_id: u16) -> Result<(), BragiError> {
         let b = file_id.to_le_bytes();
         let rx = self.exchange(&[self.magic(), CMD_CREATE_FILE, b[0], b[1]])?;
@@ -482,7 +576,6 @@ impl BragiTransport {
         Ok(())
     }
 
-    /// Remove a free-use Bragi flash file (`0x6D60..=0x7FFF`) via `CMD_REMOVE_FILE (0x0C)`.
     pub fn remove_file(&mut self, file_id: u16) -> Result<(), BragiError> {
         let b = file_id.to_le_bytes();
         let rx = self.exchange(&[self.magic(), CMD_REMOVE_FILE, b[0], b[1]])?;
@@ -493,7 +586,7 @@ impl BragiTransport {
         Ok(())
     }
 
-    /// Write raw bytes to an existing Bragi flash file by `FileId` (with full open/write/close).
+    /// Write raw bytes to an existing Bragi flash file by `FileId` with full ACK verification.
     pub fn write_file(&mut self, file_id: u16, data: &[u8]) -> Result<(), BragiError> {
         let handle = 0x00u8;
         let _ = self.close_handle(handle);
@@ -501,7 +594,7 @@ impl BragiTransport {
         if code != ERR_OK {
             return Err(BragiError::from_code(code));
         }
-        let res = self.write_handle_data(handle, data);
+        let res = self.write_handle_data_reliable(handle, data);
         let _ = self.close_handle(handle);
         res
     }
@@ -509,25 +602,83 @@ impl BragiTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::match_reply;
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct MockCorsairIo {
+        writes: Mutex<Vec<Vec<u8>>>,
+        reads: Mutex<VecDeque<Vec<u8>>>,
+    }
+
+    impl MockCorsairIo {
+        fn new(reads: Vec<Vec<u8>>) -> Self {
+            Self {
+                writes: Mutex::new(Vec::new()),
+                reads: Mutex::new(reads.into()),
+            }
+        }
+    }
+
+    impl HidIo for MockCorsairIo {
+        fn write(&self, data: &[u8]) -> Result<usize, hidapi::HidError> {
+            self.writes.lock().unwrap().push(data.to_vec());
+            Ok(data.len())
+        }
+
+        fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> Result<usize, hidapi::HidError> {
+            if timeout_ms <= 0 {
+                return Ok(0);
+            }
+            let Some(pkt) = self.reads.lock().unwrap().pop_front() else {
+                return Ok(0);
+            };
+            let n = pkt.len().min(buf.len());
+            buf[..n].copy_from_slice(&pkt[..n]);
+            Ok(n)
+        }
+    }
 
     #[test]
     fn reply_matches_command_byte() {
         let rx = [0x00, 0x09, 0x00, 0x01, 0x02];
-        assert_eq!(match_reply(&rx, 0x09), Some(&rx[..]));
+        assert_eq!(match_reply(&rx, 0x08, 0x09), Some(&rx[..]));
     }
 
     #[test]
     fn reply_with_report_id_prefix_is_unwrapped() {
         let rx = [0x00, 0x08, 0x02, 0x00, 0x55];
-        assert_eq!(match_reply(&rx, 0x02), Some(&rx[1..]));
+        assert_eq!(match_reply(&rx, 0x08, 0x02), Some(&rx[1..]));
     }
 
     #[test]
-    fn foreign_reports_are_rejected() {
-        // Late reply of a previous GET (0x02) while waiting for OPEN_HANDLE (0x0D)
-        assert_eq!(match_reply(&[0x00, 0x02, 0x00, 0x10], 0x0D), None);
-        // Too short to be a reply
-        assert_eq!(match_reply(&[0x00, 0x0D], 0x0D), None);
+    fn foreign_reports_and_error_echo_do_not_false_match() {
+        assert_eq!(match_reply(&[0x00, 0x02, 0x00, 0x10], 0x08, 0x0D), None);
+        assert_eq!(match_reply(&[0x00, 0x0D], 0x08, 0x0D), None);
+        // Reply to CMD_GET (0x02) carrying ERR_NOT_SUPPORTED (0x05) must NOT match CMD_CLOSE_HANDLE (0x05)
+        assert_eq!(match_reply(&[0x00, 0x02, 0x05, 0x00], 0x08, 0x05), None);
+    }
+
+    #[test]
+    fn reliable_write_verifies_every_continuation_ack() {
+        // 30 bytes payload on 16-byte report (15 payload: first chunk takes 8 bytes, 2 continuations needed)
+        let io = MockCorsairIo::new(vec![
+            vec![0x00, 0x08, CMD_WRITE_DATA, ERR_OK],
+            vec![0x00, 0x08, CMD_CONTINUE_WRITE, ERR_OK],
+            vec![0x00, 0x08, CMD_CONTINUE_WRITE, ERR_INVALID_VALUE],
+        ]);
+        let mut t = BragiTransport::from_io(Box::new(io), 0, 16, 16);
+        let err = t.write_handle_data_reliable(0, &[0xAA; 30]).unwrap_err();
+        assert!(matches!(err, BragiError::Protocol(ERR_INVALID_VALUE, _)));
+    }
+
+    #[test]
+    fn read_handle_data_fails_on_mid_stream_truncation() {
+        let io = MockCorsairIo::new(vec![
+            vec![0x00, 0x08, CMD_READ_DATA, ERR_OK, 1, 2, 3, 4],
+            vec![0x00, 0x08, CMD_READ_DATA, ERR_FAILED_OR_OPEN],
+        ]);
+        let mut t = BragiTransport::from_io(Box::new(io), 0, 16, 16);
+        assert!(t.read_handle_data(0, 64).is_err());
     }
 }

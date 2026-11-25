@@ -143,6 +143,15 @@ fn default_true() -> bool {
     true
 }
 
+fn default_omen_zones() -> [String; 4] {
+    [
+        "#00D4FF".to_string(),
+        "#00D4FF".to_string(),
+        "#00D4FF".to_string(),
+        "#00D4FF".to_string(),
+    ]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub active_profile: String,
@@ -168,6 +177,15 @@ pub struct AppConfig {
     /// Windows notification when a wireless device battery drops to 15 % and 5 %.
     #[serde(default = "default_true")]
     pub battery_alerts: bool,
+    /// Synchronize HP OMEN 4-zone keyboard RGB with OpenGear's active lighting effect.
+    #[serde(default)]
+    pub omen_sync_rgb: bool,
+    /// Saved 4-zone RGB colors for HP OMEN keyboards.
+    #[serde(default = "default_omen_zones")]
+    pub omen_zone_colors: [String; 4],
+    /// Automatically drop to 60 Hz, Cool thermal mode, and keyboard backlight off on battery.
+    #[serde(default)]
+    pub laptop_auto_battery_saver: bool,
     pub profiles: Vec<KeyboardProfile>,
 }
 
@@ -188,6 +206,9 @@ impl Default for AppConfig {
             lights_off_on_lock: true,
             idle_lights_off_min: 0,
             battery_alerts: true,
+            omen_sync_rgb: false,
+            omen_zone_colors: default_omen_zones(),
+            laptop_auto_battery_saver: false,
             profiles: vec![KeyboardProfile::default()],
         }
     }

@@ -9,7 +9,10 @@ pub use device::{
     CorsairCoolerCaps, CorsairDevice, CorsairDeviceInfo, CorsairDeviceKind, CorsairHeadsetCaps,
     CorsairMouseCaps,
 };
-pub use hwp::{HwpLightingKind, HwpLightingLayer, HwpProfileInfo};
+pub use hwp::{
+    CorsairFlashBackup, HwpLightingKind, HwpLightingLayer, HwpProfileInfo,
+    corsair_backup_path_for, list_corsair_backups, restore_corsair_backup,
+};
 pub use k70_tkl::{CorsairKeyboard, CorsairKeyboardInfo, LightingEndpoint};
-pub use keymap::{K70_TKL_KEYS, K70_TKL_LED_COUNT, KeyDef};
+pub use keymap::{K70_TKL_KEYS, K70_TKL_LED_COUNT, KeyDef, KeyboardLayoutDesc, layout_for_device};
 pub use proto::BragiError;

@@ -1,13 +1,4 @@
-//! Safe DDR5/DDR4 RAM RGB controller via ASUS BIOS `root\wmi\ASUSManagement` SMBus methods.
-//!
-//! Safety guarantees:
-//! - Uses ONLY the signed ASUS BIOS ACPI WMI interface (`ASUSManagement::read_smbus_byte`,
-//!   `write_smbus_word`, `write_smbus_byte`) — zero unsigned Ring-0 drivers (`WinRing0`/`InpOutx64`).
-//! - NEVER probes or writes to SPD EEPROM (`0x50..0x57`) or DDR5 PMIC (`0x48..0x4F`) addresses.
-//! - ONLY scans the ENE DRAM RGB address window (`0x70..=0x77`) using a 100% read-only 16-byte
-//!   hardware fingerprint (`reg 0xA0..0xAF == 0x00..0x0F`) before issuing a single register select.
-//! - Verifies the ENE firmware signature at `0x1000` (`AUDA0-E6K5-*`, `DIMM_LED-*`, `AUMA0-E6K5-*`)
-//!   and explicitly rejects Micron controllers (`0x1030 == "Micron"`).
+//! Safe DDR5/DDR4 RAM RGB controller via PawnIO SMBus, ASUS `ASUSManagement` COM WMI, or OpenRGB SDK.
 
 use crate::cooling::is_elevated;
 use crate::pawnio::{
@@ -17,9 +8,7 @@ use crate::pawnio::{
 use anyhow::{Context, Result};
 use opengear_core::Rgb;
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 
-/// Physical DIMM stick metadata from `Win32_PhysicalMemory` (works without Admin).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhysicalDimmInfo {
     pub slot: String,
@@ -30,22 +19,14 @@ pub struct PhysicalDimmInfo {
     pub memory_type: String,
 }
 
-/// Verified ENE SMBus or OpenRGB SDK RGB controller found on a DIMM module.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EneRamModule {
-    /// 7-bit SMBus address (0x70..=0x77) or OpenRGB device index
     pub address_7bit: u8,
-    /// Actual `slave` argument accepted by `ASUSManagement` WMI (either `addr` or `addr << 1`)
     pub wmi_slave_arg: u16,
-    /// Firmware string read from `ENE_REG_DEVICE_NAME` (e.g. `AUDA0-E6K5-0101`, `DIMM_LED-0102`)
     pub firmware: String,
-    /// True if V2 register map (`0x8100`/`0x8160`), false if V1 (`0x8000`/`0x8010`)
     pub is_v2: bool,
-    /// LED count read from ENE config table (`0x1C02`)
     pub led_count: u8,
-    /// Current hardware mode read from `0x8021`
     pub current_mode: u8,
-    /// Transport backend ("asus_wmi" or "openrgb_sdk")
     #[serde(default = "default_backend_wmi")]
     pub backend: String,
 }
@@ -54,12 +35,10 @@ fn default_backend_wmi() -> String {
     "asus_wmi".to_string()
 }
 
-/// Full RAM RGB subsystem status exposed to UI & CLI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RamRgbStatus {
     pub is_admin: bool,
     pub wmi_smbus_available: bool,
-    /// Universal PawnIO WHQL driver status: "ready" | "needs_admin" | "not_installed"
     #[serde(default)]
     pub pawnio_status: String,
     pub physical_dimms: Vec<PhysicalDimmInfo>,
@@ -171,59 +150,282 @@ impl EneRamMode {
     }
 }
 
-/// Read installed physical RAM sticks via `Win32_PhysicalMemory` (no Admin required).
+/// Read installed physical RAM sticks via native COM `Win32_PhysicalMemory` (no Admin required).
 pub fn read_physical_dimms() -> Vec<PhysicalDimmInfo> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let script = r#"
-$mems = Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue
-foreach ($m in $mems) {
-  $gb = [math]::Round($m.Capacity / 1GB)
-  $mt = switch ($m.SMBIOSMemoryType) { 26 { 'DDR4' } 34 { 'DDR5' } default { "Type-$($m.SMBIOSMemoryType)" } }
-  "$($m.DeviceLocator)|$($m.Manufacturer)|$($m.PartNumber)|$gb|$($m.ConfiguredClockSpeed)|$mt"
-}
-"#;
-        let out = Command::new("powershell")
-            .args(["-NoProfile", "-Command", script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
+        let Ok(conn) = crate::wmi_com::WmiConn::connect(r"root\cimv2") else {
+            return Vec::new();
+        };
+        let Ok(rows) = conn.query(
+            "SELECT DeviceLocator, Manufacturer, PartNumber, Capacity, ConfiguredClockSpeed, SMBIOSMemoryType FROM Win32_PhysicalMemory",
+        ) else {
+            return Vec::new();
+        };
         let mut dimms = Vec::new();
-        if let Ok(o) = out {
-            let txt = String::from_utf8_lossy(&o.stdout);
-            for (idx, line) in txt.lines().enumerate() {
-                let parts: Vec<&str> = line.trim().split('|').collect();
-                if parts.len() >= 6 {
-                    let raw_slot = parts[0].trim();
-                    let slot = if raw_slot.is_empty() || raw_slot == "DIMM 1" {
-                        format!("DIMM #{}", idx + 1)
-                    } else {
-                        raw_slot.to_string()
-                    };
-                    dimms.push(PhysicalDimmInfo {
-                        slot,
-                        manufacturer: parts[1].trim().to_string(),
-                        part_number: parts[2].trim().to_string(),
-                        capacity_gb: parts[3].trim().parse().unwrap_or(0),
-                        speed_mts: parts[4].trim().parse().unwrap_or(0),
-                        memory_type: parts[5].trim().to_string(),
-                    });
-                }
-            }
+        for (idx, row) in rows.iter().enumerate() {
+            let raw_slot = row
+                .get("DeviceLocator")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let slot = if raw_slot.is_empty() || raw_slot == "DIMM 1" {
+                format!("DIMM #{}", idx + 1)
+            } else {
+                raw_slot.to_string()
+            };
+            let cap_bytes = row.get("Capacity").and_then(|v| v.as_u64()).unwrap_or(0);
+            let capacity_gb = ((cap_bytes as f64) / (1024.0 * 1024.0 * 1024.0)).round() as u32;
+            let smbios_mt = row
+                .get("SMBIOSMemoryType")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let memory_type = match smbios_mt {
+                26 => "DDR4".to_string(),
+                34 => "DDR5".to_string(),
+                other => format!("Type-{other}"),
+            };
+            dimms.push(PhysicalDimmInfo {
+                slot,
+                manufacturer: row
+                    .get("Manufacturer")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                part_number: row
+                    .get("PartNumber")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                capacity_gb,
+                speed_mts: row
+                    .get("ConfiguredClockSpeed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+                memory_type,
+            });
         }
         dimms
     }
     #[cfg(not(windows))]
-    {
-        Vec::new()
+    Vec::new()
+}
+
+#[cfg(windows)]
+mod wmi_smbus {
+    use super::*;
+    use crate::pawnio::NamedMutexGuard;
+    use crate::wmi_com::{WmiConn, WmiVal};
+
+    fn read_smbus_byte(conn: &WmiConn, obj_path: &str, slave: u32, cmd: u32) -> Option<u8> {
+        let res = conn
+            .exec_method(
+                obj_path,
+                "ASUSManagement",
+                "read_smbus_byte",
+                &[("slave", WmiVal::U32(slave)), ("cmd", WmiVal::U32(cmd))],
+            )
+            .ok()?;
+        let code = res.get("Result").and_then(|v| v.as_u64())?;
+        if code != 0 && code != 1 {
+            return None;
+        }
+        res.get("data")
+            .and_then(|v| v.as_u64())
+            .map(|d| (d & 0xFF) as u8)
+    }
+
+    fn write_smbus_byte(conn: &WmiConn, obj_path: &str, slave: u32, cmd: u32, data: u32) -> Result<()> {
+        let res = conn.exec_method(
+            obj_path,
+            "ASUSManagement",
+            "write_smbus_byte",
+            &[
+                ("slave", WmiVal::U32(slave)),
+                ("cmd", WmiVal::U32(cmd)),
+                ("data", WmiVal::U32(data)),
+            ],
+        )?;
+        let code = res.get("Result").and_then(|v| v.as_u64()).unwrap_or(1);
+        if code != 0 {
+            anyhow::bail!("ASUSManagement write_smbus_byte failed (Result={code})");
+        }
+        Ok(())
+    }
+
+    fn write_smbus_word(conn: &WmiConn, obj_path: &str, slave: u32, cmd: u32, data: u32) -> Result<()> {
+        let res = conn.exec_method(
+            obj_path,
+            "ASUSManagement",
+            "write_smbus_word",
+            &[
+                ("slave", WmiVal::U32(slave)),
+                ("cmd", WmiVal::U32(cmd)),
+                ("data", WmiVal::U32(data)),
+            ],
+        )?;
+        let code = res.get("Result").and_then(|v| v.as_u64()).unwrap_or(1);
+        if code != 0 {
+            anyhow::bail!("ASUSManagement write_smbus_word failed (Result={code})");
+        }
+        Ok(())
+    }
+
+    fn read_ene_reg(conn: &WmiConn, obj_path: &str, slave: u32, reg: u16) -> Option<u8> {
+        write_smbus_word(conn, obj_path, slave, 0x00, reg.swap_bytes() as u32).ok()?;
+        read_smbus_byte(conn, obj_path, slave, 0x81)
+    }
+
+    fn write_ene_reg(conn: &WmiConn, obj_path: &str, slave: u32, reg: u16, val: u8) -> Result<()> {
+        write_smbus_word(conn, obj_path, slave, 0x00, reg.swap_bytes() as u32)?;
+        write_smbus_byte(conn, obj_path, slave, 0x01, val as u32)?;
+        Ok(())
+    }
+
+    fn test_ene_fingerprint(conn: &WmiConn, obj_path: &str, slave: u32) -> bool {
+        for i in 0..16u32 {
+            match read_smbus_byte(conn, obj_path, slave, 0xA0 + i) {
+                Some(v) if v as u32 == i => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    pub(super) fn probe_wmi_ene() -> (bool, Vec<EneRamModule>) {
+        let Some(_lock) = NamedMutexGuard::acquire(r"Global\Access_SMBUS.HTP.Method", 1500) else {
+            return (false, Vec::new());
+        };
+        let Ok(conn) = WmiConn::connect(r"root\wmi") else {
+            return (false, Vec::new());
+        };
+        let Ok(Some(obj_path)) = conn.first_instance_path("ASUSManagement") else {
+            return (false, Vec::new());
+        };
+
+        let mut modules = Vec::new();
+        for shift in [0u32, 1u32] {
+            if !modules.is_empty() {
+                break;
+            }
+            for addr7 in 0x70u8..=0x77u8 {
+                let slave = (addr7 as u32) << shift;
+                if !test_ene_fingerprint(&conn, &obj_path, slave) {
+                    continue;
+                }
+                let mut mbytes = [0u8; 6];
+                for i in 0..6 {
+                    mbytes[i] = read_ene_reg(&conn, &obj_path, slave, 0x1030 + i as u16).unwrap_or(0);
+                }
+                if &mbytes == b"Micron" {
+                    continue;
+                }
+                let mut nbytes = Vec::with_capacity(16);
+                for i in 0..16u16 {
+                    match read_ene_reg(&conn, &obj_path, slave, 0x1000 + i) {
+                        Some(b) if (32..=126).contains(&b) => nbytes.push(b),
+                        _ => break,
+                    }
+                }
+                let fw = String::from_utf8_lossy(&nbytes).trim().to_string();
+                if fw.len() < 4 {
+                    continue;
+                }
+                let leds = read_ene_reg(&conn, &obj_path, slave, 0x1C02)
+                    .filter(|&n| (1..=20).contains(&n))
+                    .unwrap_or(8);
+                let cur_mode = read_ene_reg(&conn, &obj_path, slave, 0x8021).unwrap_or(1);
+                let is_v2 = !matches!(
+                    fw.as_str(),
+                    "LED-0116" | "DIMM_LED-0102" | "DIMM_LED-0103" | "AUMA0-E8K4-0101"
+                );
+                modules.push(EneRamModule {
+                    address_7bit: addr7,
+                    wmi_slave_arg: slave as u16,
+                    firmware: fw,
+                    is_v2,
+                    led_count: leds,
+                    current_mode: cur_mode,
+                    backend: "asus_wmi".to_string(),
+                });
+            }
+        }
+        (true, modules)
+    }
+
+    pub(super) fn set_wmi_modes_only(wmi: &[(&EneRamModule, u8)]) -> Result<usize> {
+        let _lock = NamedMutexGuard::acquire(r"Global\Access_SMBUS.HTP.Method", 1500)
+            .context("Bus SMBus occupé par un autre logiciel")?;
+        let conn = WmiConn::connect(r"root\wmi")?;
+        let obj_path = conn
+            .first_instance_path("ASUSManagement")?
+            .context("ASUSManagement WMI introuvable")?;
+
+        let mut applied = 0usize;
+        for (m, mode) in wmi {
+            let slave = m.wmi_slave_arg as u32;
+            if !test_ene_fingerprint(&conn, &obj_path, slave) {
+                continue;
+            }
+            write_ene_reg(&conn, &obj_path, slave, 0x8020, 0)?;
+            write_ene_reg(&conn, &obj_path, slave, 0x8021, *mode)?;
+            write_ene_reg(&conn, &obj_path, slave, 0x80A0, 1)?;
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
+    pub(super) fn apply_wmi_ram_rgb(
+        targets: &[&EneRamModule],
+        mode: EneRamMode,
+        color: Rgb,
+        speed: u8,
+        reverse: bool,
+        save_eeprom: bool,
+    ) -> Result<String> {
+        let _lock = NamedMutexGuard::acquire(r"Global\Access_SMBUS.HTP.Method", 1500)
+            .context("Bus SMBus occupé par un autre logiciel")?;
+        let conn = WmiConn::connect(r"root\wmi")?;
+        let obj_path = conn
+            .first_instance_path("ASUSManagement")?
+            .context("ASUSManagement WMI introuvable")?;
+
+        let ene_speed = speed.min(4);
+        let ene_dir = if reverse { 1 } else { 0 };
+        let mut applied = 0usize;
+        for m in targets {
+            let sl = m.wmi_slave_arg as u32;
+            if !test_ene_fingerprint(&conn, &obj_path, sl) {
+                continue;
+            }
+            applied += 1;
+            let effect_reg: u16 = if m.is_v2 { 0x8160 } else { 0x8010 };
+            let leds = m.led_count.clamp(1, 16) as u16;
+            write_ene_reg(&conn, &obj_path, sl, 0x8020, 0)?;
+            for i in 0..leds {
+                let base = effect_reg + i * 3;
+                write_ene_reg(&conn, &obj_path, sl, base, color.r)?;
+                write_ene_reg(&conn, &obj_path, sl, base + 1, color.b)?;
+                write_ene_reg(&conn, &obj_path, sl, base + 2, color.g)?;
+            }
+            write_ene_reg(&conn, &obj_path, sl, 0x8021, mode as u8)?;
+            write_ene_reg(&conn, &obj_path, sl, 0x8022, ene_speed)?;
+            write_ene_reg(&conn, &obj_path, sl, 0x8023, ene_dir)?;
+            write_ene_reg(&conn, &obj_path, sl, 0x80A0, 1)?;
+            if save_eeprom {
+                write_ene_reg(&conn, &obj_path, sl, 0x80A0, 0xAA)?;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        if applied == 0 {
+            anyhow::bail!("Aucune barrette ENE vérifiée — aucune écriture effectuée");
+        }
+        Ok(format!("OK ({applied}/{} DIMM)", targets.len()))
     }
 }
 
-/// Perform a 100% safe scan of ENE DRAM RGB controllers via `root\wmi\ASUSManagement`.
-///
-/// Only probes `0x70..=0x77` using the read-only 16-byte ENE fingerprint (`0xA0..0xAF == 0x00..0x0F`).
-/// Automatically detects whether `ASUSManagement` expects 7-bit (`0x71`) or 8-bit (`0xE2`) slave addresses.
 pub fn probe_ram_rgb() -> RamRgbStatus {
     let physical_dimms = read_physical_dimms();
     let admin = is_elevated();
@@ -255,9 +457,9 @@ pub fn probe_ram_rgb() -> RamRgbStatus {
             };
         }
         let msg = if pio == PawnIoAvailability::NeedsAdmin {
-            "Pilote universel signé PawnIO détecté ! Clique sur « Relancer en Administrateur (UAC) » pour piloter ta RAM DDR4/DDR5 RGB et lire la température CPU Ryzen/Intel en natif (sur n'importe quelle carte mère).".into()
+            "Pilote universel signé PawnIO détecté ! Relance en Administrateur (UAC) pour piloter ta RAM DDR4/DDR5 RGB et lire la température CPU Ryzen/Intel en natif.".into()
         } else {
-            "Lance OpenGear en Administrateur (UAC) avec le pilote officiel PawnIO (pawnio.eu) pour le SMBus universel AMD/Intel, OU lance OpenRGB (SDK port 6742) sans Admin.".into()
+            "Lance OpenGear en Administrateur (UAC) avec le pilote officiel PawnIO pour le SMBus universel AMD/Intel, OU lance OpenRGB (SDK port 6742) sans Admin.".into()
         };
         return RamRgbStatus {
             is_admin: false,
@@ -272,7 +474,6 @@ pub fn probe_ram_rgb() -> RamRgbStatus {
         };
     }
 
-    // 1. UNIVERSAL PAWNIO SMBUS FIRST (works on ANY AMD AM4/AM5 or Intel motherboard — zero PowerShell!)
     if pio == PawnIoAvailability::Ready {
         let pio_mods = probe_pawnio_ene_ram();
         if !pio_mods.is_empty() {
@@ -304,117 +505,10 @@ pub fn probe_ram_rgb() -> RamRgbStatus {
 
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-        // Safe single-session PowerShell WMI SMBus scanner:
-        // 1. Read-only check reg 0xA0..0xAF == 0x00..0x0F on 0x70..0x77 (tests 7-bit first, then 8-bit if none found)
-        // 2. Only on verified ENE chips: read Micron check (0x1030), Device Name (0x1000), Config LED count (0x1C02), Mode (0x8021)
-        let script = r#"
-$inst = Get-CimInstance -Namespace root\wmi -ClassName ASUSManagement -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $inst) { Write-Output 'NO_WMI'; exit 0 }
-
-function Read-SmbusByte([uint32]$slave, [uint32]$cmd) {
-    $r = Invoke-CimMethod -InputObject $inst -MethodName read_smbus_byte -Arguments @{ slave = $slave; cmd = $cmd } -ErrorAction SilentlyContinue
-    if ($null -eq $r) { return -1 }
-    if ($r.Result -ne 0 -and $r.Result -ne 1) { return -1 }
-    return ([int]$r.data -band 0xFF)
-}
-
-function Read-EneReg([uint32]$slave, [uint16]$reg) {
-    $swapped = [uint32]((($reg -shl 8) -band 0xFF00) -bor (($reg -shr 8) -band 0x00FF))
-    $w = Invoke-CimMethod -InputObject $inst -MethodName write_smbus_word -Arguments @{ slave = $slave; cmd = [uint32]0x00; data = $swapped } -ErrorAction SilentlyContinue
-    if ($null -eq $w -or ($w.Result -ne 0 -and $w.Result -ne 1)) { return -1 }
-    return (Read-SmbusByte $slave 0x81)
-}
-
-function Test-EneFingerprint([uint32]$slave) {
-    for ($i = 0; $i -lt 16; $i++) {
-        $v = Read-SmbusByte $slave (0xA0 + $i)
-        if ($v -ne $i) { return $false }
-    }
-    return $true
-}
-
-$found = @()
-foreach ($shift in @(0, 1)) {
-    if ($found.Count -gt 0) { break }
-    foreach ($addr7 in 0x70..0x77) {
-        $slave = [uint32]($addr7 -shl $shift)
-        if (Test-EneFingerprint $slave) {
-            # Verify not Micron (0x1030)
-            $mBytes = @()
-            for ($i = 0; $i -lt 6; $i++) {
-                $b = Read-EneReg $slave (0x1030 + $i)
-                if ($b -gt 0) { $mBytes += [char]$b }
-            }
-            if ((-join $mBytes) -eq 'Micron') { continue }
-
-            # Read ENE device version string (0x1000..0x100F)
-            $nBytes = @()
-            for ($i = 0; $i -lt 16; $i++) {
-                $b = Read-EneReg $slave (0x1000 + $i)
-                if ($b -ge 32 -and $b -le 126) { $nBytes += [char]$b } else { break }
-            }
-            $fw = (-join $nBytes).Trim()
-            if ($fw.Length -lt 4) { continue }
-
-            $leds = Read-EneReg $slave 0x1C02
-            if ($leds -lt 1 -or $leds -gt 20) { $leds = 8 }
-            $curMode = Read-EneReg $slave 0x8021
-            if ($curMode -lt 0) { $curMode = 1 }
-            $found += "ENE|$addr7|$slave|$fw|$leds|$curMode"
-        }
-    }
-}
-Write-Output 'WMI_OK'
-foreach ($line in $found) { Write-Output $line }
-"#;
-
-        let out = Command::new("powershell")
-            .args(["-NoProfile", "-Command", script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-
-        let mut wmi_ok = false;
-        let mut modules = Vec::new();
-        if let Ok(o) = out {
-            let txt = String::from_utf8_lossy(&o.stdout);
-            for line in txt.lines() {
-                let l = line.trim();
-                if l == "WMI_OK" {
-                    wmi_ok = true;
-                } else if let Some(rest) = l.strip_prefix("ENE|") {
-                    let parts: Vec<&str> = rest.split('|').collect();
-                    if parts.len() >= 5 {
-                        let addr7: u8 = parts[0].parse().unwrap_or(0);
-                        let slave: u16 = parts[1].parse().unwrap_or(addr7 as u16);
-                        let fw = parts[2].to_string();
-                        let leds: u8 = parts[3].parse().unwrap_or(8);
-                        let cur_mode: u8 = parts[4].parse().unwrap_or(1);
-                        let is_v2 = !matches!(
-                            fw.as_str(),
-                            "LED-0116" | "DIMM_LED-0102" | "DIMM_LED-0103" | "AUMA0-E8K4-0101"
-                        );
-                        modules.push(EneRamModule {
-                            address_7bit: addr7,
-                            wmi_slave_arg: slave,
-                            firmware: fw,
-                            is_v2,
-                            led_count: leds,
-                            current_mode: cur_mode,
-                            backend: "asus_wmi".to_string(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // Pure-TCP OpenRGB SDK fallback (127.0.0.1:6742, zero drivers, works for any RGB RAM if OpenRGB --server is running)
+        let (wmi_ok, mut modules) = wmi_smbus::probe_wmi_ene();
         if modules.is_empty() {
             modules.extend(probe_openrgb_sdk_ram());
         }
-
         let message = if !modules.is_empty() {
             format!(
                 "{} barrette(s) DDR5 RGB détectée(s) ({}).",
@@ -431,7 +525,7 @@ foreach ($line in $found) { Write-Output $line }
         } else if !wmi_ok {
             "Admin actif, mais ASUSManagement WMI est indisponible sur cette carte mère.".into()
         } else {
-            "ASUSManagement WMI actif, aucun contrôleur ENE DRAM n'a répondu sur 0x70..0x77 (sur AM5 B650 le bus DRAM SMBus est parfois routé hors WMI). Astuce 100% safe : lance OpenRGB avec le serveur SDK (port 6742) puis clique sur Scanner — OpenGear pilotera ta RAM DDR5 directement !".into()
+            "ASUSManagement WMI actif, aucun contrôleur ENE DRAM n'a répondu sur 0x70..0x77. Tu peux aussi utiliser OpenRGB avec le serveur SDK (port 6742).".into()
         };
 
         RamRgbStatus {
@@ -448,29 +542,41 @@ foreach ($line in $found) { Write-Output $line }
     }
 
     #[cfg(not(windows))]
-    {
-        RamRgbStatus {
-            is_admin: false,
-            wmi_smbus_available: false,
-            pawnio_status,
-            physical_dimms,
-            ene_modules: Vec::new(),
-            message: "Non supporté hors Windows.".into(),
-            last_mode: "Static".into(),
-            last_color: "#00D2FF".into(),
-            last_speed: 2,
-        }
+    RamRgbStatus {
+        is_admin: false,
+        wmi_smbus_available: false,
+        pawnio_status,
+        physical_dimms,
+        ene_modules: Vec::new(),
+        message: "Non supporté hors Windows.".into(),
+        last_mode: "Static".into(),
+        last_color: "#00D2FF".into(),
+        last_speed: 2,
     }
 }
 
-/// Apply an ENE hardware lighting mode + color to one or all verified ENE DDR5 RAM modules.
-///
-/// Color byte order on ENE SMBus is verified `[Red, Blue, Green]` (RBG) per OpenRGB `ENESMBusController`.
-/// When `save_eeprom` is true, writes `0xAA` to `ENE_REG_APPLY (0x80A0)` so the effect persists across power cycles.
-/// Switch RAM lighting off / back on by writing ONLY the ENE effect-mode register of each module
-/// (colors, speed and EEPROM untouched), so restoring the previous mode restores the exact look.
-/// `modes`: (module, raw mode byte). Supports PawnIO and ASUSManagement WMI backends; modules
-/// driven through the OpenRGB SDK are skipped. Returns the number of modules updated.
+pub(crate) fn partition_ram_targets<'a>(
+    targets: &[&'a EneRamModule],
+) -> (
+    Vec<&'a EneRamModule>,
+    Vec<&'a EneRamModule>,
+    Vec<&'a EneRamModule>,
+) {
+    let mut pawnio = Vec::new();
+    let mut openrgb = Vec::new();
+    let mut wmi = Vec::new();
+    for &m in targets {
+        if m.backend == "pawnio_piix4" || m.backend == "pawnio_i801" {
+            pawnio.push(m);
+        } else if m.backend == "openrgb_sdk" {
+            openrgb.push(m);
+        } else {
+            wmi.push(m);
+        }
+    }
+    (pawnio, openrgb, wmi)
+}
+
 pub fn set_ram_modes_only(modes: &[(&EneRamModule, u8)]) -> Result<usize> {
     let pawnio: Vec<(&EneRamModule, u8)> = modes
         .iter()
@@ -494,63 +600,7 @@ pub fn set_ram_modes_only(modes: &[(&EneRamModule, u8)]) -> Result<usize> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let mut targets = String::new();
-        for (m, mode) in &wmi {
-            targets.push_str(&format!(
-                "@{{ slave = [uint32]{}; mode = [uint32]{} }},\n",
-                m.wmi_slave_arg, mode
-            ));
-        }
-        let script = format!(
-            r#"
-$inst = Get-CimInstance -Namespace root\wmi -ClassName ASUSManagement -ErrorAction Stop | Select-Object -First 1
-if (-not $inst) {{ throw 'ASUSManagement WMI introuvable' }}
-function Write-EneReg([uint32]$slave, [uint16]$reg, [uint32]$val) {{
-    $swapped = [uint32]((($reg -shl 8) -band 0xFF00) -bor (($reg -shr 8) -band 0x00FF))
-    $w1 = Invoke-CimMethod -InputObject $inst -MethodName write_smbus_word -Arguments @{{ slave = $slave; cmd = [uint32]0x00; data = $swapped }} -ErrorAction Stop
-    if ($w1.Result -ne 0) {{ throw "SMBus write_word failed (slave=$slave reg=$reg)" }}
-    $w2 = Invoke-CimMethod -InputObject $inst -MethodName write_smbus_byte -Arguments @{{ slave = $slave; cmd = [uint32]0x01; data = $val }} -ErrorAction Stop
-    if ($w2.Result -ne 0) {{ throw "SMBus write_byte failed (slave=$slave reg=$reg)" }}
-}}
-function Test-EneFingerprint([uint32]$slave) {{
-    for ($i = 0; $i -lt 16; $i++) {{
-        $r = Invoke-CimMethod -InputObject $inst -MethodName read_smbus_byte -Arguments @{{ slave = $slave; cmd = [uint32](0xA0 + $i) }} -ErrorAction SilentlyContinue
-        if ($null -eq $r -or ($r.Result -ne 0 -and $r.Result -ne 1)) {{ return $false }}
-        if ((([int]$r.data) -band 0xFF) -ne $i) {{ return $false }}
-    }}
-    return $true
-}}
-$targets = @(
-{targets}
-)
-$applied = 0
-foreach ($t in $targets) {{
-    if (-not (Test-EneFingerprint $t.slave)) {{ continue }}
-    Write-EneReg $t.slave 0x8020 0
-    Write-EneReg $t.slave 0x8021 $t.mode
-    Write-EneReg $t.slave 0x80A0 1
-    $applied++
-}}
-"$applied"
-"#
-        );
-        let out = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .context("Échec exécution PowerShell WMI SMBus")?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "Erreur SMBus ENE RAM : {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        applied += String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse::<usize>()
-            .unwrap_or(0);
+        applied += wmi_smbus::set_wmi_modes_only(&wmi)?;
     }
     Ok(applied)
 }
@@ -572,139 +622,73 @@ pub fn apply_ram_rgb(
         anyhow::bail!("Aucune barrette RGB détectée à piloter (clique d'abord sur Scanner la RAM).");
     }
 
-    // Route PawnIO Universal SMBus modules (AMD PIIX4 / Intel I801 — zero PowerShell!)
-    if targets
-        .iter()
-        .all(|m| m.backend == "pawnio_piix4" || m.backend == "pawnio_i801")
-    {
-        return apply_pawnio_ene_ram(&targets, mode, color, speed, reverse, save_eeprom);
+    let (pawnio, openrgb, wmi) = partition_ram_targets(&targets);
+    let mut results = Vec::new();
+
+    if !pawnio.is_empty() {
+        results.push(apply_pawnio_ene_ram(
+            &pawnio,
+            mode,
+            color,
+            speed,
+            reverse,
+            save_eeprom,
+        )?);
     }
 
-    // Route OpenRGB SDK modules via pure TCP (works even without Admin!)
-    if targets.iter().all(|m| m.backend == "openrgb_sdk") {
+    if !openrgb.is_empty() {
         let mut applied = 0usize;
-        for m in &targets {
+        for m in &openrgb {
             apply_openrgb_sdk_ram(m.address_7bit as u32, m.led_count as usize, mode, color)?;
             applied += 1;
         }
-        return Ok(format!("OK OpenRGB SDK ({applied} DIMM)"));
+        results.push(format!("OK OpenRGB SDK ({applied} DIMM)"));
     }
 
-    if !is_elevated() {
-        anyhow::bail!("Relance OpenGear en Administrateur pour contrôler le RGB de la RAM DDR5 via ASUSManagement WMI.");
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-        let mode_val = mode as u8;
-        // ENE speed register: 0x04 slowest .. 0x00 fastest
-        let ene_speed = speed.min(4);
-        let ene_dir: u8 = if reverse { 1 } else { 0 };
-        let apply_val: u8 = if save_eeprom { 0xAA } else { 0x01 };
-
-        // Build target list literal for PowerShell
-        let mut target_cmds = String::new();
-        for m in &targets {
-            let effect_reg: u16 = if m.is_v2 { 0x8160 } else { 0x8010 };
-            let leds = m.led_count.clamp(1, 16);
-            target_cmds.push_str(&format!(
-                "@{{ slave = [uint32]{}; effectReg = [uint16]{}; leds = {}; addr7 = {} }},\n",
-                m.wmi_slave_arg, effect_reg, leds, m.address_7bit
-            ));
+    if !wmi.is_empty() {
+        if !is_elevated() {
+            anyhow::bail!("Relance OpenGear en Administrateur pour contrôler le RGB de la RAM DDR5 via ASUSManagement WMI.");
         }
-
-        let script = format!(
-            r#"
-$inst = Get-CimInstance -Namespace root\wmi -ClassName ASUSManagement -ErrorAction Stop | Select-Object -First 1
-if (-not $inst) {{ throw 'ASUSManagement WMI introuvable' }}
-
-function Write-EneReg([uint32]$slave, [uint16]$reg, [uint32]$val) {{
-    $swapped = [uint32]((($reg -shl 8) -band 0xFF00) -bor (($reg -shr 8) -band 0x00FF))
-    $w1 = Invoke-CimMethod -InputObject $inst -MethodName write_smbus_word -Arguments @{{ slave = $slave; cmd = [uint32]0x00; data = $swapped }} -ErrorAction Stop
-    if ($w1.Result -ne 0) {{ throw "SMBus write_word failed (slave=$slave reg=$reg res=$($w1.Result))" }}
-    $w2 = Invoke-CimMethod -InputObject $inst -MethodName write_smbus_byte -Arguments @{{ slave = $slave; cmd = [uint32]0x01; data = $val }} -ErrorAction Stop
-    if ($w2.Result -ne 0) {{ throw "SMBus write_byte failed (slave=$slave reg=$reg res=$($w2.Result))" }}
-}}
-
-function Test-EneFingerprint([uint32]$slave) {{
-    for ($i = 0; $i -lt 16; $i++) {{
-        $r = Invoke-CimMethod -InputObject $inst -MethodName read_smbus_byte -Arguments @{{ slave = $slave; cmd = [uint32](0xA0 + $i) }} -ErrorAction SilentlyContinue
-        if ($null -eq $r -or ($r.Result -ne 0 -and $r.Result -ne 1)) {{ return $false }}
-        if ((([int]$r.data) -band 0xFF) -ne $i) {{ return $false }}
-    }}
-    return $true
-}}
-
-$targets = @(
-{target_cmds}
-)
-
-$r = [uint32]{r}; $g = [uint32]{g}; $b = [uint32]{b}
-$modeVal = [uint32]{mode_val}
-$speedVal = [uint32]{ene_speed}
-$dirVal = [uint32]{ene_dir}
-$applyVal = [uint32]{apply_val}
-
-$applied = 0
-foreach ($t in $targets) {{
-    $sl = $t.slave
-    # Re-verify the read-only ENE fingerprint right before any write (cached scan may be stale)
-    if (-not (Test-EneFingerprint $sl)) {{ continue }}
-    $applied++
-    # Disable Direct mode (use hardware effect engine)
-    Write-EneReg $sl 0x8020 0
-    # Write R, B, G triplet per LED to effect color table
-    for ($i = 0; $i -lt $t.leds; $i++) {{
-        $base = [uint16]($t.effectReg + ($i * 3))
-        Write-EneReg $sl $base $r
-        Write-EneReg $sl ([uint16]($base + 1)) $b
-        Write-EneReg $sl ([uint16]($base + 2)) $g
-    }}
-    Write-EneReg $sl 0x8021 $modeVal
-    Write-EneReg $sl 0x8022 $speedVal
-    Write-EneReg $sl 0x8023 $dirVal
-    Write-EneReg $sl 0x80A0 1
-    if ($applyVal -eq 0xAA) {{
-        Write-EneReg $sl 0x80A0 0xAA
-    }}
-}}
-if ($applied -eq 0) {{ throw "Aucune barrette ENE verifiee - aucune ecriture effectuee" }}
-"OK ($applied/$($targets.Count) DIMM)"
-"#,
-            target_cmds = target_cmds,
-            r = color.r,
-            g = color.g,
-            b = color.b,
-            mode_val = mode_val,
-            ene_speed = ene_speed,
-            ene_dir = ene_dir,
-            apply_val = apply_val,
-        );
-
-        let out = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .context("Échec exécution PowerShell WMI SMBus")?;
-
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            anyhow::bail!("Erreur SMBus ENE RAM : {}", err.trim());
+        #[cfg(windows)]
+        {
+            results.push(wmi_smbus::apply_wmi_ram_rgb(
+                &wmi,
+                mode,
+                color,
+                speed,
+                reverse,
+                save_eeprom,
+            )?);
         }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        #[cfg(not(windows))]
+        anyhow::bail!("Non supporté hors Windows");
     }
 
-    #[cfg(not(windows))]
-    {
-        let _ = (mode, color, speed, reverse, save_eeprom);
-        anyhow::bail!("Non supporté hors Windows")
-    }
+    Ok(results.join(" + "))
 }
 
 // ================= PURE-RUST OPENRGB SDK TCP CLIENT (127.0.0.1:6742, ZERO DRIVERS) =================
+
+const MAX_OPENRGB_PACKET_LEN: u32 = 262_144;
+
+pub(crate) fn parse_openrgb_header(hdr: &[u8; 16]) -> std::io::Result<(u32, u32, usize)> {
+    if &hdr[0..4] != b"ORGB" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid ORGB magic",
+        ));
+    }
+    let dev_idx = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+    let pkt_id = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+    let len = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
+    if len > MAX_OPENRGB_PACKET_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Oversized OpenRGB packet ({len} bytes)"),
+        ));
+    }
+    Ok((dev_idx, pkt_id, len as usize))
+}
 
 fn openrgb_send_packet(
     stream: &mut std::net::TcpStream,
@@ -729,15 +713,7 @@ fn openrgb_recv_packet(stream: &mut std::net::TcpStream) -> std::io::Result<(u32
     use std::io::Read;
     let mut hdr = [0u8; 16];
     stream.read_exact(&mut hdr)?;
-    if &hdr[0..4] != b"ORGB" {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Invalid ORGB magic",
-        ));
-    }
-    let dev_idx = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-    let pkt_id = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
-    let len = u32::from_le_bytes(hdr[12..16].try_into().unwrap()).min(262_144) as usize;
+    let (dev_idx, pkt_id, len) = parse_openrgb_header(&hdr)?;
     let mut buf = vec![0u8; len];
     if len > 0 {
         stream.read_exact(&mut buf)?;
@@ -751,7 +727,6 @@ fn openrgb_connect() -> Option<std::net::TcpStream> {
         std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(120)).ok()?;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(250)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(250)));
-    // Set client name (packet 50)
     let _ = openrgb_send_packet(&mut stream, 0, 50, b"OpenGear\0");
     Some(stream)
 }
@@ -779,7 +754,47 @@ fn read_orgb_str(buf: &[u8], off: &mut usize) -> Option<String> {
     )
 }
 
-/// Probe `127.0.0.1:6742` OpenRGB SDK for DRAM controllers (`device_type == 1`).
+fn parse_openrgb_dram_leds(data: &[u8], off: &mut usize) -> Option<u8> {
+    // Skip num_modes (u16) + active_mode (i32) + modes...
+    let num_modes = read_u16_le(data, off)? as usize;
+    let _active_mode = read_u32_le(data, off)?;
+    for _ in 0..num_modes.min(64) {
+        let _name = read_orgb_str(data, off)?;
+        let _val = read_u32_le(data, off)?;
+        let _flags = read_u32_le(data, off)?;
+        let _speed_min = read_u32_le(data, off)?;
+        let _speed_max = read_u32_le(data, off)?;
+        let _b_min = read_u32_le(data, off)?;
+        let _b_max = read_u32_le(data, off)?;
+        let _colors_min = read_u32_le(data, off)?;
+        let _colors_max = read_u32_le(data, off)?;
+        let _speed = read_u32_le(data, off)?;
+        let _brightness = read_u32_le(data, off)?;
+        let _dir = read_u32_le(data, off)?;
+        let _cmode = read_u32_le(data, off)?;
+        let num_colors = read_u16_le(data, off)? as usize;
+        *off = off.checked_add(num_colors * 4)?;
+        if *off > data.len() {
+            return None;
+        }
+    }
+    let num_zones = read_u16_le(data, off)? as usize;
+    for _ in 0..num_zones.min(32) {
+        let _zname = read_orgb_str(data, off)?;
+        let _ztype = read_u32_le(data, off)?;
+        let _zmin = read_u32_le(data, off)?;
+        let _zmax = read_u32_le(data, off)?;
+        let _zcount = read_u32_le(data, off)?;
+        let mat_len = read_u16_le(data, off)? as usize;
+        *off = off.checked_add(mat_len)?;
+        if *off > data.len() {
+            return None;
+        }
+    }
+    let num_leds = read_u16_le(data, off)? as usize;
+    Some(num_leds.clamp(1, 32) as u8)
+}
+
 fn probe_openrgb_sdk_ram() -> Vec<EneRamModule> {
     let mut stream = match openrgb_connect() {
         Some(s) => s,
@@ -805,18 +820,19 @@ fn probe_openrgb_sdk_ram() -> Vec<EneRamModule> {
             Ok(p) => p,
             Err(_) => continue,
         };
-        let mut off = 4usize; // skip data_size u32
-        let dev_type = match read_u32_le(&data, &mut off) {
-            Some(t) => t,
-            None => continue,
+        let mut off = 4usize;
+        let Some(dev_type) = read_u32_le(&data, &mut off) else {
+            continue;
         };
-        // OpenRGB DEVICE_TYPE_DRAM = 1
         if dev_type != 1 {
             continue;
         }
         let name = read_orgb_str(&data, &mut off).unwrap_or_else(|| format!("DRAM #{idx}"));
         let _desc = read_orgb_str(&data, &mut off);
         let version = read_orgb_str(&data, &mut off).unwrap_or_default();
+        let _serial = read_orgb_str(&data, &mut off);
+        let _location = read_orgb_str(&data, &mut off);
+        let led_count = parse_openrgb_dram_leds(&data, &mut off).unwrap_or(8);
         let fw = if !version.is_empty() {
             format!("{name} ({version})")
         } else {
@@ -827,7 +843,7 @@ fn probe_openrgb_sdk_ram() -> Vec<EneRamModule> {
             wmi_slave_arg: idx as u16,
             firmware: fw,
             is_v2: true,
-            led_count: 8,
+            led_count,
             current_mode: 1,
             backend: "openrgb_sdk".to_string(),
         });
@@ -843,12 +859,14 @@ fn apply_openrgb_sdk_ram(
 ) -> Result<()> {
     let mut stream =
         openrgb_connect().context("Serveur OpenRGB SDK (127.0.0.1:6742) indisponible")?;
+    // Switch controller to Direct / Custom mode (packet 1100) before sending UpdateLEDs (1050).
+    let _ = openrgb_send_packet(&mut stream, dev_idx, 1100, &[]);
+
     let c = if mode == EneRamMode::Off {
         Rgb::BLACK
     } else {
         color
     };
-    // UpdateLEDs (packet 1050): u32 data_size + u16 num_colors + num_colors * [R, G, B, 0]
     let n = led_count.clamp(1, 32);
     let mut payload = Vec::with_capacity(6 + n * 4);
     let data_size = (6 + n * 4) as u32;
@@ -863,4 +881,46 @@ fn apply_openrgb_sdk_ram(
     openrgb_send_packet(&mut stream, dev_idx, 1050, &payload)
         .context("Échec envoi couleurs OpenRGB SDK")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openrgb_header_rejects_oversized_packet() {
+        let mut hdr = [0u8; 16];
+        hdr[0..4].copy_from_slice(b"ORGB");
+        hdr[12..16].copy_from_slice(&(MAX_OPENRGB_PACKET_LEN + 1).to_le_bytes());
+        assert!(parse_openrgb_header(&hdr).is_err());
+
+        hdr[12..16].copy_from_slice(&128u32.to_le_bytes());
+        assert_eq!(parse_openrgb_header(&hdr).unwrap(), (0, 0, 128));
+    }
+
+    #[test]
+    fn mixed_ram_backends_are_partitioned_cleanly() {
+        let m1 = EneRamModule {
+            address_7bit: 0x71,
+            wmi_slave_arg: 0,
+            firmware: "AUDA0".into(),
+            is_v2: true,
+            led_count: 8,
+            current_mode: 1,
+            backend: "pawnio_piix4".into(),
+        };
+        let m2 = EneRamModule {
+            address_7bit: 0,
+            wmi_slave_arg: 0,
+            firmware: "DRAM".into(),
+            is_v2: true,
+            led_count: 8,
+            current_mode: 1,
+            backend: "openrgb_sdk".into(),
+        };
+        let (p, o, w) = partition_ram_targets(&[&m1, &m2]);
+        assert_eq!(p.len(), 1);
+        assert_eq!(o.len(), 1);
+        assert!(w.is_empty());
+    }
 }

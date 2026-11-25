@@ -281,25 +281,61 @@ impl LocalAssetCatalog {
     }
 }
 
-fn find_latest_lghub_depot() -> Option<PathBuf> {
-    let base = PathBuf::from(r"C:\ProgramData\LGHUB\depots");
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&base)
+fn parse_depot_version(path: &Path) -> Vec<u64> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| {
+            s.split(|c: char| !c.is_ascii_digit())
+                .filter(|seg| !seg.is_empty())
+                .filter_map(|seg| seg.parse::<u64>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn find_latest_depot_in(base: &Path) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(base)
         .ok()?
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_dir())
         .collect();
-    dirs.sort();
+    dirs.sort_by(|a, b| {
+        parse_depot_version(a)
+            .cmp(&parse_depot_version(b))
+            .then_with(|| a.file_name().cmp(&b.file_name()))
+    });
     dirs.pop()
 }
 
+fn find_latest_lghub_depot() -> Option<PathBuf> {
+    let program_data = std::env::var_os("ProgramData")
+        .or_else(|| std::env::var_os("PROGRAMDATA"))
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    find_latest_depot_in(&program_data.join("LGHUB").join("depots"))
+}
+
 fn find_icue_devices_dir() -> Option<PathBuf> {
-    let candidates = [
+    let roots = [
+        std::env::var_os("ProgramFiles"),
+        std::env::var_os("ProgramFiles(x86)"),
+    ];
+    for root in roots.into_iter().flatten().filter(|v| !v.is_empty()) {
+        let p = PathBuf::from(root)
+            .join("Corsair")
+            .join("Corsair iCUE5 Software")
+            .join("devices");
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    for fallback in [
         r"C:\Program Files\Corsair\Corsair iCUE5 Software\devices",
         r"C:\Program Files (x86)\Corsair\Corsair iCUE5 Software\devices",
-    ];
-    for c in candidates {
-        let p = PathBuf::from(c);
+    ] {
+        let p = PathBuf::from(fallback);
         if p.is_dir() {
             return Some(p);
         }
@@ -414,10 +450,11 @@ pub fn parse_qt_rcc(data: &[u8]) -> HashMap<String, Vec<u8>> {
             }
             let raw = &data[start..end];
             if (flags & 0x01) != 0 && raw.len() > 4 {
-                // Qt zlib compressed: first 4 bytes are big-endian expected length, followed by zlib stream
-                let mut dec = ZlibDecoder::new(&raw[4..]);
+                // Cap decompressed RCC payload at 16 MiB to guard against malformed streams.
+                const MAX_RCC_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+                let mut dec = ZlibDecoder::new(&raw[4..]).take(MAX_RCC_ENTRY_BYTES + 1);
                 let mut buf = Vec::new();
-                if dec.read_to_end(&mut buf).is_ok() {
+                if dec.read_to_end(&mut buf).is_ok() && (buf.len() as u64) <= MAX_RCC_ENTRY_BYTES {
                     out.insert(path, buf);
                 }
             } else {
@@ -484,4 +521,48 @@ fn parse_battery_xml(folder: &str, xml: &str) -> Option<ParsedBatteryModel> {
         mcu_mw,
         report_rate_mw,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{Compression, write::ZlibEncoder};
+    use std::io::Write;
+
+    #[test]
+    fn find_latest_depot_in_sorts_numerically() {
+        let dir = std::env::temp_dir().join(format!(
+            "opengear_depot_sort_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("99999")).unwrap();
+        std::fs::create_dir_all(dir.join("100000")).unwrap();
+        std::fs::create_dir_all(dir.join("2024.9")).unwrap();
+        std::fs::create_dir_all(dir.join("2024.10")).unwrap();
+
+        let latest = find_latest_depot_in(&dir).unwrap();
+        assert_eq!(latest.file_name().unwrap().to_str().unwrap(), "100000");
+
+        let _ = std::fs::remove_dir_all(dir.join("99999"));
+        let _ = std::fs::remove_dir_all(dir.join("100000"));
+        let latest_ver = find_latest_depot_in(&dir).unwrap();
+        assert_eq!(latest_ver.file_name().unwrap().to_str().unwrap(), "2024.10");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_qt_rcc_rejects_oversized_compressed_blob() {
+        // Build a synthetic zlib stream slightly over 16 MiB and verify parser drops it cleanly.
+        let big = vec![b'A'; (16 * 1024 * 1024) + 128];
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(&big).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let mut dec = ZlibDecoder::new(compressed.as_slice()).take(16 * 1024 * 1024 + 1);
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert!((out.len() as u64) > 16 * 1024 * 1024);
+    }
 }

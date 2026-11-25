@@ -1,24 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::process::Command;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CurvePoint {
-    pub temp_c: u8,
-    pub duty_pct: u8,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FanHeaderKind {
-    /// CPU_FAN (Radiator fans on be quiet! Silent Loop 3)
     CpuFan,
-    /// AIO_PUMP (be quiet! Silent Loop 3 — 6-pole 3-phase PWM pump, up to 3500 RPM)
     AioPump,
-    /// CHA_FAN1 (Chassis / Intake fans)
     ChassisFan1,
-    /// CHA_FAN2 (Chassis / Exhaust fans)
     ChassisFan2,
-    /// CHA_FAN3
     ChassisFan3,
 }
 
@@ -31,7 +19,27 @@ impl FanHeaderKind {
         Self::ChassisFan3,
     ];
 
-    /// ASUSManagement WMI `FanType` numeric ID mapping on desktop ROG boards.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::CpuFan => "cpu_fan",
+            Self::AioPump => "aio_pump",
+            Self::ChassisFan1 => "cha_fan1",
+            Self::ChassisFan2 => "cha_fan2",
+            Self::ChassisFan3 => "cha_fan3",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CpuFan => "CPU_FAN (Ventilateur CPU / Radiateur)",
+            Self::AioPump => "AIO_PUMP (Pompe Watercooling)",
+            Self::ChassisFan1 => "CHA_FAN1 (Boîtier #1)",
+            Self::ChassisFan2 => "CHA_FAN2 (Boîtier #2)",
+            Self::ChassisFan3 => "CHA_FAN3 (Boîtier #3)",
+        }
+    }
+
+    /// ASUS `ASUSManagement` WMI FanType IDs (verified on ASUS ROG desktop boards).
     pub fn asus_wmi_fan_type(self) -> u8 {
         match self {
             Self::CpuFan => 0,
@@ -42,80 +50,94 @@ impl FanHeaderKind {
         }
     }
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::AioPump => "Pompe AIO — be quiet! Silent Loop 3 (PWM 3500 RPM)",
-            Self::CpuFan => "Ventilateurs Radiateur (CPU_FAN)",
-            Self::ChassisFan1 => "Ventilateurs Boîtier #1 (CHA_FAN1)",
-            Self::ChassisFan2 => "Ventilateurs Boîtier #2 (CHA_FAN2)",
-            Self::ChassisFan3 => "Ventilateurs Boîtier #3 (CHA_FAN3)",
-        }
-    }
-
-    pub fn short_label(self) -> &'static str {
-        match self {
-            Self::AioPump => "AIO Pump (Silent Loop 3)",
-            Self::CpuFan => "CPU_FAN (Radiateur)",
-            Self::ChassisFan1 => "CHA_FAN1",
-            Self::ChassisFan2 => "CHA_FAN2",
-            Self::ChassisFan3 => "CHA_FAN3",
+    pub fn from_id(s: &str) -> Option<Self> {
+        match s {
+            "cpu_fan" => Some(Self::CpuFan),
+            "aio_pump" => Some(Self::AioPump),
+            "cha_fan1" => Some(Self::ChassisFan1),
+            "cha_fan2" => Some(Self::ChassisFan2),
+            "cha_fan3" => Some(Self::ChassisFan3),
+            _ => None,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FanPolicyMode {
+    Manual,
     Silent,
     Standard,
     Turbo,
     FullSpeed,
-    Manual,
 }
 
 impl FanPolicyMode {
-    pub const ALL: &'static [Self] = &[
-        Self::Silent,
-        Self::Standard,
-        Self::Turbo,
-        Self::FullSpeed,
-        Self::Manual,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Silent => "Silencieux",
-            Self::Standard => "Standard",
-            Self::Turbo => "Turbo",
-            Self::FullSpeed => "Pleine vitesse (100%)",
-            Self::Manual => "Courbe manuelle (8 pts)",
-        }
-    }
-
     pub fn asus_profile_str(self) -> &'static str {
         match self {
+            Self::Manual => "Manual",
             Self::Silent => "Silent",
             Self::Standard => "Standard",
             Self::Turbo => "Turbo",
             Self::FullSpeed => "Full Speed",
-            Self::Manual => "Manual",
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Silent => "silent",
+            Self::Standard => "standard",
+            Self::Turbo => "turbo",
+            Self::FullSpeed => "full_speed",
+        }
+    }
+
+    pub fn from_id(s: &str) -> Self {
+        match s {
+            "silent" => Self::Silent,
+            "standard" => Self::Standard,
+            "turbo" => Self::Turbo,
+            "full_speed" => Self::FullSpeed,
+            _ => Self::Manual,
         }
     }
 }
 
-/// Temperature source inspired by FanControl: BIOS CPU, Live GPU (AMD ADL2), or Mix max(CPU, GPU).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurvePoint {
+    pub temp_c: u8,
+    pub duty_pct: u8,
+}
+
+/// Thermal sensor driving a fan channel when OpenGear Smart Cooling is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum FanTempSource {
+    /// Hardware BIOS curve handles it natively (0 background polling needed).
     #[default]
     CpuBios,
-    GpuLive,
-    MixCpuGpu,
+    /// Driven dynamically by AMD ADL2 / NVIDIA NVML GPU Edge temperature.
+    GpuEdge,
+    /// Driven dynamically by AMD ADL2 GPU Hotspot temperature.
+    GpuHotspot,
+    /// Driven dynamically by `max(CPU, GPU Edge)` — ideal for radiator / case airflow!
+    MaxCpuGpu,
 }
 
 impl FanTempSource {
-    pub fn from_str_id(s: &str) -> Self {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::CpuBios => "cpu_bios",
+            Self::GpuEdge => "gpu_edge",
+            Self::GpuHotspot => "gpu_hotspot",
+            Self::MaxCpuGpu => "max_cpu_gpu",
+        }
+    }
+
+    pub fn from_id(s: &str) -> Self {
         match s {
-            "GpuLive" => Self::GpuLive,
-            "MixCpuGpu" => Self::MixCpuGpu,
+            "gpu_edge" => Self::GpuEdge,
+            "gpu_hotspot" => Self::GpuHotspot,
+            "max_cpu_gpu" => Self::MaxCpuGpu,
             _ => Self::CpuBios,
         }
     }
@@ -125,12 +147,9 @@ impl FanTempSource {
 pub struct FanChannelConfig {
     pub header: FanHeaderKind,
     pub policy: FanPolicyMode,
-    /// 8-point temperature/duty curve (matches ASUSManagement `SetManualFanCurvePro`)
     pub curve: [CurvePoint; 8],
-    /// FanControl-style smart temperature source (BIOS CPU / Live GPU / Mix max(CPU,GPU))
     #[serde(default)]
     pub source: FanTempSource,
-    /// Hysteresis in °C before ramping fans down (prevents Ryzen/GPU fan yoyo!)
     #[serde(default = "default_hysteresis")]
     pub hysteresis_c: u8,
 }
@@ -156,21 +175,17 @@ impl FanHeaderKind {
 impl FanChannelConfig {
     /// Return a hardware-safe copy of the 8-point curve:
     /// - points sorted by temperature, temperatures clamped to 20..=100 °C and strictly increasing,
-    /// - duty clamped to `min_safe_duty_pct..=100` and monotonically non-decreasing
-    ///   (a hotter point can never ask for less airflow than a cooler one).
+    /// - duty clamped to `min_safe_duty_pct..=100` and monotonically non-decreasing.
     pub fn sanitized_curve(&self) -> [CurvePoint; 8] {
         let min_duty = self.header.min_safe_duty_pct();
         let mut pts = self.curve;
         pts.sort_by_key(|p| p.temp_c);
         let mut prev_temp: Option<u8> = None;
         let mut prev_duty = min_duty;
-        for p in pts.iter_mut() {
-            let mut t = p.temp_c.clamp(20, 100);
-            if let Some(pt) = prev_temp {
-                if t <= pt {
-                    t = (pt + 1).min(100);
-                }
-            }
+        for (i, p) in pts.iter_mut().enumerate() {
+            let min_t = prev_temp.map(|pt| pt.saturating_add(1)).unwrap_or(20);
+            let max_t = 100u8.saturating_sub((7 - i) as u8);
+            let t = p.temp_c.clamp(min_t, max_t.max(min_t));
             p.temp_c = t;
             prev_temp = Some(t);
             p.duty_pct = p.duty_pct.clamp(min_duty, 100).max(prev_duty);
@@ -179,12 +194,16 @@ impl FanChannelConfig {
         pts
     }
 
-    /// Linearly interpolate target PWM duty (%) from the 8-point curve for a given temperature (°C).
+    /// Linearly interpolate target PWM duty (%) from the sanitized 8-point curve for `temp_c`.
+    /// Non-finite sensor values fail safe to 100 % duty, and header safety floors are always enforced.
     pub fn interpolate_duty(&self, temp_c: f32) -> u8 {
-        let mut pts = self.curve;
-        pts.sort_by_key(|p| p.temp_c);
+        if !temp_c.is_finite() {
+            return 100;
+        }
+        let min_duty = self.header.min_safe_duty_pct();
+        let pts = self.sanitized_curve();
         if temp_c <= pts[0].temp_c as f32 {
-            return pts[0].duty_pct;
+            return pts[0].duty_pct.clamp(min_duty, 100);
         }
         for w in pts.windows(2) {
             let t0 = w[0].temp_c as f32;
@@ -192,15 +211,15 @@ impl FanChannelConfig {
             if temp_c <= t1 && t1 > t0 {
                 let f = ((temp_c - t0) / (t1 - t0)).clamp(0.0, 1.0);
                 let d = w[0].duty_pct as f32 + (w[1].duty_pct as f32 - w[0].duty_pct as f32) * f;
-                return d.round().clamp(0.0, 100.0) as u8;
+                return (d.round() as i32).clamp(min_duty as i32, 100) as u8;
             }
         }
-        pts[7].duty_pct
+        pts[7].duty_pct.clamp(min_duty, 100)
     }
 
     pub fn default_for(header: FanHeaderKind) -> Self {
         let curve = match header {
-            // be quiet! Silent Loop 3: keep minimum >= 45% for steady coolant flow & zero airlocks
+            // AIO pump: keep minimum >= 45% for steady coolant flow & zero airlocks
             FanHeaderKind::AioPump => [
                 CurvePoint { temp_c: 30, duty_pct: 55 },
                 CurvePoint { temp_c: 40, duty_pct: 58 },
@@ -241,7 +260,7 @@ impl FanChannelConfig {
         }
     }
 
-    /// Preset curves specifically tuned for be quiet! Silent Loop 3 pump (4-pin PWM, 3500 RPM max).
+    /// Preset curves tuned for 4-pin PWM AIO pumps (minimum 45% floor enforced).
     pub fn silent_loop3_preset(preset: &str) -> [CurvePoint; 8] {
         match preset {
             "ultra_silent" => [
@@ -309,9 +328,10 @@ pub fn is_elevated() -> bool {
     false
 }
 
-/// Relaunch OpenGear elevated via Windows UAC (`ShellExecuteW("runas")`) to unlock ASUS WMI fan control.
+/// Relaunch OpenGear elevated via Windows UAC (`ShellExecuteW("runas")`).
 #[cfg(windows)]
 pub fn relaunch_as_admin() -> Result<()> {
+    use anyhow::Context;
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -341,7 +361,7 @@ pub fn relaunch_as_admin() -> Result<()> {
     anyhow::bail!("Non supporté hors Windows")
 }
 
-/// Probe `root\wmi\ASUSManagement` availability (requires Admin rights).
+/// Probe `root\wmi\ASUSManagement` availability via native COM WMI (requires Admin rights).
 pub fn probe_asus_wmi_cooling() -> AsusWmiCoolingStatus {
     let admin = is_elevated();
     if !admin {
@@ -353,26 +373,13 @@ pub fn probe_asus_wmi_cooling() -> AsusWmiCoolingStatus {
     }
 
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let out = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "$i = Get-CimInstance -Namespace root\\wmi -ClassName ASUSManagement -ErrorAction SilentlyContinue; if ($i) { 'OK' } else { 'NO_INSTANCE' }",
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        if let Ok(o) = out {
-            let txt = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if txt == "OK" {
-                return AsusWmiCoolingStatus {
-                    is_admin: true,
-                    wmi_available: true,
-                    message: "Interface BIOS/EC ASUSManagement WMI active (prête pour les courbes PWM).".into(),
-                };
-            }
+    if let Ok(conn) = crate::wmi_com::WmiConn::connect(r"root\wmi") {
+        if matches!(conn.first_instance_path("ASUSManagement"), Ok(Some(_))) {
+            return AsusWmiCoolingStatus {
+                is_admin: true,
+                wmi_available: true,
+                message: "Interface BIOS/EC ASUSManagement WMI active (prête pour les courbes PWM).".into(),
+            };
         }
     }
 
@@ -383,8 +390,7 @@ pub fn probe_asus_wmi_cooling() -> AsusWmiCoolingStatus {
     }
 }
 
-/// Parse the `PolicyErr=<n> [CurveErr=<n>]` status line printed by the WMI script.
-/// Succeeds only if every expected code is present, numeric and equal to 0.
+/// Validate explicit `0` ErrorCode values returned by `ASUSManagement` WMI methods.
 pub(crate) fn check_wmi_error_codes(stdout: &str, expect_curve: bool) -> Result<()> {
     let mut expected = vec!["PolicyErr="];
     if expect_curve {
@@ -398,7 +404,7 @@ pub(crate) fn check_wmi_error_codes(stdout: &str, expect_curve: bool) -> Result<
         match code {
             Some(0) => {}
             Some(_) => anyhow::bail!(
-                "ASUSManagement BIOS a refusé la commande ({stdout}) — utilise le contrôle direct SuperIO PawnIO (live RPM/PWM) juste en dessous !"
+                "ASUSManagement BIOS a refusé la commande ({stdout}) — utilise le contrôle direct SuperIO PawnIO !"
             ),
             None => anyhow::bail!(
                 "ASUSManagement n'a pas renvoyé de code de retour valide ({stdout:?}) — commande non confirmée"
@@ -408,7 +414,7 @@ pub(crate) fn check_wmi_error_codes(stdout: &str, expect_curve: bool) -> Result<
     Ok(())
 }
 
-/// Apply an 8-point PWM fan/pump curve to the ASUS ROG motherboard via `ASUSManagement::SetManualFanCurvePro` + `SetFanPolicy`.
+/// Apply an 8-point PWM fan/pump curve to the ASUS motherboard via native COM `ASUSManagement`.
 pub fn apply_asus_wmi_curve(cfg: &FanChannelConfig) -> Result<String> {
     if !is_elevated() {
         anyhow::bail!("Lance OpenGear en Administrateur pour appliquer les courbes PWM sur la carte mère ASUS.");
@@ -416,64 +422,108 @@ pub fn apply_asus_wmi_curve(cfg: &FanChannelConfig) -> Result<String> {
 
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use anyhow::Context;
+        use crate::wmi_com::{WmiConn, WmiVal};
+
+        let conn = WmiConn::connect(r"root\wmi")?;
+        let obj_path = conn
+            .first_instance_path("ASUSManagement")?
+            .context("Instance ASUSManagement WMI introuvable")?;
+
         let ft = cfg.header.asus_wmi_fan_type();
-        let prof = cfg.policy.asus_profile_str();
-        // Never send a raw UI curve to the BIOS: enforce ordering, monotonic duty and header floors.
+        let prof = cfg.policy.asus_profile_str().to_string();
+        let low_limit = (cfg.header.min_safe_duty_pct().max(20)) as u32;
         let safe_curve = cfg.sanitized_curve();
-        let p = &safe_curve;
 
-        let script = if cfg.policy == FanPolicyMode::Manual {
-            format!(
-                "$i = Get-CimInstance -Namespace root\\wmi -ClassName ASUSManagement | Select-Object -First 1; \
-                 if (-not $i) {{ throw 'ASUSManagement WMI instance introuvable' }}; \
-                 $r1 = Invoke-CimMethod -InputObject $i -MethodName SetFanPolicy -Arguments @{{ FanType=[byte]{ft}; Mode='PWM'; Profile='Manual'; Source='CPU'; LowLimit=[uint32]20 }}; \
-                 $r2 = Invoke-CimMethod -InputObject $i -MethodName SetManualFanCurvePro -Arguments @{{ \
-                   FanType=[byte]{ft}; Mode='PWM'; \
-                   Point1Temp=[byte]{}; Point1Duty=[byte]{}; \
-                   Point2Temp=[byte]{}; Point2Duty=[byte]{}; \
-                   Point3Temp=[byte]{}; Point3Duty=[byte]{}; \
-                   Point4Temp=[byte]{}; Point4Duty=[byte]{}; \
-                   Point5Temp=[byte]{}; Point5Duty=[byte]{}; \
-                   Point6Temp=[byte]{}; Point6Duty=[byte]{}; \
-                   Point7Temp=[byte]{}; Point7Duty=[byte]{}; \
-                   Point8Temp=[byte]{}; Point8Duty=[byte]{} \
-                 }}; \
-                 \"PolicyErr=$($r1.ErrorCode) CurveErr=$($r2.ErrorCode)\"",
-                p[0].temp_c, p[0].duty_pct,
-                p[1].temp_c, p[1].duty_pct,
-                p[2].temp_c, p[2].duty_pct,
-                p[3].temp_c, p[3].duty_pct,
-                p[4].temp_c, p[4].duty_pct,
-                p[5].temp_c, p[5].duty_pct,
-                p[6].temp_c, p[6].duty_pct,
-                p[7].temp_c, p[7].duty_pct,
-            )
+        let r1 = conn.exec_method(
+            &obj_path,
+            "ASUSManagement",
+            "SetFanPolicy",
+            &[
+                ("FanType", WmiVal::U8(ft)),
+                ("Mode", WmiVal::String("PWM".into())),
+                ("Profile", WmiVal::String(prof)),
+                ("Source", WmiVal::String("CPU".into())),
+                ("LowLimit", WmiVal::U32(low_limit)),
+            ],
+        )?;
+        let policy_err = r1.get("ErrorCode").and_then(|v| v.as_u64());
+
+        if cfg.policy == FanPolicyMode::Manual {
+            let p = &safe_curve;
+            let curve_res = conn.exec_method(
+                &obj_path,
+                "ASUSManagement",
+                "SetManualFanCurvePro",
+                &[
+                    ("FanType", WmiVal::U8(ft)),
+                    ("Mode", WmiVal::String("PWM".into())),
+                    ("Point1Temp", WmiVal::U8(p[0].temp_c)),
+                    ("Point1Duty", WmiVal::U8(p[0].duty_pct)),
+                    ("Point2Temp", WmiVal::U8(p[1].temp_c)),
+                    ("Point2Duty", WmiVal::U8(p[1].duty_pct)),
+                    ("Point3Temp", WmiVal::U8(p[2].temp_c)),
+                    ("Point3Duty", WmiVal::U8(p[2].duty_pct)),
+                    ("Point4Temp", WmiVal::U8(p[3].temp_c)),
+                    ("Point4Duty", WmiVal::U8(p[3].duty_pct)),
+                    ("Point5Temp", WmiVal::U8(p[4].temp_c)),
+                    ("Point5Duty", WmiVal::U8(p[4].duty_pct)),
+                    ("Point6Temp", WmiVal::U8(p[5].temp_c)),
+                    ("Point6Duty", WmiVal::U8(p[5].duty_pct)),
+                    ("Point7Temp", WmiVal::U8(p[6].temp_c)),
+                    ("Point7Duty", WmiVal::U8(p[6].duty_pct)),
+                    ("Point8Temp", WmiVal::U8(p[7].temp_c)),
+                    ("Point8Duty", WmiVal::U8(p[7].duty_pct)),
+                ],
+            );
+            let curve_err = match curve_res {
+                Ok(ref r2) => r2.get("ErrorCode").and_then(|v| v.as_u64()),
+                Err(e) => {
+                    // Roll back Manual policy to BIOS Standard if curve programming failed.
+                    let _ = conn.exec_method(
+                        &obj_path,
+                        "ASUSManagement",
+                        "SetFanPolicy",
+                        &[
+                            ("FanType", WmiVal::U8(ft)),
+                            ("Mode", WmiVal::String("PWM".into())),
+                            ("Profile", WmiVal::String("Standard".into())),
+                            ("Source", WmiVal::String("CPU".into())),
+                            ("LowLimit", WmiVal::U32(low_limit)),
+                        ],
+                    );
+                    return Err(e);
+                }
+            };
+            let summary = format!(
+                "PolicyErr={} CurveErr={}",
+                policy_err.map(|v| v.to_string()).unwrap_or_default(),
+                curve_err.map(|v| v.to_string()).unwrap_or_default(),
+            );
+            if check_wmi_error_codes(&summary, true).is_err() {
+                let _ = conn.exec_method(
+                    &obj_path,
+                    "ASUSManagement",
+                    "SetFanPolicy",
+                    &[
+                        ("FanType", WmiVal::U8(ft)),
+                        ("Mode", WmiVal::String("PWM".into())),
+                        ("Profile", WmiVal::String("Standard".into())),
+                        ("Source", WmiVal::String("CPU".into())),
+                        ("LowLimit", WmiVal::U32(low_limit)),
+                    ],
+                );
+                check_wmi_error_codes(&summary, true)?;
+            }
+            Ok(summary)
         } else {
-            format!(
-                "$i = Get-CimInstance -Namespace root\\wmi -ClassName ASUSManagement | Select-Object -First 1; \
-                 if (-not $i) {{ throw 'ASUSManagement WMI instance introuvable' }}; \
-                 $r1 = Invoke-CimMethod -InputObject $i -MethodName SetFanPolicy -Arguments @{{ FanType=[byte]{ft}; Mode='PWM'; Profile='{prof}'; Source='CPU'; LowLimit=[uint32]20 }}; \
-                 \"PolicyErr=$($r1.ErrorCode)\""
-            )
-        };
-
-        let out = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .context("Échec exécution PowerShell WMI")?;
-
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            anyhow::bail!("Erreur ASUSManagement WMI : {}", err.trim());
+            let summary = format!(
+                "PolicyErr={}",
+                policy_err.map(|v| v.to_string()).unwrap_or_default()
+            );
+            check_wmi_error_codes(&summary, false)?;
+            Ok(summary)
         }
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        // STRICT ERROR CHECK: never claim success unless the ASUS BIOS explicitly returned 0
-        // for every call (an empty / unparsable ErrorCode means the method did not run).
-        check_wmi_error_codes(&stdout, cfg.policy == FanPolicyMode::Manual)?;
-        Ok(stdout)
     }
 
     #[cfg(not(windows))]
@@ -484,36 +534,44 @@ pub fn apply_asus_wmi_curve(cfg: &FanChannelConfig) -> Result<String> {
 }
 
 /// Read back the current BIOS/EC policy and 8-point PWM curve from `root\wmi\ASUSManagement`
-/// (`GetFanPolicy` + `GetManualFanCurvePro`) when running elevated as Admin.
+/// via native COM WMI (`GetFanPolicy` + `GetManualFanCurvePro`).
 pub fn read_asus_wmi_channel(header: FanHeaderKind) -> Option<FanChannelConfig> {
     if !is_elevated() {
         return None;
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use crate::wmi_com::{WmiConn, WmiVal};
+
+        let conn = WmiConn::connect(r"root\wmi").ok()?;
+        let obj_path = conn.first_instance_path("ASUSManagement").ok()??;
         let ft = header.asus_wmi_fan_type();
-        let script = format!(
-            "$i = Get-CimInstance -Namespace root\\wmi -ClassName ASUSManagement -ErrorAction SilentlyContinue | Select-Object -First 1; \
-             if (-not $i) {{ exit 1 }}; \
-             $p = Invoke-CimMethod -InputObject $i -MethodName GetFanPolicy -Arguments @{{ FanType=[byte]{ft} }} -ErrorAction SilentlyContinue; \
-             $c = Invoke-CimMethod -InputObject $i -MethodName GetManualFanCurvePro -Arguments @{{ FanType=[byte]{ft}; Mode='PWM' }} -ErrorAction SilentlyContinue; \
-             $pol = if ($p -and $p.Profile) {{ $p.Profile }} else {{ 'Manual' }}; \
-             if ($c) {{ \
-               \"$pol|$($c.Point1Temp),$($c.Point1Duty);$($c.Point2Temp),$($c.Point2Duty);$($c.Point3Temp),$($c.Point3Duty);$($c.Point4Temp),$($c.Point4Duty);$($c.Point5Temp),$($c.Point5Duty);$($c.Point6Temp),$($c.Point6Duty);$($c.Point7Temp),$($c.Point7Duty);$($c.Point8Temp),$($c.Point8Duty)\" \
-             }} else {{ \"$pol|\" }}"
-        );
-        let out = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let (pol_str, pts_str) = line.split_once('|')?;
+
+        let p = conn
+            .exec_method(
+                &obj_path,
+                "ASUSManagement",
+                "GetFanPolicy",
+                &[("FanType", WmiVal::U8(ft))],
+            )
+            .ok();
+        let c = conn
+            .exec_method(
+                &obj_path,
+                "ASUSManagement",
+                "GetManualFanCurvePro",
+                &[
+                    ("FanType", WmiVal::U8(ft)),
+                    ("Mode", WmiVal::String("PWM".into())),
+                ],
+            )
+            .ok();
+
+        let pol_str = p
+            .as_ref()
+            .and_then(|m| m.get("Profile"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Manual");
         let mut cfg = FanChannelConfig::default_for(header);
         cfg.policy = match pol_str.trim() {
             "Silent" => FanPolicyMode::Silent,
@@ -522,21 +580,24 @@ pub fn read_asus_wmi_channel(header: FanHeaderKind) -> Option<FanChannelConfig> 
             "Full Speed" | "FullSpeed" => FanPolicyMode::FullSpeed,
             _ => FanPolicyMode::Manual,
         };
-        let mut parsed_pts = Vec::new();
-        for tok in pts_str.split(';') {
-            if let Some((t, d)) = tok.split_once(',') {
-                if let (Ok(tv), Ok(dv)) = (t.trim().parse::<u8>(), d.trim().parse::<u8>()) {
-                    if tv >= 20 && tv <= 105 && dv <= 100 {
-                        parsed_pts.push(CurvePoint {
-                            temp_c: tv.min(100),
-                            duty_pct: dv,
-                        });
-                    }
+
+        if let Some(cm) = c {
+            let mut parsed = Vec::with_capacity(8);
+            for i in 1..=8 {
+                let tk = format!("Point{i}Temp");
+                let dk = format!("Point{i}Duty");
+                let tv = cm.get(&tk).and_then(|v| v.as_u64()).unwrap_or(0);
+                let dv = cm.get(&dk).and_then(|v| v.as_u64()).unwrap_or(255);
+                if (20..=105).contains(&tv) && dv <= 100 {
+                    parsed.push(CurvePoint {
+                        temp_c: (tv as u8).min(100),
+                        duty_pct: dv as u8,
+                    });
                 }
             }
-        }
-        if parsed_pts.len() == 8 {
-            cfg.curve.copy_from_slice(&parsed_pts);
+            if parsed.len() == 8 {
+                cfg.curve.copy_from_slice(&parsed);
+            }
         }
         Some(cfg)
     }
@@ -563,6 +624,17 @@ mod safety_tests {
     fn pump_curve_never_drops_below_floor() {
         let c = cfg_with(FanHeaderKind::AioPump, [(30, 0); 8]);
         assert!(c.sanitized_curve().iter().all(|p| p.duty_pct >= 45));
+        assert!(c.interpolate_duty(10.0) >= 45);
+        assert!(c.interpolate_duty(55.0) >= 45);
+    }
+
+    #[test]
+    fn interpolate_enforces_floor_and_nan_failsafe() {
+        let mut c = cfg_with(FanHeaderKind::CpuFan, [(30, 0); 8]);
+        c.curve[0] = CurvePoint { temp_c: 30, duty_pct: 5 };
+        assert!(c.interpolate_duty(25.0) >= 20);
+        assert_eq!(c.interpolate_duty(f32::NAN), 100);
+        assert_eq!(c.interpolate_duty(f32::INFINITY), 100);
     }
 
     #[test]
@@ -571,6 +643,20 @@ mod safety_tests {
         assert!(cpu.sanitized_curve().iter().all(|p| p.duty_pct >= 20));
         let cha = cfg_with(FanHeaderKind::ChassisFan1, [(30, 0); 8]);
         assert_eq!(cha.sanitized_curve()[0].duty_pct, 0);
+    }
+
+    #[test]
+    fn curve_is_sorted_strictly_increasing_even_at_100c() {
+        let c = cfg_with(
+            FanHeaderKind::ChassisFan1,
+            [(100, 10), (100, 20), (100, 30), (100, 40), (100, 50), (100, 60), (100, 70), (100, 80)],
+        );
+        let s = c.sanitized_curve();
+        for w in s.windows(2) {
+            assert!(w[1].temp_c > w[0].temp_c, "temps must strictly increase: {s:?}");
+            assert!(w[1].duty_pct >= w[0].duty_pct, "duty must not decrease: {s:?}");
+        }
+        assert_eq!(s[7].temp_c, 100);
     }
 
     #[test]
@@ -592,7 +678,6 @@ mod safety_tests {
         assert!(check_wmi_error_codes("PolicyErr=0 CurveErr=0", true).is_ok());
         assert!(check_wmi_error_codes("PolicyErr=0", false).is_ok());
         assert!(check_wmi_error_codes("PolicyErr=1 CurveErr=0", true).is_err());
-        // Empty / missing codes used to be reported as success
         assert!(check_wmi_error_codes("PolicyErr= CurveErr=", true).is_err());
         assert!(check_wmi_error_codes("PolicyErr=0", true).is_err());
         assert!(check_wmi_error_codes("", false).is_err());

@@ -5,7 +5,8 @@
 use crate::audio_ext::read_audio_state;
 use opengear_asus::{
     AuraMainboardController, FanHeaderKind, TelemetryCollector, diagnose_smbus_readonly,
-    is_elevated, pawnio_availability, probe_ram_rgb, read_asus_wmi_channel, read_native_cpu_temp,
+    is_elevated, is_laptop_chassis, pawnio_availability, probe_hp_omen, probe_ram_rgb,
+    read_asus_wmi_channel, read_display_info, read_laptop_battery, read_native_cpu_temp,
     read_superio_snapshot,
 };
 use opengear_corsair::CorsairDevice;
@@ -129,22 +130,84 @@ pub fn run_full_selftest() -> SelfTestReport {
         }),
     }
 
-    // 4. GPU ADL2 & Windows WASAPI Audio
+    // 4. GPU (NVML / ADL2) & Windows WASAPI Audio
+    let is_laptop = is_laptop_chassis();
     let mut tel = TelemetryCollector::new();
     let sample = tel.sample();
+    let gpu_backend = if sample.gpu.backend.is_empty() {
+        "N/A"
+    } else {
+        sample.gpu.backend.as_str()
+    };
     checks.push(SelfTestCheck {
-        name: "GPU AMD ADL2 & Télémétrie".into(),
+        name: "GPU & Télémétrie".into(),
         status: if sample.gpu.available { "PASS" } else { "WARN" }.into(),
         detail: format!(
-            "CPU {:.0}% | RAM {:.1}/{:.1} Go | GPU={} ({:?}°C, {:?}W)",
+            "CPU {:.0}% | RAM {:.1}/{:.1} Go | {} ({}) : {:.0?}°C, {:.1?}W",
             sample.cpu_usage_pct,
             sample.ram_used_gb,
             sample.ram_total_gb,
-            if sample.gpu.available { "ADL2 OK" } else { "N/A" },
+            tel.static_info.gpu_name,
+            gpu_backend,
             sample.gpu.edge_temp_c,
             sample.gpu.power_watts
         ),
     });
+
+    // 4b. Batterie & Écran Portable (si châssis portable / batterie présente)
+    let bat = read_laptop_battery();
+    if is_laptop || bat.present {
+        let disp = read_display_info();
+        checks.push(SelfTestCheck {
+            name: "Batterie & Écran Portable".into(),
+            status: "PASS".into(),
+            detail: format!(
+                "Batterie {}% (Santé {}%, {} cycles, {}) | Écran {}x{} @ {} Hz ({:?}) Luminosité {}%",
+                bat.percent.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
+                bat.health_pct.map(|h| format!("{h:.0}")).unwrap_or_else(|| "—".into()),
+                bat.cycle_count.map(|c| c.to_string()).unwrap_or_else(|| "—".into()),
+                if bat.ac_online { "Secteur" } else { "Batterie" },
+                disp.width,
+                disp.height,
+                disp.current_hz.map(|h| h.to_string()).unwrap_or_else(|| "—".into()),
+                disp.supported_hz,
+                disp.brightness_pct.map(|b| b.to_string()).unwrap_or_else(|| "—".into()),
+            ),
+        });
+    }
+
+    // 4c. HP OMEN BIOS WMI (hpqBIntM)
+    let omen = probe_hp_omen();
+    if omen.detected {
+        let (st_str, detail) = if !admin {
+            (
+                "SKIP_ADMIN",
+                format!(
+                    "{} ({}) détecté — relance en Administrateur pour interroger hpqBIntM (ventilateurs, RGB 4 zones, TGP GPU).",
+                    omen.model, omen.board_id
+                ),
+            )
+        } else if omen.wmi_accessible {
+            (
+                "PASS",
+                format!(
+                    "{} | Ventilateurs={} ({:?} tr/min) | Clavier={} | Rétroéclairage={}",
+                    omen.diagnostic,
+                    omen.fan_count,
+                    omen.fan_rpms,
+                    omen.keyboard_label,
+                    if omen.backlight_on { "ON" } else { "OFF" }
+                ),
+            )
+        } else {
+            ("WARN", omen.diagnostic.clone())
+        };
+        checks.push(SelfTestCheck {
+            name: "HP OMEN BIOS WMI (hpqBIntM)".into(),
+            status: st_str.into(),
+            detail,
+        });
+    }
 
     let au = read_audio_state();
     checks.push(SelfTestCheck {
@@ -208,8 +271,12 @@ pub fn run_full_selftest() -> SelfTestReport {
         } else {
             checks.push(SelfTestCheck {
                 name: "PawnIO SuperIO (LpcIO)".into(),
-                status: "FAIL".into(),
-                detail: sio.diagnostic,
+                status: if is_laptop { "WARN" } else { "FAIL" }.into(),
+                detail: if is_laptop {
+                    format!("{} — non applicable sur PC portable (contrôle via EC / WMI constructeur).", sio.diagnostic)
+                } else {
+                    sio.diagnostic
+                },
             });
         }
 

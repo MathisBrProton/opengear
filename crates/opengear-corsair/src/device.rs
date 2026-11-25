@@ -1,5 +1,5 @@
 use crate::k70_tkl::LightingEndpoint;
-use crate::keymap::{K70_TKL_KEYS, K70_TKL_LED_COUNT};
+use crate::keymap::{K70_TKL_KEYS, K70_TKL_LED_COUNT, layout_for_device};
 use crate::proto::*;
 use crate::transport::{BragiHidCandidate, BragiTransport};
 use opengear_core::{KeyboardLayout, OperatingMode, PollingRate, Rgb, RgbEffectConfig};
@@ -127,13 +127,7 @@ impl CorsairDevice {
             // 1. Open primary host/wired interface (subdevice 0)
             match Self::open_and_probe(&cand, 0) {
                 Ok((dev, subdev_bitmap)) => {
-                    let is_dongle = dev.info.kind == CorsairDeviceKind::Dongle;
-                    if !is_dongle || subdev_bitmap == 0 {
-                        devices.push(dev);
-                    } else {
-                        // Still include dongle if user wants visibility, plus every connected wireless subdevice
-                        devices.push(dev);
-                    }
+                    devices.push(dev);
                     // 2. Probe any connected SLIPSTREAM wireless subdevices (bits 1..=7 in 0x36)
                     if subdev_bitmap != 0 {
                         for slot in 1..=7u8 {
@@ -162,9 +156,14 @@ impl CorsairDevice {
     ) -> Result<(Self, u32), BragiError> {
         let mut transport = BragiTransport::open_candidate(cand, subdevice_id)?;
 
-        // Probe real device VID/PID (essential for wireless subdevices behind a SLIPSTREAM dongle!)
-        let vid = transport
-            .get_property(PROP_VID)
+        // Probe real device VID/PID (essential for wireless subdevices behind a SLIPSTREAM dongle).
+        // Fail fast on hard HID I/O or timeout errors so a dead/disconnected device never presents
+        // as a fake `Generic` `FW 0.0.0` device after 35 timeouts.
+        let vid_probe = transport.get_property(PROP_VID);
+        if matches!(vid_probe, Err(BragiError::Hid(_)) | Err(BragiError::Timeout)) {
+            return Err(vid_probe.unwrap_err());
+        }
+        let vid = vid_probe
             .ok()
             .filter(|&v| v > 0 && v <= 0xFFFF)
             .map(|v| v as u16)
@@ -176,7 +175,11 @@ impl CorsairDevice {
             .map(|v| v as u16)
             .unwrap_or(transport.pid);
 
-        let initial_mode_raw = transport.get_property(PROP_MODE).unwrap_or(MODE_HARDWARE as u32);
+        let initial_mode_raw = match transport.get_property(PROP_MODE) {
+            Ok(v) => v,
+            Err(e @ BragiError::Hid(_)) | Err(e @ BragiError::Timeout) => return Err(e),
+            Err(_) => MODE_HARDWARE as u32,
+        };
         let mode = if initial_mode_raw == MODE_SOFTWARE as u32 {
             OperatingMode::Software
         } else {
@@ -341,12 +344,27 @@ impl CorsairDevice {
         };
 
         let display_name = if subdevice_id > 0 {
-            format!("{} (Sans-fil #{subdevice_id})", transport.product_name)
+            format!(
+                "Corsair {} Sans-fil (0x{:04X} #{subdevice_id})",
+                kind.label(),
+                pid
+            )
         } else {
             transport.product_name.clone()
         };
 
-        let id = format!("corsair_{:04X}_{:04X}_sub{}", vid, pid, subdevice_id);
+        let uniq = if !transport.serial.trim().is_empty() {
+            transport.serial.trim().to_string()
+        } else {
+            // Stable FNV-1a suffix from HID path to disambiguate identical devices without serials.
+            let mut h: u32 = 0x811C_9DC5;
+            for b in transport.path.as_bytes() {
+                h ^= *b as u32;
+                h = h.wrapping_mul(0x0100_0193);
+            }
+            format!("{h:08X}")
+        };
+        let id = format!("corsair_{:04X}_{:04X}_sub{}_{uniq}", vid, pid, subdevice_id);
 
         let info = CorsairDeviceInfo {
             id,
@@ -364,8 +382,8 @@ impl CorsairDevice {
             max_pollrate: max_poll_raw.and_then(PollingRate::from_bragi_value),
             hw_brightness_raw,
             brightness_is_coarse,
-            out_report_len: transport.out_report_len,
-            in_report_len: transport.in_report_len,
+            out_report_len: transport.out_report_len(),
+            in_report_len: transport.in_report_len(),
             lighting_endpoint: LightingEndpoint::Planar0x01,
             battery_pct,
             battery_status,
@@ -454,6 +472,10 @@ impl CorsairDevice {
         Ok(())
     }
 
+    pub fn set_restore_hw_on_drop(&mut self, restore: bool) {
+        self.restore_hw_on_drop = restore;
+    }
+
     pub fn hw_brightness_pct(&self) -> u8 {
         match self.info.hw_brightness_raw {
             Some(v) if self.info.brightness_is_coarse => match v {
@@ -506,20 +528,15 @@ impl CorsairDevice {
         };
         let code = self.transport.open_handle(HANDLE_LIGHTING, res)?;
         if code != ERR_OK {
-            let alt = match self.info.lighting_endpoint {
-                LightingEndpoint::Triplets0x22 => {
-                    self.info.lighting_endpoint = LightingEndpoint::Planar0x01;
-                    RES_LIGHTING_PLANAR
-                }
-                LightingEndpoint::Planar0x01 => {
-                    self.info.lighting_endpoint = LightingEndpoint::Triplets0x22;
-                    RES_LIGHTING_TRIPLETS
-                }
+            let (alt_ep, alt_res) = match self.info.lighting_endpoint {
+                LightingEndpoint::Triplets0x22 => (LightingEndpoint::Planar0x01, RES_LIGHTING_PLANAR),
+                LightingEndpoint::Planar0x01 => (LightingEndpoint::Triplets0x22, RES_LIGHTING_TRIPLETS),
             };
-            let code2 = self.transport.open_handle(HANDLE_LIGHTING, alt)?;
+            let code2 = self.transport.open_handle(HANDLE_LIGHTING, alt_res)?;
             if code2 != ERR_OK {
                 return Err(BragiError::from_code(code2));
             }
+            self.info.lighting_endpoint = alt_ep;
         }
         self.lighting_handle_open = true;
         Ok(())
@@ -600,9 +617,8 @@ impl CorsairDevice {
         self.transport
             .set_property(PROP_PRESS_DEBOUNCE_ENABLED, u16::from(enabled))?;
         if enabled {
-            let _ = self
-                .transport
-                .set_property(PROP_PRESS_DEBOUNCE_TIMEOUT, timeout_ms as u16);
+            self.transport
+                .set_property(PROP_PRESS_DEBOUNCE_TIMEOUT, timeout_ms as u16)?;
         }
         self.info.debounce_enabled = Some(enabled);
         self.info.debounce_timeout_ms = Some(timeout_ms);
@@ -622,24 +638,12 @@ impl CorsairDevice {
         Ok(())
     }
 
-    /// Low-level read of any Bragi onboard flash file by `FileId` (e.g. `0x0011` FileListing, `0x000F` ProfilesList).
-    /// Temporarily ensures Software mode (required by Bragi v2 MCU to open flash handles) and restores Hardware mode cleanly.
     pub fn read_flash_file(&mut self, file_id: u16) -> Result<Vec<u8>, BragiError> {
-        // File access reuses handle 0 (= the lighting handle) and closes it afterwards:
-        // forget it so the next frame re-opens it instead of writing to a closed handle.
-        self.lighting_handle_open = false;
-        let was_hw = self.info.mode == OperatingMode::Hardware;
-        if was_hw {
-            let _ = self.transport.set_property(PROP_MODE, MODE_SOFTWARE);
-        }
-        let res = self.transport.read_file(file_id);
-        if was_hw {
-            let _ = self.transport.set_property(PROP_MODE, MODE_HARDWARE);
-        }
-        res
+        self.with_flash_session(|t| t.read_file(file_id))
     }
 
-    /// Execute a batch of flash file operations inside a single Software-mode session, restoring Hardware mode on exit.
+    /// Execute a batch of flash file operations inside a single Software-mode session,
+    /// guaranteed by an RAII guard to restore Hardware mode even on early return or panic.
     pub fn with_flash_session<T, F: FnOnce(&mut BragiTransport) -> Result<T, BragiError>>(
         &mut self,
         f: F,
@@ -651,28 +655,50 @@ impl CorsairDevice {
         }
         if was_hw {
             self.transport.set_property(PROP_MODE, MODE_SOFTWARE)?;
+            self.info.mode = OperatingMode::Software;
             std::thread::sleep(Duration::from_millis(60));
             self.transport.drain_input();
         }
-        let res = f(&mut self.transport);
+
+        struct FlashModeGuard<'a> {
+            dev: &'a mut CorsairDevice,
+            restore_hw: bool,
+        }
+        impl Drop for FlashModeGuard<'_> {
+            fn drop(&mut self) {
+                self.dev.lighting_handle_open = false;
+                if self.restore_hw && self.dev.info.mode == OperatingMode::Software {
+                    if self.dev.transport.set_property(PROP_MODE, MODE_HARDWARE).is_ok() {
+                        self.dev.info.mode = OperatingMode::Hardware;
+                    }
+                }
+            }
+        }
+
+        let mut guard = FlashModeGuard {
+            dev: self,
+            restore_hw: was_hw,
+        };
+        let res = f(&mut guard.dev.transport);
+        guard.dev.lighting_handle_open = false;
         if was_hw {
-            let _ = self.transport.set_property(PROP_MODE, MODE_HARDWARE);
+            guard.restore_hw = false;
+            guard.dev.transport.set_property(PROP_MODE, MODE_HARDWARE)?;
+            guard.dev.info.mode = OperatingMode::Hardware;
         }
         res
     }
 
     pub fn create_flash_file(&mut self, file_id: u16) -> Result<(), BragiError> {
-        self.transport.create_file(file_id)
+        self.with_flash_session(|t| t.create_file(file_id))
     }
 
     pub fn remove_flash_file(&mut self, file_id: u16) -> Result<(), BragiError> {
-        self.transport.remove_file(file_id)
+        self.with_flash_session(|t| t.remove_file(file_id))
     }
 
     pub fn write_flash_file(&mut self, file_id: u16, data: &[u8]) -> Result<(), BragiError> {
-        // Same handle-0 reuse as read_flash_file: the lighting handle must be re-opened afterwards.
-        self.lighting_handle_open = false;
-        self.transport.write_file(file_id, data)
+        self.with_flash_session(|t| t.write_file(file_id, data))
     }
 
     // ---- Universal Bragi Mouse Controls ----
@@ -752,26 +778,32 @@ impl CorsairDevice {
     where
         F: Fn(usize, f32, f32, &str) -> Rgb,
     {
+        if self.info.kind != CorsairDeviceKind::Keyboard {
+            return Ok(());
+        }
+        let layout = layout_for_device(self.info.vid, self.info.pid);
+        let (led_count, keys) = match layout {
+            Some(l) => (l.led_count, l.keys),
+            None => (K70_TKL_LED_COUNT, K70_TKL_KEYS),
+        };
+
         if self.info.mode != OperatingMode::Software {
             self.set_mode(OperatingMode::Software)?;
         }
         self.ensure_lighting_handle()?;
         self.tick_keepalive();
 
-        let mut frame = [Rgb::BLACK; K70_TKL_LED_COUNT];
         let base_sample = sampler(0, 0.5, 0.5, "");
-        for slot in &mut frame {
-            *slot = base_sample;
-        }
-        for key in K70_TKL_KEYS {
-            if key.led_index < K70_TKL_LED_COUNT {
+        let mut frame = vec![base_sample; led_count];
+        for key in keys {
+            if key.led_index < led_count {
                 frame[key.led_index] = sampler(key.led_index, key.norm_x(), key.norm_y(), key.id);
             }
         }
 
         let payload = match self.info.lighting_endpoint {
             LightingEndpoint::Triplets0x22 => {
-                let mut buf = Vec::with_capacity(2 + K70_TKL_LED_COUNT * 3);
+                let mut buf = Vec::with_capacity(2 + led_count * 3);
                 buf.push(0x12);
                 buf.push(0x00);
                 for c in &frame {
@@ -782,11 +814,11 @@ impl CorsairDevice {
                 buf
             }
             LightingEndpoint::Planar0x01 => {
-                let mut buf = vec![0u8; K70_TKL_LED_COUNT * 3];
+                let mut buf = vec![0u8; led_count * 3];
                 for (i, c) in frame.iter().enumerate() {
                     buf[i] = c.r;
-                    buf[K70_TKL_LED_COUNT + i] = c.g;
-                    buf[K70_TKL_LED_COUNT * 2 + i] = c.b;
+                    buf[led_count + i] = c.g;
+                    buf[led_count * 2 + i] = c.b;
                 }
                 buf
             }

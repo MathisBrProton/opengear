@@ -8,16 +8,17 @@ mod selftest;
 mod system_events;
 mod system_ext;
 mod tray_icon;
-mod webview_ui;
+mod ui;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use opengear_asus::{
     AuraHwMode, AuraMainboardController, EneRamMode, TelemetryCollector, apply_ram_rgb,
-    list_power_plans, probe_asus_wmi_cooling, probe_ram_rgb, read_hardware_sensors,
+    list_power_plans, probe_asus_wmi_cooling, probe_hp_omen, probe_ram_rgb, read_display_info,
+    read_hardware_sensors, read_laptop_battery,
 };
 use opengear_core::{EffectKind, OperatingMode, PollingRate, Rgb, RgbEffectConfig, scan_hid_devices};
-use opengear_corsair::{CorsairDevice, CorsairKeyboard};
+use opengear_corsair::CorsairDevice;
 use opengear_logitech::{
     BatteryPowerModel, LodLevel, LogitechHeadset, LogitechKeyboard, LogitechMouse, OnboardMode,
 };
@@ -42,6 +43,9 @@ struct Cli {
     /// (interne) Surveille le processus <PID> et rend les ventilateurs au BIOS s'il meurt.
     #[arg(long, hide = true, value_name = "PID")]
     fan_watchdog: Option<u32>,
+    /// (interne) Nettoie le dossier temporaire d'extraction du setup après installation.
+    #[arg(long, hide = true, value_name = "DIR")]
+    cleanup_dir: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -79,6 +83,8 @@ enum Commands {
     },
     /// Lancer l'auto-test matériel complet (read-back vérifié + rapport %TEMP%\opengear_selftest.txt)
     Selftest,
+    /// Sonder en lecture seule un PC portable (GPU NVML/ADL2, batterie, écran, HP OMEN hpqBIntM)
+    HpProbe,
 }
 
 #[derive(Subcommand)]
@@ -195,8 +201,11 @@ fn main() -> Result<()> {
         return fan_watchdog::run_watchdog(parent_pid);
     }
     if cli.install {
-        tray_icon::install_to_windows()?;
+        tray_icon::install_to_windows(cli.cleanup_dir.as_deref())?;
         return Ok(());
+    }
+    if let Some(dir) = cli.cleanup_dir.as_deref() {
+        tray_icon::cleanup_installer_temp_dir(dir);
     }
     if cli.uninstall {
         tray_icon::uninstall_from_windows()?;
@@ -215,7 +224,7 @@ fn main() -> Result<()> {
     }
 
     match cli.command.unwrap_or(Commands::Gui) {
-        Commands::Gui => webview_ui::run_gui(cli.minimized),
+        Commands::Gui => ui::run_gui(cli.minimized),
         Commands::Scan { all } => cmd_scan(all),
         Commands::Telemetry => cmd_telemetry(),
         Commands::Corsair { action } => cmd_corsair(action),
@@ -234,6 +243,7 @@ fn main() -> Result<()> {
             println!("Rapport sauvegardé : {}", rep.report_path);
             Ok(())
         }
+        Commands::HpProbe => cmd_hp_probe(),
     }
 }
 
@@ -276,7 +286,8 @@ fn cmd_telemetry() -> Result<()> {
     println!("GPU        : {}", s.gpu_name);
     if sample.gpu.available {
         println!(
-            "  ADL2     : Edge={:?}°C | Hotspot={:?}°C | Charge={:?}% | Fan={:?} RPM | Core={:?} MHz | Power={:?} W",
+            "  {}     : Edge={:?}°C | Hotspot={:?}°C | Charge={:?}% | Fan={:?} RPM | Core={:?} MHz | Power={:?} W",
+            sample.gpu.backend,
             sample.gpu.edge_temp_c,
             sample.gpu.hotspot_temp_c,
             sample.gpu.activity_pct,
@@ -285,11 +296,68 @@ fn cmd_telemetry() -> Result<()> {
             sample.gpu.power_watts
         );
     } else {
-        println!("  ADL2     : indisponible");
+        println!("  GPU      : indisponible");
     }
     println!("\n=== Modes d'alimentation Windows ===");
     for p in list_power_plans() {
         println!("  {} {} ({})", if p.active { "*" } else { " " }, p.name, p.guid);
+    }
+    Ok(())
+}
+
+fn cmd_hp_probe() -> Result<()> {
+    let mut tel = TelemetryCollector::new();
+    std::thread::sleep(Duration::from_millis(200));
+    let sample = tel.sample();
+    let s = &tel.static_info;
+    let bat = read_laptop_battery();
+    let disp = read_display_info();
+    let omen = probe_hp_omen();
+
+    println!("=== OpenGear Laptop / HP OMEN Probe ===");
+    println!("Machine     : {} | {}", s.manufacturer, s.model);
+    println!("Carte mère  : {} (BIOS {})", s.motherboard, s.bios_version);
+    println!("CPU         : {} — {:.1}%", s.cpu_name, sample.cpu_usage_pct);
+    println!(
+        "GPU         : {} [{}] | Edge={:?}°C | Charge={:?}% | Core={:?} MHz | Power={:?} W",
+        s.gpu_name,
+        if sample.gpu.backend.is_empty() { "N/A" } else { &sample.gpu.backend },
+        sample.gpu.edge_temp_c,
+        sample.gpu.activity_pct,
+        sample.gpu.core_clock_mhz,
+        sample.gpu.power_watts
+    );
+    if bat.present {
+        println!(
+            "Batterie    : {:?}% | Santé {:?}% ({:?}/{:?} mWh) | Cycles={:?} | Secteur={} | Tension={:?}V | Puissance={:?}W",
+            bat.percent,
+            bat.health_pct,
+            bat.full_charged_capacity_mwh,
+            bat.design_capacity_mwh,
+            bat.cycle_count,
+            bat.ac_online,
+            bat.voltage_v,
+            bat.power_watts
+        );
+    }
+    println!(
+        "Écran       : {}x{} @ {:?} Hz (supportés: {:?}) | Luminosité={:?}%",
+        disp.width, disp.height, disp.current_hz, disp.supported_hz, disp.brightness_pct
+    );
+    println!(
+        "HP OMEN WMI : detected={} admin={} wmi={} thermal_v={} fans={} rpms={:?} kbd={} backlight={}",
+        omen.detected,
+        omen.is_admin,
+        omen.wmi_accessible,
+        omen.thermal_version,
+        omen.fan_count,
+        omen.fan_rpms,
+        omen.keyboard_label,
+        omen.backlight_on
+    );
+    println!("Diagnostic  : {}", omen.diagnostic);
+    for line in &omen.probe_log {
+        println!("  [WMI] {line}");
     }
     Ok(())
 }
@@ -422,7 +490,11 @@ fn cmd_corsair(action: CorsairCmd) -> Result<()> {
         return Ok(());
     }
 
-    let mut kb = CorsairKeyboard::connect(None)?;
+    let devices = CorsairDevice::connect_all();
+    let mut kb = devices
+        .into_iter()
+        .find(|d| d.info.kind == opengear_corsair::CorsairDeviceKind::Keyboard)
+        .context("Aucun clavier Corsair Bragi détecté")?;
 
     match action {
         CorsairCmd::Info | CorsairCmd::HwpDump => unreachable!(),
@@ -430,7 +502,7 @@ fn cmd_corsair(action: CorsairCmd) -> Result<()> {
             kb.set_restore_hw_on_drop(false);
             match hz {
                 None => {
-                    let current = kb.get_pollrate()?;
+                    let current = kb.info.pollrate.context("Polling rate indisponible")?;
                     println!("Fréquence actuelle : {current}");
                     if let Some(max) = kb.info.max_pollrate {
                         println!("Fréquence maximale : {max}");

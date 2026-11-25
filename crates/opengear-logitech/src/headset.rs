@@ -1,5 +1,5 @@
 use crate::features::*;
-use crate::hidpp::{HidppError, HidppTransport};
+use crate::hidpp::{BatteryInfo, HidppError, HidppTransport, read_battery_info};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -39,6 +39,7 @@ pub struct LogitechHeadsetInfo {
     pub proto_version: String,
     pub firmware: Vec<String>,
     pub features: Vec<FeatureEntry>,
+    pub battery: Option<BatteryInfo>,
     pub supports_sidetone: bool,
     pub sidetone_pct: u8,
     pub equalizer: Option<EqualizerInfo>,
@@ -75,6 +76,7 @@ impl LogitechHeadset {
             || transport.get_feature_index(FEAT_HEADSET_AUDIO_SIDETONE).is_some()
             || transport.pid == 0x0AAA;
 
+        let battery = read_battery_info(&transport);
         let sidetone_pct = Self::read_sidetone_inner(&transport).unwrap_or(0);
         let equalizer = Self::read_equalizer_inner(&transport);
 
@@ -85,6 +87,7 @@ impl LogitechHeadset {
             proto_version,
             firmware,
             features: transport.features.clone(),
+            battery,
             supports_sidetone,
             sidetone_pct,
             equalizer,
@@ -120,27 +123,26 @@ impl LogitechHeadset {
         } else if self.transport.get_feature_index(FEAT_HEADSET_AUDIO_SIDETONE).is_some() {
             self.transport
                 .request_feature(FEAT_HEADSET_AUDIO_SIDETONE, 0x10, &[0x01, pct])?;
-        } else {
+        } else if self.info.pid == 0x0AAA {
             // Direct G PRO X fallback verified from HeadsetControl (`logitech_gpro.hpp`: {0x05, 0x1a, level})
             self.transport.write_raw_long(0xFF, &[0x05, 0x1A, pct])?;
+        } else {
+            return Err(HidppError::UnsupportedFeature(FEAT_SIDETONE));
         }
         self.info.sidetone_pct = pct;
         Ok(())
     }
 
-    fn read_equalizer_inner(t: &HidppTransport) -> Option<EqualizerInfo> {
-        if t.get_feature_index(FEAT_EQUALIZER).is_none() {
-            return None;
-        }
-        let info_r = t.request_feature(FEAT_EQUALIZER, 0x00, &[]).ok()?;
+    fn parse_equalizer_info(info_r: &[u8]) -> Option<(usize, i8, i8)> {
         if info_r.len() < 5 {
             return None;
         }
         let count = info_r[0] as usize;
-        if count == 0 || count > 16 {
+        if count == 0 || count > 15 {
             return None;
         }
-        let db_range = info_r[1] as i8;
+        // Clamp symmetric range below 128 so negating `-db_range` never overflows i8::MIN.
+        let db_range = (info_r[1] & 0x7F).min(24) as i8;
         let mut min_db = info_r[3] as i8;
         let mut max_db = info_r[4] as i8;
         if min_db == 0 {
@@ -149,6 +151,18 @@ impl LogitechHeadset {
         if max_db == 0 {
             max_db = db_range;
         }
+        if min_db > max_db {
+            std::mem::swap(&mut min_db, &mut max_db);
+        }
+        Some((count, min_db, max_db))
+    }
+
+    fn read_equalizer_inner(t: &HidppTransport) -> Option<EqualizerInfo> {
+        if t.get_feature_index(FEAT_EQUALIZER).is_none() {
+            return None;
+        }
+        let info_r = t.request_feature(FEAT_EQUALIZER, 0x00, &[]).ok()?;
+        let (count, min_db, max_db) = Self::parse_equalizer_info(&info_r)?;
 
         let mut frequencies_hz = Vec::with_capacity(count);
         for g in 0..count.div_ceil(7) {
@@ -208,5 +222,19 @@ impl LogitechHeadset {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_equalizer_info_guards_overflow_and_band_limit() {
+        assert_eq!(LogitechHeadset::parse_equalizer_info(&[5, 0x80, 0, 0, 0]), Some((5, 0, 0)));
+        assert_eq!(LogitechHeadset::parse_equalizer_info(&[5, 12, 0, 0, 0]), Some((5, -12, 12)));
+        assert_eq!(LogitechHeadset::parse_equalizer_info(&[5, 6, 0, 10, 2]), Some((5, 2, 10)));
+        assert_eq!(LogitechHeadset::parse_equalizer_info(&[16, 12, 0, 0, 0]), None);
+        assert_eq!(LogitechHeadset::parse_equalizer_info(&[0, 12, 0, 0, 0]), None);
     }
 }

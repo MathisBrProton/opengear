@@ -1496,6 +1496,7 @@ dependencies = [
  "tao",
  "tracing",
  "tracing-subscriber",
+ "windows",
  "windows-sys 0.59.0",
  "wry",
 ]
@@ -1506,11 +1507,14 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "hidapi",
+ "libc",
  "libloading",
  "opengear-core",
  "serde",
+ "sha2",
  "thiserror 2.0.21",
  "tracing",
+ "windows",
  "windows-sys 0.59.0",
 ]
 

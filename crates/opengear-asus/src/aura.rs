@@ -23,6 +23,8 @@ const CMD_CONFIG_TABLE: u8 = 0xB0;
 
 const DIRECT_APPLY_FLAG: u8 = 0x80;
 const DIRECT_OVERFLOW_FLAG: u8 = 0x10;
+const MAX_ARGB_HEADERS: u8 = 16;
+const MAX_DIRECT_LEDS: usize = 511;
 
 #[derive(Debug, Error)]
 pub enum AuraError {
@@ -34,6 +36,8 @@ pub enum AuraError {
     InvalidConfigTable,
     #[error("Index de canal Aura invalide ({0})")]
     InvalidChannel(usize),
+    #[error("Plage de LED Aura hors limites (start={start}, count={count})")]
+    LedRangeOutOfBounds { start: usize, count: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,15 +151,58 @@ pub struct AuraMainboardInfo {
 pub struct AuraMainboardController {
     dev: HidDevice,
     pub info: AuraMainboardInfo,
-    in_direct_mode: bool,
+    channel_direct: Vec<bool>,
+}
+
+/// Build the 65-byte Aura Direct packets for `colors`, splitting cleanly at LED 256 so a single
+/// packet never straddles the 8-bit `offset` wrap boundary.
+pub(crate) fn build_direct_packets(direct_channel: u8, colors: &[Rgb]) -> Vec<[u8; PACKET_LEN]> {
+    let total = colors.len().min(MAX_DIRECT_LEDS);
+    if total == 0 {
+        return Vec::new();
+    }
+
+    let mut packets = Vec::new();
+    let mut configured = 0usize;
+    while configured < total {
+        let in_high_bank = configured >= 256;
+        let bank_end = if in_high_bank { total } else { total.min(256) };
+        let bank_remaining = bank_end - configured;
+        let in_pkt = bank_remaining.min(LEDS_PER_PACKET);
+        let is_final = configured + in_pkt == total;
+
+        let mut command = direct_channel;
+        if in_high_bank {
+            command |= DIRECT_OVERFLOW_FLAG;
+        }
+        if is_final {
+            command |= DIRECT_APPLY_FLAG;
+        }
+
+        let offset = (configured % 256) as u8;
+        let mut buf = [0u8; PACKET_LEN];
+        buf[0] = REPORT_ID;
+        buf[1] = CMD_DIRECT;
+        buf[2] = command;
+        buf[3] = offset;
+        buf[4] = in_pkt as u8;
+
+        for i in 0..in_pkt {
+            let c = colors[configured + i];
+            buf[5 + i * 3] = c.r;
+            buf[6 + i * 3] = c.g;
+            buf[7 + i * 3] = c.b;
+        }
+        packets.push(buf);
+        configured += in_pkt;
+    }
+    packets
 }
 
 impl AuraMainboardController {
     pub fn connect() -> Result<Self, AuraError> {
         let api = HidApi::new()?;
 
-        // Prefer exact match on Usage Page 0xFF72 / Usage 0x00A1 (used by 0x19AF ROG B650-A),
-        // falling back to any known ASUS Aura motherboard PID on Usage Page 0xFF72.
         let found = api
             .device_list()
             .find(|d| {
@@ -188,8 +235,8 @@ impl AuraMainboardController {
         let config_table = Self::read_config_table(&dev)?;
 
         let mainboard_fixed_leds = config_table[0x1B];
-        let mut rgb_12v_headers = config_table[0x1D];
-        let argb_5v_headers = config_table[0x02];
+        let mut rgb_12v_headers = config_table[0x1D].min(8);
+        let argb_5v_headers = config_table[0x02].min(MAX_ARGB_HEADERS);
         if mainboard_fixed_leds < rgb_12v_headers {
             rgb_12v_headers = 0;
         }
@@ -203,7 +250,7 @@ impl AuraMainboardController {
                 argb_5v_headers
             } else {
                 let c = effect_channel;
-                effect_channel += 1;
+                effect_channel = effect_channel.saturating_add(1);
                 c
             };
             channels.push(AuraChannel {
@@ -229,7 +276,7 @@ impl AuraMainboardController {
                 led_count: 20,
                 rgb_headers_12v: 0,
             });
-            effect_channel += 1;
+            effect_channel = effect_channel.saturating_add(1);
         }
 
         let config_table_hex = config_table
@@ -239,6 +286,7 @@ impl AuraMainboardController {
             .collect::<Vec<_>>()
             .join(" ");
 
+        let channel_count = channels.len();
         let info = AuraMainboardInfo {
             vid,
             pid,
@@ -264,10 +312,11 @@ impl AuraMainboardController {
         let mut ctrl = Self {
             dev,
             info,
-            in_direct_mode: false,
+            channel_direct: vec![false; channel_count],
         };
-        // Put ARGB Gen2 headers in Gen1 direct-addressable compatibility mode (matches OpenRGB SetGen1)
-        ctrl.set_gen1()?;
+        if ctrl.info.argb_5v_headers > 0 {
+            ctrl.set_gen1()?;
+        }
         Ok(ctrl)
     }
 
@@ -327,7 +376,12 @@ impl AuraMainboardController {
         }
     }
 
-    fn send_effect_cmd(&self, effect_channel: u8, mode: AuraHwMode, shutdown_effect: bool) -> Result<(), AuraError> {
+    fn send_effect_cmd(
+        &self,
+        effect_channel: u8,
+        mode: AuraHwMode,
+        shutdown_effect: bool,
+    ) -> Result<(), AuraError> {
         let mut buf = [0u8; PACKET_LEN];
         buf[0] = REPORT_ID;
         buf[1] = CMD_EFFECT;
@@ -339,9 +393,21 @@ impl AuraMainboardController {
         Ok(())
     }
 
-    fn send_effect_color(&self, start_led: usize, led_count: usize, color: Rgb, shutdown_effect: bool) -> Result<(), AuraError> {
-        if led_count == 0 || start_led + led_count > 16 {
+    fn send_effect_color(
+        &self,
+        start_led: usize,
+        led_count: usize,
+        color: Rgb,
+        shutdown_effect: bool,
+    ) -> Result<(), AuraError> {
+        if led_count == 0 {
             return Ok(());
+        }
+        if start_led.saturating_add(led_count) > 16 {
+            return Err(AuraError::LedRangeOutOfBounds {
+                start: start_led,
+                count: led_count,
+            });
         }
         let mask: u16 = (((1u32 << led_count) - 1) << start_led) as u16;
         let mut buf = [0u8; PACKET_LEN];
@@ -381,12 +447,15 @@ impl AuraMainboardController {
         self.send_effect_cmd(ch.effect_channel, mode, shutdown_effect)?;
 
         if mode == AuraHwMode::Direct {
-            self.in_direct_mode = true;
+            if let Some(flag) = self.channel_direct.get_mut(channel_idx) {
+                *flag = true;
+            }
             return Ok(());
         }
-        self.in_direct_mode = false;
+        if let Some(flag) = self.channel_direct.get_mut(channel_idx) {
+            *flag = false;
+        }
 
-        // Compute LED offset for hardware color mask (matches OpenRGB AuraMainboardController::SetMode)
         let mut start_led = 0usize;
         for c in self.info.channels.iter().take(channel_idx) {
             start_led += match c.kind {
@@ -427,26 +496,31 @@ impl AuraMainboardController {
         Ok(())
     }
 
-    /// Switch all channels into Direct mode for real-time per-LED streaming / Aura+Corsair Sync.
-    /// True while the controller is streaming software (Direct) colors instead of a hardware effect.
+    /// True while at least one controller channel is in software Direct mode.
     pub fn is_in_direct_mode(&self) -> bool {
-        self.in_direct_mode
+        self.channel_direct.iter().any(|&d| d)
     }
 
     pub fn enter_direct_mode(&mut self) -> Result<(), AuraError> {
-        if self.in_direct_mode {
-            return Ok(());
-        }
         for i in 0..self.info.channels.len() {
+            if self.channel_direct.get(i).copied().unwrap_or(false) {
+                continue;
+            }
             let eff_ch = self.info.channels[i].effect_channel;
             self.send_effect_cmd(eff_ch, AuraHwMode::Direct, false)?;
+            if let Some(flag) = self.channel_direct.get_mut(i) {
+                *flag = true;
+            }
         }
-        self.in_direct_mode = true;
         Ok(())
     }
 
     /// Stream direct per-LED RGB colors to a specific channel (Mainboard or ARGB header).
-    pub fn send_channel_direct(&mut self, channel_idx: usize, colors: &[Rgb]) -> Result<(), AuraError> {
+    pub fn send_channel_direct(
+        &mut self,
+        channel_idx: usize,
+        colors: &[Rgb],
+    ) -> Result<(), AuraError> {
         let ch = self
             .info
             .channels
@@ -454,51 +528,37 @@ impl AuraMainboardController {
             .ok_or(AuraError::InvalidChannel(channel_idx))?
             .clone();
 
-        if !self.in_direct_mode {
-            self.enter_direct_mode()?;
+        if !self.channel_direct.get(channel_idx).copied().unwrap_or(false) {
+            self.send_effect_cmd(ch.effect_channel, AuraHwMode::Direct, false)?;
+            if let Some(flag) = self.channel_direct.get_mut(channel_idx) {
+                *flag = true;
+            }
         }
 
-        let total = colors.len();
-        if total == 0 {
-            return Ok(());
-        }
-
-        let mut command = ch.direct_channel;
-        let mut offset: usize = 0;
-        let mut configured: usize = 0;
-
-        while configured < total {
-            let remaining = total - configured;
-            let in_pkt = if remaining > LEDS_PER_PACKET {
-                LEDS_PER_PACKET
-            } else {
-                command |= DIRECT_APPLY_FLAG;
-                remaining
-            };
-
-            let mut buf = [0u8; PACKET_LEN];
-            buf[0] = REPORT_ID;
-            buf[1] = CMD_DIRECT;
-            buf[2] = command;
-            buf[3] = (offset & 0xFF) as u8;
-            buf[4] = in_pkt as u8;
-
-            for i in 0..in_pkt {
-                let c = colors[configured + i];
-                buf[5 + i * 3] = c.r;
-                buf[6 + i * 3] = c.g;
-                buf[7 + i * 3] = c.b;
-            }
-
-            self.dev.write(&buf)?;
-
-            configured += in_pkt;
-            offset += in_pkt;
-            if configured > 255 {
-                command |= DIRECT_OVERFLOW_FLAG;
-                offset = configured - 256;
-            }
+        for pkt in build_direct_packets(ch.direct_channel, colors) {
+            self.dev.write(&pkt)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_packets_split_cleanly_at_256_boundary() {
+        let colors = vec![Rgb::new(1, 2, 3); 265];
+        let pkts = build_direct_packets(0x01, &colors);
+        // 256 LEDs -> 12*20 + 16 = 13 packets; remaining 9 LEDs -> 1 packet
+        assert_eq!(pkts.len(), 14);
+        // Packet #12 (index 240..256): 16 LEDs, NO overflow, NO apply
+        assert_eq!(pkts[12][2], 0x01);
+        assert_eq!(pkts[12][3], 240);
+        assert_eq!(pkts[12][4], 16);
+        // Packet #13 (index 256..265): 9 LEDs, overflow + apply, offset 0
+        assert_eq!(pkts[13][2], 0x01 | DIRECT_OVERFLOW_FLAG | DIRECT_APPLY_FLAG);
+        assert_eq!(pkts[13][3], 0);
+        assert_eq!(pkts[13][4], 9);
     }
 }

@@ -1,6 +1,5 @@
 use crate::features::*;
-use crate::hidpp::{HidppError, HidppTransport};
-use crate::mouse::{BatteryInfo, BatteryState};
+use crate::hidpp::{BatteryInfo, HidppError, HidppTransport, read_battery_info};
 use opengear_core::Rgb;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -35,6 +34,7 @@ pub struct LogitechKeyboardInfo {
 /// Universal Logitech G Keyboard HID++ 2.0 driver (`0x8071` RGB Effects, `0x8040` Brightness, `0x4521`/`0x4522` Game Mode).
 pub struct LogitechKeyboard {
     transport: HidppTransport,
+    max_brightness: u16,
     pub info: LogitechKeyboardInfo,
 }
 
@@ -75,7 +75,7 @@ impl LogitechKeyboard {
         let firmware = transport.read_firmware_versions();
         let proto_version = format!("{}.{}", transport.proto_major, transport.proto_minor);
 
-        let battery = read_kb_battery(&transport);
+        let battery = read_battery_info(&transport);
         let supports_rgb_effects = transport.get_feature_index(FEAT_RGB_EFFECTS).is_some()
             || transport.get_feature_index(FEAT_COLOR_LED_EFFECTS).is_some();
         let rgb_cluster_count = if transport.get_feature_index(FEAT_RGB_EFFECTS).is_some() {
@@ -88,15 +88,33 @@ impl LogitechKeyboard {
             1
         };
 
-        let supports_brightness = transport.get_feature_index(0x8040).is_some();
-        let brightness_pct = if supports_brightness {
+        let supports_brightness = transport.get_feature_index(FEAT_BRIGHTNESS_CONTROL).is_some();
+        let max_brightness = if supports_brightness {
             transport
-                .request_feature(0x8040, 0x10, &[])
+                .request_feature(FEAT_BRIGHTNESS_CONTROL, 0x00, &[])
                 .ok()
                 .and_then(|r| {
                     if r.len() >= 2 {
-                        let raw = u16::from_be_bytes([r[0], r[1]]);
-                        Some(((raw.min(1000)) / 10) as u8)
+                        let m = u16::from_be_bytes([r[0], r[1]]);
+                        Some(m.max(1))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1000)
+        } else {
+            1000
+        };
+        let brightness_pct = if supports_brightness {
+            transport
+                .request_feature(FEAT_BRIGHTNESS_CONTROL, 0x10, &[])
+                .ok()
+                .and_then(|r| {
+                    if r.len() >= 2 {
+                        let raw = u16::from_be_bytes([r[0], r[1]]).min(max_brightness);
+                        let pct = ((raw as u32 * 100 + (max_brightness as u32 / 2)) / max_brightness as u32)
+                            .min(100) as u8;
+                        Some(pct)
                     } else {
                         None
                     }
@@ -136,7 +154,11 @@ impl LogitechKeyboard {
             info.device_index,
             info.features.len()
         );
-        Self { transport, info }
+        Self {
+            transport,
+            max_brightness,
+            info,
+        }
     }
 
     /// Apply RGB lighting effect via `0x8071` (`RGB_EFFECTS`) or fallback `0x8070` (`COLOR_LED_EFFECTS`).
@@ -196,31 +218,12 @@ impl LogitechKeyboard {
     /// Set keyboard backlight brightness (0..=100%) via `0x8040`.
     pub fn set_brightness_pct(&mut self, pct: u8) -> Result<(), HidppError> {
         let clamped = pct.min(100);
-        let raw = ((clamped as u16) * 10).to_be_bytes();
-        self.transport.request_feature(0x8040, 0x20, &raw)?;
+        let raw_val = (((clamped as u32) * (self.max_brightness as u32) + 50) / 100)
+            .min(self.max_brightness as u32) as u16;
+        let raw = raw_val.to_be_bytes();
+        self.transport
+            .request_feature(FEAT_BRIGHTNESS_CONTROL, 0x20, &raw)?;
         self.info.brightness_pct = Some(clamped);
         Ok(())
     }
-}
-
-fn read_kb_battery(t: &HidppTransport) -> Option<BatteryInfo> {
-    if let Ok(r) = t.request_feature(FEAT_UNIFIED_BATTERY, 0x10, &[]) {
-        if r.len() >= 3 {
-            let pct = r[0];
-            let state = match r[2] {
-                0 => BatteryState::Discharging,
-                1 => BatteryState::Charging,
-                2 => BatteryState::SlowCharging,
-                3 => BatteryState::Full,
-                4 => BatteryState::AlmostFull,
-                o => BatteryState::Unknown(o),
-            };
-            return Some(BatteryInfo {
-                percent: if pct <= 100 { Some(pct) } else { None },
-                voltage_mv: None,
-                state,
-            });
-        }
-    }
-    None
 }

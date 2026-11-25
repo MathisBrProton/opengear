@@ -2,6 +2,27 @@
 pub const K70_TKL_LED_COUNT: usize = 193;
 
 #[derive(Debug, Clone, Copy)]
+pub struct KeyboardLayoutDesc {
+    pub name: &'static str,
+    pub led_count: usize,
+    pub keys: &'static [KeyDef],
+}
+
+/// Look up physical LED/key geometry by Corsair `(vid, pid)`.
+pub fn layout_for_device(vid: u16, pid: u16) -> Option<KeyboardLayoutDesc> {
+    if vid == crate::proto::CORSAIR_VID
+        && matches!(pid, crate::proto::PID_K70_RGB_TKL | crate::proto::PID_K70_RGB_TKL_CS)
+    {
+        return Some(KeyboardLayoutDesc {
+            name: "Corsair K70 RGB TKL",
+            led_count: K70_TKL_LED_COUNT,
+            keys: K70_TKL_KEYS,
+        });
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct KeyDef {
     /// Canonical key identifier used for bindings/macros (e.g. "ESC", "A", "LCTRL", "LOGO_L")
     pub id: &'static str,
@@ -197,3 +218,32 @@ pub const K70_TKL_KEYS: &[KeyDef] = &[
     k("DOWN", "↓", "↓", 81, 16.25, 6.25, 1.0),
     k("RIGHT", "→", "→", 79, 17.25, 6.25, 1.0),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn k70_tkl_leds_are_unique_and_within_bounds() {
+        let mut seen = HashSet::new();
+        for key in K70_TKL_KEYS {
+            assert!(
+                key.led_index < K70_TKL_LED_COUNT,
+                "LED {} out of bounds for {}",
+                key.led_index,
+                key.id
+            );
+            assert!(
+                seen.insert(key.led_index),
+                "Duplicate LED index {} on {}",
+                key.led_index,
+                key.id
+            );
+            assert!((0.0..=1.0).contains(&key.norm_x()));
+            assert!((0.0..=1.0).contains(&key.norm_y()));
+        }
+        assert!(layout_for_device(0x1B1C, 0x1B73).is_some());
+        assert!(layout_for_device(0x1B1C, 0xFFFF).is_none());
+    }
+}

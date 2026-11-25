@@ -27,6 +27,7 @@ pub const FEAT_DISABLE_KEYS: u16 = 0x4521;
 pub const FEAT_DISABLE_KEYS_BY_USAGE: u16 = 0x4522;
 pub const FEAT_REPORT_RATE: u16 = 0x8060;
 pub const FEAT_EXTENDED_REPORT_RATE: u16 = 0x8061;
+pub const FEAT_BRIGHTNESS_CONTROL: u16 = 0x8040;
 pub const FEAT_COLOR_LED_EFFECTS: u16 = 0x8070;
 pub const FEAT_RGB_EFFECTS: u16 = 0x8071;
 pub const FEAT_ONBOARD_PROFILES: u16 = 0x8100;
@@ -44,6 +45,8 @@ pub struct FeatureEntry {
     pub index: u8,
     pub id: u16,
     pub flags: u8,
+    #[serde(default)]
+    pub version: u8,
     pub name: String,
 }
 

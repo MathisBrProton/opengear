@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 tao.workspace = true
 wry.workspace = true
+windows.workspace = true
 windows-sys.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

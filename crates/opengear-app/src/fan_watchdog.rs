@@ -72,20 +72,50 @@ pub fn clear_marker() {
     let _ = std::fs::remove_file(marker_path());
 }
 
-/// Give fan control back to the BIOS as described by the marker. Returns one line per action.
-pub fn restore_from_marker(marker: &FanOverrideMarker) -> Vec<String> {
+/// Give fan control back to the BIOS as described by the marker. Returns `(logs, remaining)`
+/// where `remaining` keeps only items whose restoration failed so callers can retry later.
+pub(crate) fn restore_from_marker_with<F>(
+    marker: &FanOverrideMarker,
+    mut apply_wmi: F,
+) -> (Vec<String>, Option<FanOverrideMarker>)
+where
+    F: FnMut(&FanChannelConfig) -> Result<(), String>,
+{
     let mut log = Vec::new();
+    let mut remaining_wmi = Vec::new();
     for cfg in &marker.wmi_restore {
-        match apply_asus_wmi_curve(cfg) {
-            Ok(_) => log.push(format!("Ventilateur {:?} rendu au BIOS", cfg.header)),
-            Err(e) => log.push(format!("Ventilateur {:?} : restauration échouée : {e}", cfg.header)),
+        match apply_wmi(cfg) {
+            Ok(()) => log.push(format!("Ventilateur {:?} rendu au BIOS", cfg.header)),
+            Err(e) => {
+                log.push(format!("Ventilateur {:?} : restauration échouée : {e}", cfg.header));
+                remaining_wmi.push(cfg.clone());
+            }
         }
     }
-    log.extend(restore_superio_saved_states(&marker.superio_restore));
-    log
+    let superio_logs = if marker.superio_restore.is_empty() {
+        Vec::new()
+    } else {
+        restore_superio_saved_states(&marker.superio_restore)
+    };
+    let superio_failed = superio_logs.iter().any(|l| {
+        let low = l.to_ascii_lowercase();
+        low.contains("échou") || low.contains("erreur") || low.contains("impossible")
+    });
+    log.extend(superio_logs);
+    let rem = FanOverrideMarker {
+        pid: marker.pid,
+        wmi_restore: remaining_wmi,
+        superio_restore: if superio_failed {
+            marker.superio_restore.clone()
+        } else {
+            Vec::new()
+        },
+    };
+    let remaining = if rem.is_empty() { None } else { Some(rem) };
+    (log, remaining)
 }
 
-/// Startup recovery: a marker left by a previous (dead) session is applied, then removed.
+/// Startup recovery: a marker left by a previous (dead) session is applied, then updated or removed.
 /// Call only once the single-instance lock is held, so the owner cannot still be running.
 pub fn recover_stale_marker() {
     let Some(marker) = read_marker() else {
@@ -100,10 +130,16 @@ pub fn recover_stale_marker() {
         return;
     }
     warn!("Ventilateurs laissés en mode manuel par une session précédente — restauration BIOS.");
-    for line in restore_from_marker(&marker) {
+    let (logs, remaining) = restore_from_marker_with(&marker, |cfg| {
+        apply_asus_wmi_curve(cfg).map(|_| ()).map_err(|e| e.to_string())
+    });
+    for line in logs {
         info!("{line}");
     }
-    clear_marker();
+    match remaining {
+        Some(rem) => write_marker(&rem),
+        None => clear_marker(),
+    }
 }
 
 /// Spawn the hidden watchdog for the current process (once per session).
@@ -128,10 +164,16 @@ pub fn run_watchdog(parent_pid: u32) -> anyhow::Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(500));
     if let Some(marker) = read_marker() {
         if marker.pid == parent_pid {
-            for line in restore_from_marker(&marker) {
+            let (logs, remaining) = restore_from_marker_with(&marker, |cfg| {
+                apply_asus_wmi_curve(cfg).map(|_| ()).map_err(|e| e.to_string())
+            });
+            for line in logs {
                 info!("{line}");
             }
-            clear_marker();
+            match remaining {
+                Some(rem) => write_marker(&rem),
+                None => clear_marker(),
+            }
         }
     }
     Ok(())
@@ -177,5 +219,32 @@ mod tests {
         assert_eq!(back.wmi_restore.len(), 1);
         assert!(!back.is_empty());
         assert!(FanOverrideMarker::default().is_empty());
+    }
+
+    #[test]
+    fn partial_restore_retains_failed_entries_only() {
+        use opengear_asus::FanHeaderKind;
+        let m = FanOverrideMarker {
+            pid: 99,
+            wmi_restore: vec![
+                FanChannelConfig::default_for(FanHeaderKind::CpuFan),
+                FanChannelConfig::default_for(FanHeaderKind::AioPump),
+            ],
+            superio_restore: Vec::new(),
+        };
+        let (logs, remaining) = restore_from_marker_with(&m, |cfg| {
+            if cfg.header == FanHeaderKind::CpuFan {
+                Ok(())
+            } else {
+                Err("WMI busy".into())
+            }
+        });
+        assert_eq!(logs.len(), 2);
+        let rem = remaining.expect("failed entry should be retained");
+        assert_eq!(rem.wmi_restore.len(), 1);
+        assert_eq!(rem.wmi_restore[0].header, FanHeaderKind::AioPump);
+
+        let (_, none_left) = restore_from_marker_with(&m, |_| Ok(()));
+        assert!(none_left.is_none());
     }
 }

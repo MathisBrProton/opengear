@@ -90,18 +90,34 @@ pub const KEY_TABLE: &[(&str, u16)] = &[
     ("Y", 0x59),
     ("Z", 0x5A),
     ("OEM_7", 0xDE),      // ² on AZERTY
-    ("MINUS", 0xDB),      // ) on AZERTY / [ on US
+    ("OEM_4", 0xDB),      // ) on AZERTY / [ on US
+    ("MINUS", 0xBD),      // - / _ (VK_OEM_MINUS)
     ("EQUALS", 0xBB),     // = / +
     ("LBRACKET", 0xDD),   // ^
     ("RBRACKET", 0xBA),   // $
     ("BACKSLASH", 0xDC),  // *
     ("APOSTROPHE", 0xC0), // ù
-    ("ISO_HASH", 0xDC),
     ("ISO_BSLASH", 0xE2), // < >
     ("COMMA", 0xBC),
     ("PERIOD", 0xBE),
     ("SLASH", 0xBF),
     ("EXCLAIM", 0xDF),
+    ("NUMLOCK", 0x90),
+    ("NUM0", 0x60),
+    ("NUM1", 0x61),
+    ("NUM2", 0x62),
+    ("NUM3", 0x63),
+    ("NUM4", 0x64),
+    ("NUM5", 0x65),
+    ("NUM6", 0x66),
+    ("NUM7", 0x67),
+    ("NUM8", 0x68),
+    ("NUM9", 0x69),
+    ("NUM_MUL", 0x6A),
+    ("NUM_ADD", 0x6B),
+    ("NUM_SUB", 0x6D),
+    ("NUM_DEC", 0x6E),
+    ("NUM_DIV", 0x6F),
     ("VOLUME_MUTE", 0xAD),
     ("VOLUME_DOWN", 0xAE),
     ("VOLUME_UP", 0xAF),
@@ -118,8 +134,10 @@ pub const ALL_BINDABLE_KEYS: &[&str] = &[
     "CAPSLOCK", "SPACE", "LSHIFT", "RSHIFT", "LCTRL", "RCTRL", "LALT", "RALT", "LWIN", "RWIN",
     "MENU", "LEFT", "UP", "RIGHT", "DOWN", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K",
     "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "0", "1", "2", "3",
-    "4", "5", "6", "7", "8", "9", "VOLUME_MUTE", "VOLUME_DOWN", "VOLUME_UP", "MEDIA_NEXT",
-    "MEDIA_PREV", "MEDIA_STOP", "MEDIA_PLAY",
+    "4", "5", "6", "7", "8", "9", "MINUS", "NUMLOCK", "NUM0", "NUM1", "NUM2", "NUM3", "NUM4",
+    "NUM5", "NUM6", "NUM7", "NUM8", "NUM9", "NUM_MUL", "NUM_ADD", "NUM_SUB", "NUM_DEC", "NUM_DIV",
+    "VOLUME_MUTE", "VOLUME_DOWN", "VOLUME_UP", "MEDIA_NEXT", "MEDIA_PREV", "MEDIA_STOP",
+    "MEDIA_PLAY",
 ];
 
 pub fn key_name_to_vk(name: &str) -> Option<u16> {
@@ -135,4 +153,23 @@ pub fn vk_to_key_name(vk: u16) -> Option<&'static str> {
         .iter()
         .find(|(_, code)| *code == vk)
         .map(|(k, _)| *k)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn key_table_has_unique_names_and_vks() {
+        let mut names = HashSet::new();
+        let mut vks = HashSet::new();
+        for &(name, vk) in KEY_TABLE {
+            assert!(names.insert(name), "duplicate key name: {name}");
+            assert!(vks.insert(vk), "duplicate VK code: 0x{vk:02X} ({name})");
+        }
+        assert_eq!(key_name_to_vk("minus"), Some(0xBD));
+        assert_eq!(key_name_to_vk("num5"), Some(0x65));
+        assert_eq!(vk_to_key_name(0xDC), Some("BACKSLASH"));
+    }
 }
