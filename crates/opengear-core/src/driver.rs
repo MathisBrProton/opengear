@@ -317,6 +317,11 @@ pub trait Device: Send {
         Vec::new()
     }
 
+    /// Lighting of the device, if it has LEDs (see [`crate::lighting`]).
+    fn lighting(&mut self) -> Option<&mut dyn crate::lighting::Lighting> {
+        None
+    }
+
     /// Apply a value already validated against the setting returned by [`Device::settings`].
     fn apply_setting(&mut self, id: &str, value: &Value) -> Result<()> {
         let _ = value;

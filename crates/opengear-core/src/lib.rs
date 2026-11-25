@@ -3,6 +3,7 @@ pub mod cooling;
 pub mod device;
 pub mod driver;
 pub mod keyboard;
+pub mod lighting;
 pub mod profile;
 pub mod scanner;
 pub mod serde_util;
