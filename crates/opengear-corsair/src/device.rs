@@ -1,5 +1,7 @@
 use crate::k70_tkl::LightingEndpoint;
-use crate::keymap::{K70_TKL_KEYS, K70_TKL_LED_COUNT, layout_for_device};
+use crate::keymap::{
+    K70_TKL_KEYS, K70_TKL_LED_COUNT, KeyDef, KeyboardLayoutDesc, keys_for_layout, layout_for_device,
+};
 use crate::proto::*;
 use crate::transport::{BragiHidCandidate, BragiTransport};
 use opengear_core::{KeyboardLayout, OperatingMode, PollingRate, Rgb, RgbEffectConfig};
@@ -837,12 +839,6 @@ impl CorsairDevice {
             None => (K70_TKL_LED_COUNT, K70_TKL_KEYS),
         };
 
-        if self.info.mode != OperatingMode::Software {
-            self.set_mode(OperatingMode::Software)?;
-        }
-        self.ensure_lighting_handle()?;
-        self.tick_keepalive();
-
         let base_sample = sampler(0, 0.5, 0.5, "");
         let mut frame = vec![base_sample; led_count];
         for key in keys {
@@ -850,13 +846,32 @@ impl CorsairDevice {
                 frame[key.led_index] = sampler(key.led_index, key.norm_x(), key.norm_y(), key.id);
             }
         }
+        self.write_raw_frame(&frame)
+    }
 
+    pub(crate) fn active_keymap(&self) -> (usize, Vec<KeyDef>) {
+        let desc = layout_for_device(self.info.vid, self.info.pid).unwrap_or(KeyboardLayoutDesc {
+            name: "Corsair Bragi",
+            led_count: K70_TKL_LED_COUNT,
+            keys: K70_TKL_KEYS,
+        });
+        (desc.led_count, keys_for_layout(&desc, self.info.layout))
+    }
+
+    pub(crate) fn write_raw_frame(&mut self, frame: &[Rgb]) -> Result<(), BragiError> {
+        if self.info.mode != OperatingMode::Software {
+            self.set_mode(OperatingMode::Software)?;
+        }
+        self.ensure_lighting_handle()?;
+        self.tick_keepalive();
+
+        let led_count = frame.len();
         let payload = match self.info.lighting_endpoint {
             LightingEndpoint::Triplets0x22 => {
                 let mut buf = Vec::with_capacity(2 + led_count * 3);
                 buf.push(0x12);
                 buf.push(0x00);
-                for c in &frame {
+                for c in frame {
                     buf.push(c.r);
                     buf.push(c.g);
                     buf.push(c.b);
@@ -876,6 +891,17 @@ impl CorsairDevice {
         self.transport
             .write_handle_data(HANDLE_LIGHTING, &payload)?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_transport(transport: BragiTransport, info: CorsairDeviceInfo) -> Self {
+        Self {
+            transport,
+            info,
+            lighting_handle_open: false,
+            last_keepalive: Instant::now(),
+            restore_hw_on_drop: false,
+        }
     }
 }
 

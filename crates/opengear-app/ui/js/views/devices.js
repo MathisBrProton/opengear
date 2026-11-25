@@ -1,7 +1,6 @@
 import { ICONS, arr, esc, fmtHz, num, plural, safeHex } from "../utils.js";
 import { S, deviceById, devicesList, getEq, headsetImage, isExpert, local } from "../state.js";
-import { advancedHint, batteryBadge, deviceSettings, deviceVisual, emptyState, expertTag, pageHeader, seg, sensorChips, sliderRow, sw } from "../components.js";
-import { cardLogiKbLighting, cardRam } from "./lighting.js";
+import { advancedHint, batteryBadge, deviceSettings, deviceVisual, emptyState, expertTag, pageHeader, sensorChips } from "../components.js";
 import { cardCorsairMouse, cardLogiDpi } from "./performance.js";
 import { cardLogiOnboard } from "./input.js";
 
@@ -70,7 +69,7 @@ function fiche(d) {
           </div>
         </div>` : ""}
       ${cardLogiOnboard(m, i)}
-      ${arr(m.led_zones).length ? linkCard("L'éclairage de cette souris se règle dans Éclairage.", "lighting", "logi", "Éclairage") : ""}
+      ${arr(m.led_zones).length ? linkCard("L'éclairage de cette souris se règle dans Éclairage.", "lighting", "devices", "Éclairage") : ""}
       ${ex ? `<div class="card expert-card"><div class="card-head"><h2 class="card-title">Informations techniques ${expertTag()}</h2></div>${infoTable([
         ["Identifiant USB", `${m.vid}:${m.pid} (emplacement ${m.device_index})`, true],
         ["Protocole", `HID++ ${m.proto_version}`, true],
@@ -78,40 +77,13 @@ function fiche(d) {
         ["Fonctions exposées", `${arr(m.features).length}`],
       ])}</div>` : ""}`;
   }
-  if (kind === "logi-kb") {
-    const kb = S.logi_keyboards[i];
-    return `
-      ${ficheHead(d)}
-      ${cardLogiKbLighting(kb, i)}
-      <div class="card"><div class="card-head"><h2 class="card-title">Informations</h2></div>${infoTable([
-        ["Firmware", arr(kb.firmware).join(" | ") || "—", true],
-        ex ? ["Identifiant USB", `${kb.vid}:${kb.pid} (emplacement ${kb.device_index})`, true] : null,
-        ex ? ["Protocole", `HID++ ${kb.proto_version}`, true] : null,
-      ])}</div>`;
-  }
   if (kind === "logi-hs") return ficheLogiHeadset(d, S.logi_headsets[i], i);
-  if (kind === "asus") {
-    const a = S.asus;
-    return `
-      ${ficheHead(d)}
-      ${linkCard("Effets, couleurs et synchronisation de la carte mère se règlent dans Éclairage.", "lighting", "asus", "Éclairage de la carte mère")}
-      ${linkCard("Ventilateurs et pompe se règlent dans Performances.", "performance", "cooling", "Ventilation")}
-      <div class="card"><div class="card-head"><h2 class="card-title">Informations</h2></div>${infoTable([
-        ["Carte mère", S.static_info.motherboard],
-        ["BIOS", S.static_info.bios_version],
-        ["Processeur", S.static_info.cpu_name],
-        ["Carte graphique", S.static_info.gpu_name],
-        ["Éclairage", `${num(a.mainboard_fixed_leds)} LEDs intégrées · ${num(a.rgb_12v_headers)} connecteur(s) RGB 12 V · ${num(a.argb_5v_headers)} connecteur(s) ARGB 5 V`],
-        ex ? ["Contrôleur Aura", `${a.vid}:${a.pid} · ${a.firmware}`, true] : null,
-      ])}</div>
-      ${advancedHint("Enregistrement permanent des effets, éclairage PC éteint et calibration ARGB sont en mode Expert (Éclairage › Carte mère).")}`;
-  }
   if (kind === "cooling") {
     const c = S.cooling;
     return `
       ${ficheHead(d)}
       ${linkCard("Modes de ventilation, pompe et courbes se règlent dans Performances.", "performance", "cooling", "Ventilation")}
-      ${linkCard("L'éclairage du bloc pompe se règle dans Éclairage.", "lighting", "aio", "Éclairage du watercooling")}
+      ${linkCard("L'éclairage par zone / température se règle dans Éclairage.", "lighting", "devices", "Éclairage")}
       <div class="card"><div class="card-head"><h2 class="card-title">État</h2></div>${infoTable([
         ["Droits administrateur", c.is_admin ? "Oui" : "Non (lecture seule)"],
         ["Accès BIOS (ASUS WMI)", c.wmi_available ? "Disponible" : "Indisponible"],
@@ -121,17 +93,16 @@ function fiche(d) {
       ])}</div>
       <div class="card"><div class="card-head"><h2 class="card-title">Capteurs en direct</h2></div><div class="sensor-chip-row" id="cool-live">${sensorChips(S.telemetry)}</div></div>`;
   }
-  if (kind === "ram") {
-    return `${ficheHead(d)}${linkCard("Effets et couleurs de la RAM se règlent dans Éclairage.", "lighting", "ram", "Éclairage de la RAM")}${cardRam()}`;
-  }
   if (kind === "hp-omen") {
     const o = S.hp_omen || {};
     const b = S.laptop_battery || {};
     const disp = S.laptop_display || {};
-    const omenRgb = o.keyboard_type === "FourZoneRgb" || o.keyboard_type === "PerKeyRgb";
+    const omenDev = deviceById("hp_omen:keyboard");
+    const omenRgb = !!(omenDev && omenDev.lighting);
     return `
       ${ficheHead(d)}
-      ${omenRgb ? linkCard("Rétroéclairage et zones RGB du clavier se règlent dans Éclairage.", "lighting", "omen", "Clavier OMEN") : ""}
+      ${deviceSettings("hp_omen:keyboard", { title: "Clavier" })}
+      ${omenRgb ? linkCard("Couleurs et synchronisation du clavier se règlent dans Éclairage.", "lighting", "devices", "Éclairage") : ""}
       ${linkCard("Ventilateurs, mode thermique et puissance GPU se règlent dans Performances.", "performance", "cooling", "Ventilation & OMEN")}
       ${linkCard("Batterie, luminosité et fréquence d'écran se règlent dans Performances › Alimentation.", "performance", "power", "Alimentation")}
       <div class="card"><div class="card-head"><h2 class="card-title">Informations</h2></div>${infoTable([
@@ -156,6 +127,7 @@ function ficheGeneric(d) {
   const conn = { usb: "USB", wireless: "Sans fil", bluetooth: "Bluetooth", internal: "Interne" }[dev.info.connection];
   return `
     ${ficheHead(d)}
+    ${dev.lighting ? linkCard("Effets logiciels, effets matériels et placement bureau se règlent dans Éclairage.", "lighting", "devices", "Éclairage") : ""}
     ${deviceSettings(d.deviceId)}
     <div class="card"><div class="card-head"><h2 class="card-title">Informations</h2></div>${infoTable([
       ["Fabricant", dev.info.vendor], ["Connexion", conn], ["Firmware", dev.info.firmware, true], isExpert() ? ["Identifiant", dev.info.id, true] : null,
@@ -189,21 +161,12 @@ function ficheCorsair(d, dev, i) {
   }
   if (dev.kind !== "Keyboard") return `${ficheHead(d)}${info}`;
 
-  const hwpList = arr(dev.hwp_profiles);
-  const hwpIdx = clamp(num(local.hwpProfSel[i], 0), 0, Math.max(0, hwpList.length - 1));
-  const hp = hwpList[hwpIdx];
-  const l = hp && hp.lighting;
-
   return `
     ${ficheHead(d, dev.esports_switch_on ? `<span class="pill rog">Interrupteur tournoi activé</span>` : "")}
-    ${linkCard("Effets, couleurs et peinture par touche se règlent dans Éclairage.", "lighting", "global", "Éclairage")}
+    ${linkCard("Effets, couleurs, peinture par touche et profils matériels se règlent dans Éclairage.", "lighting", "global", "Éclairage")}
     <div class="card accent-cyan">
       <div class="card-head"><h2 class="card-title">Réglages du clavier</h2></div>
       ${deviceSettings(dev.device_id, { bare: true })}
-      <div class="row-between mt-12">
-        <span class="field-label">Qui contrôle l'éclairage</span>
-        ${seg([["hw", "Le clavier (autonome)"], ["sw", "OpenGear (en direct)"]], dev.mode, "cs-mode", { dev: i })}
-      </div>
     </div>
     ${ex ? `
       <div class="card expert-card">
@@ -215,26 +178,7 @@ function ficheCorsair(d, dev, i) {
           <input type="color" id="cs-ind-col-${i}" class="og-color" value="#FF1848" aria-label="Couleur du voyant" />
           <button type="button" class="btn btn-sm btn-secondary" data-act="cs-ind" data-dev="${i}">Appliquer</button>
         </div>
-      </div>
-      ${hp ? `
-        <div class="card expert-card">
-          <div class="card-head">
-            <div><h2 class="card-title">Effet enregistré dans le clavier ${expertTag()}</h2><div class="card-desc">Actif quand OpenGear est fermé. Fichier ${esc(hp.profile_file_id)} · éclairage ${esc((l && l.file_id) || "—")} (${num(l && l.led_count)} LEDs)</div></div>
-            <div class="row">
-              ${hwpList.length > 1 ? `<select id="hwp-prof-${i}" class="og-select auto" data-change="hwp-prof-sel" data-dev="${i}" aria-label="Profil matériel">${hwpList.map((item, pidx) => `<option value="${pidx}" ${pidx === hwpIdx ? "selected" : ""}>Profil ${num(item.slot_index, pidx + 1)} (${esc(item.name)})</option>`).join("")}</select>` : ""}
-              <button type="button" class="btn btn-sm btn-secondary" data-act="cs-hwp-reload" data-dev="${i}">Relire le clavier</button>
-            </div>
-          </div>
-          <div class="row">
-            <input id="hwp-name-${i}" class="og-input" style="width:160px" value="${esc(hp.name)}" aria-label="Nom du profil" />
-            <select id="hwp-kind-${i}" class="og-select auto" aria-label="Effet">${S.hwp_lighting_kinds.map((k) => `<option value="${esc(k.id)}" ${l && l.kind === k.id ? "selected" : ""}>${esc(k.label)}</option>`).join("")}</select>
-            <input type="color" id="hwp-c1-${i}" class="og-color" value="${safeHex(l && arr(l.colors)[0], "#1ECFDF")}" aria-label="Couleur 1" />
-            <input type="color" id="hwp-c2-${i}" class="og-color" value="${safeHex(l && arr(l.colors)[1], "#9B3CFF")}" aria-label="Couleur 2" />
-            <select id="hwp-speed-${i}" class="og-select auto" aria-label="Vitesse">${[[0, "Lent"], [1, "Moyen"], [2, "Rapide"]].map(([v, t]) => `<option value="${v}" ${num(l && l.speed, 1) === v ? "selected" : ""}>${t}</option>`).join("")}</select>
-            <select id="hwp-dir-${i}" class="og-select auto" aria-label="Direction">${[[0, "Gauche"], [1, "Droite"], [2, "Haut"], [3, "Bas"], [4, "Horaire"], [5, "Anti-horaire"]].map(([v, t]) => `<option value="${v}" ${num(l && l.direction, 1) === v ? "selected" : ""}>${t}</option>`).join("")}</select>
-          </div>
-          <div class="row mt-12"><button type="button" class="btn btn-primary" data-act="cs-hwp-flash" data-dev="${i}" data-prof="${hwpIdx}">Écrire l'effet dans le clavier</button></div>
-        </div>` : ""}` : advancedHint("Anti-rebond matériel, voyants, raccourcis bloqués et écriture d'effets dans le clavier sont en mode Expert.")}
+      </div>` : advancedHint("Anti-rebond matériel, voyants et raccourcis bloqués sont en mode Expert.")}
     ${info}`;
 }
 

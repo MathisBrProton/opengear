@@ -16,6 +16,8 @@ pub use hwp::{
 };
 pub use k70_tkl::{CorsairKeyboard, CorsairKeyboardInfo, LightingEndpoint};
 pub use keymap::{
-    K70_TKL_KEYS, K70_TKL_LED_COUNT, KeyDef, KeyboardLayoutDesc, keys_for_layout, layout_for_device,
+    K70_TKL_KEYS, K70_TKL_LED_COUNT, KeyDef, KeyboardLayoutDesc, key_code_for_led_index,
+    keys_for_layout, layout_for_device,
 };
+pub use model::CorsairDriver;
 pub use proto::BragiError;

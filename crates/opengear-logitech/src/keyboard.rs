@@ -33,9 +33,10 @@ pub struct LogitechKeyboardInfo {
 
 /// Universal Logitech G Keyboard HID++ 2.0 driver (`0x8071` RGB Effects, `0x8040` Brightness, `0x4521`/`0x4522` Game Mode).
 pub struct LogitechKeyboard {
-    transport: HidppTransport,
+    pub(crate) transport: HidppTransport,
     max_brightness: u16,
     pub info: LogitechKeyboardInfo,
+    pub(crate) last_frame: Vec<Rgb>,
 }
 
 impl LogitechKeyboard {
@@ -163,41 +164,73 @@ impl LogitechKeyboard {
             transport,
             max_brightness,
             info,
+            last_frame: Vec::new(),
         }
     }
 
-    /// Apply RGB lighting effect via `0x8071` (`RGB_EFFECTS`) or fallback `0x8070` (`COLOR_LED_EFFECTS`).
-    pub fn set_rgb_effect(
+    #[cfg(test)]
+    pub(crate) fn from_test_transport(
+        transport: HidppTransport,
+        rgb_cluster_count: u8,
+        supports_rgb_effects: bool,
+    ) -> Self {
+        let id = format!(
+            "logi_kb_{:04X}_{:04X}_s{:02X}",
+            transport.vid, transport.pid, transport.device_index
+        );
+        let info = LogitechKeyboardInfo {
+            id,
+            vid: transport.vid,
+            pid: transport.pid,
+            device_index: transport.device_index,
+            name: "Mock Logitech Keyboard".into(),
+            proto_version: "4.5".into(),
+            firmware: Vec::new(),
+            features: transport.features.clone(),
+            battery: None,
+            supports_rgb_effects,
+            rgb_cluster_count,
+            supports_brightness: false,
+            brightness_pct: None,
+            supports_game_mode: false,
+        };
+        Self {
+            transport,
+            max_brightness: 1000,
+            info,
+            last_frame: Vec::new(),
+        }
+    }
+
+    /// Apply RGB lighting effect to one cluster (for `0x8071`) or zone 0 (for `0x8070`).
+    pub fn set_cluster_rgb(
         &mut self,
+        cluster: u8,
         mode: KeyboardRgbMode,
         color: Rgb,
         speed_ms: u16,
     ) -> Result<(), HidppError> {
         let sp = speed_ms.to_be_bytes();
         if self.transport.get_feature_index(FEAT_RGB_EFFECTS).is_some() {
-            // 0x8071 fn 0x10: setClusterEffect(clusterIdx, effectId, R, G, B, ...)
-            let clusters = self.info.rgb_cluster_count.clamp(1, 4);
-            for cluster in 0..clusters {
-                let params: Vec<u8> = match mode {
-                    KeyboardRgbMode::Off => vec![cluster, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                    KeyboardRgbMode::Fixed => {
-                        vec![
-                            cluster, 0x01, color.r, color.g, color.b, 0, 0, 0, 0, 0, 0, 0,
-                        ]
-                    }
-                    KeyboardRgbMode::Cycle => {
-                        vec![cluster, 0x03, 0, 0, 0, 0, 0, sp[0], sp[1], 100, 0, 0]
-                    }
-                    KeyboardRgbMode::Wave => {
-                        vec![cluster, 0x04, 0, 0, 0, 0, 0, sp[0], sp[1], 1, 100, 0]
-                    }
-                    KeyboardRgbMode::Breathing => vec![
-                        cluster, 0x0A, color.r, color.g, color.b, sp[0], sp[1], 0x01, 100, 0, 0, 0,
-                    ],
-                };
-                self.transport
-                    .request_feature(FEAT_RGB_EFFECTS, 0x10, &params)?;
-            }
+            let params: Vec<u8> = match mode {
+                KeyboardRgbMode::Off => vec![cluster, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                KeyboardRgbMode::Fixed => {
+                    vec![
+                        cluster, 0x01, color.r, color.g, color.b, 0, 0, 0, 0, 0, 0, 0,
+                    ]
+                }
+                KeyboardRgbMode::Cycle => {
+                    vec![cluster, 0x03, 0, 0, 0, 0, 0, sp[0], sp[1], 100, 0, 0]
+                }
+                KeyboardRgbMode::Wave => {
+                    vec![cluster, 0x04, 0, 0, 0, 0, 0, sp[0], sp[1], 1, 100, 0]
+                }
+                KeyboardRgbMode::Breathing => vec![
+                    cluster, 0x0A, color.r, color.g, color.b, sp[0], sp[1], 0x01, 100, 0, 0, 0,
+                ],
+            };
+            self.transport
+                .request_feature(FEAT_RGB_EFFECTS, 0x10, &params)?;
             return Ok(());
         }
         if self
@@ -224,6 +257,24 @@ impl LogitechKeyboard {
             return Ok(());
         }
         Err(HidppError::UnsupportedFeature(FEAT_RGB_EFFECTS))
+    }
+
+    /// Apply RGB lighting effect via `0x8071` (`RGB_EFFECTS`) or fallback `0x8070` (`COLOR_LED_EFFECTS`).
+    pub fn set_rgb_effect(
+        &mut self,
+        mode: KeyboardRgbMode,
+        color: Rgb,
+        speed_ms: u16,
+    ) -> Result<(), HidppError> {
+        if self.transport.get_feature_index(FEAT_RGB_EFFECTS).is_some() {
+            // 0x8071 fn 0x10: setClusterEffect(clusterIdx, effectId, R, G, B, ...)
+            let clusters = self.info.rgb_cluster_count.clamp(1, 4);
+            for cluster in 0..clusters {
+                self.set_cluster_rgb(cluster, mode, color, speed_ms)?;
+            }
+            return Ok(());
+        }
+        self.set_cluster_rgb(0, mode, color, speed_ms)
     }
 
     /// Set keyboard backlight brightness (0..=100%) via `0x8040`.

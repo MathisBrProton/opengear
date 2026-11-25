@@ -5,7 +5,7 @@ import { S, applyState, getDraftFor, local, registerHooks, ui, updateChrome } fr
 import { seg, updateTelemetryDom } from "./components.js";
 import { startRgbPreviewLoop } from "./rgb-preview.js";
 import { presetCard, viewHome } from "./views/home.js";
-import { viewLighting } from "./views/lighting.js";
+import { viewLighting, buildOverridePayload } from "./views/lighting.js";
 import { renderFanCurve, viewPerformance } from "./views/performance.js";
 import { startSocdPolling, viewInput } from "./views/input.js";
 import { viewProfiles } from "./views/profiles.js";
@@ -137,7 +137,7 @@ function onWizardKey(e) {
 
 function renderWizard() {
   if (!wiz) return;
-  const devs = S ? (S.corsair_devices.length + S.logi_mice.length + S.logi_keyboards.length + S.logi_headsets.length + (S.asus ? 1 : 0)) : 0;
+  const devs = S ? arr(S.device_list).length : 0;
   const presets = S.presets;
   const step = wiz.step;
   const chosen = presets.find((p) => p.id === wiz.preset);
@@ -303,18 +303,46 @@ const ACT = {
   "wizard-open": () => openWizard(),
 
   // Lighting
-  "rgb-enable": (el) => call("set_rgb_config", { enable_rgb: el.dataset.on === "1" }, { btn: el, ok: el.dataset.on === "1" ? "Éclairage allumé" : "Éclairage coupé" }),
   "rgb-kind": (el) => call("set_rgb_config", { kind: el.dataset.kind, enable_rgb: true }, { btn: el, ok: `Effet : ${el.textContent.trim()}` }),
   "rgb-swatch": (el) => call("set_rgb_config", { primary: el.dataset.color, commit: true }, { btn: el, ok: "Couleur appliquée" }),
   "paint-toggle": () => { local.paintMode = !local.paintMode; render(); },
   "clear-per-key": (el) => call("clear_per_key", {}, { btn: el, ok: "Peinture par touche effacée" }),
   "kb-view": (el) => { local.kbViewMode = el.dataset.val; render(); },
+  "lgt-mode": (el) => {
+    const k = `${el.dataset.devId}|${el.dataset.zoneId || ""}`;
+    local.lightingDrafts[k] = Object.assign(local.lightingDrafts[k] || {}, { mode: el.dataset.val });
+    render();
+  },
+  "lgt-sw-kind": (el) => {
+    const k = `${el.dataset.devId}|${el.dataset.zoneId || ""}`;
+    local.lightingDrafts[k] = Object.assign(local.lightingDrafts[k] || {}, { swKind: el.dataset.kind });
+    render();
+  },
+  "lgt-hw-pick": (el) => {
+    const k = `${el.dataset.devId}|${el.dataset.zoneId || ""}`;
+    local.lightingDrafts[k] = Object.assign(local.lightingDrafts[k] || {}, { hwEffect: el.dataset.effect });
+    render();
+  },
+  "lgt-apply": (el) => {
+    const devId = el.dataset.devId;
+    const zoneId = el.dataset.zoneId || null;
+    const ov = buildOverridePayload(devId, zoneId);
+    if (ov && ov.mode === "hardware" && ov.request) {
+      ov.request.save = el.dataset.save === "1";
+    }
+    call("lighting_set_device", {
+      device_id: devId,
+      ...(zoneId ? { zone_id: zoneId } : {}),
+      override: ov,
+    }, { btn: el, ok: el.dataset.save === "1" ? "Effet enregistré dans l'appareil" : "Éclairage mis à jour" });
+  },
+  "canvas-reset": (el) => call("lighting_set_placement", { device_id: el.dataset.devId, x: 0, y: 0, width: 1, height: 1 }, { btn: el, ok: "Placement réinitialisé" }),
   // Shared device model: choice buttons (`data-val`) and quick actions (`data-json`).
   "dev-set": (el) => setDeviceSetting(el, el.dataset.json !== undefined ? JSON.parse(el.dataset.json) : el.dataset.val, el),
   "kb-key": (el) => {
     local.selectedKeyId = el.dataset.keyId;
-    if (local.tab === "lighting" && local.paintMode) {
-      call("set_per_key_color", { led_index: Number(el.dataset.led), color: safeHex(local.paintColor) }, { silent: true });
+    if (local.tab === "lighting" && local.paintMode && el.dataset.code) {
+      call("set_per_key_color", { key_code: el.dataset.code, color: safeHex(local.paintColor) }, { silent: true });
     } else {
       render();
     }
@@ -327,20 +355,7 @@ const ACT = {
     if (!Number.isFinite(v) || v < 100 || v > 30000) { toast("Le DPI doit être compris entre 100 et 30 000.", "err"); return; }
     call("corsair_mouse_set_dpi_stage", { device_index: devIdx(el), stage: Number(el.dataset.stage), dpi: v }, { btn: el, ok: `Palier ${Number(el.dataset.stage) + 1} : ${v} DPI` });
   },
-  "cs-mode": (el) => call("corsair_set_mode", { device_index: devIdx(el), mode: el.dataset.val }, { btn: el, ok: el.dataset.val === "sw" ? "Éclairage piloté par OpenGear" : "Le clavier gère son éclairage seul" }),
   "cs-ind": (el) => call("corsair_set_indicator_color", { device_index: devIdx(el), indicator: inputVal(`cs-ind-${devIdx(el)}`), color: safeHex(inputVal(`cs-ind-col-${devIdx(el)}`)) }, { btn: el, ok: "Couleur du voyant appliquée" }),
-  "cs-hwp-reload": (el) => call("corsair_reload_hwp", { device_index: devIdx(el) }, { btn: el, ok: "Mémoire du clavier relue" }),
-  "cs-hwp-flash": (el) => {
-    const i = devIdx(el);
-    const profIdx = Number(el.dataset.prof ?? inputVal(`hwp-prof-${i}`) ?? local.hwpProfSel[i] ?? 0);
-    call("corsair_flash_hwp_lighting", {
-      device_index: i, profile_index: profIdx, name: inputVal(`hwp-name-${i}`), kind: inputVal(`hwp-kind-${i}`),
-      primary: safeHex(inputVal(`hwp-c1-${i}`)), secondary: safeHex(inputVal(`hwp-c2-${i}`)),
-      speed: Number(inputVal(`hwp-speed-${i}`)), direction: Number(inputVal(`hwp-dir-${i}`)),
-    }, { btn: el, ok: "Effet écrit dans le clavier et vérifié : il reste actif sans OpenGear." }).then((r) => {
-      if (r) local.backups.corsairData = null;
-    });
-  },
 
   // Logitech
   "logi-dpi": (el) => call("logi_set_dpi", { device_index: devIdx(el), x: Number(el.dataset.dpi), y: Number(el.dataset.dpi) }, { btn: el, ok: `Sensibilité : ${el.dataset.dpi} DPI` }),
@@ -355,9 +370,6 @@ const ACT = {
     if (!m || !m.dpi) return;
     call("logi_set_dpi", { device_index: devIdx(el), x: m.dpi.dpi_x, y: m.dpi.dpi_y, lod: el.dataset.val }, { btn: el, ok: `Distance de décrochage : ${el.textContent.trim()}` });
   },
-  "lkb-quick": (el) => call("logi_kb_set_rgb", { device_index: devIdx(el), mode: el.dataset.mode, color: safeHex(S.config.profile.rgb.primary) }, { btn: el, ok: "Éclairage du clavier appliqué" }),
-  "lkb-apply": (el) => call("logi_kb_set_rgb", { device_index: devIdx(el), mode: inputVal(`lkb-mode-${devIdx(el)}`), color: safeHex(inputVal(`lkb-col-${devIdx(el)}`)) }, { btn: el, ok: "Éclairage du clavier appliqué" }),
-  "lml-apply": (el) => call("logi_set_led", { device_index: devIdx(el), mode: inputVal(`lml-mode-${devIdx(el)}`), color: safeHex(inputVal(`lml-col-${devIdx(el)}`)) }, { btn: el, ok: "Éclairage de la souris appliqué" }),
   "eq-preset": (el) => {
     const i = devIdx(el);
     const h = S.logi_headsets[i];
@@ -422,41 +434,8 @@ const ACT = {
     if (r) { delete local.drafts[i]; local.backups.data = null; render(); }
   },
 
-  // ASUS / RAM / Watercooling
-  "asus-direct": (el) => call("asus_set_direct", { enabled: el.dataset.on === "1" }, { btn: el, ok: el.dataset.on === "1" ? "Carte mère synchronisée avec OpenGear" : "Carte mère en mode autonome" }),
-  "aura-quick": (el) => call("asus_set_hw_mode", { mode: el.dataset.mode, color: safeHex(S.asus && S.asus.hw_color, "#FF1848"), commit: false }, { btn: el, ok: `Carte mère : ${el.textContent.trim()}` }).then((r) => { if (r) local.auraDraftMode = el.dataset.mode; }),
-  "aura-mode": (el) => {
-    local.auraDraftMode = el.dataset.mode;
-    call("asus_set_hw_mode", { mode: local.auraDraftMode, color: safeHex(inputVal("asus-color"), "#FF1848"), commit: false }, { btn: el, ok: `Effet carte mère : ${el.textContent.trim()}` });
-  },
-  "aura-swatch": (el) => {
-    const inp = document.getElementById("asus-color");
-    if (inp) inp.value = el.dataset.color;
-    call("asus_set_hw_mode", { mode: local.auraDraftMode || S.asus.hw_mode, color: el.dataset.color, commit: false }, { btn: el, ok: "Couleur de la carte mère appliquée" });
-  },
-  "aura-apply": (el) => call("asus_set_hw_mode", { mode: local.auraDraftMode || S.asus.hw_mode, color: safeHex(inputVal("asus-color"), "#FF1848"), commit: false }, { btn: el, ok: "Effet appliqué à la carte mère" }),
-  "aura-commit": (el) => call("asus_set_hw_mode", { mode: local.auraDraftMode || S.asus.hw_mode, color: safeHex(inputVal("asus-color"), "#FF1848"), commit: true }, { btn: el, ok: "Effet enregistré dans la carte mère" }),
-  "aura-shutdown": (el) => call("asus_set_shutdown_mode", { mode: inputVal("asus-sd-mode"), color: safeHex(inputVal("asus-sd-color"), "#000000") }, { btn: el, ok: "Éclairage PC éteint enregistré" }),
-  "ram-mode": (el) => call("ram_apply_rgb", { mode: el.dataset.mode, color: safeHex(inputVal("ram-color"), "#00D2FF"), speed: Number(inputVal("ram-speed") ?? 2), save_eeprom: false }, { btn: el, ok: `RAM : ${el.textContent.trim()}` }),
-  "ram-swatch": (el) => {
-    const inp = document.getElementById("ram-color");
-    if (inp) inp.value = el.dataset.color;
-    call("ram_apply_rgb", { mode: (S.ram_rgb && S.ram_rgb.last_mode) || "Static", color: el.dataset.color, speed: Number(inputVal("ram-speed") ?? 2), save_eeprom: false }, { btn: el, ok: "Couleur de la RAM appliquée" });
-  },
-  "ram-apply": (el) => call("ram_apply_rgb", { mode: (S.ram_rgb && S.ram_rgb.last_mode) || "Static", color: safeHex(inputVal("ram-color"), "#00D2FF"), speed: Number(inputVal("ram-speed") ?? 2), save_eeprom: false }, { btn: el, ok: "Effet appliqué à la RAM" }),
-  "ram-eeprom": (el) => call("ram_apply_rgb", { mode: (S.ram_rgb && S.ram_rgb.last_mode) || "Static", color: safeHex(inputVal("ram-color"), "#00D2FF"), speed: Number(inputVal("ram-speed") ?? 2), save_eeprom: true }, { btn: el, ok: "Effet enregistré dans les barrettes" }),
-  "ram-sync-aura": (el) => {
-    const col = safeHex(inputVal("asus-color") || (S.asus && S.asus.hw_color), "#FF1848");
-    call("ram_apply_rgb", { mode: "Static", color: col, speed: Number(inputVal("ram-speed") ?? 2), save_eeprom: false }, { btn: el, ok: "RAM alignée sur la couleur de la carte mère" });
-  },
-  "ram-off": (el) => call("ram_apply_rgb", { mode: "Off", color: "#000000", speed: 2, save_eeprom: false }, { btn: el, ok: "Éclairage de la RAM éteint" }),
-  "ram-scan": (el) => call("ram_scan", {}, { btn: el, ok: "Recherche des barrettes terminée" }),
   "relaunch-admin": (el) => call("cooling_relaunch_admin", {}, { btn: el, ok: "Relance en administrateur…" }),
   "sl3-preset": (el) => { local.selectedCoolingIdx = 0; call("cooling_sl3_preset", { preset: el.dataset.preset }, { btn: el, ok: `Pompe : ${el.textContent.trim()}` }); },
-  "sl3-color": (el) => {
-    local.sl3Color = safeHex(inputVal("sl3-color"), "#FF8C1A");
-    call("cooling_sl3_argb", { channel: Number(inputVal("sl3-ch")), color: local.sl3Color, thermal: false }, { btn: el, ok: "Couleur du watercooling appliquée" });
-  },
 
   // Cooling
   "cool-ch": (el) => { local.selectedCoolingIdx = Number(el.dataset.val); render(); },
@@ -486,19 +465,7 @@ const ACT = {
     call("omen_set_manual_fan", { pct }, { btn: el, ok: `Ventilateurs forcés à ${pct} %` });
   },
   "omen-fan-auto": (el) => call("omen_set_manual_fan", { pct: null }, { btn: el, ok: "Ventilateurs rendus au BIOS" }),
-  "omen-swatch": (el) => {
-    const c = safeHex(el.dataset.color);
-    for (let i = 0; i < 4; i++) {
-      const inp = document.getElementById(`omen-z-${i}`);
-      if (inp) inp.value = c;
-    }
-    call("omen_set_kb_zones", { colors: [c, c, c, c] }, { btn: el, ok: "Clavier OMEN mis à jour" });
-  },
-  "omen-zones-apply": (el) => {
-    const colors = [0, 1, 2, 3].map((i) => safeHex(inputVal(`omen-z-${i}`)));
-    call("omen_set_kb_zones", { colors }, { btn: el, ok: "Couleurs des 4 zones appliquées" });
-  },
-  "laptop-hz": (el) => call("laptop_set_refresh_rate", { hz: Number(el.dataset.val) }, { btn: el }),
+  "laptop-hz": (el) => call("laptop_set_refresh_rate", { hz: Number(el.dataset.val) }, { btn: el, ok: `Écran réglé sur ${el.dataset.val} Hz` }),
 
   // Input / Macros
   "input-engine-on": (el) => call("input_set_enabled", { enabled: true }, { btn: el, ok: "Moteur d'entrée démarré" }),
@@ -678,17 +645,25 @@ function setDeviceSetting(el, value, btn = null) {
 const CHANGE = {
   "dev-set": (el) => setDeviceSetting(el, el.type === "checkbox" ? el.checked : el.type === "range" ? Number(el.value) : el.value),
   "switch-profile": (el) => call("switch_profile", { name: el.value }, { ok: `Profil « ${el.value} » activé` }),
-  "rgb-enable-sw": (el) => call("set_rgb_config", { enable_rgb: el.checked }, { ok: el.checked ? "Éclairage allumé" : "Éclairage coupé" }),
   "rgb-commit": (el) => {
     const field = el.dataset.field;
     const v = field === "primary" || field === "secondary" ? safeHex(el.value) : parseFloat(el.value);
     call("set_rgb_config", { [field]: v, commit: true }, { rerender: false, silent: true });
   },
-  "sync-all": (el) => call("set_sync_all", { enabled: el.checked }, { ok: el.checked ? "Toutes les marques sont synchronisées" : "Synchronisation désactivée" }),
+  "lighting-sync-all": (el) => call("lighting_sync_all", { enabled: el.checked }, { ok: el.checked ? "Tous les appareils sont synchronisés" : "Synchronisation globale coupée" }),
+  "lgt-dev-en": (el) => call("lighting_set_device", { device_id: el.dataset.devId, enabled: el.checked }, { ok: el.checked ? "Appareil synchronisé" : "Appareil en mode autonome" }),
+  "lgt-resize-zone": (el) => call("lighting_resize_zone", { device_id: el.dataset.devId, zone_id: el.dataset.zoneId, led_count: Number(el.value) }, { ok: `Zone réglée sur ${el.value} LEDs` }),
+  "lgt-draft-chk": (el) => {
+    const k = `${el.dataset.devId}|${el.dataset.zoneId || ""}`;
+    local.lightingDrafts[k] = Object.assign(local.lightingDrafts[k] || {}, { [el.dataset.field]: el.checked });
+  },
+  "canvas-coord": (el) => {
+    const devId = el.dataset.devId;
+    const pl = Object.assign({ x: 0, y: 0, width: 1, height: 1 }, (S.config.device_placements || {})[devId] || {});
+    pl[el.dataset.field] = clamp(Number(el.value) / 100, 0, 1);
+    call("lighting_set_placement", { device_id: devId, ...pl }, { silent: true });
+  },
   "rgb-reverse": (el) => call("set_rgb_config", { reverse: el.checked, commit: true }, { silent: true }),
-  "argb-count": (el) => call("asus_set_led_count", { channel: Number(el.dataset.ch), count: Number(el.value) }, { ok: `Connecteur réglé sur ${el.value} LEDs` }),
-  "asus-direct-sw": (el) => call("asus_set_direct", { enabled: el.checked }, { ok: el.checked ? "Carte mère synchronisée avec OpenGear" : "Carte mère en mode autonome" }),
-  "sl3-thermal": (el) => call("cooling_sl3_argb", { channel: Number(inputVal("sl3-ch")), thermal: el.checked }, { ok: el.checked ? "Couleur selon la température activée" : "Couleur selon la température désactivée" }),
   "cool-src": (el) => {
     const ch = S.cooling.channels[local.selectedCoolingIdx];
     if (!ch) return;
@@ -751,24 +726,21 @@ const CHANGE = {
     local.btnSel[i] = b;
     render();
   },
-  "hwp-prof-sel": (el) => {
-    local.hwpProfSel[devIdx(el)] = Number(el.value);
-    render();
-  },
-  "wa-vol": (el) => call("audio_set_volume", { is_mic: el.dataset.mic === "1", percent: Number(el.value) }, { rerender: false, ok: `${el.dataset.mic === "1" ? "Micro" : "Volume"} : ${el.value} %` }),
-  "sys-pref": (el) => call("sys_set_prefs", { [el.dataset.key]: el.checked }, { ok: "Préférence enregistrée" }),
-  "sys-pref-num": (el) => call("sys_set_prefs", { [el.dataset.key]: Number(el.value) }, { ok: "Préférence enregistrée" }),
   "bk-mouse": (el) => { local.backups.mouse = Number(el.value); },
   "bk-corsair": (el) => { local.backups.corsairDev = Number(el.value); },
   "omen-maxfan": (el) => call("omen_set_max_fan", { enabled: el.checked }, { ok: el.checked ? "Max Fan activé" : "Max Fan désactivé" }),
-  "omen-kblight": (el) => call("omen_set_kb_backlight", { enabled: el.checked }, { ok: el.checked ? "Rétroéclairage clavier allumé" : "Rétroéclairage clavier éteint" }),
-  "omen-sync": (el) => call("omen_set_sync_rgb", { enabled: el.checked }, { ok: el.checked ? "Clavier OMEN synchronisé avec OpenGear" : "Synchronisation OMEN désactivée" }),
   "laptop-bright": (el) => call("laptop_set_brightness", { percent: Number(el.value) }, { rerender: false, ok: `Luminosité écran : ${el.value} %` }),
   "laptop-auto-bat": (el) => call("laptop_set_auto_battery", { enabled: el.checked }, { ok: el.checked ? "Mode économie sur batterie activé" : "Mode économie sur batterie désactivé" }),
 };
 
 const INPUT = {
   label: (el) => updateLabel(el),
+  "lgt-draft": (el) => {
+    updateLabel(el);
+    const k = `${el.dataset.devId}|${el.dataset.zoneId || ""}`;
+    const v = el.type === "range" ? parseFloat(el.value) : el.value;
+    local.lightingDrafts[k] = Object.assign(local.lightingDrafts[k] || {}, { [el.dataset.field]: v });
+  },
   "rgb-live": (el) => {
     updateLabel(el);
     const field = el.dataset.field;
@@ -858,15 +830,54 @@ document.addEventListener("focusout", () => {
   }, 80);
 });
 
+// Desk canvas drag & resize
+let canvasDrag = null;
+document.addEventListener("pointerdown", (ev) => {
+  const resizeGrip = ev.target.closest("[data-canvas-resize]");
+  const devBox = ev.target.closest("[data-canvas-dev]");
+  const canvas = document.getElementById("desk-canvas");
+  if (!canvas || (!resizeGrip && !devBox)) return;
+  const devId = resizeGrip ? resizeGrip.dataset.canvasResize : devBox.dataset.canvasDev;
+  local.canvasSelectedId = devId;
+  const box = canvas.querySelector(`[data-canvas-dev="${CSS.escape(devId)}"]`);
+  const pl = Object.assign({ x: 0, y: 0, width: 1, height: 1 }, (S && S.config && S.config.device_placements && S.config.device_placements[devId]) || {});
+  const rect = canvas.getBoundingClientRect();
+  canvasDrag = { devId, box, rect, mode: resizeGrip ? "resize" : "move", startX: ev.clientX, startY: ev.clientY, init: { ...pl }, cur: { ...pl }, moved: false };
+});
+document.addEventListener("pointermove", (ev) => {
+  if (!canvasDrag) return;
+  const dx = (ev.clientX - canvasDrag.startX) / Math.max(1, canvasDrag.rect.width);
+  const dy = (ev.clientY - canvasDrag.startY) / Math.max(1, canvasDrag.rect.height);
+  if (Math.abs(dx) > 0.004 || Math.abs(dy) > 0.004) canvasDrag.moved = true;
+  const cur = canvasDrag.cur;
+  if (canvasDrag.mode === "move") {
+    cur.x = clamp(canvasDrag.init.x + dx, 0, 1 - cur.width);
+    cur.y = clamp(canvasDrag.init.y + dy, 0, 1 - cur.height);
+  } else {
+    cur.width = clamp(canvasDrag.init.width + dx, 0.08, 1 - cur.x);
+    cur.height = clamp(canvasDrag.init.height + dy, 0.08, 1 - cur.y);
+  }
+  canvasDrag.box.style.left = `${(cur.x * 100).toFixed(1)}%`;
+  canvasDrag.box.style.top = `${(cur.y * 100).toFixed(1)}%`;
+  canvasDrag.box.style.width = `${(cur.width * 100).toFixed(1)}%`;
+  canvasDrag.box.style.height = `${(cur.height * 100).toFixed(1)}%`;
+});
+document.addEventListener("pointerup", () => {
+  if (!canvasDrag) return;
+  const drag = canvasDrag;
+  canvasDrag = null;
+  if (drag.moved) {
+    call("lighting_set_placement", { device_id: drag.devId, ...drag.cur }, { silent: true });
+  } else {
+    render();
+  }
+});
+
 // ==================== BACKEND PUSHES ====================
 const deviceSignature = () => {
   if (!S) return "";
   return [
-    ...S.corsair_devices.map((d, i) => `c:${i}:${d.product_name}`),
-    ...S.logi_mice.map((m, i) => `lm:${i}:${m.name}`),
-    ...S.logi_keyboards.map((k, i) => `lk:${i}:${k.name}`),
-    ...S.logi_headsets.map((h, i) => `lh:${i}:${h.name}`),
-    S.asus ? "asus" : "",
+    ...arr(S.device_list).map((d) => d.info.id),
     S.hp_omen && S.hp_omen.detected ? "omen" : "",
   ].join("|");
 };
@@ -894,7 +905,7 @@ startRgbPreviewLoop();
 rpc("get_state")
   .then((st) => {
     applyState(st);
-    const n = S.corsair_devices.length + S.logi_mice.length + S.logi_keyboards.length + S.logi_headsets.length + (S.asus ? 1 : 0) + (S.hp_omen && S.hp_omen.detected ? 1 : 0);
+    const n = arr(S.device_list).length;
     setStatus(n ? `Prêt : ${plural(n, "appareil actif", "appareils actifs")}.` : "Prêt : aucun appareil détecté pour l'instant.");
     loadDiagnostics();
     if (!ui().onboarding_done) openWizard();

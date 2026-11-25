@@ -1,7 +1,6 @@
-use super::state::battery_is_charging;
 use super::{
     BackendMsg, SHUTDOWN_REQUESTED, SMART_FAN_ACTIVE, THERMAL_RGB_ACTIVE, UI_VISIBLE, UserEvent,
-    send_reply, should_use_live_rgb,
+    send_reply,
 };
 use crate::audio_ext::read_output_peak;
 use crate::fan_watchdog;
@@ -14,17 +13,20 @@ use crate::system_ext::{
 };
 use crate::tray_icon::tray_notify;
 use opengear_asus::{
-    AsusWmiCoolingStatus, AuraChannelKind, AuraHwMode, AuraMainboardController,
-    apply_asus_wmi_curve, probe_asus_wmi_cooling, read_asus_wmi_channel,
+    AsusWmiCoolingStatus, AuraMainboardController, apply_asus_wmi_curve, probe_asus_wmi_cooling,
+    read_asus_wmi_channel,
 };
 use opengear_core::cooling::{FanChannelConfig, FanHeaderKind, FanPolicyMode, FanTempSource};
+use opengear_core::driver::{Device, Value};
+use opengear_core::lighting::{
+    DeviceLightingConfig, EffectRequest, LightingOverride, Zone, frame_len, render_frame,
+};
 use opengear_hp::{
-    HpOmenStatus, OmenKeyboardType, OmenThermalMode, probe_hp_omen, read_hp_omen_live_fans,
-    set_hp_omen_fan_level, set_hp_omen_kb_backlight, set_hp_omen_kb_zones, set_hp_omen_max_fan,
-    set_hp_omen_thermal_mode,
+    HpOmenDevice, HpOmenStatus, OmenThermalMode, probe_hp_omen, read_hp_omen_live_fans,
+    set_hp_omen_fan_level, set_hp_omen_max_fan, set_hp_omen_thermal_mode,
 };
 use opengear_mainboard::{
-    EneRamMode, HardwareSensorsSnapshot, RamRgbStatus, SuperIoSnapshot, read_superio_snapshot,
+    HardwareSensorsSnapshot, RamRgbDevice, SuperIoSnapshot, read_superio_snapshot,
     restore_all_superio_fans_auto,
 };
 use opengear_platform::{
@@ -35,11 +37,13 @@ use opengear_platform::{
 
 const SMART_FAN_FAILSAFE_TEMP_C: f32 = 100.0;
 use super::keyboard_view::KeyboardView;
-use opengear_core::{AppConfig, DetectedDevice, EffectKind, OperatingMode, Rgb, scan_hid_devices};
-use opengear_corsair::{CorsairDevice, CorsairDeviceKind};
+use opengear_core::{
+    AppConfig, DetectedDevice, EffectKind, Rgb, RgbEffectConfig, scan_hid_devices,
+};
+use opengear_corsair::{CorsairDevice, CorsairDeviceKind, key_code_for_led_index};
 use opengear_input::{InputEngine, reset_held_state};
-use opengear_logitech::{LogitechHeadset, LogitechKeyboard, LogitechMouse};
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
@@ -47,24 +51,16 @@ use std::time::{Duration, Instant};
 use tao::event_loop::EventLoopProxy;
 use tracing::{error, info};
 
-const ARGB_MAX_LEDS: usize = 120;
-
 pub(crate) struct BackendEngine {
     pub config_path: PathBuf,
     pub config: AppConfig,
     pub config_warning: Option<String>,
     pub local_assets: Arc<LocalAssetCatalog>,
     pub shared_sensors: Arc<Mutex<HardwareSensorsSnapshot>>,
-    pub corsair_devices: Vec<CorsairDevice>,
-    pub asus_aura: Option<AuraMainboardController>,
-    pub asus_err: Option<String>,
-    pub logi_mice: Vec<LogitechMouse>,
-    pub logi_keyboards: Vec<LogitechKeyboard>,
-    pub logi_headsets: Vec<LogitechHeadset>,
     /// Registered device drivers (see `crate::drivers::device_drivers`).
     pub drivers: Vec<Box<dyn opengear_core::driver::Driver>>,
     /// Devices opened through `drivers`.
-    pub driver_devices: Vec<Box<dyn opengear_core::driver::Device>>,
+    pub driver_devices: Vec<Box<dyn Device>>,
     pub last_hid_sig: Vec<(u16, u16, u16)>,
     pub telemetry: TelemetryCollector,
     pub last_tel: SystemTelemetry,
@@ -72,19 +68,16 @@ pub(crate) struct BackendEngine {
     pub cooling_status: AsusWmiCoolingStatus,
     pub cooling_channels: Vec<FanChannelConfig>,
     pub initial_cooling_channels: Vec<Option<FanChannelConfig>>,
-    pub ram_rgb: RamRgbStatus,
     pub input_engine: InputEngine,
     pub scanned_devices: Vec<DetectedDevice>,
-    pub aura_hw_mode: AuraHwMode,
-    pub aura_hw_color: Rgb,
-    pub aura_shutdown_mode: AuraHwMode,
-    pub aura_shutdown_color: Rgb,
     pub start_time: Instant,
     pub foreground_app: Option<String>,
     pub manual_profile_name: String,
     pub auto_switched: bool,
     pub last_ambilight: Option<AmbilightFrame>,
     pub audio_smooth_peak: f32,
+    pub last_device_frame_at: HashMap<String, Instant>,
+    pub live_active_devices: HashSet<String>,
     pub smart_fan_last_duty: [Option<u8>; 5],
     pub smart_fan_ref_temp: [f32; 5],
     pub superio: SuperIoSnapshot,
@@ -97,19 +90,15 @@ pub(crate) struct BackendEngine {
     pub blackout_lock: bool,
     pub blackout_idle: bool,
     pub blackout_applied: bool,
-    pub battery_alerted: std::collections::HashMap<String, u8>,
-    pub ram_restore_modes: Option<Vec<(u8, u8)>>,
+    pub battery_alerted: HashMap<String, u8>,
     pub is_laptop: bool,
     /// Key editor geometry + active Windows layout, rebuilt every few seconds (see `keyboard_view`).
     pub keyboard_view_cache: Option<(Instant, KeyboardView)>,
     pub hp_omen: HpOmenStatus,
     pub laptop_battery: LaptopBatteryInfo,
     pub laptop_display: DisplayInfo,
-    pub omen_color_table: Option<Vec<u8>>,
-    pub omen_last_rgb_push: Instant,
     pub omen_last_fan_keepalive: Instant,
     pub omen_fan_modified: bool,
-    pub omen_kb_restore_backlight: Option<bool>,
     pub last_ac_online: Option<bool>,
     pub ac_saved_hz: Option<u32>,
     pub ac_saved_thermal: Option<OmenThermalMode>,
@@ -163,31 +152,19 @@ impl BackendEngine {
     ) -> Self {
         let config_path = AppConfig::default_config_path();
         let (mut config, config_warning) = AppConfig::load_or_recover(&config_path);
+        migrate_legacy_profiles(&mut config);
         let scanned_devices = scan_hid_devices(false).unwrap_or_default();
         let last_hid_sig = compute_hid_signature();
         let power_plans = list_power_plans();
 
-        let corsair_devices = CorsairDevice::connect_all();
         let drivers = crate::drivers::device_drivers();
-        let driver_devices = super::devices::discover_all(&drivers);
-        let (mut asus_aura, asus_err) = match AuraMainboardController::connect() {
-            Ok(a) => (Some(a), None),
-            Err(e) => (None, Some(e.to_string())),
-        };
-        let logi_mice = LogitechMouse::connect_all();
-        let logi_keyboards = LogitechKeyboard::connect_all();
-        let logi_headsets = LogitechHeadset::connect_all();
+        let mut driver_devices = super::devices::discover_all(&drivers);
+        seed_and_resize_device_lighting(&mut config, &mut driver_devices);
 
-        if let Some(aura) = asus_aura.as_mut() {
-            let counts = config.active_profile_mut().asus_argb_led_counts.clone();
-            for (ch_idx, count) in counts {
-                aura.set_channel_led_count(ch_idx, count);
-            }
-        }
-        if let Some(kb) = corsair_devices
-            .iter()
-            .find(|d| d.info.kind == CorsairDeviceKind::Keyboard)
-        {
+        if let Some(kb) = driver_devices.iter().find_map(|d| {
+            let c = d.as_any()?.downcast_ref::<CorsairDevice>()?;
+            (c.info.kind == CorsairDeviceKind::Keyboard).then_some(c)
+        }) {
             let pr = kb.info.pollrate;
             let br = kb.hw_brightness_pct();
             let prof = config.active_profile_mut();
@@ -199,7 +176,14 @@ impl BackendEngine {
 
         let mut telemetry = TelemetryCollector::new();
         let last_tel = telemetry.sample();
-        let hp_omen = probe_hp_omen();
+        let hp_omen = driver_devices
+            .iter()
+            .find_map(|d| {
+                d.as_any()?
+                    .downcast_ref::<HpOmenDevice>()
+                    .map(|o| o.status.clone())
+            })
+            .unwrap_or_else(probe_hp_omen);
         let is_laptop = is_laptop_chassis() || hp_omen.detected;
         let laptop_battery = if is_laptop {
             read_laptop_battery()
@@ -225,7 +209,6 @@ impl BackendEngine {
         } else {
             probe_asus_wmi_cooling()
         };
-        let ram_rgb = crate::drivers::ram_rgb().probe();
         let initial_cooling_channels: Vec<Option<FanChannelConfig>> = FanHeaderKind::ALL
             .iter()
             .map(|&h| {
@@ -260,12 +243,6 @@ impl BackendEngine {
             config_warning,
             local_assets,
             shared_sensors,
-            corsair_devices,
-            asus_aura,
-            asus_err,
-            logi_mice,
-            logi_keyboards,
-            logi_headsets,
             drivers,
             driver_devices,
             last_hid_sig,
@@ -275,19 +252,16 @@ impl BackendEngine {
             cooling_status,
             cooling_channels,
             initial_cooling_channels,
-            ram_rgb,
             input_engine: InputEngine::new(),
             scanned_devices,
-            aura_hw_mode: AuraHwMode::Static,
-            aura_hw_color: Rgb::new(255, 24, 72),
-            aura_shutdown_mode: AuraHwMode::Off,
-            aura_shutdown_color: Rgb::BLACK,
             start_time: Instant::now(),
             foreground_app: None,
             manual_profile_name: String::new(),
             auto_switched: false,
             last_ambilight: None,
             audio_smooth_peak: 0.0,
+            last_device_frame_at: HashMap::new(),
+            live_active_devices: HashSet::new(),
             smart_fan_last_duty: [None; 5],
             smart_fan_ref_temp: [40.0; 5],
             superio,
@@ -300,18 +274,14 @@ impl BackendEngine {
             blackout_lock: false,
             blackout_idle: false,
             blackout_applied: false,
-            battery_alerted: std::collections::HashMap::new(),
-            ram_restore_modes: None,
+            battery_alerted: HashMap::new(),
             is_laptop,
             keyboard_view_cache: None,
             hp_omen,
             laptop_battery,
             laptop_display,
-            omen_color_table: None,
-            omen_last_rgb_push: Instant::now(),
             omen_last_fan_keepalive: Instant::now(),
             omen_fan_modified: false,
-            omen_kb_restore_backlight: None,
             last_ac_online,
             ac_saved_hz: None,
             ac_saved_thermal: None,
@@ -388,19 +358,11 @@ impl BackendEngine {
         self.input_engine.stop();
         reset_held_state();
 
-        for dev in &mut self.corsair_devices {
-            if dev.info.kind == CorsairDeviceKind::Keyboard
-                && dev.info.mode == OperatingMode::Software
-            {
-                let _ = dev.set_mode(OperatingMode::Hardware);
+        for dev in &mut self.driver_devices {
+            if let Some(lighting) = dev.lighting() {
+                let _ = lighting.release();
             }
         }
-        if let Some(aura) = self.asus_aura.as_mut()
-            && aura.is_in_direct_mode()
-        {
-            let _ = aura.set_all_hw_mode(self.aura_hw_mode, self.aura_hw_color, false);
-        }
-        self.ram_restore();
         if self.omen_fan_modified && self.hp_omen.wmi_accessible {
             let _ = set_hp_omen_max_fan(false);
             let _ = set_hp_omen_fan_level(None, &self.hp_omen.fan_max_rpms);
@@ -463,17 +425,7 @@ impl BackendEngine {
             }
 
             let ui_open = UI_VISIBLE.load(Ordering::Relaxed);
-            let prof_snapshot = self.config.active_profile_mut().clone();
-            let is_corsair_kb_sw = self
-                .corsair_devices
-                .iter()
-                .any(|d| d.info.kind == CorsairDeviceKind::Keyboard);
-            let omen_sync_active = self.config.omen_sync_rgb
-                && self.hp_omen.wmi_accessible
-                && self.hp_omen.keyboard_type.is_software_rgb();
-            let live_rgb_active =
-                should_use_live_rgb(&prof_snapshot, is_corsair_kb_sw, omen_sync_active);
-            let thermal_rgb_active = prof_snapshot.silent_loop3_thermal_rgb;
+            let (live_rgb_active, thermal_rgb_active) = self.lighting_activity_flags();
             let smart_fan_active = self.cooling_status.is_admin
                 && self.cooling_status.wmi_available
                 && self
@@ -692,14 +644,14 @@ impl BackendEngine {
             }
 
             // 3. Battery refresh + Laptop/OMEN polls
-            let logi_interval = if ui_open {
+            let status_interval = if ui_open {
                 Duration::from_secs(30)
             } else {
                 Duration::from_secs(300)
             };
-            if !self.suspended && last_logi_poll.elapsed() >= logi_interval {
-                for m in &mut self.logi_mice {
-                    m.refresh_telemetry();
+            if !self.suspended && last_logi_poll.elapsed() >= status_interval {
+                for dev in &mut self.driver_devices {
+                    dev.refresh_status();
                 }
                 self.check_battery_alerts();
                 last_logi_poll = Instant::now();
@@ -828,7 +780,8 @@ impl BackendEngine {
             } => {
                 if refresh_hw {
                     self.superio = read_superio_snapshot();
-                    self.ram_rgb = crate::drivers::ram_rgb().probe();
+                    self.driver_devices = super::devices::discover_all(&self.drivers);
+                    seed_and_resize_device_lighting(&mut self.config, &mut self.driver_devices);
                 }
                 if let Some(rep) = selftest {
                     self.last_selftest = Some(rep);
@@ -898,7 +851,7 @@ impl BackendEngine {
             .as_ref()
             .is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(2));
         if stale {
-            let view = KeyboardView::build(&self.config, &self.corsair_devices, self.is_laptop);
+            let view = KeyboardView::build(&self.config, &self.driver_devices, self.is_laptop);
             self.keyboard_view_cache = Some((Instant::now(), view));
         }
         &self
@@ -913,24 +866,93 @@ impl BackendEngine {
         self.keyboard_view_cache = None;
     }
 
+    pub(crate) fn lighting_activity_flags(&mut self) -> (bool, bool) {
+        let prof = self.config.active_profile_mut().clone();
+        let mut any_live = false;
+        let mut any_thermal = false;
+        for d in &mut self.driver_devices {
+            let id = d.info().id;
+            if d.lighting().is_none() {
+                continue;
+            }
+            let Some(cfg) = prof.device_lighting.get(&id) else {
+                continue;
+            };
+            if !cfg.enabled {
+                continue;
+            }
+            let mut consider = |ov: &LightingOverride| {
+                let kind = match ov {
+                    LightingOverride::Global => prof.rgb.kind,
+                    LightingOverride::Software { effect } => effect.kind,
+                    LightingOverride::Hardware { .. } | LightingOverride::Off => return,
+                };
+                any_live = true;
+                if kind == EffectKind::Thermal {
+                    any_thermal = true;
+                }
+            };
+            let base = cfg.mode.as_ref().unwrap_or(&LightingOverride::Global);
+            consider(base);
+            for ov in cfg.zones.values() {
+                consider(ov);
+            }
+        }
+        (any_live, any_thermal)
+    }
+
+    fn compute_thermal_rgb(&self) -> Rgb {
+        let sensors = self.latest_sensors();
+        let temp = sensors
+            .cpu_temp_c
+            .or(self.last_tel.gpu.edge_temp_c)
+            .or(self.last_tel.gpu.hotspot_temp_c)
+            .unwrap_or(35.0 + self.last_tel.cpu_usage_pct * 0.5);
+        thermal_rgb(temp)
+    }
+
     fn push_live_rgb_frame(&mut self) {
         let t = self.start_time.elapsed().as_secs_f32();
         let prof = self.config.active_profile_mut().clone();
+        let thermal_col = self.compute_thermal_rgb();
 
-        let omen_sync = self.config.omen_sync_rgb
-            && self.hp_omen.wmi_accessible
-            && self.hp_omen.keyboard_type == OmenKeyboardType::FourZoneRgb;
-        let any_strip_rgb = prof.enable_rgb || prof.sync_asus_aura || omen_sync;
+        let mut need_ambilight = false;
+        let mut need_audio = false;
+        let mut need_reactive = false;
+        for d in &mut self.driver_devices {
+            let id = d.info().id;
+            if d.lighting().is_none() {
+                continue;
+            }
+            let Some(cfg) = prof.device_lighting.get(&id) else {
+                continue;
+            };
+            if !cfg.enabled {
+                continue;
+            }
+            for ov in std::iter::once(cfg.mode.as_ref().unwrap_or(&LightingOverride::Global))
+                .chain(cfg.zones.values())
+            {
+                let kind = match ov {
+                    LightingOverride::Global => prof.rgb.kind,
+                    LightingOverride::Software { effect } => effect.kind,
+                    LightingOverride::Hardware { .. } | LightingOverride::Off => continue,
+                };
+                match kind {
+                    EffectKind::Ambilight => need_ambilight = true,
+                    EffectKind::AudioVisualizer => need_audio = true,
+                    EffectKind::ReactiveTyping => need_reactive = true,
+                    _ => {}
+                }
+            }
+        }
 
-        let needs_ambilight = any_strip_rgb && prof.rgb.kind == EffectKind::Ambilight;
-        if needs_ambilight
-            && let Some(frame) = sample_ambilight_screen(self.last_ambilight.as_ref())
+        if need_ambilight && let Some(frame) = sample_ambilight_screen(self.last_ambilight.as_ref())
         {
             self.last_ambilight = Some(frame);
         }
 
-        let needs_audio_vis = any_strip_rgb && prof.rgb.kind == EffectKind::AudioVisualizer;
-        if needs_audio_vis {
+        if need_audio {
             let raw = (read_output_peak() * 1.45).clamp(0.0, 1.0);
             if raw > self.audio_smooth_peak {
                 self.audio_smooth_peak = self.audio_smooth_peak * 0.35 + raw * 0.65;
@@ -939,119 +961,86 @@ impl BackendEngine {
             }
         }
 
-        let reactive_centers: Vec<(f32, f32, f32)> =
-            if any_strip_rgb && prof.rgb.kind == EffectKind::ReactiveTyping {
-                if !self.input_engine.is_running() {
-                    let _ = self.input_engine.start();
+        let reactive_centers: Vec<(f32, f32, f32)> = if need_reactive {
+            if !self.input_engine.is_running() {
+                let _ = self.input_engine.start();
+            }
+            let ripples = self.input_engine.recent_key_ripples(1.1);
+            let view = self.keyboard_view();
+            ripples
+                .into_iter()
+                .filter_map(|(kname, age)| view.norm_center(&kname).map(|(x, y)| (x, y, age)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let amb = self.last_ambilight.clone();
+        let audio_peak = self.audio_smooth_peak;
+        let placements = self.config.device_placements.clone();
+
+        for dev in &mut self.driver_devices {
+            let id = dev.info().id;
+            let Some(lighting) = dev.lighting() else {
+                continue;
+            };
+            let cfg = prof.device_lighting.get(&id).cloned().unwrap_or_default();
+            let base = cfg.mode.as_ref().unwrap_or(&LightingOverride::Global);
+            let has_software_zone = cfg.enabled
+                && (!matches!(base, LightingOverride::Hardware { .. })
+                    || cfg
+                        .zones
+                        .values()
+                        .any(|z| !matches!(z, LightingOverride::Hardware { .. })));
+
+            if !has_software_zone {
+                if self.live_active_devices.remove(&id) {
+                    let _ = lighting.release();
                 }
-                let ripples = self.input_engine.recent_key_ripples(1.1);
-                let view = self.keyboard_view();
-                ripples
-                    .into_iter()
-                    .filter_map(|(kname, age)| view.norm_center(&kname).map(|(x, y)| (x, y, age)))
-                    .collect()
-            } else {
-                Vec::new()
+                continue;
+            }
+
+            let min_dt = Duration::from_secs_f32(1.0 / lighting.max_fps().max(1) as f32);
+            if self
+                .last_device_frame_at
+                .get(&id)
+                .is_some_and(|at| at.elapsed() < min_dt)
+            {
+                continue;
+            }
+
+            let zones = lighting.zones();
+            let placement = placements.get(&id).copied().unwrap_or_default();
+            let mut frame = Vec::with_capacity(frame_len(&zones));
+
+            let frame_ctx = LiveFrameCtx {
+                t,
+                amb: amb.as_ref(),
+                reactive_centers: &reactive_centers,
+                audio_peak,
+                thermal_col,
             };
 
-        if prof.enable_rgb {
-            for dev in &mut self.corsair_devices {
-                if dev.info.kind == CorsairDeviceKind::Keyboard {
-                    match prof.rgb.kind {
-                        EffectKind::Ambilight => {
-                            if let Some(ref amb) = self.last_ambilight {
-                                let br = prof.rgb.brightness;
-                                let _ = dev.render_custom_frame(|_i, nx, ny, _id| {
-                                    amb.sample_uv(nx, ny).scale(br)
-                                });
-                            }
-                        }
-                        EffectKind::ReactiveTyping => {
-                            let bg = prof.rgb.secondary.scale(0.14);
-                            let fg = prof.rgb.primary;
-                            let br = prof.rgb.brightness;
-                            let spd = prof.rgb.speed;
-                            let _ = dev.render_custom_frame(|_i, nx, ny, _id| {
-                                let mut intensity = 0.0f32;
-                                for &(cx, cy, age) in &reactive_centers {
-                                    let dx = nx - cx;
-                                    let dy = (ny - cy) * 0.45;
-                                    let dist = (dx * dx + dy * dy).sqrt();
-                                    let radius = age * 0.95 * spd;
-                                    let ring = (1.0 - (dist - radius).abs() * 9.0).clamp(0.0, 1.0);
-                                    let fade = (1.0 - age / 1.1).clamp(0.0, 1.0);
-                                    intensity = intensity.max(ring * fade);
-                                }
-                                bg.lerp(fg, intensity).scale(br)
-                            });
-                        }
-                        EffectKind::AudioVisualizer => {
-                            let lvl = self.audio_smooth_peak;
-                            let c1 = prof.rgb.primary;
-                            let c2 = prof.rgb.secondary;
-                            let br = prof.rgb.brightness;
-                            let _ = dev.render_custom_frame(|_i, nx, ny, _id| {
-                                let dist = (nx - 0.5).abs() * 2.0;
-                                let bar = ((lvl - dist) * 5.0).clamp(0.0, 1.0);
-                                let bg = c2.scale(0.08);
-                                let peak_col = c1.lerp(c2, dist * 0.7 + (1.0 - ny) * 0.3);
-                                bg.lerp(peak_col, bar).scale(br)
-                            });
-                        }
-                        _ => {
-                            let _ = dev.render_effect(&prof.rgb, t);
-                        }
+            for zone in &zones {
+                let ov = cfg.zones.get(&zone.id).unwrap_or(base);
+                match ov {
+                    LightingOverride::Off | LightingOverride::Hardware { .. } => {
+                        frame.extend(std::iter::repeat_n(Rgb::BLACK, zone.leds.len()));
+                    }
+                    LightingOverride::Global => {
+                        frame.extend(render_effect_for_zone(
+                            &prof.rgb, zone, &placement, &frame_ctx,
+                        ));
+                    }
+                    LightingOverride::Software { effect } => {
+                        frame.extend(render_effect_for_zone(effect, zone, &placement, &frame_ctx));
                     }
                 }
             }
-        }
-        if prof.sync_asus_aura {
-            if let Some(aura) = self.asus_aura.as_mut() {
-                let counts: Vec<usize> = aura.info.channels.iter().map(|c| c.led_count).collect();
-                for (ch_idx, count) in counts.into_iter().enumerate() {
-                    let leds = sample_strip_rgb(
-                        &prof.rgb,
-                        count,
-                        t,
-                        self.last_ambilight.as_ref(),
-                        &reactive_centers,
-                        self.audio_smooth_peak,
-                    );
-                    let _ = aura.send_channel_direct(ch_idx, &leds);
-                }
-            }
-        } else if prof.silent_loop3_thermal_rgb {
-            let sensors = self.latest_sensors();
-            if let (Some(ch_idx), Some(aura)) =
-                (prof.silent_loop3_argb_channel, self.asus_aura.as_mut())
-                && let Some(ch) = aura.info.channels.get(ch_idx)
-            {
-                let temp = sensors
-                    .cpu_temp_c
-                    .or(self.last_tel.gpu.edge_temp_c)
-                    .or(self.last_tel.gpu.hotspot_temp_c)
-                    .unwrap_or(35.0 + self.last_tel.cpu_usage_pct * 0.5);
-                let col = thermal_rgb(temp);
-                let leds = vec![col; ch.led_count];
-                let _ = aura.send_channel_direct(ch_idx, &leds);
-            }
-        }
 
-        if omen_sync && self.omen_last_rgb_push.elapsed() >= Duration::from_millis(120) {
-            let strip = sample_strip_rgb(
-                &prof.rgb,
-                4,
-                t,
-                self.last_ambilight.as_ref(),
-                &reactive_centers,
-                self.audio_smooth_peak,
-            );
-            let zones = [strip[0], strip[1], strip[2], strip[3]];
-            if let Ok(tbl) = set_hp_omen_kb_zones(zones, self.omen_color_table.as_deref()) {
-                self.omen_color_table = Some(tbl);
-                self.hp_omen.zone_colors = zones;
-            }
-            self.omen_last_rgb_push = Instant::now();
+            let _ = lighting.set_frame(&frame);
+            self.live_active_devices.insert(id.clone());
+            self.last_device_frame_at.insert(id, Instant::now());
         }
     }
 
@@ -1069,53 +1058,35 @@ impl BackendEngine {
     }
 
     pub(crate) fn reconnect_vendors(&mut self, vendors: &[u16]) {
-        if vendors.contains(&0x1B1C) {
-            self.corsair_devices.clear();
-            self.corsair_devices = CorsairDevice::connect_all();
-        }
-        if vendors.contains(&0x046D) {
-            self.logi_mice.clear();
-            self.logi_keyboards.clear();
-            self.logi_headsets.clear();
-            self.logi_mice = LogitechMouse::connect_all();
-            self.logi_keyboards = LogitechKeyboard::connect_all();
-            self.logi_headsets = LogitechHeadset::connect_all();
-        }
-        if vendors.contains(&0x0B05) {
-            self.asus_aura = None;
-            match AuraMainboardController::connect() {
-                Ok(a) => {
-                    self.asus_aura = Some(a);
-                    self.asus_err = None;
-                }
-                Err(e) => self.asus_err = Some(e.to_string()),
-            }
-        }
         self.rediscover_drivers_for(vendors);
+        seed_and_resize_device_lighting(&mut self.config, &mut self.driver_devices);
+        self.last_device_frame_at.clear();
+        self.live_active_devices.clear();
+        self.invalidate_keyboard_view();
         self.scanned_devices = scan_hid_devices(false).unwrap_or_default();
     }
 
     pub(crate) fn reconnect_all(&mut self) {
-        self.corsair_devices.clear();
-        self.asus_aura = None;
-        self.logi_mice.clear();
-        self.logi_keyboards.clear();
-        self.logi_headsets.clear();
-
-        self.corsair_devices = CorsairDevice::connect_all();
-        match AuraMainboardController::connect() {
-            Ok(a) => {
-                self.asus_aura = Some(a);
-                self.asus_err = None;
-            }
-            Err(e) => self.asus_err = Some(e.to_string()),
-        }
-        self.logi_mice = LogitechMouse::connect_all();
-        self.logi_keyboards = LogitechKeyboard::connect_all();
-        self.logi_headsets = LogitechHeadset::connect_all();
         self.driver_devices = super::devices::discover_all(&self.drivers);
+        seed_and_resize_device_lighting(&mut self.config, &mut self.driver_devices);
+        self.last_device_frame_at.clear();
+        self.live_active_devices.clear();
+        self.invalidate_keyboard_view();
 
-        self.cooling_status = probe_asus_wmi_cooling();
+        self.hp_omen = self
+            .typed_devices::<HpOmenDevice>()
+            .first()
+            .map(|o| o.status.clone())
+            .unwrap_or_else(probe_hp_omen);
+        self.cooling_status = if self.hp_omen.detected {
+            AsusWmiCoolingStatus {
+                is_admin: is_elevated(),
+                wmi_available: false,
+                message: "PC portable HP OMEN détecté : contrôle ventilateurs via HP BIOS WMI (hpqBIntM).".into(),
+            }
+        } else {
+            probe_asus_wmi_cooling()
+        };
         self.power_plans = list_power_plans();
         self.scanned_devices = scan_hid_devices(false).unwrap_or_default();
         self.last_hid_sig = compute_hid_signature();
@@ -1123,33 +1094,51 @@ impl BackendEngine {
 
     pub(crate) fn profile_needs_input_engine(&mut self) -> bool {
         let p = self.config.active_profile_mut();
+        let any_reactive = p.rgb.kind == EffectKind::ReactiveTyping
+            || p.device_lighting.values().any(|cfg| {
+                cfg.enabled
+                    && std::iter::once(cfg.mode.as_ref())
+                        .flatten()
+                        .chain(cfg.zones.values())
+                        .any(|ov| {
+                            matches!(
+                                ov,
+                                LightingOverride::Software { effect }
+                                if effect.kind == EffectKind::ReactiveTyping
+                            )
+                        })
+            });
         p.socd.enabled
             || p.key_chatter_ms > 0
             || p.mouse_debounce_ms > 0
             || p.win_lock
             || !p.bindings.is_empty()
-            || p.rgb.kind == EffectKind::ReactiveTyping
+            || any_reactive
     }
 
     pub(crate) fn reapply_runtime_state(&mut self) {
-        let (sync, thermal, counts) = {
-            let p = self.config.active_profile_mut();
-            (
-                p.sync_asus_aura,
-                p.silent_loop3_thermal_rgb,
-                p.asus_argb_led_counts.clone(),
-            )
-        };
-        let blackout = self.blackout_lock || self.blackout_idle;
-        if let Some(aura) = self.asus_aura.as_mut() {
-            for (ch, n) in counts {
-                aura.set_channel_led_count(ch, n);
-            }
-            if sync || thermal || blackout {
-                let _ = aura.enter_direct_mode();
+        seed_and_resize_device_lighting(&mut self.config, &mut self.driver_devices);
+        let prof = self.config.active_profile_mut().clone();
+        self.blackout_applied = false;
+        self.last_device_frame_at.clear();
+        for dev in &mut self.driver_devices {
+            let id = dev.info().id;
+            let Some(lighting) = dev.lighting() else {
+                continue;
+            };
+            if let Some(cfg) = prof.device_lighting.get(&id) {
+                if !cfg.enabled {
+                    let _ = lighting.release();
+                } else if let Some(LightingOverride::Hardware { request }) = &cfg.mode {
+                    let _ = apply_validated_hw_effect(lighting, request);
+                }
+                for ov in cfg.zones.values() {
+                    if let LightingOverride::Hardware { request } = ov {
+                        let _ = apply_validated_hw_effect(lighting, request);
+                    }
+                }
             }
         }
-        self.blackout_applied = false;
         if self.profile_needs_input_engine()
             && !self.input_engine.is_running()
             && let Err(e) = self.input_engine.start()
@@ -1159,6 +1148,7 @@ impl BackendEngine {
     }
 
     pub(crate) fn apply_restored_config(&mut self) {
+        migrate_legacy_profiles(&mut self.config);
         self.sync_input_rules();
         let need_engine = self.profile_needs_input_engine();
         if need_engine && !self.input_engine.is_running() {
@@ -1166,147 +1156,47 @@ impl BackendEngine {
         } else if !need_engine && self.input_engine.is_running() {
             self.input_engine.stop();
         }
-
-        let (enable_rgb, sync_aura, thermal, counts) = {
-            let p = self.config.active_profile_mut();
-            (
-                p.enable_rgb,
-                p.sync_asus_aura,
-                p.silent_loop3_thermal_rgb,
-                p.asus_argb_led_counts.clone(),
-            )
-        };
-        if !enable_rgb {
-            for dev in &mut self.corsair_devices {
-                if dev.info.kind == CorsairDeviceKind::Keyboard
-                    && dev.info.mode == OperatingMode::Software
-                {
-                    let _ = dev.set_mode(OperatingMode::Hardware);
-                }
-            }
-        }
-        if let Some(aura) = self.asus_aura.as_mut() {
-            for (ch, n) in counts {
-                aura.set_channel_led_count(ch, n);
-            }
-            if sync_aura || thermal {
-                let _ = aura.enter_direct_mode();
-            } else if aura.is_in_direct_mode() {
-                let _ = aura.set_all_hw_mode(self.aura_hw_mode, self.aura_hw_color, false);
-            }
-        }
+        self.reapply_runtime_state();
         self.persist_config();
     }
 
     pub(crate) fn push_blackout_frame(&mut self) {
-        for dev in &mut self.corsair_devices {
-            if dev.info.kind == CorsairDeviceKind::Keyboard {
-                let _ = dev.render_custom_frame(|_, _, _, _| Rgb::BLACK);
+        for dev in &mut self.driver_devices {
+            let is_fast = dev
+                .as_any()
+                .is_some_and(|a| a.is::<CorsairDevice>() || a.is::<AuraMainboardController>());
+            if self.blackout_applied && !is_fast {
+                continue;
             }
-        }
-        if let Some(aura) = self.asus_aura.as_mut() {
-            let _ = aura.enter_direct_mode();
-            let counts: Vec<usize> = aura
-                .info
-                .channels
-                .iter()
-                .map(|c| match c.kind {
-                    AuraChannelKind::AddressableGen2 => c.led_count.max(ARGB_MAX_LEDS),
-                    _ => c.led_count,
-                })
-                .collect();
-            for (ch, n) in counts.into_iter().enumerate() {
-                let _ = aura.send_channel_direct(ch, &vec![Rgb::BLACK; n]);
+            if let Some(lighting) = dev.lighting() {
+                let len = frame_len(&lighting.zones());
+                let _ = lighting.set_frame(&vec![Rgb::BLACK; len]);
             }
         }
         if !self.blackout_applied {
-            if self.hp_omen.wmi_accessible
-                && self.hp_omen.keyboard_type.is_software_rgb()
-                && self.hp_omen.backlight_on
-            {
-                self.omen_kb_restore_backlight = Some(true);
-                let _ = set_hp_omen_kb_backlight(false);
-            }
-            self.ram_blackout();
             info!("Éclairage coupé (session verrouillée ou inactivité)");
         }
         self.blackout_applied = true;
     }
 
-    fn ram_blackout(&mut self) {
-        if self.ram_restore_modes.is_some() || self.ram_rgb.ene_modules.is_empty() || !is_elevated()
-        {
-            return;
-        }
-        let restore: Vec<(u8, u8)> = self
-            .ram_rgb
-            .ene_modules
-            .iter()
-            .map(|m| (m.address_7bit, m.current_mode))
-            .filter(|&(_, mode)| mode != EneRamMode::Off as u8)
-            .collect();
-        if restore.is_empty() {
-            return;
-        }
-        let targets: Vec<(&opengear_mainboard::EneRamModule, u8)> = self
-            .ram_rgb
-            .ene_modules
-            .iter()
-            .filter(|m| restore.iter().any(|(a, _)| *a == m.address_7bit))
-            .map(|m| (m, EneRamMode::Off as u8))
-            .collect();
-        match crate::drivers::ram_rgb().set_modes(&targets) {
-            Ok(n) if n > 0 => self.ram_restore_modes = Some(restore),
-            Ok(_) => {}
-            Err(e) => error!("Extinction RAM impossible : {e}"),
-        }
-    }
-
-    pub(crate) fn ram_restore(&mut self) {
-        let Some(restore) = self.ram_restore_modes.take() else {
-            return;
-        };
-        let targets: Vec<(&opengear_mainboard::EneRamModule, u8)> = restore
-            .iter()
-            .filter_map(|(addr, mode)| {
-                self.ram_rgb
-                    .ene_modules
-                    .iter()
-                    .find(|m| m.address_7bit == *addr)
-                    .map(|m| (m, *mode))
-            })
-            .collect();
-        if let Err(e) = crate::drivers::ram_rgb().set_modes(&targets) {
-            error!("Rallumage RAM impossible : {e}");
-        }
-    }
-
     fn end_blackout(&mut self) {
-        let (enable_rgb, sync, thermal) = {
-            let p = self.config.active_profile_mut();
-            (p.enable_rgb, p.sync_asus_aura, p.silent_loop3_thermal_rgb)
-        };
-        if !enable_rgb {
-            for dev in &mut self.corsair_devices {
-                if dev.info.kind == CorsairDeviceKind::Keyboard
-                    && dev.info.mode == OperatingMode::Software
-                {
-                    let _ = dev.set_mode(OperatingMode::Hardware);
-                }
+        let prof = self.config.active_profile_mut().clone();
+        for dev in &mut self.driver_devices {
+            let id = dev.info().id;
+            let Some(lighting) = dev.lighting() else {
+                continue;
+            };
+            let cfg = prof.device_lighting.get(&id);
+            let enabled = cfg.is_some_and(|c| c.enabled);
+            if !enabled {
+                let _ = lighting.release();
+            } else if let Some(LightingOverride::Hardware { request }) =
+                cfg.and_then(|c| c.mode.as_ref())
+            {
+                let _ = apply_validated_hw_effect(lighting, request);
             }
         }
-        if !(sync || thermal)
-            && let Some(aura) = self.asus_aura.as_mut()
-        {
-            let _ = aura.set_all_hw_mode(self.aura_hw_mode, self.aura_hw_color, false);
-        }
-        self.ram_restore();
-        if self.omen_kb_restore_backlight.take() == Some(true)
-            && self.hp_omen.wmi_accessible
-            && self.hp_omen.keyboard_type.is_software_rgb()
-        {
-            let _ = set_hp_omen_kb_backlight(true);
-        }
+        self.last_device_frame_at.clear();
         self.blackout_applied = false;
         info!("Éclairage rétabli");
     }
@@ -1350,7 +1240,9 @@ impl BackendEngine {
                 }
                 if self.hp_omen.keyboard_type.is_software_rgb()
                     && self.hp_omen.backlight_on
-                    && set_hp_omen_kb_backlight(false).is_ok()
+                    && let Some(d) = self.device_mut("hp_omen:keyboard")
+                    && d.apply_setting("hp.kb_backlight", &Value::Bool(false))
+                        .is_ok()
                 {
                     self.hp_omen.backlight_on = false;
                 }
@@ -1375,7 +1267,9 @@ impl BackendEngine {
                 }
                 if self.hp_omen.keyboard_type.is_software_rgb()
                     && self.ac_saved_kb_backlight.take() == Some(true)
-                    && set_hp_omen_kb_backlight(true).is_ok()
+                    && let Some(d) = self.device_mut("hp_omen:keyboard")
+                    && d.apply_setting("hp.kb_backlight", &Value::Bool(true))
+                        .is_ok()
                 {
                     self.hp_omen.backlight_on = true;
                 }
@@ -1393,31 +1287,16 @@ impl BackendEngine {
         if !self.config.battery_alerts {
             return;
         }
-        let mut readings: Vec<(String, String, u8, bool)> = Vec::new();
-        for m in &self.logi_mice {
-            if let Some(b) = &m.info.battery
-                && let Some(pct) = b.percent
-            {
-                readings.push((
-                    format!("mouse-{:04X}-{}", m.info.pid, m.info.device_index),
-                    m.info.name.clone(),
-                    pct,
-                    battery_is_charging(b.state),
-                ));
-            }
-        }
-        for k in &self.logi_keyboards {
-            if let Some(b) = &k.info.battery
-                && let Some(pct) = b.percent
-            {
-                readings.push((
-                    format!("kb-{:04X}-{}", k.info.pid, k.info.device_index),
-                    k.info.name.clone(),
-                    pct,
-                    battery_is_charging(b.state),
-                ));
-            }
-        }
+        let readings: Vec<(String, String, u8, bool)> = self
+            .driver_devices
+            .iter()
+            .filter_map(|d| {
+                let st = d.status();
+                let pct = st.battery_pct?;
+                let info = d.info();
+                Some((info.id, info.model, pct, st.charging.unwrap_or(false)))
+            })
+            .collect();
         for (key, name, pct, charging) in readings {
             let last = self.battery_alerted.get(&key).copied();
             let (next, notify) = battery_alert_step(last, pct, charging);
@@ -1455,47 +1334,172 @@ impl BackendEngine {
     }
 }
 
-pub(crate) fn sample_strip_rgb(
-    cfg: &opengear_core::RgbEffectConfig,
-    count: usize,
-    t: f32,
-    amb: Option<&AmbilightFrame>,
-    reactive_centers: &[(f32, f32, f32)],
-    audio_peak: f32,
-) -> Vec<Rgb> {
-    (0..count)
-        .map(|i| {
-            let nx = if count <= 1 {
-                0.5
-            } else {
-                i as f32 / (count - 1) as f32
-            };
-            match cfg.kind {
-                EffectKind::Ambilight => amb
-                    .map(|a| a.sample_uv(nx, 0.5).scale(cfg.brightness))
-                    .unwrap_or(cfg.primary),
-                EffectKind::ReactiveTyping => {
-                    let pulse = reactive_centers
-                        .iter()
-                        .map(|&(_, _, age)| (1.0 - age / 1.1).clamp(0.0, 1.0))
-                        .fold(0.0f32, f32::max);
-                    cfg.secondary
-                        .scale(0.18)
-                        .lerp(cfg.primary, pulse)
-                        .scale(cfg.brightness)
-                }
-                EffectKind::AudioVisualizer => {
-                    let dist = (nx - 0.5).abs() * 2.0;
-                    let bar = ((audio_peak - dist) * 4.5).clamp(0.0, 1.0);
-                    cfg.secondary
-                        .scale(0.10)
-                        .lerp(cfg.primary.lerp(cfg.secondary, dist), bar)
-                        .scale(cfg.brightness)
-                }
-                _ => cfg.sample(i, nx, 0.5, t),
+pub(crate) fn migrate_legacy_profiles(config: &mut AppConfig) {
+    for prof in &mut config.profiles {
+        if prof.lighting_migrated {
+            continue;
+        }
+        prof.rgb
+            .migrate_per_key_codes(|idx| key_code_for_led_index(0x1B1C, 0x1B73, idx));
+        prof.lighting_migrated = true;
+    }
+}
+
+pub(crate) fn seed_and_resize_device_lighting(
+    config: &mut AppConfig,
+    devices: &mut [Box<dyn Device>],
+) {
+    let omen_sync = config.omen_sync_rgb;
+    for prof in &mut config.profiles {
+        for d in devices.iter_mut() {
+            let id = d.info().id;
+            let is_corsair = d.as_any().is_some_and(|a| a.is::<CorsairDevice>());
+            let is_asus = d
+                .as_any()
+                .is_some_and(|a| a.is::<AuraMainboardController>());
+            let is_omen = d.as_any().is_some_and(|a| a.is::<HpOmenDevice>());
+            let _is_ram = d.as_any().is_some_and(|a| a.is::<RamRgbDevice>());
+            if d.lighting().is_none() {
+                continue;
             }
+            prof.device_lighting.entry(id).or_insert_with(|| {
+                let mut cfg = DeviceLightingConfig::default();
+                if is_corsair {
+                    cfg.enabled = prof.enable_rgb;
+                } else if is_asus {
+                    cfg.enabled = prof.sync_asus_aura || prof.silent_loop3_thermal_rgb;
+                    if prof.silent_loop3_thermal_rgb
+                        && let Some(ch) = prof.silent_loop3_argb_channel
+                    {
+                        let mut eff = prof.rgb.clone();
+                        eff.kind = EffectKind::Thermal;
+                        cfg.zones.insert(
+                            format!("ch_{ch}"),
+                            LightingOverride::Software { effect: eff },
+                        );
+                    }
+                    for (&ch, &count) in &prof.asus_argb_led_counts {
+                        cfg.zone_led_counts
+                            .insert(format!("ch_{ch}"), count.clamp(1, 120) as u16);
+                    }
+                } else if is_omen {
+                    cfg.enabled = omen_sync;
+                } else {
+                    cfg.enabled = false;
+                }
+                cfg
+            });
+        }
+    }
+
+    let counts_map: HashMap<String, Vec<(String, u16)>> = config
+        .active_profile_mut()
+        .device_lighting
+        .iter()
+        .map(|(dev_id, cfg)| {
+            (
+                dev_id.clone(),
+                cfg.zone_led_counts
+                    .iter()
+                    .map(|(z, &c)| (z.clone(), c))
+                    .collect(),
+            )
         })
-        .collect()
+        .collect();
+
+    for d in devices.iter_mut() {
+        let id = d.info().id;
+        if let Some(counts) = counts_map.get(&id)
+            && let Some(lighting) = d.lighting()
+        {
+            for (zone_id, led_count) in counts {
+                let _ = lighting.resize_zone(zone_id, *led_count);
+            }
+        }
+    }
+}
+
+pub(crate) fn apply_validated_hw_effect(
+    lighting: &mut dyn opengear_core::lighting::Lighting,
+    req: &EffectRequest,
+) -> anyhow::Result<()> {
+    let effects = lighting.hardware_effects();
+    let def = effects
+        .iter()
+        .find(|e| e.id == req.effect)
+        .ok_or_else(|| anyhow::anyhow!("Effet matériel inconnu : {}", req.effect))?;
+    let validated = def.validate(req)?;
+    lighting.apply_hardware_effect(&validated)
+}
+
+struct LiveFrameCtx<'a> {
+    t: f32,
+    amb: Option<&'a AmbilightFrame>,
+    reactive_centers: &'a [(f32, f32, f32)],
+    audio_peak: f32,
+    thermal_col: Rgb,
+}
+
+fn render_effect_for_zone(
+    effect: &RgbEffectConfig,
+    zone: &Zone,
+    placement: &opengear_core::lighting::Placement,
+    ctx: &LiveFrameCtx<'_>,
+) -> Vec<Rgb> {
+    match effect.kind {
+        EffectKind::Ambilight => zone
+            .leds
+            .iter()
+            .map(|led| {
+                let (nx, ny) = placement.map(led);
+                ctx.amb
+                    .map(|a| a.sample_uv(nx, ny).scale(effect.brightness))
+                    .unwrap_or(effect.primary.scale(effect.brightness))
+            })
+            .collect(),
+        EffectKind::ReactiveTyping => {
+            let bg = effect.secondary.scale(0.14);
+            let fg = effect.primary;
+            let br = effect.brightness;
+            let spd = effect.speed;
+            zone.leds
+                .iter()
+                .map(|led| {
+                    let (nx, ny) = placement.map(led);
+                    let mut intensity = 0.0f32;
+                    for &(cx, cy, age) in ctx.reactive_centers {
+                        let dx = nx - cx;
+                        let dy = (ny - cy) * 0.45;
+                        let dist = (dx * dx + dy * dy).sqrt();
+                        let radius = age * 0.95 * spd;
+                        let ring = (1.0 - (dist - radius).abs() * 9.0).clamp(0.0, 1.0);
+                        let fade = (1.0 - age / 1.1).clamp(0.0, 1.0);
+                        intensity = intensity.max(ring * fade);
+                    }
+                    bg.lerp(fg, intensity).scale(br)
+                })
+                .collect()
+        }
+        EffectKind::AudioVisualizer => {
+            let lvl = ctx.audio_peak;
+            let c1 = effect.primary;
+            let c2 = effect.secondary;
+            let br = effect.brightness;
+            zone.leds
+                .iter()
+                .map(|led| {
+                    let (nx, ny) = placement.map(led);
+                    let dist = (nx - 0.5).abs() * 2.0;
+                    let bar = ((lvl - dist) * 5.0).clamp(0.0, 1.0);
+                    let bg = c2.scale(0.08);
+                    let peak_col = c1.lerp(c2, dist * 0.7 + (1.0 - ny) * 0.3);
+                    bg.lerp(peak_col, bar).scale(br)
+                })
+                .collect()
+        }
+        EffectKind::Thermal => vec![ctx.thermal_col.scale(effect.brightness); zone.leds.len()],
+        _ => render_frame(std::slice::from_ref(zone), placement, effect, ctx.t),
+    }
 }
 
 pub(crate) fn thermal_rgb(temp_c: f32) -> Rgb {

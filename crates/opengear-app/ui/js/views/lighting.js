@@ -1,102 +1,133 @@
 import { arr, clamp, esc, num, plural, safeHex } from "../utils.js";
 import { S, isExpert, local } from "../state.js";
 import {
-  advancedHint, batteryBadge, deviceSettings, emptyState, expertTag, pageHeader, renderKeyboard, sliderRow,
-  subtabs, sw, swatches,
+  advancedHint, deviceSettings, emptyState, expertTag, pageHeader, renderKeyboard, seg, sliderRow,
+  sw, swatches,
 } from "../components.js";
 
-const isOmenRgb = (o) => !!(o && o.detected && (o.keyboard_type === "FourZoneRgb" || o.keyboard_type === "PerKeyRgb"));
+function lightingDevices() {
+  return arr(S && S.device_list).filter((d) => !!d.lighting);
+}
+
+function deviceCfg(devId) {
+  const map = (S && S.config && S.config.profile && S.config.profile.device_lighting) || {};
+  return map[devId] || { enabled: false, mode: null, zones: {}, zone_led_counts: {} };
+}
+
+function overrideModeName(ov, isZone) {
+  if (!ov) return isZone ? "inherit" : "global";
+  return ov.mode || "global";
+}
+
+function getDraft(devId, zoneId, ov, hwEffects) {
+  const k = `${devId}|${zoneId || ""}`;
+  const isZone = zoneId != null;
+  if (!local.lightingDrafts[k]) {
+    const rgb = S.config.profile.rgb;
+    const swEff = ov && ov.mode === "software" && ov.effect ? ov.effect : rgb;
+    const hwReq = ov && ov.mode === "hardware" && ov.request ? ov.request : null;
+    const firstHw = arr(hwEffects)[0] || null;
+    local.lightingDrafts[k] = {
+      mode: overrideModeName(ov, isZone),
+      swKind: swEff.kind || "Static",
+      swPrimary: safeHex(swEff.primary, "#00D4FF"),
+      swSecondary: safeHex(swEff.secondary, "#9B3CFF"),
+      swSpeed: num(swEff.speed, 1),
+      swBrightness: num(swEff.brightness, 1),
+      swReverse: !!swEff.reverse,
+      hwEffect: hwReq ? hwReq.effect : (firstHw ? firstHw.id : ""),
+      hwColor1: safeHex(hwReq && hwReq.colors && hwReq.colors[0], "#00D4FF"),
+      hwColor2: safeHex(hwReq && hwReq.colors && hwReq.colors[1], "#9B3CFF"),
+      hwSpeed: hwReq && hwReq.speed != null ? num(hwReq.speed) : (firstHw && firstHw.params && firstHw.params.speed ? Math.floor((firstHw.params.speed[0] + firstHw.params.speed[1]) / 2) : 1),
+      hwReverse: !!(hwReq && hwReq.reverse),
+    };
+  }
+  return local.lightingDrafts[k];
+}
+
+export function buildOverridePayload(devId, zoneId = null) {
+  const dev = lightingDevices().find((d) => d.info.id === devId);
+  const hwEffects = arr(dev && dev.lighting && dev.lighting.hardware_effects);
+  const k = `${devId}|${zoneId || ""}`;
+  const d = local.lightingDrafts[k] || {};
+  if (d.mode === "inherit") return null;
+  if (d.mode === "global") return { mode: "global" };
+  if (d.mode === "off") return { mode: "off" };
+  if (d.mode === "software") {
+    return {
+      mode: "software",
+      effect: {
+        kind: d.swKind || "Static",
+        primary: safeHex(d.swPrimary, "#00D4FF"),
+        secondary: safeHex(d.swSecondary, "#9B3CFF"),
+        speed: num(d.swSpeed, 1),
+        brightness: num(d.swBrightness, 1),
+        reverse: !!d.swReverse,
+      },
+    };
+  }
+  if (d.mode === "hardware") {
+    const def = hwEffects.find((e) => e.id === d.hwEffect) || hwEffects[0];
+    if (!def) return null;
+    const p = def.params || {};
+    const cRange = arr(p.colors);
+    const maxColors = num(cRange[1], 0);
+    const colors = [];
+    if (maxColors >= 1) colors.push(safeHex(d.hwColor1, "#00D4FF"));
+    if (maxColors >= 2) colors.push(safeHex(d.hwColor2, "#9B3CFF"));
+    return {
+      mode: "hardware",
+      request: {
+        effect: def.id,
+        zone: zoneId || null,
+        colors,
+        speed: p.speed ? clamp(Math.round(num(d.hwSpeed, p.speed[0])), p.speed[0], p.speed[1]) : null,
+        brightness: null,
+        reverse: !!(p.direction && d.hwReverse),
+        save: false,
+      },
+    };
+  }
+  return null;
+}
 
 export function viewLighting() {
-  const hasOmenRgb = isOmenRgb(S.hp_omen);
+  const devs = lightingDevices();
   const items = [
     { id: "global", label: "Effet global" },
-    ...(hasOmenRgb ? [{ id: "omen", label: "Clavier OMEN" }] : []),
-    { id: "asus", label: "Carte mère" },
-    { id: "ram", label: "Mémoire RAM" },
-    { id: "aio", label: "Watercooling" },
-    { id: "logi", label: "Logitech" },
+    { id: "devices", label: `Appareils & zones${devs.length ? ` (${devs.length})` : ""}` },
+    { id: "canvas", label: "Disposition bureau" },
   ];
-  const cur = local.sub.lighting === "omen" && !hasOmenRgb ? "global" : local.sub.lighting;
+  const validIds = new Set(items.map((x) => x.id));
+  const cur = validIds.has(local.sub.lighting) ? local.sub.lighting : "global";
   let body = "";
-  if (cur === "omen") body = lightingOmen();
-  else if (cur === "asus") body = lightingAsus();
-  else if (cur === "ram") body = cardRam();
-  else if (cur === "aio") body = cardSl3Argb();
-  else if (cur === "logi") body = lightingLogi();
-  else body = lightingGlobal();
+  if (cur === "devices") body = lightingDevicesView(devs);
+  else if (cur === "canvas") body = lightingCanvas(devs);
+  else body = lightingGlobal(devs);
   return `
-    ${pageHeader("Éclairage", "Un effet pour tout le setup, puis des réglages par zone.", "", "")}
+    ${pageHeader("Éclairage", "Un effet commun synchronisé sur tout le bureau, puis des réglages fins par appareil et par zone.")}
     ${subtabs("lighting", items, cur)}
     ${body}`;
 }
 
-export function lightingOmen() {
-  const o = S.hp_omen || {};
-  if (!isOmenRgb(o)) return emptyState("Clavier OMEN RGB non détecté", "Cette section est réservée aux portables HP OMEN équipés d'un clavier RGB pilotable via BIOS WMI.");
-  const zones = arr(o.zone_colors).length === 4 ? o.zone_colors : arr(o.saved_zones).length === 4 ? o.saved_zones : ["#00D4FF", "#00D4FF", "#00D4FF", "#00D4FF"];
-  const labels = ["Zone 1 · Gauche", "Zone 2 · Centre-gauche", "Zone 3 · Centre-droite", "Zone 4 · Droite / Pavé"];
-  return `
-    ${!o.is_admin ? `
-      <div class="alert warn mb-16">
-        <span class="alert-icon">🔒</span>
-        <div class="grow"><div class="alert-title">Droits administrateur requis pour le clavier HP OMEN</div><div class="muted">Le BIOS HP OMEN (hpqBIntM) exige l'exécution en administrateur pour modifier le rétroéclairage et les 4 zones RGB.</div></div>
-        <button type="button" class="btn btn-warn btn-sm" data-act="relaunch-admin">Relancer en administrateur</button>
-      </div>` : ""}
-    <div class="grid-stage">
-      <div class="hero-stage"><img class="stage-img" src="/assets/laptop.svg" alt="HP OMEN" style="max-height:240px" /></div>
-      <div class="card accent-cyan">
-        <div class="card-head">
-          <div>
-            <h2 class="card-title">Clavier ${esc(o.model || "HP OMEN")}</h2>
-            <div class="card-desc">${esc(o.keyboard_label || "Rétroéclairage BIOS WMI")} · ${esc(o.board_id || "")}</div>
-          </div>
-          <span class="pill ${o.wmi_accessible ? "emerald" : "amber"}"><span class="dot"></span>${o.wmi_accessible ? (o.backlight_on ? "Allumé" : "Éteint") : (o.is_admin ? "WMI absent" : "Admin requis")}</span>
-        </div>
-        <div class="row mb-16">
-          ${sw(!!o.backlight_on, "Rétroéclairage du clavier actif", "omen-kblight")}
-          ${o.keyboard_type === "FourZoneRgb" ? sw(!!o.sync_rgb, "Synchroniser avec l'effet OpenGear", "omen-sync") : ""}
-        </div>
-        ${o.keyboard_type === "FourZoneRgb" ? `
-          <div class="divider"></div>
-          <div class="stack" style="gap:10px">
-            ${zones.map((hex, i) => `
-              <div class="color-row">
-                <label class="field-label" for="omen-z-${i}" style="min-width:170px">${labels[i]}</label>
-                <input type="color" id="omen-z-${i}" class="og-color" value="${safeHex(hex)}" />
-              </div>`).join("")}
-          </div>
-          <div class="color-row mt-12">
-            <span class="field-label">Tout peindre en :</span>
-            ${swatches("omen-swatch", zones[0])}
-          </div>
-          <div class="row mt-16">
-            <button type="button" class="btn btn-primary" data-act="omen-zones-apply">Appliquer les 4 zones</button>
-            <button type="button" class="btn btn-secondary" data-act="omen-refresh">Relire le BIOS</button>
-          </div>` : o.keyboard_type === "White"
-            ? `<div class="note">Ce modèle dispose d'un clavier <strong>rétroéclairé blanc</strong> (1 seule zone). Certains portables HP OMEN à LED blanches ne sont pilotables que matériellement avec la touche <strong>Fn + F4</strong>.</div>`
-            : `<div class="note">Type de clavier détecté : ${esc(o.keyboard_label || "inconnu")}. Utilise l'interrupteur ci-dessus pour allumer ou éteindre le rétroéclairage.</div>`}
-      </div>
-    </div>`;
-}
-
-function lightingGlobal() {
+function lightingGlobal(devs) {
   const prof = S.config.profile;
   const rgb = prof.rgb;
-  const syncAll = !!(prof.enable_rgb && prof.sync_asus_aura);
-  const keyboards = S.corsair_devices.map((d, i) => ({ d, i })).filter((x) => x.d.kind === "Keyboard");
+  const syncedCount = devs.filter((d) => deviceCfg(d.info.id).enabled).length;
+  const allEnabled = devs.length > 0 && syncedCount === devs.length;
   const br = num(rgb.brightness, 1);
   const sp = num(rgb.speed, 1);
+  const perKeyBoards = devs.filter((d) => arr(d.lighting.zones).some((z) => arr(z.leds).some((l) => l.key_code)));
+
   return `
     <div class="card accent-cyan">
       <div class="card-head">
         <div>
-          <h2 class="card-title">Effet OpenGear</h2>
-          <div class="card-desc">Appliqué en direct aux claviers Corsair${S.asus ? " et, si la synchronisation est active, à la carte mère ASUS" : ""}.</div>
+          <h2 class="card-title">Effet logiciel OpenGear</h2>
+          <div class="card-desc">${devs.length ? `${syncedCount} / ${devs.length} appareil(s) actif(s) en direct` : "Aucun appareil RGB détecté"}</div>
         </div>
         <div class="row">
-          ${sw(!!prof.enable_rgb, "Éclairage actif", "rgb-enable-sw")}
-          ${S.asus ? sw(syncAll, "Synchroniser toutes les marques", "sync-all") : ""}
+          ${devs.length ? sw(allEnabled, "Tout synchroniser", "lighting-sync-all") : ""}
         </div>
       </div>
       <div class="chip-grid" role="group" aria-label="Effets">
@@ -111,7 +142,7 @@ function lightingGlobal() {
       <div class="color-row mt-12">
         <label class="field-label" for="rgb-secondary">Couleur secondaire</label>
         <input type="color" class="og-color" id="rgb-secondary" value="${safeHex(rgb.secondary, "#9B3CFF")}" data-input="rgb-live" data-change="rgb-commit" data-field="secondary" />
-        <label class="mini-check"><input type="checkbox" ${rgb.reverse ? "checked" : ""} data-change="rgb-reverse" /> Inverser le sens de l'animation</label>
+        <label class="mini-check"><input type="checkbox" ${rgb.reverse ? "checked" : ""} data-change="rgb-reverse" /> Inverser le sens</label>
       </div>
       <div class="stack mt-16" style="gap:10px">
         ${sliderRow("Luminosité", { id: "rgb-brightness", min: 0, max: 1, step: 0.05, value: br, input: "rgb-live", change: "rgb-commit", data: { field: "brightness", fmt: "pct" }, display: `${Math.round(br * 100)} %` })}
@@ -119,12 +150,12 @@ function lightingGlobal() {
       </div>
     </div>
 
-    ${keyboards.length ? keyboards.map(({ d, i }) => `
+    ${perKeyBoards.map((d) => `
       <div class="card mt-16">
         <div class="card-head">
           <div>
-            <h2 class="card-title">${esc(d.product_name)} — aperçu et peinture par touche</h2>
-            <div class="card-desc">Active le pinceau puis clique sur les touches pour leur donner une couleur. L'effet passe automatiquement en « par touche ».</div>
+            <h2 class="card-title">${esc(d.info.model)} — peinture par touche</h2>
+            <div class="card-desc">Active le pinceau puis clique sur les touches (mémorisées par position physique).</div>
           </div>
           <div class="row">
             <button type="button" class="btn btn-sm ${local.paintMode ? "btn-primary" : "btn-secondary"}" data-act="paint-toggle" aria-pressed="${local.paintMode}">${local.paintMode ? "Pinceau actif" : "Activer le pinceau"}</button>
@@ -132,212 +163,173 @@ function lightingGlobal() {
             <button type="button" class="btn btn-sm btn-secondary" data-act="clear-per-key">Effacer la peinture</button>
           </div>
         </div>
-        ${renderKeyboard("paint", d)}
+        ${renderKeyboard("paint", { product_name: d.info.model })}
         <div class="stack mt-16" style="gap:10px">
-          ${deviceSettings(d.device_id, { sections: ["lighting"], bare: true })}
+          ${deviceSettings(d.info.id, { sections: ["lighting"], bare: true })}
         </div>
-      </div>`).join("") : ""}`;
+      </div>`).join("")}`;
 }
 
-function lightingAsus() {
-  if (!S.asus) {
-    return emptyState("Carte mère ASUS non détectée", `${S.asus_err ? S.asus_err + " — " : ""}Seules les cartes mères ASUS équipées d'un contrôleur Aura USB sont prises en charge. Si ta carte est compatible, vérifie qu'Armoury Crate n'est pas en train de l'utiliser puis réessaie.`,
-      `<button type="button" class="btn btn-primary" data-act="rescan">Réessayer la connexion</button>`);
-  }
-  const a = S.asus;
-  const direct = !!S.config.profile.sync_asus_aura;
-  const mode = local.auraDraftMode || a.hw_mode;
-  const color = safeHex(a.hw_color, "#FF1848");
-  const hotspots = [
-    { label: "Zone E/S", x: 18, y: 28 },
-    { label: "RAM", x: 58, y: 34 },
-    { label: "Chipset", x: 78, y: 69 },
-    { label: "ARGB 1", x: 75, y: 12 },
-    { label: "ARGB 2", x: 79, y: 55 },
-    { label: "ARGB 3", x: 32, y: 92 },
+function renderOverrideEditor(devId, zoneId, hwEffects, existingOverride) {
+  const d = getDraft(devId, zoneId, existingOverride, hwEffects);
+  const isZone = zoneId != null;
+  const zoneHwEffects = isZone ? arr(hwEffects).filter((e) => arr(e.zones).includes(zoneId)) : arr(hwEffects);
+  const modeOpts = [
+    ...(isZone ? [["inherit", "Identique à l'appareil"]] : []),
+    ["global", "Effet global OpenGear"],
+    ["software", "Effet logiciel personnalisé"],
+    ...(zoneHwEffects.length ? [["hardware", "Effet matériel interne"]] : []),
+    ["off", "Éteint"],
   ];
-  const argb = arr(a.channels).filter((c) => c.kind === "argb");
+  const curDef = zoneHwEffects.find((e) => e.id === d.hwEffect) || zoneHwEffects[0] || null;
+  const cMax = curDef && curDef.params ? num(arr(curDef.params.colors)[1], 0) : 0;
+  const spdRange = curDef && curDef.params ? curDef.params.speed : null;
+  const dataAttr = `data-dev-id="${esc(devId)}" ${isZone ? `data-zone-id="${esc(zoneId)}"` : ""}`;
+
   return `
-    <div class="grid-stage">
-      <div class="stack">
-        <div class="hero-stage rog-bg">
-          <div class="stage-img-wrap">
-            <img class="stage-img" src="/assets/motherboard.svg" alt="Carte mère" />
-            ${hotspots.map((h) => `<span class="mb-hotspot" style="left:${h.x}%;top:${h.y}%;--zone-col:${color}"><span class="led-dot"></span>${esc(h.label)}</span>`).join("")}
-          </div>
-        </div>
-        <div class="note">Les effets « matériels » tournent dans la carte mère elle-même, même quand OpenGear est fermé. La synchronisation, elle, nécessite qu'OpenGear tourne.</div>
+    <div class="stack" style="gap:10px">
+      <div class="row-between">
+        <span class="field-label">${isZone ? "Source de la zone" : "Mode d'éclairage"}</span>
+        ${seg(modeOpts, d.mode, "lgt-mode", isZone ? { devId, zoneId } : { devId })}
       </div>
-      <div class="stack">
-        <div class="card accent-rog">
-          <div class="card-head">
-            <div>
-              <h2 class="card-title">Éclairage de la carte mère</h2>
-              <div class="card-desc">${esc(S.static_info.motherboard || a.product_name || "")}</div>
-            </div>
-            ${sw(direct, "Synchroniser avec l'effet OpenGear", "asus-direct-sw")}
-          </div>
-          ${direct ? `<div class="note">La carte mère suit l'effet global (onglet « Effet global »). Désactive la synchronisation pour choisir un effet propre à la carte mère.</div>` : `
-            <div class="chip-grid" role="group" aria-label="Effets carte mère">
-              ${S.aura_modes.map((m) => `<button type="button" class="chip rog ${mode === m.id ? "active" : ""}" aria-pressed="${mode === m.id}" data-act="aura-mode" data-mode="${esc(m.id)}">${esc(m.label)}</button>`).join("")}
-            </div>
-            <div class="color-row mt-12">
-              <label class="field-label" for="asus-color">Couleur</label>
-              <input type="color" class="og-color" id="asus-color" value="${color}" />
-              ${swatches("aura-swatch", a.hw_color)}
-            </div>
-            <div class="row mt-16">
-              <button type="button" class="btn btn-primary" data-act="aura-apply">Appliquer</button>
-              ${isExpert() ? `<button type="button" class="btn btn-secondary" data-act="aura-commit" title="Écrit l'effet dans la mémoire de la carte mère">Enregistrer dans la carte mère</button>` : ""}
-            </div>`}
+      ${d.mode === "software" ? `
+        <div class="chip-grid">
+          ${S.effects.map((e) => `<button type="button" class="chip ${d.swKind === e.id ? "active" : ""}" data-act="lgt-sw-kind" ${dataAttr} data-kind="${esc(e.id)}">${esc(e.label)}</button>`).join("")}
         </div>
-        ${isExpert() ? `
-          <div class="card expert-card">
-            <div class="card-head"><div><h2 class="card-title">Éclairage PC éteint ${expertTag()}</h2><div class="card-desc">Écrit de façon permanente dans la carte mère.</div></div></div>
-            <div class="row">
-              <select id="asus-sd-mode" class="og-select auto" aria-label="Effet PC éteint">
-                ${[["Off", "Éteint"], ["Static", "Statique"], ["Breathing", "Respiration"], ["Rainbow", "Arc-en-ciel"]].map(([v, l]) => `<option value="${v}" ${a.shutdown_mode === v ? "selected" : ""}>${l}</option>`).join("")}
-              </select>
-              <input type="color" id="asus-sd-color" class="og-color" value="${safeHex(a.shutdown_color, "#000000")}" aria-label="Couleur PC éteint" />
-              <button type="button" class="btn btn-secondary" data-act="aura-shutdown">Enregistrer</button>
-            </div>
-          </div>
-          ${argb.length ? `
-            <div class="card expert-card">
-              <div class="card-head"><div><h2 class="card-title">Nombre de LEDs par connecteur ARGB ${expertTag()}</h2><div class="card-desc">Nécessaire pour la synchronisation en direct des bandeaux et ventilateurs ARGB.</div></div></div>
-              <div class="stack" style="gap:10px">
-                ${argb.map((c) => sliderRow(c.name, { id: `argb-${c.index}`, min: 4, max: 90, value: num(c.led_count, 16), input: "label", change: "argb-count", data: { ch: c.index, fmt: "leds" }, display: `${num(c.led_count, 16)} LEDs` })).join("")}
+        <div class="color-row">
+          <span class="field-label">Couleurs</span>
+          <input type="color" class="og-color" value="${safeHex(d.swPrimary)}" data-input="lgt-draft" ${dataAttr} data-field="swPrimary" />
+          <input type="color" class="og-color" value="${safeHex(d.swSecondary)}" data-input="lgt-draft" ${dataAttr} data-field="swSecondary" />
+          <label class="mini-check"><input type="checkbox" ${d.swReverse ? "checked" : ""} data-change="lgt-draft-chk" ${dataAttr} data-field="swReverse" /> Inverser</label>
+        </div>
+        ${sliderRow("Luminosité", { min: 0, max: 1, step: 0.05, value: d.swBrightness, input: "lgt-draft", data: { devId, ...(isZone ? { zoneId } : {}), field: "swBrightness", fmt: "pct" }, display: `${Math.round(d.swBrightness * 100)} %` })}
+        ${sliderRow("Vitesse", { min: 0.2, max: 4.5, step: 0.1, value: d.swSpeed, input: "lgt-draft", data: { devId, ...(isZone ? { zoneId } : {}), field: "swSpeed", fmt: "x" }, display: `${num(d.swSpeed, 1).toFixed(1)}×` })}
+        <div class="row"><button type="button" class="btn btn-primary btn-sm" data-act="lgt-apply" ${dataAttr} data-save="0">Appliquer l'effet</button></div>` : ""}
+      ${d.mode === "hardware" && curDef ? `
+        <div class="chip-grid">
+          ${zoneHwEffects.map((e) => `<button type="button" class="chip ${curDef.id === e.id ? "active" : ""}" data-act="lgt-hw-pick" ${dataAttr} data-effect="${esc(e.id)}">${esc(e.label)}</button>`).join("")}
+        </div>
+        ${cMax >= 1 ? `
+          <div class="color-row">
+            <span class="field-label">${cMax > 1 ? "Couleurs" : "Couleur"}</span>
+            <input type="color" class="og-color" value="${safeHex(d.hwColor1)}" data-input="lgt-draft" ${dataAttr} data-field="hwColor1" />
+            ${cMax >= 2 ? `<input type="color" class="og-color" value="${safeHex(d.hwColor2)}" data-input="lgt-draft" ${dataAttr} data-field="hwColor2" />` : ""}
+            ${curDef.params.direction ? `<label class="mini-check"><input type="checkbox" ${d.hwReverse ? "checked" : ""} data-change="lgt-draft-chk" ${dataAttr} data-field="hwReverse" /> Inverser</label>` : ""}
+          </div>` : (curDef.params.direction ? `<label class="mini-check"><input type="checkbox" ${d.hwReverse ? "checked" : ""} data-change="lgt-draft-chk" ${dataAttr} data-field="hwReverse" /> Inverser le sens</label>` : "")}
+        ${spdRange ? sliderRow("Vitesse", { min: spdRange[0], max: spdRange[1], step: 1, value: clamp(num(d.hwSpeed, spdRange[0]), spdRange[0], spdRange[1]), input: "lgt-draft", data: { devId, ...(isZone ? { zoneId } : {}), field: "hwSpeed" }, display: String(clamp(num(d.hwSpeed, spdRange[0]), spdRange[0], spdRange[1])) }) : ""}
+        <div class="row">
+          <button type="button" class="btn btn-primary btn-sm" data-act="lgt-apply" ${dataAttr} data-save="0">Appliquer</button>
+          ${curDef.params.savable && isExpert() ? `<button type="button" class="btn btn-secondary btn-sm" data-act="lgt-apply" ${dataAttr} data-save="1">Enregistrer en mémoire (${expertTag()})</button>` : ""}
+        </div>` : ""}
+      ${d.mode === "global" || d.mode === "off" || d.mode === "inherit" ? `
+        <div class="row"><button type="button" class="btn btn-secondary btn-sm" data-act="lgt-apply" ${dataAttr} data-save="0">${d.mode === "inherit" ? "Suivre l'appareil" : "Appliquer ce choix"}</button></div>` : ""}
+    </div>`;
+}
+
+function lightingDevicesView(devs) {
+  if (!devs.length) {
+    return emptyState("Aucun appareil RGB détecté", "Branche un clavier, une souris, une carte mère ou des barrettes RAM compatibles puis relance la détection.", `<button type="button" class="btn btn-primary" data-act="rescan">Relancer la détection</button>`);
+  }
+  return `
+    <div class="stack" style="gap:16px">
+      ${devs.map((d) => {
+        const l = d.lighting;
+        const cfg = deviceCfg(d.info.id);
+        const totalLeds = arr(l.zones).reduce((s, z) => s + arr(z.leds).length, 0);
+        return `
+          <div class="card accent-cyan">
+            <div class="card-head">
+              <div>
+                <h2 class="card-title">${esc(d.info.model)}</h2>
+                <div class="card-desc">${esc(d.info.vendor)} · ${plural(arr(l.zones).length, "zone", "zones")} · ${plural(totalLeds, "LED", "LEDs")} · max ${num(l.max_fps, 30)} FPS</div>
               </div>
-            </div>` : ""}
-          <div class="card expert-card">
-            <table class="meta-table">
-              <tr><td class="k">Contrôleur</td><td class="mono">${esc(a.vid)}:${esc(a.pid)} · ${esc(a.firmware)}</td></tr>
-              <tr><td class="k">Topologie</td><td>${num(a.mainboard_fixed_leds)} LEDs carte · ${num(a.rgb_12v_headers)} RGB 12 V · ${num(a.argb_5v_headers)} ARGB 5 V</td></tr>
-            </table>
-          </div>` : advancedHint("Enregistrement permanent, éclairage PC éteint et calibration ARGB sont disponibles en mode Expert.")}
-      </div>
+              <div class="row">
+                ${sw(!!cfg.enabled, "Piloté par OpenGear", "lgt-dev-en", { devId: d.info.id })}
+              </div>
+            </div>
+            ${renderOverrideEditor(d.info.id, null, l.hardware_effects, cfg.mode)}
+            ${deviceSettings(d.info.id, { sections: ["lighting"], bare: true })}
+            ${arr(l.zones).length > 1 || arr(l.zones).some((z) => z.resizable) ? `
+              <div class="divider"></div>
+              <div class="card-eyebrow mb-8">Zones de l'appareil</div>
+              <div class="zone-list">
+                ${l.zones.map((z) => {
+                  const zOv = (cfg.zones && cfg.zones[z.id]) || null;
+                  const count = num((cfg.zone_led_counts && cfg.zone_led_counts[z.id]) || arr(z.leds).length);
+                  return `
+                    <div class="zone-item">
+                      <div class="row-between mb-8">
+                        <strong>${esc(z.name)}</strong>
+                        <span class="pill">${plural(count, "LED", "LEDs")}</span>
+                      </div>
+                      ${z.resizable ? sliderRow(`Nombre de LEDs ${isExpert() ? expertTag() : ""}`, { min: z.resizable[0], max: z.resizable[1], step: 1, value: count, input: "label", change: "lgt-resize-zone", data: { devId: d.info.id, zoneId: z.id, fmt: "leds" }, display: `${count} LEDs` }) : ""}
+                      ${arr(l.zones).length > 1 ? renderOverrideEditor(d.info.id, z.id, l.hardware_effects, zOv) : ""}
+                    </div>`;
+                }).join("")}
+              </div>` : ""}
+          </div>`;
+      }).join("")}
+      ${!isExpert() ? advancedHint("L'enregistrement permanent en mémoire flash / EEPROM des effets matériels est disponible en mode Expert.") : ""}
     </div>`;
 }
 
-export function cardRam() {
-  const ram = S.ram_rgb;
-  if (!ram) return emptyState("Mémoire RGB indisponible", "Le moteur OpenGear n'a pas renvoyé d'informations sur la mémoire vive.");
-  const dimms = arr(ram.physical_dimms);
-  const ene = arr(ram.ene_modules);
-  const total = dimms.reduce((a, d) => a + num(d.capacity_gb), 0);
-  const speedLabels = ["Très rapide", "Rapide", "Normal", "Lent", "Très lent"];
-  const spd = clamp(num(ram.last_speed, 2), 0, 4);
-  return `
-    <div class="card accent-cyan">
-      <div class="card-head">
-        <div>
-          <h2 class="card-title">Mémoire RAM</h2>
-          <div class="card-desc">${plural(dimms.length, "barrette", "barrettes")}${total ? ` · ${total} Go` : ""}${dimms[0] ? ` ${esc(dimms[0].memory_type)}` : ""}${dimms[0] && dimms[0].speed_mts ? ` à ${num(dimms[0].speed_mts)} MT/s` : ""}</div>
-        </div>
-        <span class="pill ${ene.length ? "emerald" : "amber"}"><span class="dot"></span>${ene.length ? plural(ene.length, "barrette RGB pilotable", "barrettes RGB pilotables") : ram.is_admin ? "Aucun RGB pilotable" : "Droits administrateur requis"}</span>
-      </div>
-      ${ram.message ? `<div class="note mb-16">${esc(ram.message)}</div>` : ""}
-      ${!ram.is_admin ? `
-        <div class="row">
-          <button type="button" class="btn btn-warn" data-act="relaunch-admin">Relancer en administrateur</button>
-          <button type="button" class="btn btn-secondary" data-act="ram-scan">Actualiser</button>
-        </div>` : ene.length ? `
-        <div class="chip-grid" role="group" aria-label="Effets RAM">
-          ${S.ram_rgb_modes.map((m) => `<button type="button" class="chip ${ram.last_mode === m.id ? "active" : ""}" aria-pressed="${ram.last_mode === m.id}" data-act="ram-mode" data-mode="${esc(m.id)}">${esc(m.label)}</button>`).join("")}
-        </div>
-        <div class="color-row mt-12">
-          <label class="field-label" for="ram-color">Couleur</label>
-          <input type="color" id="ram-color" class="og-color" value="${safeHex(ram.last_color, "#00D2FF")}" />
-          ${swatches("ram-swatch", ram.last_color)}
-        </div>
-        <div class="stack mt-12">
-          ${sliderRow("Vitesse de l'effet", { id: "ram-speed", min: 0, max: 4, value: spd, input: "label", data: { fmt: "ramspeed" }, display: speedLabels[spd] })}
-        </div>
-        <div class="row mt-16">
-          <button type="button" class="btn btn-primary" data-act="ram-apply">Appliquer</button>
-          ${S.asus ? `<button type="button" class="btn btn-secondary" data-act="ram-sync-aura">Reprendre la couleur de la carte mère</button>` : ""}
-          ${isExpert() ? `<button type="button" class="btn btn-secondary" data-act="ram-eeprom">Enregistrer dans les barrettes</button>` : ""}
-          <button type="button" class="btn btn-ghost" data-act="ram-scan">Actualiser</button>
-        </div>` : `
-        <div class="row"><button type="button" class="btn btn-primary" data-act="ram-scan">Rechercher les barrettes RGB (lecture seule)</button></div>`}
-      ${isExpert() && (dimms.length || ene.length) ? `
-        <div class="divider"></div>
-        <div class="card-eyebrow" style="margin-bottom:8px">Détails techniques ${expertTag()}</div>
-        <table class="meta-table">
-          ${dimms.map((d) => `<tr><td class="k">${esc(d.slot)}</td><td>${esc(d.manufacturer)} <span class="mono">${esc(d.part_number)}</span> · ${num(d.capacity_gb)} Go ${esc(d.memory_type)} · ${num(d.speed_mts)} MT/s</td></tr>`).join("")}
-          ${ene.map((m) => `<tr><td class="k">Contrôleur 0x${num(m.address_7bit).toString(16).toUpperCase().padStart(2, "0")}</td><td class="mono">${esc(m.firmware)} · ${num(m.led_count)} LEDs · ${m.is_v2 ? "V2" : "V1"}</td></tr>`).join("")}
-          <tr><td class="k">Pilote PawnIO</td><td>${esc(ram.pawnio_status || "inconnu")}</td></tr>
-        </table>` : ""}
-      ${advancedHint("L'enregistrement permanent dans les barrettes et les détails techniques sont en mode Expert.")}
-    </div>`;
-}
-
-function cardSl3Argb() {
-  const argb = arr(S.asus && S.asus.channels).filter((x) => x.kind === "argb");
-  if (!argb.length) {
-    return emptyState("Aucun connecteur ARGB disponible", "L'éclairage du bloc de watercooling passe par les connecteurs ARGB de la carte mère ASUS. Aucun contrôleur Aura compatible n'a été détecté.",
-      `<button type="button" class="btn btn-secondary" data-act="rescan">Relancer la recherche</button>`);
+function lightingCanvas(devs) {
+  if (!devs.length) {
+    return emptyState("Aucun appareil à placer", "Branche un périphérique ou une carte mère compatible pour disposer son emplacement sur le bureau.");
   }
-  const prof = S.config.profile;
-  const ch = prof.silent_loop3_argb_channel != null ? prof.silent_loop3_argb_channel : argb[0].index;
-  const tempSrc = S.telemetry.sensors && S.telemetry.sensors.cpu_temp_c != null ? "du processeur" : "de la carte graphique";
+  const placements = (S.config && S.config.device_placements) || {};
+  const selectedId = devs.some((d) => d.info.id === local.canvasSelectedId) ? local.canvasSelectedId : devs[0].info.id;
+  local.canvasSelectedId = selectedId;
+  const selDev = devs.find((d) => d.info.id === selectedId);
+  const selPl = placements[selectedId] || selDev.lighting.placement || { x: 0, y: 0, width: 1, height: 1 };
+
   return `
     <div class="grid-stage">
-      <div class="hero-stage amber-bg"><img class="stage-img" src="/assets/aio.svg" alt="Watercooling" style="max-height:250px" /></div>
-      <div class="card accent-amber">
-        <div class="card-head"><div><h2 class="card-title">Éclairage du watercooling</h2><div class="card-desc">Bloc pompe relié à un connecteur ARGB de la carte mère.</div></div></div>
-        <div class="row">
-          <label class="field-label" for="sl3-ch">Connecteur</label>
-          <select id="sl3-ch" class="og-select auto">
-            ${argb.map((x) => `<option value="${num(x.index)}" ${x.index === ch ? "selected" : ""}>${esc(x.name)} (${num(x.led_count)} LEDs)</option>`).join("")}
-          </select>
+      <div class="card accent-cyan">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">Canevas du bureau</h2>
+            <div class="card-desc">Glisse et redimensionne chaque appareil pour que les vagues RGB traversent ton installation dans l'ordre réel.</div>
+          </div>
+          <button type="button" class="btn btn-sm btn-secondary" data-act="canvas-reset" data-dev-id="${esc(selectedId)}">Plein écran</button>
         </div>
-        <div class="color-row mt-12">
-          <label class="field-label" for="sl3-color">Couleur</label>
-          <input type="color" id="sl3-color" class="og-color" value="${safeHex(local.sl3Color, "#FF8C1A")}" />
-          <button type="button" class="btn btn-primary btn-sm" data-act="sl3-color">Appliquer</button>
+        <div class="desk-canvas" id="desk-canvas">
+          ${devs.map((d) => {
+            const pl = placements[d.info.id] || d.lighting.placement || { x: 0, y: 0, width: 1, height: 1 };
+            const isSel = d.info.id === selectedId;
+            const dots = [];
+            arr(d.lighting.zones).forEach((z) => {
+              const step = Math.max(1, Math.floor(arr(z.leds).length / 40));
+              for (let i = 0; i < arr(z.leds).length; i += step) {
+                const led = z.leds[i];
+                const cx = clamp(pl.x + led.x * pl.width, 0, 1);
+                const cy = clamp(pl.y + led.y * pl.height, 0, 1);
+                dots.push(`<span class="canvas-led" data-code="${esc(led.key_code || "")}" data-cx="${cx.toFixed(3)}" data-cy="${cy.toFixed(3)}" style="left:${(led.x * 100).toFixed(1)}%;top:${(led.y * 100).toFixed(1)}%"></span>`);
+              }
+            });
+            return `
+              <div class="canvas-dev ${isSel ? "selected" : ""}" data-canvas-dev="${esc(d.info.id)}" style="left:${(pl.x * 100).toFixed(1)}%;top:${(pl.y * 100).toFixed(1)}%;width:${(pl.width * 100).toFixed(1)}%;height:${(pl.height * 100).toFixed(1)}%">
+                <div class="canvas-dev-title">${esc(d.info.model)}</div>
+                <div class="canvas-dev-sub">${esc(d.info.vendor)}</div>
+                ${dots.join("")}
+                <div class="canvas-handle" data-canvas-resize="${esc(d.info.id)}" title="Redimensionner"></div>
+              </div>`;
+          }).join("")}
         </div>
-        <div class="divider"></div>
-        ${sw(!!prof.silent_loop3_thermal_rgb, `Couleur selon la température ${esc(tempSrc)} (cyan → vert → ambre → rouge)`, "sl3-thermal")}
       </div>
-    </div>`;
-}
-
-function lightingLogi() {
-  const kbs = S.logi_keyboards;
-  const mice = S.logi_mice.map((m, i) => ({ m, i })).filter((x) => arr(x.m.led_zones).length);
-  if (!kbs.length && !mice.length) {
-    return emptyState("Aucun appareil Logitech avec éclairage détecté", "Branche le récepteur LIGHTSPEED / Bolt ou le câble USB de ton clavier ou de ta souris Logitech, puis relance la recherche.",
-      `<button type="button" class="btn btn-primary" data-act="rescan">Relancer la recherche</button>`);
-  }
-  return `<div class="grid-auto">${kbs.map((k, i) => cardLogiKbLighting(k, i)).join("")}${mice.map(({ m, i }) => cardLogiMouseLed(m, i)).join("")}</div>`;
-}
-
-export function cardLogiKbLighting(kb, i) {
-  return `
-    <div class="card accent-cyan">
-      <div class="card-head"><div><h2 class="card-title">${esc(kb.name)}</h2><div class="card-desc">Éclairage du clavier</div></div>${kb.battery && kb.battery.percent != null ? batteryBadge(kb.battery.percent, !!kb.battery.is_charging) : ""}</div>
-      <div class="row">
-        <select id="lkb-mode-${i}" class="og-select auto" aria-label="Effet">
-          <option value="Fixed">Statique</option><option value="Breathing">Respiration</option><option value="Cycle">Cycle de couleurs</option><option value="Wave">Vague arc-en-ciel</option><option value="Off">Éteint</option>
-        </select>
-        <input type="color" id="lkb-col-${i}" class="og-color" value="#00D4FF" aria-label="Couleur" />
-        <button type="button" class="btn btn-primary btn-sm" data-act="lkb-apply" data-dev="${i}">Appliquer</button>
-      </div>
-      <div class="mt-12">${deviceSettings(kb.device_id, { sections: ["lighting"], bare: true })}</div>
-    </div>`;
-}
-
-export function cardLogiMouseLed(m, i) {
-  return `
-    <div class="card accent-cyan">
-      <div class="card-head"><div><h2 class="card-title">${esc(m.name)}</h2><div class="card-desc">Éclairage de la souris (${plural(arr(m.led_zones).length, "zone", "zones")})</div></div></div>
-      <div class="row">
-        <select id="lml-mode-${i}" class="og-select auto" aria-label="Effet">
-          <option value="Fixed">Statique</option><option value="Breathing">Respiration</option><option value="Cycle">Cycle de couleurs</option><option value="Off">Éteint</option>
-        </select>
-        <input type="color" id="lml-col-${i}" class="og-color" value="#00D4FF" aria-label="Couleur" />
-        <button type="button" class="btn btn-primary btn-sm" data-act="lml-apply" data-dev="${i}">Appliquer</button>
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">${esc(selDev.info.model)}</h2>
+            <div class="card-desc">Position normalisée sur le bureau (0 à 100 %).</div>
+          </div>
+        </div>
+        <div class="stack" style="gap:10px">
+          ${sliderRow("Position X", { min: 0, max: 95, step: 1, value: Math.round(selPl.x * 100), input: "label", change: "canvas-coord", data: { devId: selectedId, field: "x", fmt: "pct100" }, display: `${Math.round(selPl.x * 100)} %` })}
+          ${sliderRow("Position Y", { min: 0, max: 95, step: 1, value: Math.round(selPl.y * 100), input: "label", change: "canvas-coord", data: { devId: selectedId, field: "y", fmt: "pct100" }, display: `${Math.round(selPl.y * 100)} %` })}
+          ${sliderRow("Largeur", { min: 5, max: 100, step: 1, value: Math.round(selPl.width * 100), input: "label", change: "canvas-coord", data: { devId: selectedId, field: "width", fmt: "pct100" }, display: `${Math.round(selPl.width * 100)} %` })}
+          ${sliderRow("Hauteur", { min: 5, max: 100, step: 1, value: Math.round(selPl.height * 100), input: "label", change: "canvas-coord", data: { devId: selectedId, field: "height", fmt: "pct100" }, display: `${Math.round(selPl.height * 100)} %` })}
+        </div>
       </div>
     </div>`;
 }

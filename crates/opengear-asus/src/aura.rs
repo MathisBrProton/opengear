@@ -1,5 +1,12 @@
+use anyhow::Context;
 use hidapi::{HidApi, HidDevice};
 use opengear_core::Rgb;
+use opengear_core::driver::{
+    Connection, Device, DeviceInfo, DeviceKind, DeviceStatus, Driver, Setting, Value,
+};
+use opengear_core::lighting::{
+    EffectParams, EffectRequest, HardwareEffect, Lighting, Zone, ZoneKind,
+};
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use thiserror::Error;
@@ -112,6 +119,30 @@ impl AuraHwMode {
             Self::Static | Self::Breathing | Self::Flashing | Self::ChaseFade | Self::Chase
         )
     }
+
+    pub fn from_str_id(s: &str) -> Self {
+        match s {
+            "Off" => Self::Off,
+            "Static" => Self::Static,
+            "Breathing" => Self::Breathing,
+            "Flashing" => Self::Flashing,
+            "SpectrumCycle" => Self::SpectrumCycle,
+            "Rainbow" => Self::Rainbow,
+            "SpectrumCycleBreathing" => Self::SpectrumCycleBreathing,
+            "ChaseFade" => Self::ChaseFade,
+            "SpectrumCycleChaseFade" => Self::SpectrumCycleChaseFade,
+            "Chase" => Self::Chase,
+            "SpectrumCycleChase" => Self::SpectrumCycleChase,
+            "Wave" => Self::Wave,
+            "ChaseRainbowPulse" => Self::ChaseRainbowPulse,
+            "RandomFlicker" => Self::RandomFlicker,
+            "GentleTransition" => Self::GentleTransition,
+            "WavePropagation" => Self::WavePropagation,
+            "RedPulse" => Self::RedPulse,
+            "Direct" => Self::Direct,
+            _ => Self::Static,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,8 +179,23 @@ pub struct AuraMainboardInfo {
     pub channels: Vec<AuraChannel>,
 }
 
+pub(crate) trait AuraIo: Send {
+    fn write(&self, data: &[u8]) -> Result<usize, hidapi::HidError>;
+    fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> Result<usize, hidapi::HidError>;
+}
+
+impl AuraIo for HidDevice {
+    fn write(&self, data: &[u8]) -> Result<usize, hidapi::HidError> {
+        HidDevice::write(self, data)
+    }
+
+    fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> Result<usize, hidapi::HidError> {
+        HidDevice::read_timeout(self, buf, timeout_ms)
+    }
+}
+
 pub struct AuraMainboardController {
-    dev: HidDevice,
+    dev: Box<dyn AuraIo>,
     pub info: AuraMainboardInfo,
     channel_direct: Vec<bool>,
 }
@@ -229,10 +275,10 @@ impl AuraMainboardController {
             .unwrap_or("ASUS AURA LED Controller")
             .to_string();
 
-        let dev = api.open_path(&path)?;
+        let dev: Box<dyn AuraIo> = Box::new(api.open_path(&path)?);
 
-        let firmware_version = Self::read_firmware_version(&dev)?;
-        let config_table = Self::read_config_table(&dev)?;
+        let firmware_version = Self::read_firmware_version(dev.as_ref())?;
+        let config_table = Self::read_config_table(dev.as_ref())?;
 
         let mainboard_fixed_leds = config_table[0x1B];
         let mut rgb_12v_headers = config_table[0x1D].min(8);
@@ -320,7 +366,7 @@ impl AuraMainboardController {
         Ok(ctrl)
     }
 
-    fn read_firmware_version(dev: &HidDevice) -> Result<String, AuraError> {
+    fn read_firmware_version(dev: &dyn AuraIo) -> Result<String, AuraError> {
         let mut buf = [0u8; PACKET_LEN];
         buf[0] = REPORT_ID;
         buf[1] = CMD_FIRMWARE;
@@ -338,7 +384,7 @@ impl AuraMainboardController {
         }
     }
 
-    fn read_config_table(dev: &HidDevice) -> Result<[u8; 60], AuraError> {
+    fn read_config_table(dev: &dyn AuraIo) -> Result<[u8; 60], AuraError> {
         let mut buf = [0u8; PACKET_LEN];
         buf[0] = REPORT_ID;
         buf[1] = CMD_CONFIG_TABLE;
@@ -545,11 +591,273 @@ impl AuraMainboardController {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_io(dev: Box<dyn AuraIo>, info: AuraMainboardInfo) -> Self {
+        let count = info.channels.len();
+        Self {
+            dev,
+            info,
+            channel_direct: vec![false; count],
+        }
+    }
+}
+
+/// Driver discovering ASUS Aura USB mainboard lighting controllers.
+pub struct AsusAuraDriver;
+
+impl Driver for AsusAuraDriver {
+    fn name(&self) -> &'static str {
+        "asus_aura"
+    }
+
+    fn usb_vendor_ids(&self) -> &'static [u16] {
+        &[ASUS_VID]
+    }
+
+    fn discover(&self) -> Vec<Box<dyn Device>> {
+        AuraMainboardController::connect()
+            .ok()
+            .map(|d| Box::new(d) as Box<dyn Device>)
+            .into_iter()
+            .collect()
+    }
+}
+
+impl Device for AuraMainboardController {
+    fn info(&self) -> DeviceInfo {
+        DeviceInfo {
+            id: format!("asus_aura:{:04x}:{:04x}", self.info.vid, self.info.pid),
+            vendor: "ASUS".into(),
+            model: self.info.product_name.clone(),
+            kind: DeviceKind::Motherboard,
+            connection: Connection::Usb,
+            firmware: Some(self.info.firmware_version.clone()),
+        }
+    }
+
+    fn status(&self) -> DeviceStatus {
+        DeviceStatus::default()
+    }
+
+    fn settings(&self) -> Vec<Setting> {
+        Vec::new()
+    }
+
+    fn lighting(&mut self) -> Option<&mut dyn Lighting> {
+        Some(self)
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn apply_setting(&mut self, id: &str, _value: &Value) -> anyhow::Result<()> {
+        anyhow::bail!("Réglage ASUS Aura inconnu : {id}")
+    }
+}
+
+fn aura_channel_idx_from_zone(zone_id: &str) -> Option<usize> {
+    zone_id.strip_prefix("ch_")?.parse().ok()
+}
+
+impl Lighting for AuraMainboardController {
+    fn zones(&self) -> Vec<Zone> {
+        self.info
+            .channels
+            .iter()
+            .map(|ch| {
+                let mut zone =
+                    Zone::linear(&format!("ch_{}", ch.index), &ch.name, ch.led_count, 0.5);
+                if ch.kind == AuraChannelKind::MainboardFixed && ch.led_count <= 1 {
+                    zone.kind = ZoneKind::Single;
+                }
+                zone.resizable = (ch.kind == AuraChannelKind::AddressableGen2).then_some((1, 120));
+                zone
+            })
+            .collect()
+    }
+
+    fn resize_zone(&mut self, zone_id: &str, led_count: u16) -> anyhow::Result<()> {
+        if let Some(idx) = aura_channel_idx_from_zone(zone_id) {
+            self.set_channel_led_count(idx, led_count as usize);
+        }
+        Ok(())
+    }
+
+    fn max_fps(&self) -> u8 {
+        30
+    }
+
+    fn hardware_effects(&self) -> Vec<HardwareEffect> {
+        let zone_ids: Vec<String> = self
+            .info
+            .channels
+            .iter()
+            .map(|ch| format!("ch_{}", ch.index))
+            .collect();
+        let mut effects: Vec<HardwareEffect> = AuraHwMode::HARDWARE_MODES
+            .iter()
+            .map(|&mode| HardwareEffect {
+                id: format!("{mode:?}"),
+                label: mode.label().into(),
+                params: EffectParams {
+                    colors: if mode.uses_color() { (1, 1) } else { (0, 0) },
+                    speed: None,
+                    brightness: None,
+                    direction: false,
+                    savable: true,
+                },
+                zones: zone_ids.clone(),
+            })
+            .collect();
+
+        for mode in [
+            AuraHwMode::Off,
+            AuraHwMode::Static,
+            AuraHwMode::Breathing,
+            AuraHwMode::Rainbow,
+        ] {
+            effects.push(HardwareEffect {
+                id: format!("shutdown:{mode:?}"),
+                label: format!("À l'extinction : {}", mode.label()),
+                params: EffectParams {
+                    colors: if mode == AuraHwMode::Static {
+                        (1, 1)
+                    } else {
+                        (0, 0)
+                    },
+                    speed: None,
+                    brightness: None,
+                    direction: false,
+                    savable: true,
+                },
+                zones: Vec::new(),
+            });
+        }
+        effects
+    }
+
+    fn set_frame(&mut self, colors: &[Rgb]) -> anyhow::Result<()> {
+        let mut offset = 0usize;
+        for idx in 0..self.info.channels.len() {
+            let count = self.info.channels[idx].led_count;
+            let end = (offset + count).min(colors.len());
+            let slice = &colors[offset..end];
+            offset = end;
+            if !slice.is_empty() {
+                self.send_channel_direct(idx, slice)
+                    .context("Envoi trame Direct ASUS Aura")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_hardware_effect(&mut self, req: &EffectRequest) -> anyhow::Result<()> {
+        let color = req.colors.first().copied().unwrap_or(Rgb::CYAN);
+        if let Some(shutdown_mode) = req.effect.strip_prefix("shutdown:") {
+            anyhow::ensure!(
+                req.save,
+                "Le mode d'extinction ASUS Aura écrit en flash et nécessite une confirmation explicite"
+            );
+            let mode = AuraHwMode::from_str_id(shutdown_mode);
+            self.set_all_hw_mode(mode, color, true)
+                .context("Application mode d'extinction ASUS Aura")?;
+            self.commit().context("Sauvegarde flash ASUS Aura")?;
+            return Ok(());
+        }
+
+        let mode = AuraHwMode::from_str_id(&req.effect);
+        match req.zone.as_deref().and_then(aura_channel_idx_from_zone) {
+            Some(ch_idx) => self
+                .set_channel_hw_mode(ch_idx, mode, color, false)
+                .context("Application mode matériel ASUS Aura")?,
+            None => self
+                .set_all_hw_mode(mode, color, false)
+                .context("Application mode matériel ASUS Aura")?,
+        }
+        if req.save {
+            self.commit().context("Sauvegarde flash ASUS Aura")?;
+        }
+        Ok(())
+    }
+
+    fn release(&mut self) -> anyhow::Result<()> {
+        for idx in 0..self.info.channels.len() {
+            if self.channel_direct.get(idx).copied().unwrap_or(false) {
+                self.set_channel_hw_mode(idx, AuraHwMode::Rainbow, Rgb::CYAN, false)
+                    .context("Restauration mode matériel ASUS Aura")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opengear_core::lighting::{Placement, render_frame};
+    use opengear_core::{EffectKind, RgbEffectConfig};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct MockAuraIo {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl AuraIo for MockAuraIo {
+        fn write(&self, data: &[u8]) -> Result<usize, hidapi::HidError> {
+            self.writes.lock().unwrap().push(data.to_vec());
+            Ok(data.len())
+        }
+
+        fn read_timeout(
+            &self,
+            _buf: &mut [u8],
+            _timeout_ms: i32,
+        ) -> Result<usize, hidapi::HidError> {
+            Ok(0)
+        }
+    }
+
+    fn test_info() -> AuraMainboardInfo {
+        AuraMainboardInfo {
+            vid: ASUS_VID,
+            pid: 0x19AF,
+            product_name: "ASUS ROG STRIX".into(),
+            firmware_version: "AURA-V1".into(),
+            config_table_hex: String::new(),
+            mainboard_fixed_leds: 4,
+            rgb_12v_headers: 1,
+            argb_5v_headers: 1,
+            channels: vec![
+                AuraChannel {
+                    index: 0,
+                    name: "Carte mère".into(),
+                    kind: AuraChannelKind::MainboardFixed,
+                    effect_channel: 0,
+                    direct_channel: 0x04,
+                    default_led_count: 4,
+                    led_count: 4,
+                    rgb_headers_12v: 1,
+                },
+                AuraChannel {
+                    index: 1,
+                    name: "Header ARGB #1".into(),
+                    kind: AuraChannelKind::AddressableGen2,
+                    effect_channel: 1,
+                    direct_channel: 0,
+                    default_led_count: 20,
+                    led_count: 24,
+                    rgb_headers_12v: 0,
+                },
+            ],
+        }
+    }
 
     #[test]
     fn direct_packets_split_cleanly_at_256_boundary() {
@@ -565,5 +873,91 @@ mod tests {
         assert_eq!(pkts[13][2], 0x01 | DIRECT_OVERFLOW_FLAG | DIRECT_APPLY_FLAG);
         assert_eq!(pkts[13][3], 0);
         assert_eq!(pkts[13][4], 9);
+    }
+
+    #[test]
+    fn lighting_set_frame_and_hw_effects_match_legacy_hid_bytes() {
+        let io_old = MockAuraIo::default();
+        let io_new = MockAuraIo::default();
+        let mut old_ctrl =
+            AuraMainboardController::from_test_io(Box::new(io_old.clone()), test_info());
+        let mut new_ctrl =
+            AuraMainboardController::from_test_io(Box::new(io_new.clone()), test_info());
+
+        let eff = RgbEffectConfig {
+            kind: EffectKind::RainbowWave,
+            brightness: 0.85,
+            speed: 1.5,
+            ..Default::default()
+        };
+        let t = 0.42f32;
+        for (ch_idx, ch) in old_ctrl.info.channels.clone().iter().enumerate() {
+            let leds: Vec<Rgb> = (0..ch.led_count)
+                .map(|i| {
+                    let nx = if ch.led_count <= 1 {
+                        0.5
+                    } else {
+                        i as f32 / (ch.led_count - 1) as f32
+                    };
+                    eff.sample(i, nx, 0.5, t)
+                })
+                .collect();
+            old_ctrl.send_channel_direct(ch_idx, &leds).unwrap();
+        }
+        old_ctrl
+            .set_all_hw_mode(AuraHwMode::Breathing, Rgb::new(10, 20, 30), false)
+            .unwrap();
+        old_ctrl.commit().unwrap();
+        old_ctrl
+            .set_all_hw_mode(AuraHwMode::Static, Rgb::new(1, 2, 3), true)
+            .unwrap();
+        old_ctrl.commit().unwrap();
+
+        let zones = new_ctrl.zones();
+        assert_eq!(zones[0].resizable, None);
+        assert_eq!(zones[1].resizable, Some((1, 120)));
+        let frame = render_frame(&zones, &Placement::default(), &eff, t);
+        new_ctrl.set_frame(&frame).unwrap();
+        new_ctrl
+            .apply_hardware_effect(&EffectRequest {
+                effect: "Breathing".into(),
+                zone: None,
+                colors: vec![Rgb::new(10, 20, 30)],
+                speed: None,
+                brightness: None,
+                reverse: false,
+                save: true,
+            })
+            .unwrap();
+        // Shutdown mode refuses without save:true.
+        assert!(
+            new_ctrl
+                .apply_hardware_effect(&EffectRequest {
+                    effect: "shutdown:Static".into(),
+                    zone: None,
+                    colors: vec![Rgb::new(1, 2, 3)],
+                    speed: None,
+                    brightness: None,
+                    reverse: false,
+                    save: false,
+                })
+                .is_err()
+        );
+        new_ctrl
+            .apply_hardware_effect(&EffectRequest {
+                effect: "shutdown:Static".into(),
+                zone: None,
+                colors: vec![Rgb::new(1, 2, 3)],
+                speed: None,
+                brightness: None,
+                reverse: false,
+                save: true,
+            })
+            .unwrap();
+
+        assert_eq!(
+            *io_old.writes.lock().unwrap(),
+            *io_new.writes.lock().unwrap()
+        );
     }
 }

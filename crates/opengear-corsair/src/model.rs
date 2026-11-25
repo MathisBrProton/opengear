@@ -1,12 +1,38 @@
 //! Corsair Bragi devices in the shared device model (`opengear_core::driver`).
 
 use crate::device::{CorsairDevice, CorsairDeviceKind};
+use crate::hwp::HwpLightingKind;
+use crate::keymap::{K70_TKL_KEYS, layout_for_device};
+use crate::proto::CORSAIR_VID;
 use anyhow::{Context, Result, bail};
-use opengear_core::PollingRate;
 use opengear_core::driver::{
-    ChoiceOption, Connection, Device, DeviceInfo, DeviceKind, DeviceStatus, Section, Setting,
-    Value, polling_rate_options, setting_ids,
+    ChoiceOption, Connection, Device, DeviceInfo, DeviceKind, DeviceStatus, Driver, Section,
+    Setting, Value, polling_rate_options, setting_ids,
 };
+use opengear_core::lighting::{
+    EffectParams, EffectRequest, HardwareEffect, Led, Lighting, Zone, ZoneKind,
+};
+use opengear_core::{OperatingMode, PollingRate, Rgb};
+
+/// Driver discovering all connected Corsair Bragi v2 devices.
+pub struct CorsairDriver;
+
+impl Driver for CorsairDriver {
+    fn name(&self) -> &'static str {
+        "corsair"
+    }
+
+    fn usb_vendor_ids(&self) -> &'static [u16] {
+        &[CORSAIR_VID]
+    }
+
+    fn discover(&self) -> Vec<Box<dyn Device>> {
+        CorsairDevice::connect_all()
+            .into_iter()
+            .map(|d| Box::new(d) as Box<dyn Device>)
+            .collect()
+    }
+}
 
 const HW_PROFILE: &str = "corsair.hw_profile";
 const DEBOUNCE: &str = "corsair.debounce";
@@ -205,6 +231,18 @@ impl Device for CorsairDevice {
         out
     }
 
+    fn lighting(&mut self) -> Option<&mut dyn Lighting> {
+        (self.info.kind == CorsairDeviceKind::Keyboard).then_some(self as &mut dyn Lighting)
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     fn apply_setting(&mut self, id: &str, value: &Value) -> Result<()> {
         match id {
             setting_ids::POLLING_RATE => {
@@ -246,5 +284,298 @@ impl Device for CorsairDevice {
             }
         }
         Ok(())
+    }
+}
+
+impl Lighting for CorsairDevice {
+    fn zones(&self) -> Vec<Zone> {
+        if self.info.kind != CorsairDeviceKind::Keyboard {
+            return Vec::new();
+        }
+        let (_, keys) = self.active_keymap();
+        let raw_keys = layout_for_device(self.info.vid, self.info.pid)
+            .map(|d| d.keys)
+            .unwrap_or(K70_TKL_KEYS);
+        let leds = keys
+            .iter()
+            .map(|k| {
+                let raw = raw_keys
+                    .iter()
+                    .find(|r| r.led_index == k.led_index)
+                    .unwrap_or(k);
+                let mut led = Led::at(k.label_qwerty, raw.norm_x(), raw.norm_y());
+                if let Some(code) = k.code() {
+                    led = led.key(code);
+                }
+                led
+            })
+            .collect();
+        vec![Zone {
+            id: "keys".into(),
+            name: "Touches & voyants".into(),
+            kind: ZoneKind::Matrix,
+            leds,
+            resizable: None,
+        }]
+    }
+
+    fn hardware_effects(&self) -> Vec<HardwareEffect> {
+        if self.info.kind != CorsairDeviceKind::Keyboard || self.info.hwp_profiles.is_empty() {
+            return Vec::new();
+        }
+        HwpLightingKind::ALL_SUPPORTED
+            .iter()
+            .map(|&kind| {
+                let colors = match kind.color_count() {
+                    0 => (0, 0),
+                    1 => (1, 1),
+                    _ => (1, 2),
+                };
+                let speed = if kind == HwpLightingKind::StaticColor {
+                    None
+                } else {
+                    Some((0, 2))
+                };
+                let direction = matches!(
+                    kind,
+                    HwpLightingKind::RainbowWave
+                        | HwpLightingKind::SpiralRainbow
+                        | HwpLightingKind::ColorWave
+                        | HwpLightingKind::Visor
+                );
+                HardwareEffect {
+                    id: kind.id().into(),
+                    label: kind.label().into(),
+                    params: EffectParams {
+                        colors,
+                        speed,
+                        brightness: None,
+                        direction,
+                        savable: true,
+                    },
+                    zones: Vec::new(),
+                }
+            })
+            .collect()
+    }
+
+    fn set_frame(&mut self, colors: &[Rgb]) -> Result<()> {
+        if self.info.kind != CorsairDeviceKind::Keyboard {
+            return Ok(());
+        }
+        let (led_count, keys) = self.active_keymap();
+        let mut frame = vec![Rgb::BLACK; led_count];
+        for (key, &col) in keys.iter().zip(colors) {
+            if key.led_index < led_count {
+                frame[key.led_index] = col;
+            }
+        }
+        self.write_raw_frame(&frame)?;
+        Ok(())
+    }
+
+    fn apply_hardware_effect(&mut self, req: &EffectRequest) -> Result<()> {
+        if !req.save {
+            bail!(
+                "Les effets matériels Corsair s'enregistrent dans la mémoire flash du clavier (confirmation requise)"
+            );
+        }
+        let prof_idx = self.info.active_hw_profile.unwrap_or(0) as usize;
+        let kind = HwpLightingKind::parse_id(&req.effect);
+        let primary = req.colors.first().copied().unwrap_or(Rgb::CYAN);
+        let secondary = req.colors.get(1).copied().unwrap_or(primary);
+        let speed = req.speed.unwrap_or(1);
+        let direction = u8::from(req.reverse);
+        self.flash_hwp_lighting(prof_idx, kind, primary, secondary, speed, direction, None)?;
+        Ok(())
+    }
+
+    fn release(&mut self) -> Result<()> {
+        self.set_mode(OperatingMode::Hardware)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::LightingEndpoint;
+    use crate::device::CorsairDeviceInfo;
+    use crate::keymap::K70_TKL_LED_COUNT;
+    use crate::proto::*;
+    use crate::transport::{BragiTransport, HidIo};
+    use opengear_core::lighting::{Placement, render_frame};
+    use opengear_core::{EffectKind, KeyboardLayout, RgbEffectConfig};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct RecordingHid {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl RecordingHid {
+        fn new() -> Self {
+            Self {
+                writes: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl HidIo for RecordingHid {
+        fn write(&self, data: &[u8]) -> Result<usize, hidapi::HidError> {
+            self.writes.lock().unwrap().push(data.to_vec());
+            Ok(data.len())
+        }
+
+        fn read_timeout(
+            &self,
+            buf: &mut [u8],
+            _timeout_ms: i32,
+        ) -> Result<usize, hidapi::HidError> {
+            let writes = self.writes.lock().unwrap();
+            let Some(last) = writes.last() else {
+                return Ok(0);
+            };
+            let magic = last.get(1).copied().unwrap_or(0x08);
+            let cmd = last.get(2).copied().unwrap_or(0);
+            let reply = [0x00, magic, cmd, ERR_OK, 0, 0, 0];
+            let n = reply.len().min(buf.len());
+            buf[..n].copy_from_slice(&reply[..n]);
+            Ok(n)
+        }
+    }
+
+    fn fake_kb(io: RecordingHid, endpoint: LightingEndpoint) -> CorsairDevice {
+        let t = BragiTransport::from_io(Box::new(io), 0, 1025, 1025);
+        CorsairDevice::from_test_transport(
+            t,
+            CorsairDeviceInfo {
+                id: "corsair_1B1C_1B73_sub0_TEST".into(),
+                vid: CORSAIR_VID,
+                pid: PID_K70_RGB_TKL,
+                subdevice_id: 0,
+                product_name: "K70 RGB TKL".into(),
+                serial: "TEST".into(),
+                kind: CorsairDeviceKind::Keyboard,
+                firmware_version: "1.0.0".into(),
+                bootloader_version: "1.0.0".into(),
+                layout: KeyboardLayout::Iso,
+                mode: OperatingMode::Hardware,
+                pollrate: Some(PollingRate::Hz1000),
+                max_pollrate: Some(PollingRate::Hz8000),
+                hw_brightness_raw: Some(1000),
+                brightness_is_coarse: false,
+                out_report_len: 1025,
+                in_report_len: 1025,
+                lighting_endpoint: endpoint,
+                battery_pct: None,
+                battery_status: None,
+                hw_winlock: None,
+                winlock_shortcuts_mask: None,
+                debounce_enabled: None,
+                debounce_timeout_ms: None,
+                esports_switch_on: None,
+                active_hw_profile: Some(0),
+                storage_total_kb: None,
+                storage_free_kb: None,
+                flashtap_supported: false,
+                flashtap_enabled: None,
+                flashtap_probe: String::new(),
+                rapid_trigger_supported: false,
+                hwp_profiles: Vec::new(),
+                mouse: None,
+                headset: None,
+                cooler: None,
+            },
+        )
+    }
+
+    #[test]
+    fn lighting_set_frame_matches_legacy_key_bytes_for_planar_and_triplets() {
+        for endpoint in [LightingEndpoint::Planar0x01, LightingEndpoint::Triplets0x22] {
+            let io_old = RecordingHid::new();
+            let io_new = RecordingHid::new();
+            let mut old_dev = fake_kb(io_old.clone(), endpoint);
+            let mut new_dev = fake_kb(io_new.clone(), endpoint);
+
+            let eff = RgbEffectConfig {
+                kind: EffectKind::RainbowWave,
+                brightness: 1.0,
+                speed: 1.0,
+                ..Default::default()
+            };
+            old_dev.render_effect(&eff, 0.25).unwrap();
+
+            let zones = new_dev.zones();
+            assert!(!zones.is_empty());
+            assert!(
+                zones[0]
+                    .leds
+                    .iter()
+                    .any(|l| l.key_code.as_deref() == Some("Escape")),
+                "keyboard LEDs must carry W3C key_code"
+            );
+            let frame = render_frame(&zones, &Placement::default(), &eff, 0.25);
+            new_dev.set_frame(&frame).unwrap();
+
+            {
+                let w_old = io_old.writes.lock().unwrap();
+                let w_new = io_new.writes.lock().unwrap();
+                assert_eq!(w_old.len(), w_new.len(), "packet count must match");
+                // Setup packets (PROP_MODE, PROP_LIGHTING_CTRL_REG, CMD_OPEN_HANDLE) are byte-identical.
+                for idx in 0..w_old.len() - 1 {
+                    assert_eq!(w_old[idx], w_new[idx], "setup packet {idx} mismatch");
+                }
+                // Every physical key in ISO keymap must have identical RGB bytes in the final frame packet.
+                let p_old = w_old.last().unwrap();
+                let p_new = w_new.last().unwrap();
+                assert_eq!(&p_old[..8], &p_new[..8]);
+                let (_, keys) = new_dev.active_keymap();
+                for k in &keys {
+                    match endpoint {
+                        LightingEndpoint::Planar0x01 => {
+                            let base = 8; // 1 (report id 0x00) + 7 (Bragi CMD_WRITE_DATA header)
+                            assert_eq!(p_old[base + k.led_index], p_new[base + k.led_index]);
+                            assert_eq!(
+                                p_old[base + K70_TKL_LED_COUNT + k.led_index],
+                                p_new[base + K70_TKL_LED_COUNT + k.led_index]
+                            );
+                            assert_eq!(
+                                p_old[base + K70_TKL_LED_COUNT * 2 + k.led_index],
+                                p_new[base + K70_TKL_LED_COUNT * 2 + k.led_index]
+                            );
+                        }
+                        LightingEndpoint::Triplets0x22 => {
+                            let base = 8 + 2; // + [0x12, 0x00] header
+                            let off = base + k.led_index * 3;
+                            assert_eq!(&p_old[off..off + 3], &p_new[off..off + 3]);
+                        }
+                    }
+                }
+            }
+
+            new_dev.release().unwrap();
+            let release_pkt = io_new.writes.lock().unwrap().last().unwrap().clone();
+            assert_eq!(release_pkt[2], CMD_SET);
+            assert_eq!(release_pkt[3], PROP_MODE);
+            assert_eq!(release_pkt[5], MODE_HARDWARE as u8);
+        }
+    }
+
+    #[test]
+    fn hardware_effect_refuses_to_run_without_explicit_save() {
+        let io = RecordingHid::new();
+        let mut dev = fake_kb(io.clone(), LightingEndpoint::Planar0x01);
+        let req = EffectRequest {
+            effect: "StaticColor".into(),
+            zone: None,
+            colors: vec![Rgb::RED],
+            speed: None,
+            brightness: None,
+            reverse: false,
+            save: false,
+        };
+        assert!(dev.apply_hardware_effect(&req).is_err());
+        assert!(io.writes.lock().unwrap().is_empty());
     }
 }

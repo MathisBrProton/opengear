@@ -106,6 +106,7 @@ pub enum EffectKind {
     Ambilight,
     ReactiveTyping,
     AudioVisualizer,
+    Thermal,
     Off,
 }
 
@@ -124,6 +125,7 @@ impl EffectKind {
         Self::Ambilight,
         Self::ReactiveTyping,
         Self::AudioVisualizer,
+        Self::Thermal,
         Self::Off,
     ];
 
@@ -142,12 +144,13 @@ impl EffectKind {
             Self::Ambilight => "Ambilight (Écran live)",
             Self::ReactiveTyping => "Frappe Réactive (Ripple)",
             Self::AudioVisualizer => "Visualiseur Audio (WASAPI)",
+            Self::Thermal => "Température (CPU / GPU)",
             Self::Off => "Éteint",
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RgbEffectConfig {
     pub kind: EffectKind,
     pub primary: Rgb,
@@ -158,9 +161,10 @@ pub struct RgbEffectConfig {
     pub brightness: f32,
     /// Reverse wave direction
     pub reverse: bool,
-    /// Per-key overrides keyed by LED index (stored with string keys: TOML has no integer keys)
-    #[serde(default, with = "crate::serde_util::usize_key_map")]
-    pub per_key: BTreeMap<usize, Rgb>,
+    /// Per-key overrides keyed by W3C physical `key_code` (e.g. `"Escape"`, `"KeyQ"`).
+    /// Legacy profiles stored integer LED indices as stringified integers; those are migrated on load.
+    #[serde(default)]
+    pub per_key: BTreeMap<String, Rgb>,
 }
 
 impl Default for RgbEffectConfig {
@@ -181,10 +185,25 @@ impl RgbEffectConfig {
     /// Compute the RGB color for a key at normalized position (x in 0..1, y in 0..1)
     /// and LED index `led_idx` at elapsed time `t_sec`.
     pub fn sample(&self, led_idx: usize, norm_x: f32, norm_y: f32, t_sec: f32) -> Rgb {
+        self.sample_led(led_idx, None, norm_x, norm_y, t_sec)
+    }
+
+    /// Compute the RGB color for a LED with optional W3C `key_code` (used by `PerKey`).
+    pub fn sample_led(
+        &self,
+        _led_idx: usize,
+        key_code: Option<&str>,
+        norm_x: f32,
+        norm_y: f32,
+        t_sec: f32,
+    ) -> Rgb {
         let base = match self.kind {
             EffectKind::Off => Rgb::BLACK,
             EffectKind::Static => self.primary,
-            EffectKind::PerKey => *self.per_key.get(&led_idx).unwrap_or(&self.primary),
+            EffectKind::PerKey => key_code
+                .and_then(|c| self.per_key.get(c))
+                .copied()
+                .unwrap_or(self.primary),
             EffectKind::RainbowWave => {
                 let dir = if self.reverse { -1.0 } else { 1.0 };
                 let hue = (norm_x * 360.0 - dir * t_sec * 120.0 * self.speed).rem_euclid(360.0);
@@ -235,12 +254,43 @@ impl RgbEffectConfig {
                 let dir = if self.reverse { 1.0 - norm_x } else { norm_x };
                 self.primary.lerp(self.secondary, dir)
             }
-            EffectKind::Ambilight | EffectKind::ReactiveTyping | EffectKind::AudioVisualizer => {
-                self.primary.scale(0.25)
-            }
+            EffectKind::Ambilight
+            | EffectKind::ReactiveTyping
+            | EffectKind::AudioVisualizer
+            | EffectKind::Thermal => self.primary.scale(0.25),
         };
 
         base.scale(self.brightness)
+    }
+
+    /// Convert legacy numeric LED-index keys in `per_key` to W3C `key_code` keys.
+    /// Returns `true` if any key was converted.
+    pub fn migrate_per_key_codes(
+        &mut self,
+        mut mapper: impl FnMut(usize) -> Option<&'static str>,
+    ) -> bool {
+        let numeric_keys: Vec<(String, usize)> = self
+            .per_key
+            .keys()
+            .filter_map(|k| {
+                (!k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| k.parse::<usize>().ok().map(|idx| (k.clone(), idx)))
+                    .flatten()
+            })
+            .collect();
+        if numeric_keys.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for (raw, idx) in numeric_keys {
+            if let Some(code) = mapper(idx)
+                && let Some(color) = self.per_key.remove(&raw)
+            {
+                self.per_key.entry(code.to_string()).or_insert(color);
+                changed = true;
+            }
+        }
+        changed
     }
 }
 

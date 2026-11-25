@@ -90,11 +90,16 @@ fn resolve_key(
 }
 
 impl KeyboardView {
-    pub(crate) fn build(config: &AppConfig, corsair: &[CorsairDevice], is_laptop: bool) -> Self {
+    pub(crate) fn build(
+        config: &AppConfig,
+        devices: &[Box<dyn opengear_core::driver::Device>],
+        is_laptop: bool,
+    ) -> Self {
         let resolver = KeyResolver::for_foreground();
         let os = resolver.describe();
 
-        let device = corsair.iter().find_map(|d| {
+        let device = devices.iter().find_map(|dev| {
+            let d = dev.as_any()?.downcast_ref::<CorsairDevice>()?;
             (d.info.kind == CorsairDeviceKind::Keyboard)
                 .then(|| layout_for_device(d.info.vid, d.info.pid).map(|desc| (d, desc)))
                 .flatten()

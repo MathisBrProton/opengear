@@ -14,7 +14,7 @@ pub mod superio;
 pub use cpu_temp::read_native_cpu_temp;
 pub use ram::{
     EneRamMode, EneRamModule, PawnIoRamBackend, PhysicalDimmInfo, RamEffect, RamRgb, RamRgbBackend,
-    RamRgbStatus, read_physical_dimms,
+    RamRgbDevice, RamRgbDriver, RamRgbStatus, read_physical_dimms,
 };
 pub use sensors::{FanRpmReading, HardwareSensorsSnapshot, read_hardware_sensors};
 pub use smbus::diagnose_smbus_readonly;

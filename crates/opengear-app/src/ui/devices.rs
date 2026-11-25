@@ -1,12 +1,13 @@
 //! Every device behind the shared model (`opengear_core::driver`), whatever its vendor.
 //!
-//! Devices come from two places while the migration is in progress: the typed lists the
-//! lighting engine still drives directly (Corsair, Logitech), and `driver_devices`, filled by the
-//! [`Driver`] registry in `crate::drivers` — where new vendors plug in without touching the app.
+//! All hardware backends are registered in `crate::drivers::device_drivers` and stored in
+//! `driver_devices`, driving devices uniformly without vendor branches in the lighting engine.
 
 use super::backend::BackendEngine;
 use opengear_core::PollingRate;
-use opengear_core::driver::{Device, DeviceKind, Driver, Value, setting_ids, validate_setting};
+use opengear_core::driver::{
+    Connection, Device, DeviceKind, Driver, Value, setting_ids, validate_setting,
+};
 use serde_json::{Value as Json, json};
 
 /// Re-discover the devices of every registered driver (start-up, rescan).
@@ -15,61 +16,73 @@ pub(crate) fn discover_all(drivers: &[Box<dyn Driver>]) -> Vec<Box<dyn Device>> 
 }
 
 impl BackendEngine {
-    /// All devices, typed lists first, in a stable order.
-    pub(crate) fn devices(&self) -> Vec<&dyn Device> {
-        let mut out: Vec<&dyn Device> = Vec::new();
-        out.extend(self.corsair_devices.iter().map(|d| d as &dyn Device));
-        out.extend(self.logi_mice.iter().map(|d| d as &dyn Device));
-        out.extend(self.logi_keyboards.iter().map(|d| d as &dyn Device));
-        out.extend(self.logi_headsets.iter().map(|d| d as &dyn Device));
-        out.extend(self.driver_devices.iter().map(|d| d.as_ref()));
-        out
-    }
-
-    fn device_mut(&mut self, id: &str) -> Option<&mut (dyn Device + 'static)> {
-        let is = |d: &dyn Device| d.info().id == id;
-        if let Some(d) = self.corsair_devices.iter_mut().find(|d| is(*d)) {
-            return Some(d);
-        }
-        if let Some(d) = self.logi_mice.iter_mut().find(|d| is(*d)) {
-            return Some(d);
-        }
-        if let Some(d) = self.logi_keyboards.iter_mut().find(|d| is(*d)) {
-            return Some(d);
-        }
-        if let Some(d) = self.logi_headsets.iter_mut().find(|d| is(*d)) {
-            return Some(d);
-        }
+    pub(crate) fn device_mut(&mut self, id: &str) -> Option<&mut (dyn Device + 'static)> {
         self.driver_devices
             .iter_mut()
-            .find(|d| is(d.as_ref()))
+            .find(|d| d.info().id == id)
             .map(|d| d.as_mut())
     }
 
-    /// Re-discover the driver devices after a hot-plug of one of `vendors`.
+    pub(crate) fn typed_devices<T: 'static>(&self) -> Vec<&T> {
+        self.driver_devices
+            .iter()
+            .filter_map(|d| d.as_any().and_then(|a| a.downcast_ref::<T>()))
+            .collect()
+    }
+
+    pub(crate) fn typed_device_mut<T: 'static>(&mut self, idx: usize) -> Option<&mut T> {
+        self.driver_devices
+            .iter_mut()
+            .filter_map(|d| d.as_any_mut().and_then(|a| a.downcast_mut::<T>()))
+            .nth(idx)
+    }
+
+    /// Re-discover USB driver devices whose vendor matches a hotplug change.
     pub(crate) fn rediscover_drivers_for(&mut self, vendors: &[u16]) {
         let touched = self
             .drivers
             .iter()
             .any(|d| d.usb_vendor_ids().iter().any(|v| vendors.contains(v)));
-        if touched {
-            self.driver_devices = discover_all(&self.drivers);
+        if !touched {
+            return;
         }
+        let mut rebuilt: Vec<Box<dyn Device>> = self
+            .driver_devices
+            .drain(..)
+            .filter(|d| d.info().connection == Connection::Internal)
+            .collect();
+        for drv in &self.drivers {
+            if !drv.usb_vendor_ids().is_empty() {
+                rebuilt.extend(drv.discover());
+            }
+        }
+        self.driver_devices = rebuilt;
     }
 
-    pub(crate) fn device_list_json(&self) -> Json {
-        Json::Array(
-            self.devices()
-                .into_iter()
-                .map(|d| {
-                    json!({
-                        "info": d.info(),
-                        "status": d.status(),
-                        "settings": d.settings(),
-                    })
+    pub(crate) fn device_list_json(&mut self) -> Json {
+        let placements = self.config.device_placements.clone();
+        let mut out = Vec::with_capacity(self.driver_devices.len());
+        for d in &mut self.driver_devices {
+            let info = d.info();
+            let placement = placements.get(&info.id).cloned().unwrap_or_default();
+            let status = d.status();
+            let settings = d.settings();
+            let lighting = d.lighting().map(|l| {
+                json!({
+                    "zones": l.zones(),
+                    "hardware_effects": l.hardware_effects(),
+                    "max_fps": l.max_fps(),
+                    "placement": placement,
                 })
-                .collect(),
-        )
+            });
+            out.push(json!({
+                "info": info,
+                "status": status,
+                "settings": settings,
+                "lighting": lighting,
+            }));
+        }
+        Json::Array(out)
     }
 
     /// Validate and apply one setting, then let the app react to shared setting ids.

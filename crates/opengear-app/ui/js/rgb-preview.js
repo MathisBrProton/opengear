@@ -26,7 +26,7 @@ function lerpRgb(a, b, t) {
   return [0, 1, 2].map((k) => Math.round(a[k] + (b[k] - a[k]) * t));
 }
 
-function sampleEffect(rgb, ledIdx, nx, ny, t) {
+function sampleEffect(rgb, keyCode, nx, ny, t) {
   const p1 = hexToRgb(rgb.primary);
   const p2 = hexToRgb(rgb.secondary);
   const sp = num(rgb.speed, 1);
@@ -34,7 +34,7 @@ function sampleEffect(rgb, ledIdx, nx, ny, t) {
   let c = p1;
   switch (rgb.kind) {
     case "Off": c = [12, 15, 22]; break;
-    case "PerKey": c = rgb.per_key && rgb.per_key[String(ledIdx)] ? hexToRgb(rgb.per_key[String(ledIdx)]) : p1; break;
+    case "PerKey": c = rgb.per_key && keyCode && rgb.per_key[keyCode] ? hexToRgb(rgb.per_key[keyCode]) : p1; break;
     case "RainbowWave": c = hsvToRgb(nx * 360 - dir * t * 120 * sp, 1, 1); break;
     case "SpiralRainbow": {
       const dx = nx - 0.5;
@@ -65,6 +65,7 @@ function sampleEffect(rgb, ledIdx, nx, ny, t) {
       break;
     }
     case "Gradient": c = lerpRgb(p1, p2, rgb.reverse ? 1 - nx : nx); break;
+    case "Thermal": c = [0, 212, 255]; break;
     default: c = p1;
   }
   const br = num(rgb.brightness, 1);
@@ -81,8 +82,8 @@ function stepPreview(nowMs) {
   lastStepMs = nowMs;
 
   const keys = document.querySelectorAll(".kb-key");
-  const spots = document.querySelectorAll(".mb-hotspot");
-  if (!keys.length && !spots.length) return;
+  const canvasLeds = document.querySelectorAll(".canvas-led");
+  if (!keys.length && !canvasLeds.length) return;
 
   const prof = S.config.profile;
   const rgb = prof.rgb;
@@ -96,21 +97,13 @@ function stepPreview(nowMs) {
       keys.forEach((el) => {
         el.style.borderColor = prof.enable_rgb === false
           ? "rgba(255,255,255,0.14)"
-          : sampleEffect(rgb, Number(el.dataset.led), Number(el.dataset.nx), Number(el.dataset.ny), t);
+          : sampleEffect(rgb, el.dataset.code || "", Number(el.dataset.nx), Number(el.dataset.ny), t);
       });
     }
   }
-  if (spots.length && S.asus) {
-    const sync = !!prof.sync_asus_aura;
-    const hwAnim = ["Rainbow", "SpectrumCycle", "Wave"].includes(S.asus.hw_mode);
-    spots.forEach((el, idx) => {
-      let col = safeHex(S.asus.hw_color, "#FF1848");
-      if (sync) col = sampleEffect(rgb, idx, idx / 5, 0.5, t);
-      else if (hwAnim) {
-        const [r, g, b] = hsvToRgb(t * 85 + idx * 55, 1, 1);
-        col = `rgb(${r},${g},${b})`;
-      } else if (S.asus.hw_mode === "Off") col = "#364158";
-      el.style.setProperty("--zone-col", col);
+  if (canvasLeds.length) {
+    canvasLeds.forEach((el) => {
+      el.style.background = sampleEffect(rgb, el.dataset.code || "", Number(el.dataset.cx), Number(el.dataset.cy), t);
     });
   }
 }

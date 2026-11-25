@@ -115,34 +115,19 @@ export function riskOf(cmd, p = {}) {
         details: p._label ? [p._label] : [],
         confirm: "Restaurer",
       };
-    case "corsair_flash_hwp_lighting":
-      return {
-        title: "Flasher l'effet dans le clavier ?",
-        body: "L'effet sera écrit dans la mémoire interne du clavier (profil matériel) et restera actif même sans OpenGear. L'ancien effet est sauvegardé puis l'écriture est vérifiée. L'éclairage logiciel en direct sera coupé pour afficher l'effet flashé.",
-        details: ["Ne débranche pas le clavier pendant l'opération."],
-        confirm: "Flasher le clavier",
-      };
-    case "asus_set_hw_mode":
-      if (!p.commit) return null;
-      return {
-        title: "Enregistrer dans la carte mère ?",
-        body: "L'effet sera enregistré dans la mémoire du contrôleur ASUS Aura et réappliqué à chaque démarrage du PC, même sans OpenGear.",
-        confirm: "Enregistrer",
-      };
-    case "asus_set_shutdown_mode":
-      return {
-        title: "Modifier l'éclairage PC éteint ?",
-        body: "Ce réglage est écrit de façon permanente dans la mémoire de la carte mère. Il s'applique lorsque le PC est éteint ou en veille.",
-        confirm: "Écrire dans la carte mère",
-      };
-    case "ram_apply_rgb":
-      if (!p.save_eeprom) return null;
-      return {
-        title: "Écrire dans la mémoire des barrettes RAM ?",
-        body: "L'effet sera stocké de façon permanente dans les barrettes via le bus SMBus. Une écriture interrompue peut laisser l'éclairage des barrettes dans un état incorrect.",
-        details: ["Évite de lancer cette opération pendant une forte charge système."],
-        confirm: "Écrire dans les barrettes",
-      };
+    case "lighting_set_device":
+      if (p.override && p.override.mode === "hardware" && p.override.request && p.override.request.save) {
+        return {
+          title: "Enregistrer cet effet dans la mémoire de l'appareil ?",
+          body: "L'effet sélectionné sera écrit de façon permanente dans la mémoire non volatile de l'appareil et restera actif sans OpenGear.",
+          details: [
+            `Effet : ${p.override.request.effect || "?"}`,
+            "Ne débranche pas l'appareil pendant l'écriture.",
+          ],
+          confirm: "Enregistrer dans l'appareil",
+        };
+      }
+      return null;
     case "superio_set_pwm":
       return {
         title: "Forcer la vitesse de ce ventilateur ?",

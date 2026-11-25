@@ -27,6 +27,16 @@ pub fn layout_for_device(vid: u16, pid: u16) -> Option<KeyboardLayoutDesc> {
     None
 }
 
+/// Map a hardware Bragi LED index back to its W3C physical `key_code` (for legacy profile migration).
+pub fn key_code_for_led_index(vid: u16, pid: u16, led_index: usize) -> Option<&'static str> {
+    let keys = layout_for_device(vid, pid)
+        .map(|d| d.keys)
+        .unwrap_or(K70_TKL_KEYS);
+    keys.iter()
+        .find(|k| k.led_index == led_index)
+        .and_then(|k| k.code())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct KeyDef {
     /// Canonical key identifier used for bindings/macros (e.g. "ESC", "A", "LCTRL", "LOGO_L")

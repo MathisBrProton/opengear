@@ -113,12 +113,16 @@ La CI exécute exactement ces commandes. Si `cargo fmt` ou `cargo clippy` est in
 
 ## 5. Dette connue (à résorber, ne pas aggraver)
 
-- Corsair et Logitech sont encore ouverts par le moteur d'éclairage via des listes typées
-  (`corsair_devices`, `logi_*`) au lieu du registre `device_drivers()` : à migrer quand le trait
-  d'éclairage existera. Leurs réglages simples passent déjà par le modèle commun.
-- Commandes encore propres à une marque, à remplacer par des capacités : éclairage (`corsair_set_mode`,
-  `asus_*`, `logi_set_led`, `omen_set_kb_*`), couleurs de voyants Corsair (écriture seule),
-  paliers DPI, égaliseur, mémoire embarquée Logitech / Corsair, ventilateurs (ASUS, SuperIO, OMEN),
-  réglages OMEN (mode thermique, puissance GPU) et écran du portable.
-- `opengear-core::profile` stocke des réglages par marque (Aura, OMEN…) dans le profil global.
+- Tous les pilotes d'éclairage (Corsair, Logitech, ASUS Aura, RAM ENE, clavier HP OMEN 4 zones)
+  passent désormais par `device_drivers()` et le trait commun `Lighting` (`crates/opengear-core/src/lighting.rs`).
+- Réglages/capacités encore propres à une marque, à remplacer par des traits dédiés : couleurs de
+  voyants Corsair (écriture seule), paliers DPI, égaliseur, mémoire embarquée Logitech
+  (profils/boutons/macros), ventilateurs (ASUS, SuperIO, OMEN), réglages OMEN (mode thermique,
+  puissance GPU) et écran du portable.
+- `opengear-core::profile` conserve quelques champs hérités (`sync_asus_aura`, `asus_argb_led_counts`,
+  `silent_loop3_*`, `omen_sync_rgb`) uniquement pour la rétro-compatibilité au chargement des anciens
+  fichiers ; la configuration active vit dans `device_lighting` et `device_placements`.
+- Souris/casques Corsair sans carte de LEDs connue (`Device::lighting()` renvoie `None`) et mode
+  direct par LED RAM ENE (seul le registre uniforme `REG_DIRECT = 0` est utilisé sans fiche ENE
+  détaillée) restent à compléter.
 - JIS / ABNT utilisent la géométrie ISO dans `physical_layout`.

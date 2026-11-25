@@ -8,6 +8,10 @@
 
 use anyhow::{Context, Result};
 use opengear_core::Rgb;
+use opengear_core::driver::{
+    Connection, Device, DeviceInfo, DeviceKind, DeviceStatus, Driver, Section, Setting, Value,
+};
+use opengear_core::lighting::{EffectParams, EffectRequest, HardwareEffect, Lighting, Zone};
 use serde::{Deserialize, Serialize};
 
 pub const HPWMI_GM: u32 = 0x20008;
@@ -795,33 +799,273 @@ pub fn set_hp_omen_kb_backlight(enabled: bool) -> Result<()> {
 pub fn set_hp_omen_kb_zones(colors: [Rgb; 4], cached_table: Option<&[u8]>) -> Result<Vec<u8>> {
     #[cfg(windows)]
     {
-        anyhow::ensure!(
-            opengear_platform::is_elevated(),
-            "Droits administrateur requis pour HP OMEN WMI"
-        );
-        let conn = opengear_platform::wmi::WmiConn::connect(r"root\wmi")?;
-        let current_owned;
-        let base = match cached_table {
-            Some(c) if c.len() >= COLOR_TABLE_LEN => Some(c),
-            _ => {
-                let (rc, tbl) = conn
-                    .exec_hpq_bios_int("hpqBIOSInt128", HPWMI_KB, KB_GET_COLOR_TABLE, &[0u8; 4])
-                    .context("Lecture ColorTable HP OMEN impossible")?;
-                check_omen_wmi_rc("GetColorTable", rc)?;
-                current_owned = tbl;
-                Some(current_owned.as_slice())
-            }
-        };
-        let patched = patch_color_table(base, &colors);
-        let (rc, _) =
-            conn.exec_hpq_bios_int("hpqBIOSInt128", HPWMI_KB, KB_SET_COLOR_TABLE, &patched)?;
-        check_omen_wmi_rc("SetColorTable", rc)?;
-        Ok(patched)
+        write_kb_zones_via_io(&WindowsOmenKbIo, colors, cached_table)
     }
     #[cfg(not(windows))]
     {
         let _ = (colors, cached_table);
         anyhow::bail!("Non supporté hors Windows")
+    }
+}
+
+pub(crate) trait OmenKbIo: Send {
+    fn get_color_table(&self) -> Result<Vec<u8>>;
+    fn set_color_table(&self, table: &[u8]) -> Result<()>;
+    fn set_backlight(&self, enabled: bool) -> Result<()>;
+}
+
+#[cfg(windows)]
+struct WindowsOmenKbIo;
+
+#[cfg(windows)]
+impl OmenKbIo for WindowsOmenKbIo {
+    fn get_color_table(&self) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            opengear_platform::is_elevated(),
+            "Droits administrateur requis pour HP OMEN WMI"
+        );
+        let conn = opengear_platform::wmi::WmiConn::connect(r"root\wmi")?;
+        let (rc, tbl) = conn
+            .exec_hpq_bios_int("hpqBIOSInt128", HPWMI_KB, KB_GET_COLOR_TABLE, &[0u8; 4])
+            .context("Lecture ColorTable HP OMEN impossible")?;
+        check_omen_wmi_rc("GetColorTable", rc)?;
+        Ok(tbl)
+    }
+
+    fn set_color_table(&self, table: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            opengear_platform::is_elevated(),
+            "Droits administrateur requis pour HP OMEN WMI"
+        );
+        let conn = opengear_platform::wmi::WmiConn::connect(r"root\wmi")?;
+        let (rc, _) =
+            conn.exec_hpq_bios_int("hpqBIOSInt128", HPWMI_KB, KB_SET_COLOR_TABLE, table)?;
+        check_omen_wmi_rc("SetColorTable", rc)
+    }
+
+    fn set_backlight(&self, enabled: bool) -> Result<()> {
+        set_hp_omen_kb_backlight(enabled)
+    }
+}
+
+fn write_kb_zones_via_io(
+    io: &dyn OmenKbIo,
+    colors: [Rgb; 4],
+    cached_table: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let current_owned;
+    let base = match cached_table {
+        Some(c) if c.len() >= COLOR_TABLE_LEN => Some(c),
+        _ => {
+            current_owned = io.get_color_table()?;
+            Some(current_owned.as_slice())
+        }
+    };
+    let patched = patch_color_table(base, &colors);
+    io.set_color_table(&patched)?;
+    Ok(patched)
+}
+
+/// Driver exposing HP OMEN / Victus keyboard lighting and WMI backlight control.
+pub struct HpOmenDriver;
+
+impl Driver for HpOmenDriver {
+    fn name(&self) -> &'static str {
+        "hp_omen"
+    }
+
+    fn usb_vendor_ids(&self) -> &'static [u16] {
+        &[]
+    }
+
+    fn discover(&self) -> Vec<Box<dyn Device>> {
+        let status = probe_hp_omen();
+        if !status.detected || !status.wmi_accessible {
+            return Vec::new();
+        }
+        #[cfg(windows)]
+        {
+            vec![Box::new(HpOmenDevice::new(
+                Box::new(WindowsOmenKbIo),
+                status,
+            ))]
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = status;
+            Vec::new()
+        }
+    }
+}
+
+/// HP OMEN / Victus keyboard as a shared [`Device`] and optional 4-zone [`Lighting`].
+pub struct HpOmenDevice {
+    io: Box<dyn OmenKbIo>,
+    pub status: HpOmenStatus,
+    cached_color_table: Option<Vec<u8>>,
+    last_zones: Option<[Rgb; 4]>,
+}
+
+impl HpOmenDevice {
+    pub(crate) fn new(io: Box<dyn OmenKbIo>, status: HpOmenStatus) -> Self {
+        Self {
+            io,
+            status,
+            cached_color_table: None,
+            last_zones: None,
+        }
+    }
+}
+
+const HP_BACKLIGHT_SETTING_ID: &str = "hp.kb_backlight";
+
+impl Device for HpOmenDevice {
+    fn info(&self) -> DeviceInfo {
+        let model = if self.status.model.is_empty() {
+            "Clavier HP OMEN".into()
+        } else {
+            format!("{} ({})", self.status.model, self.status.keyboard_label)
+        };
+        DeviceInfo {
+            id: "hp_omen:keyboard".into(),
+            vendor: "HP".into(),
+            model,
+            kind: DeviceKind::Keyboard,
+            connection: Connection::Internal,
+            firmware: (!self.status.board_id.is_empty()).then(|| self.status.board_id.clone()),
+        }
+    }
+
+    fn status(&self) -> DeviceStatus {
+        DeviceStatus::default()
+    }
+
+    fn settings(&self) -> Vec<Setting> {
+        if !self.status.wmi_accessible {
+            return Vec::new();
+        }
+        vec![Setting::toggle(
+            HP_BACKLIGHT_SETTING_ID,
+            "Rétroéclairage clavier",
+            Section::Lighting,
+            self.status.backlight_on,
+        )]
+    }
+
+    fn lighting(&mut self) -> Option<&mut dyn Lighting> {
+        (self.status.wmi_accessible && self.status.keyboard_type == OmenKeyboardType::FourZoneRgb)
+            .then_some(self as &mut dyn Lighting)
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn apply_setting(&mut self, id: &str, value: &Value) -> Result<()> {
+        match id {
+            HP_BACKLIGHT_SETTING_ID => {
+                let on = value.as_bool().context("booléen attendu")?;
+                self.io.set_backlight(on)?;
+                self.status.backlight_on = on;
+                Ok(())
+            }
+            other => anyhow::bail!("Réglage HP OMEN inconnu : {other}"),
+        }
+    }
+}
+
+const OMEN_ZONE_NAMES: [&str; 4] = [
+    "Zone 1 (Gauche / WASD)",
+    "Zone 2 (Centre)",
+    "Zone 3 (Droite)",
+    "Zone 4 (Pavé numérique)",
+];
+
+impl Lighting for HpOmenDevice {
+    fn zones(&self) -> Vec<Zone> {
+        (0..4)
+            .map(|i| {
+                Zone::single(
+                    &format!("zone_{i}"),
+                    OMEN_ZONE_NAMES[i],
+                    i as f32 / 3.0,
+                    0.5,
+                )
+            })
+            .collect()
+    }
+
+    fn max_fps(&self) -> u8 {
+        // WMI BIOS calls are synchronous and take several milliseconds per update (~120 ms interval).
+        8
+    }
+
+    fn hardware_effects(&self) -> Vec<HardwareEffect> {
+        let zone_ids: Vec<String> = (0..4).map(|i| format!("zone_{i}")).collect();
+        vec![HardwareEffect {
+            id: "Static".into(),
+            label: "Statique 4 zones (BIOS)".into(),
+            params: EffectParams {
+                colors: (1, 1),
+                speed: None,
+                brightness: None,
+                direction: false,
+                savable: false,
+            },
+            zones: zone_ids,
+        }]
+    }
+
+    fn set_frame(&mut self, colors: &[Rgb]) -> Result<()> {
+        let zones = [
+            colors.first().copied().unwrap_or(Rgb::BLACK),
+            colors.get(1).copied().unwrap_or(Rgb::BLACK),
+            colors.get(2).copied().unwrap_or(Rgb::BLACK),
+            colors.get(3).copied().unwrap_or(Rgb::BLACK),
+        ];
+        if self.last_zones == Some(zones) {
+            return Ok(());
+        }
+        if !self.status.backlight_on && self.io.set_backlight(true).is_ok() {
+            self.status.backlight_on = true;
+        }
+        let tbl =
+            write_kb_zones_via_io(self.io.as_ref(), zones, self.cached_color_table.as_deref())?;
+        self.cached_color_table = Some(tbl);
+        self.status.zone_colors = zones;
+        self.last_zones = Some(zones);
+        Ok(())
+    }
+
+    fn apply_hardware_effect(&mut self, req: &EffectRequest) -> Result<()> {
+        let color = req.colors.first().copied().unwrap_or(Rgb::CYAN);
+        let mut zones = self.status.zone_colors;
+        match req
+            .zone
+            .as_deref()
+            .and_then(|z| z.strip_prefix("zone_"))
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            Some(idx) if idx < 4 => zones[idx] = color,
+            _ => zones = [color; 4],
+        }
+        if !self.status.backlight_on && self.io.set_backlight(true).is_ok() {
+            self.status.backlight_on = true;
+        }
+        let tbl =
+            write_kb_zones_via_io(self.io.as_ref(), zones, self.cached_color_table.as_deref())?;
+        self.cached_color_table = Some(tbl);
+        self.status.zone_colors = zones;
+        self.last_zones = Some(zones);
+        Ok(())
+    }
+
+    fn release(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -968,5 +1212,63 @@ mod tests {
         assert_eq!(parse_fan_level_rpms(&[0x1B, 0x00]), vec![2700, 0]);
         assert_eq!(BACKLIGHT_ON, 0xE4);
         assert_eq!(BACKLIGHT_OFF, 0x64);
+    }
+
+    #[test]
+    fn four_zone_lighting_writes_exact_128_byte_bios_table() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct MockOmenIo {
+            writes: Arc<Mutex<Vec<Vec<u8>>>>,
+            backlight_calls: Arc<Mutex<Vec<bool>>>,
+        }
+
+        impl OmenKbIo for MockOmenIo {
+            fn get_color_table(&self) -> Result<Vec<u8>> {
+                Ok(vec![0xAAu8; COLOR_TABLE_LEN])
+            }
+            fn set_color_table(&self, table: &[u8]) -> Result<()> {
+                self.writes.lock().unwrap().push(table.to_vec());
+                Ok(())
+            }
+            fn set_backlight(&self, enabled: bool) -> Result<()> {
+                self.backlight_calls.lock().unwrap().push(enabled);
+                Ok(())
+            }
+        }
+
+        let io_old = MockOmenIo::default();
+        let io_new = MockOmenIo::default();
+
+        let status = HpOmenStatus {
+            detected: true,
+            is_admin: true,
+            wmi_accessible: true,
+            model: "OMEN 15".into(),
+            board_id: "88D2".into(),
+            keyboard_type: OmenKeyboardType::FourZoneRgb,
+            keyboard_label: "RGB 4 zones".into(),
+            backlight_on: true,
+            ..Default::default()
+        };
+
+        let cols = [
+            Rgb::new(10, 20, 30),
+            Rgb::new(40, 50, 60),
+            Rgb::new(70, 80, 90),
+            Rgb::new(100, 110, 120),
+        ];
+
+        write_kb_zones_via_io(&io_old, cols, None).unwrap();
+        let mut dev = HpOmenDevice::new(Box::new(io_new.clone()), status);
+        dev.set_frame(&cols).unwrap();
+        // Repeat identical frame -> skipped cleanly
+        dev.set_frame(&cols).unwrap();
+
+        assert_eq!(
+            *io_old.writes.lock().unwrap(),
+            *io_new.writes.lock().unwrap()
+        );
     }
 }

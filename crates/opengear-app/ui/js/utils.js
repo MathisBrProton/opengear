@@ -12,10 +12,10 @@ export const SWATCHES = [
 ];
 
 export const CONFIG_CMDS = new Set([
-  "set_rgb_config", "set_sync_all", "set_per_key_color", "clear_per_key", "set_keyboard_layout",
+  "set_rgb_config", "lighting_sync_all", "lighting_set_device", "lighting_resize_zone", "lighting_set_placement",
+  "set_per_key_color", "clear_per_key", "set_keyboard_layout",
   "input_set_binding", "input_remove_binding", "input_set_esports", "input_set_winlock",
   "apply_preset", "switch_profile", "create_profile", "profile_set_linked_apps", "profile_import_json",
-  "asus_set_led_count", "cooling_sl3_argb",
 ]);
 
 export const SVG = (inner, vb = "0 0 20 20") =>

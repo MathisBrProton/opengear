@@ -322,6 +322,19 @@ pub trait Device: Send {
         None
     }
 
+    /// Refresh live telemetry/status (battery, etc.) if needed.
+    fn refresh_status(&mut self) {}
+
+    /// Optional downcast hook for capabilities not yet migrated to traits.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
+    /// Optional mutable downcast hook for capabilities not yet migrated to traits.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
+
     /// Apply a value already validated against the setting returned by [`Device::settings`].
     fn apply_setting(&mut self, id: &str, value: &Value) -> Result<()> {
         let _ = value;

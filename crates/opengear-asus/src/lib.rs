@@ -6,7 +6,7 @@ pub mod cooling;
 pub mod ram_wmi;
 
 pub use aura::{
-    ASUS_VID, AURA_MB_PIDS, AuraChannel, AuraChannelKind, AuraError, AuraHwMode,
+    ASUS_VID, AURA_MB_PIDS, AsusAuraDriver, AuraChannel, AuraChannelKind, AuraError, AuraHwMode,
     AuraMainboardController, AuraMainboardInfo,
 };
 pub use cooling::{

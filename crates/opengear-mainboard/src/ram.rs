@@ -7,8 +7,14 @@
 
 pub use crate::ene::{EneRamMode, EneRamModule, RamEffect};
 use anyhow::Result;
+use opengear_core::Rgb;
+use opengear_core::driver::{
+    Connection, Device, DeviceInfo, DeviceKind, DeviceStatus, Driver, Setting, Value,
+};
+use opengear_core::lighting::{EffectParams, EffectRequest, HardwareEffect, Lighting, Zone};
 use opengear_platform::{PawnIoAvailability, is_elevated, pawnio::pawnio_availability};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhysicalDimmInfo {
@@ -283,6 +289,251 @@ impl RamRgb {
     }
 }
 
+/// Driver exposing discovered ENE RGB RAM sticks as a single lighting device.
+pub struct RamRgbDriver {
+    ram: Arc<RamRgb>,
+}
+
+impl RamRgbDriver {
+    pub fn new(ram: RamRgb) -> Self {
+        Self { ram: Arc::new(ram) }
+    }
+}
+
+impl Driver for RamRgbDriver {
+    fn name(&self) -> &'static str {
+        "ram_rgb"
+    }
+
+    fn usb_vendor_ids(&self) -> &'static [u16] {
+        &[]
+    }
+
+    fn discover(&self) -> Vec<Box<dyn Device>> {
+        let status = self.ram.probe();
+        if status.ene_modules.is_empty() {
+            return Vec::new();
+        }
+        vec![Box::new(RamRgbDevice::new(Arc::clone(&self.ram), status))]
+    }
+}
+
+/// Discovered ENE DRAM RGB modules acting as a unified `Device` + `Lighting` target.
+pub struct RamRgbDevice {
+    ram: Arc<RamRgb>,
+    pub status: RamRgbStatus,
+    last_colors: Vec<Option<Rgb>>,
+}
+
+impl RamRgbDevice {
+    pub fn new(ram: Arc<RamRgb>, status: RamRgbStatus) -> Self {
+        let count = status.ene_modules.len();
+        Self {
+            ram,
+            status,
+            last_colors: vec![None; count],
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_modules(ram: Arc<RamRgb>, modules: Vec<EneRamModule>) -> Self {
+        let status = RamRgbStatus {
+            is_admin: true,
+            bus_available: true,
+            pawnio_status: String::new(),
+            physical_dimms: Vec::new(),
+            ene_modules: modules,
+            message: String::new(),
+            last_mode: "Static".into(),
+            last_color: "#00D2FF".into(),
+            last_speed: 2,
+        };
+        Self::new(ram, status)
+    }
+
+    pub fn modules(&self) -> &[EneRamModule] {
+        &self.status.ene_modules
+    }
+}
+
+fn parse_dimm_zone_addr(zone_id: &str) -> Option<u8> {
+    let hex = zone_id.strip_prefix("dimm_")?;
+    u8::from_str_radix(hex, 16).ok()
+}
+
+impl Device for RamRgbDevice {
+    fn info(&self) -> DeviceInfo {
+        let backends: Vec<&str> = self
+            .status
+            .ene_modules
+            .iter()
+            .map(|m| m.backend.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        DeviceInfo {
+            id: "mainboard:ram".into(),
+            vendor: if backends.is_empty() {
+                "SMBus".into()
+            } else {
+                backends.join(" / ")
+            },
+            model: format!(
+                "Mémoire RAM RGB ({} barrettes)",
+                self.status.ene_modules.len()
+            ),
+            kind: DeviceKind::Memory,
+            connection: Connection::Internal,
+            firmware: self.status.ene_modules.first().map(|m| m.firmware.clone()),
+        }
+    }
+
+    fn status(&self) -> DeviceStatus {
+        DeviceStatus::default()
+    }
+
+    fn settings(&self) -> Vec<Setting> {
+        Vec::new()
+    }
+
+    fn lighting(&mut self) -> Option<&mut dyn Lighting> {
+        (!self.status.ene_modules.is_empty()).then_some(self as &mut dyn Lighting)
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn apply_setting(&mut self, id: &str, _value: &Value) -> Result<()> {
+        anyhow::bail!("Réglage RAM RGB inconnu : {id}")
+    }
+}
+
+impl Lighting for RamRgbDevice {
+    fn zones(&self) -> Vec<Zone> {
+        self.status
+            .ene_modules
+            .iter()
+            .map(|m| {
+                let count = (m.led_count as usize).max(1);
+                Zone::linear(
+                    &format!("dimm_{:02x}", m.address_7bit),
+                    &format!("Barrette 0x{:02X} ({})", m.address_7bit, m.backend),
+                    count,
+                    0.5,
+                )
+            })
+            .collect()
+    }
+
+    fn max_fps(&self) -> u8 {
+        // SMBus host transfers are relatively slow (~ms per register write).
+        2
+    }
+
+    fn hardware_effects(&self) -> Vec<HardwareEffect> {
+        let zone_ids: Vec<String> = self
+            .status
+            .ene_modules
+            .iter()
+            .map(|m| format!("dimm_{:02x}", m.address_7bit))
+            .collect();
+        EneRamMode::ALL
+            .iter()
+            .map(|&mode| HardwareEffect {
+                id: mode.id().into(),
+                label: mode.label().into(),
+                params: EffectParams {
+                    colors: if mode.uses_color() { (1, 1) } else { (0, 0) },
+                    speed: (!matches!(mode, EneRamMode::Static | EneRamMode::Off))
+                        .then_some((0, 4)),
+                    brightness: None,
+                    direction: true,
+                    savable: true,
+                },
+                zones: zone_ids.clone(),
+            })
+            .collect()
+    }
+
+    fn set_frame(&mut self, colors: &[Rgb]) -> Result<()> {
+        // Note: `ene::apply` currently exposes `REG_DIRECT = 0` (single uniform color per DIMM)
+        // rather than verified per-LED SMBus registers across V1/V2 revisions.
+        let mut offset = 0usize;
+        for idx in 0..self.status.ene_modules.len() {
+            let count = (self.status.ene_modules[idx].led_count as usize).max(1);
+            let end = (offset + count).min(colors.len());
+            let slice = &colors[offset..end];
+            offset = end;
+            if slice.is_empty() {
+                continue;
+            }
+            let color = slice[slice.len() / 2];
+            if self.last_colors.get(idx).copied().flatten() == Some(color) {
+                continue;
+            }
+            let addr = self.status.ene_modules[idx].address_7bit;
+            let eff = RamEffect {
+                mode: EneRamMode::Static,
+                color,
+                speed: 2,
+                reverse: false,
+                save_eeprom: false,
+            };
+            self.ram.apply(&self.status.ene_modules, Some(addr), &eff)?;
+            if let Some(slot) = self.last_colors.get_mut(idx) {
+                *slot = Some(color);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_hardware_effect(&mut self, req: &EffectRequest) -> Result<()> {
+        let mode = EneRamMode::from_str_id(&req.effect);
+        // Hardware register: 0 = fastest .. 4 = slowest; EffectParams UI: 0 = slowest .. 4 = fastest.
+        let wire_speed = 4u8.saturating_sub(req.speed.unwrap_or(2).min(4));
+        let color = req.colors.first().copied().unwrap_or(Rgb::CYAN);
+        let target_addr = req.zone.as_deref().and_then(parse_dimm_zone_addr);
+        let effect = RamEffect {
+            mode,
+            color,
+            speed: wire_speed,
+            reverse: req.reverse,
+            save_eeprom: req.save,
+        };
+        self.ram
+            .apply(&self.status.ene_modules, target_addr, &effect)?;
+        self.status.last_mode = mode.id().to_string();
+        self.status.last_color = color.to_hex();
+        self.status.last_speed = wire_speed;
+        for m in &mut self.status.ene_modules {
+            if target_addr.is_none_or(|a| a == m.address_7bit) {
+                m.current_mode = mode as u8;
+            }
+        }
+        self.last_colors.fill(None);
+        Ok(())
+    }
+
+    fn release(&mut self) -> Result<()> {
+        let pairs: Vec<(&EneRamModule, u8)> = self
+            .status
+            .ene_modules
+            .iter()
+            .map(|m| (m, m.current_mode))
+            .collect();
+        if !pairs.is_empty() {
+            let _ = self.ram.set_modes(&pairs);
+        }
+        self.last_colors.fill(None);
+        Ok(())
+    }
+}
+
 /// ENE modules on the motherboard SMBus through PawnIO (AMD PIIX4 / Intel I801).
 pub struct PawnIoRamBackend;
 
@@ -538,5 +789,104 @@ mod tests {
         assert_eq!(st.ene_modules[0].backend, "b");
         assert!(st.bus_available);
         assert!(st.message.contains("via b"));
+    }
+
+    #[test]
+    fn ram_device_lighting_writes_exact_historical_smbus_registers() {
+        use std::sync::Mutex as StdMutex;
+        struct SharedBus(StdMutex<crate::ene::tests::FakeEneBus>);
+        impl crate::smbus::SmbusBus for SharedBus {
+            fn read_byte_data(&self, addr7: u8, cmd: u8) -> Option<u8> {
+                self.0.lock().unwrap().read_byte_data(addr7, cmd)
+            }
+            fn write_byte_data(&self, addr7: u8, cmd: u8, val: u8) -> Result<()> {
+                self.0.lock().unwrap().write_byte_data(addr7, cmd, val)
+            }
+            fn write_word_data(&self, addr7: u8, cmd: u8, word: u16) -> Result<()> {
+                self.0.lock().unwrap().write_word_data(addr7, cmd, word)
+            }
+        }
+
+        let bus_old = crate::ene::tests::FakeEneBus::with_module(0x71, "AUDA0-E6K5-0101", 8);
+        let bus_new = crate::ene::tests::FakeEneBus::with_module(0x71, "AUDA0-E6K5-0101", 8);
+
+        let mod_old = crate::ene::read_module(&bus_old, 0x71, 0, "fake_ene").unwrap();
+        let mod_new = crate::ene::read_module(&bus_new, 0x71, 0, "fake_ene").unwrap();
+
+        let col = Rgb::new(0x11, 0x22, 0x33);
+        crate::ene::apply(
+            &bus_old,
+            &mod_old,
+            &RamEffect {
+                mode: EneRamMode::Static,
+                color: col,
+                speed: 2,
+                reverse: false,
+                save_eeprom: false,
+            },
+        )
+        .unwrap();
+        crate::ene::apply(
+            &bus_old,
+            &mod_old,
+            &RamEffect {
+                mode: EneRamMode::Breathing,
+                color: col,
+                speed: 1, // UI speed 3 -> wire speed 4 - 3 = 1
+                reverse: true,
+                save_eeprom: true,
+            },
+        )
+        .unwrap();
+
+        // Drive via SharedBus wrapper wrapped as Arc<RamRgb>
+        struct SharedBackend(Arc<SharedBus>);
+        impl RamRgbBackend for SharedBackend {
+            fn label(&self) -> &'static str {
+                "fake_ene"
+            }
+            fn handles(&self, b: &str) -> bool {
+                b == "fake_ene"
+            }
+            fn requires_admin(&self) -> bool {
+                false
+            }
+            fn probe(&self) -> RamProbe {
+                RamProbe::default()
+            }
+            fn apply(&self, modules: &[&EneRamModule], effect: &RamEffect) -> Result<String> {
+                for m in modules {
+                    crate::ene::apply(self.0.as_ref(), m, effect)?;
+                }
+                Ok("fake_ene".into())
+            }
+            fn set_modes(&self, _m: &[(&EneRamModule, u8)]) -> Result<usize> {
+                Ok(0)
+            }
+        }
+
+        let shared = Arc::new(SharedBus(StdMutex::new(bus_new)));
+        let ram = Arc::new(RamRgb::new(vec![Box::new(SharedBackend(Arc::clone(
+            &shared,
+        )))]));
+        let mut dev = RamRgbDevice::from_test_modules(ram, vec![mod_new]);
+        let frame = vec![col; 8];
+        dev.set_frame(&frame).unwrap();
+        // Second identical frame skips SMBus writes cleanly.
+        dev.set_frame(&frame).unwrap();
+        dev.apply_hardware_effect(&EffectRequest {
+            effect: "Breathing".into(),
+            zone: Some("dimm_71".into()),
+            colors: vec![col],
+            speed: Some(3),
+            brightness: None,
+            reverse: true,
+            save: true,
+        })
+        .unwrap();
+
+        let w_old = bus_old.writes.borrow().clone();
+        let w_new = shared.0.lock().unwrap().writes.borrow().clone();
+        assert_eq!(w_old, w_new);
     }
 }

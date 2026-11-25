@@ -200,10 +200,10 @@ export function renderKeyboard(mode, kb) {
               const width = ((num(k.w, 1) - 0.1) / maxX) * 100;
               const height = ((num(k.h, 1) - 0.12) / maxY) * 100;
               const label = k.label;
-              const usable = mode === "paint" ? k.led_index != null : !!k.id;
+              const usable = mode === "paint" ? !!k.code : !!k.id;
               const isSel = !!k.id && local.selectedKeyId === k.id;
               const isBound = !!k.id && !!bindings[k.id];
-              return `<button type="button" class="kb-key ${isSel ? "selected" : ""} ${isBound ? "bound" : ""}" ${usable ? "" : "disabled"} data-act="kb-key" data-key-id="${esc(k.id || "")}" data-led="${k.led_index == null ? -1 : num(k.led_index)}" data-nx="${num(k.norm_x)}" data-ny="${num(k.norm_y)}" style="left:${left.toFixed(2)}%;top:${top.toFixed(2)}%;width:${width.toFixed(2)}%;height:${height.toFixed(2)}%" aria-label="Touche ${esc(label)}${isBound ? " (modifiée)" : ""}" ${mode === "macro" ? `aria-pressed="${isSel}"` : ""}>${esc(label)}</button>`;
+              return `<button type="button" class="kb-key ${isSel ? "selected" : ""} ${isBound ? "bound" : ""}" ${usable ? "" : "disabled"} data-act="kb-key" data-key-id="${esc(k.id || "")}" data-code="${esc(k.code || "")}" data-led="${k.led_index == null ? -1 : num(k.led_index)}" data-nx="${num(k.norm_x)}" data-ny="${num(k.norm_y)}" style="left:${left.toFixed(2)}%;top:${top.toFixed(2)}%;width:${width.toFixed(2)}%;height:${height.toFixed(2)}%" aria-label="Touche ${esc(label)}${isBound ? " (modifiée)" : ""}" ${mode === "macro" ? `aria-pressed="${isSel}"` : ""}>${esc(label)}</button>`;
             }).join("")}
           </div>`}
     </div>`;

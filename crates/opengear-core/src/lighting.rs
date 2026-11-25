@@ -210,6 +210,58 @@ pub trait Lighting {
     fn max_fps(&self) -> u8 {
         30
     }
+
+    /// Resize a zone whose `resizable` range is `Some((min, max))`.
+    fn resize_zone(&mut self, zone_id: &str, led_count: u16) -> Result<()> {
+        let _ = (zone_id, led_count);
+        bail!("Cette zone ne peut pas être redimensionnée")
+    }
+}
+
+/// Optional per-device or per-zone lighting override stored in a profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum LightingOverride {
+    /// Follow the profile's global software effect.
+    Global,
+    /// Run a custom software effect on this device or zone.
+    Software { effect: RgbEffectConfig },
+    /// Run one of the device's built-in hardware effects.
+    Hardware { request: EffectRequest },
+    /// Turn this device or zone off.
+    Off,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Per-device lighting configuration stored inside a profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceLightingConfig {
+    /// Whether OpenGear's lighting engine manages this device (default `true`).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Optional override for the whole device (`None` = follow profile global effect).
+    #[serde(default)]
+    pub mode: Option<LightingOverride>,
+    /// Optional overrides per zone ID.
+    #[serde(default)]
+    pub zones: std::collections::BTreeMap<String, LightingOverride>,
+    /// Custom LED counts for resizable zones (`zone.id` -> LED count).
+    #[serde(default)]
+    pub zone_led_counts: std::collections::BTreeMap<String, u16>,
+}
+
+impl Default for DeviceLightingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: None,
+            zones: std::collections::BTreeMap::new(),
+            zone_led_counts: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 /// Where a device sits on the shared desk canvas (`0.0..=1.0` on both axes).
@@ -257,7 +309,7 @@ pub fn render_frame(
         .enumerate()
         .map(|(i, led)| {
             let (x, y) = placement.map(led);
-            effect.sample(i, x, y, t_sec)
+            effect.sample_led(i, led.key_code.as_deref(), x, y, t_sec)
         })
         .collect()
 }
@@ -360,5 +412,30 @@ mod tests {
         let led = Led::at("a", 0.0, 0.0);
         assert_eq!(right.map(&led), (0.5, 0.0));
         assert_eq!(right.map(&Led::at("b", 1.0, 1.0)), (1.0, 1.0));
+    }
+
+    #[test]
+    fn per_key_frames_match_by_key_code() {
+        let zones = vec![Zone {
+            id: "keys".into(),
+            name: "Keys".into(),
+            kind: ZoneKind::Matrix,
+            leds: vec![
+                Led::at("Esc", 0.0, 0.0).key("Escape"),
+                Led::at("Q", 0.2, 0.3).key("KeyQ"),
+                Led::at("Logo", 0.5, 0.0),
+            ],
+            resizable: None,
+        }];
+        let mut effect = RgbEffectConfig {
+            kind: EffectKind::PerKey,
+            primary: Rgb::new(10, 10, 10),
+            brightness: 1.0,
+            ..Default::default()
+        };
+        effect.per_key.insert("Escape".into(), Rgb::RED);
+        effect.per_key.insert("KeyQ".into(), Rgb::CYAN);
+        let frame = render_frame(&zones, &Placement::default(), &effect, 0.0);
+        assert_eq!(frame, vec![Rgb::RED, Rgb::CYAN, Rgb::new(10, 10, 10)]);
     }
 }

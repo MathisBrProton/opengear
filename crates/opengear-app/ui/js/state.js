@@ -9,9 +9,7 @@ export const local = {
   paintMode: false,
   paintColor: "#00D4FF",
   kbViewMode: "interactive",
-  auraDraftMode: null,
   selectedCoolingIdx: 0,
-  sl3Color: "#FF8C1A",
   selectedMouseVariant: 0,
   selectedHeadsetVariant: 0,
   uiModeOverride: null,
@@ -30,6 +28,8 @@ export const local = {
   hwpProfSel: {},
   drafts: {},
   eqDrafts: {},
+  lightingDrafts: {},
+  canvasSelectedId: null,
   pendingRender: false,
   curveDragging: false,
   lastPreviewSig: "",
@@ -59,9 +59,8 @@ export const isExpert = () => ui().mode === "expert";
 export function normalizeState() {
   if (!S) return;
   [
-    "corsair_devices", "logi_mice", "logi_keyboards", "logi_headsets", "power_plans", "effects",
-    "aura_modes", "ram_rgb_modes", "button_presets", "bindable_keys", "devices", "device_list",
-    "firmware_inventory", "hwp_lighting_kinds",
+    "corsair_devices", "logi_mice", "logi_headsets", "power_plans", "effects",
+    "button_presets", "bindable_keys", "devices", "device_list", "firmware_inventory",
   ].forEach((k) => {
     if (!Array.isArray(S[k])) S[k] = [];
   });
@@ -81,9 +80,11 @@ export function normalizeState() {
   S.laptop_display = S.laptop_display || {};
   S.config = S.config || {};
   S.config.profiles = arr(S.config.profiles);
+  S.config.device_placements = S.config.device_placements || {};
   const p = (S.config.profile = S.config.profile || {});
   p.rgb = p.rgb || { kind: "Static", primary: "#00D4FF", secondary: "#9B3CFF", speed: 1, brightness: 1, reverse: false, per_key: {} };
   p.rgb.per_key = p.rgb.per_key || {};
+  p.device_lighting = p.device_lighting || {};
   p.bindings = p.bindings || {};
   p.linked_apps = arr(p.linked_apps);
   if (S.ui && local.uiModeOverride && !S.ui.mode) S.ui.mode = local.uiModeOverride;
@@ -96,7 +97,6 @@ export function syncDrafts() {
   Object.keys(local.eqDrafts).forEach((k) => {
     if (!local.eqDrafts[k].dirty) delete local.eqDrafts[k];
   });
-  if (S && S.asus && !local.auraDraftMode) local.auraDraftMode = S.asus.hw_mode;
   if (local.selectedCoolingIdx >= S.cooling.channels.length) local.selectedCoolingIdx = 0;
 }
 
@@ -243,15 +243,6 @@ export function devicesList() {
     }
     out.push(item);
   });
-  S.logi_keyboards.forEach((k, i) => {
-    const bat = k.battery || null;
-    out.push({
-      key: `logi-kb:${i}`, deviceId: k.device_id, vendor: "Logitech", kind: "Keyboard", name: k.name || "Clavier Logitech", type: "Clavier Logitech G",
-      img: "/assets/keyboard.svg", icon: "keyboard",
-      battery: bat ? bat.percent : null, charging: !!(bat && bat.is_charging), status: { label: "Connecté", cls: "emerald" },
-      quick: [qa("Couleur fixe", "lkb-quick", { dev: i, mode: "Fixed" }), qa("Vague", "lkb-quick", { dev: i, mode: "Wave" }), qa("Éteindre", "lkb-quick", { dev: i, mode: "Off" })],
-    });
-  });
   S.logi_headsets.forEach((h, i) => {
     const hi = headsetImage();
     const presets = arr(h.presets);
@@ -269,18 +260,6 @@ export function devicesList() {
       status: { label: "Connecté", cls: "purple" }, quick,
     });
   });
-  if (S.asus) {
-    const direct = !!prof.sync_asus_aura;
-    out.push({
-      key: "asus", vendor: "ASUS", kind: "Motherboard", name: (S.static_info.motherboard || S.asus.product_name || "Carte mère ASUS").replace(" GAMING WIFI", ""), type: "Carte mère · Aura",
-      img: "/assets/motherboard.svg", icon: "board", status: { label: direct ? "Synchronisée" : "Mode autonome", cls: direct ? "cyan" : "rog" },
-      quick: [
-        qa(direct ? "Arrêter la synchro" : "Synchroniser", "asus-direct", { on: direct ? "0" : "1" }, "Pilote l'éclairage de la carte mère avec l'effet OpenGear"),
-        qa("Arc-en-ciel", "aura-quick", { mode: "Rainbow" }),
-        qa("Éteindre", "aura-quick", { mode: "Off" }),
-      ],
-    });
-  }
   if (S.hp_omen && S.hp_omen.detected) {
     const o = S.hp_omen;
     const bat = S.laptop_battery || {};
@@ -316,24 +295,19 @@ export function devicesList() {
       quick: [qa("Silence", "sl3-preset", { preset: "ultra_silent" }), qa("Équilibré", "sl3-preset", { preset: "default" }), qa("Performance", "sl3-preset", { preset: "max_perf" })],
     });
   }
-  const ram = S.ram_rgb;
-  if (ram && (arr(ram.ene_modules).length || (!S.is_laptop && arr(ram.physical_dimms).length))) {
-    const ene = arr(ram.ene_modules).length;
-    const total = arr(ram.physical_dimms).reduce((a, d) => a + num(d.capacity_gb), 0);
-    out.push({
-      key: "ram", vendor: "Mémoire", kind: "Ram", name: "Mémoire RAM", type: `${plural(arr(ram.physical_dimms).length, "barrette", "barrettes")}${total ? ` · ${total} Go` : ""}`,
-      img: "/assets/ram.svg", icon: "ram",
-      status: ene ? { label: "RGB détecté", cls: "emerald" } : { label: ram.is_admin ? "Sans RGB pilotable" : "Admin requis", cls: "amber" },
-      quick: ene ? [qa("Couleur de la carte mère", "ram-sync-aura", {}), qa("Éteindre", "ram-off", {})] : [],
-    });
-  }
-  // Devices of drivers registered through the shared model appear automatically.
+  // Devices discovered through the shared driver registry appear automatically.
   const known = new Set(out.map((x) => x.deviceId).filter(Boolean));
+  if (S.hp_omen && S.hp_omen.detected) known.add("hp_omen:keyboard");
   arr(S.device_list).filter((d) => !known.has(d.info.id)).forEach((d) => {
     const bat = d.status.battery_pct;
+    const icon = KIND_ICON[d.info.kind] || (d.info.kind === "memory" ? "ram" : "chip");
+    const img = d.info.kind === "memory" ? "/assets/ram.svg"
+      : d.info.kind === "motherboard" ? "/assets/motherboard.svg"
+      : d.info.kind === "keyboard" ? "/assets/keyboard.svg"
+      : undefined;
     out.push({
       key: `dev:${d.info.id}`, deviceId: d.info.id, vendor: d.info.vendor, kind: d.info.kind, name: d.info.model,
-      type: KIND_LABEL[d.info.kind] || "Appareil", icon: KIND_ICON[d.info.kind] || "chip",
+      type: KIND_LABEL[d.info.kind] || "Appareil", icon, img,
       battery: bat != null ? bat : null, charging: !!d.status.charging,
       status: { label: "Connecté", cls: "emerald" }, quick: [],
     });

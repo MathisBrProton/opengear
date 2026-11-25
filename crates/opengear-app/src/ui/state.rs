@@ -1,15 +1,14 @@
 use super::backend::BackendEngine;
 use crate::tray_icon::is_autostart_enabled;
-use opengear_asus::{AuraChannelKind, AuraHwMode};
 use opengear_core::cooling::FanHeaderKind;
 use opengear_core::{EffectKind, OperatingMode};
-use opengear_corsair::HwpLightingKind;
+use opengear_corsair::CorsairDevice;
 use opengear_input::ALL_BINDABLE_KEYS;
 use opengear_logitech::{
     BatteryPowerModel, BatteryState, EQ_PRESETS, LogitechHeadset, LogitechMouse, MouseButtonAction,
     OnboardMode,
 };
-use opengear_mainboard::{EneRamMode, FanRpmReading};
+use opengear_mainboard::FanRpmReading;
 use serde_json::{Value, json};
 
 pub(crate) fn fan_short_label(h: FanHeaderKind) -> &'static str {
@@ -106,7 +105,8 @@ impl BackendEngine {
                 }
             }
         }
-        let logi_bat = self.logi_mice.first().and_then(|m| {
+        let logi_mice = self.typed_devices::<LogitechMouse>();
+        let logi_bat = logi_mice.first().and_then(|m| {
             let b = m.info.battery.as_ref()?;
             let pm = self.compute_mouse_power_model(m);
             Some(json!({
@@ -358,28 +358,6 @@ impl BackendEngine {
             .map(|&e| json!({ "id": format!("{:?}", e), "label": e.label() }))
             .collect();
 
-        let aura_modes: Vec<Value> = AuraHwMode::HARDWARE_MODES
-            .iter()
-            .map(|&m| {
-                json!({
-                    "id": format!("{:?}", m),
-                    "label": m.label(),
-                    "uses_color": m.uses_color(),
-                })
-            })
-            .collect();
-
-        let ram_rgb_modes: Vec<Value> = EneRamMode::ALL
-            .iter()
-            .map(|&m| {
-                json!({
-                    "id": m.id(),
-                    "label": m.label(),
-                    "uses_color": m.uses_color(),
-                })
-            })
-            .collect();
-
         json!({
             "presets": PRESETS.iter().map(|(id, label, description)| json!({
                 "id": id,
@@ -388,13 +366,6 @@ impl BackendEngine {
             })).collect::<Vec<_>>(),
             "bindable_keys": ALL_BINDABLE_KEYS,
             "effects": effects,
-            "hwp_lighting_kinds": HwpLightingKind::ALL_SUPPORTED.iter().map(|&k| json!({
-                "id": k.id(),
-                "label": k.label(),
-                "color_count": k.color_count(),
-            })).collect::<Vec<_>>(),
-            "aura_modes": aura_modes,
-            "ram_rgb_modes": ram_rgb_modes,
             "button_presets": button_presets,
         })
     }
@@ -409,81 +380,22 @@ impl BackendEngine {
             .collect();
 
         let corsair_list: Vec<Value> = self
-            .corsair_devices
-            .iter()
+            .typed_devices::<CorsairDevice>()
+            .into_iter()
             .enumerate()
             .map(|(i, d)| self.serialize_corsair(d, i))
             .collect();
         let corsair_primary = corsair_list.first().cloned();
 
-        let asus_json = self.asus_aura.as_ref().map(|a| {
-            let i = &a.info;
-            let channels: Vec<Value> = i
-                .channels
-                .iter()
-                .map(|c| {
-                    json!({
-                        "index": c.index,
-                        "name": c.name,
-                        "kind": if c.kind == AuraChannelKind::AddressableGen2 { "argb" } else { "mainboard" },
-                        "led_count": c.led_count,
-                        "default_led_count": c.default_led_count,
-                    })
-                })
-                .collect();
-            json!({
-                "product_name": i.product_name,
-                "vid": format!("{:04X}", i.vid),
-                "pid": format!("{:04X}", i.pid),
-                "firmware": i.firmware_version,
-                "mainboard_fixed_leds": i.mainboard_fixed_leds,
-                "rgb_12v_headers": i.rgb_12v_headers,
-                "argb_5v_headers": i.argb_5v_headers,
-                "channels": channels,
-                "hw_mode": format!("{:?}", self.aura_hw_mode),
-                "hw_color": self.aura_hw_color.to_hex(),
-                "shutdown_mode": format!("{:?}", self.aura_shutdown_mode),
-                "shutdown_color": self.aura_shutdown_color.to_hex(),
-            })
-        });
-
         let logi_mice_list: Vec<Value> = self
-            .logi_mice
-            .iter()
+            .typed_devices::<LogitechMouse>()
+            .into_iter()
             .enumerate()
             .map(|(i, m)| self.serialize_logi_mouse(m, i))
             .collect();
-        let logi_kbs_list: Vec<Value> = self
-            .logi_keyboards
-            .iter()
-            .enumerate()
-            .map(|(idx, k)| {
-                let i = &k.info;
-                json!({
-                    "index": idx,
-                    "device_id": opengear_core::driver::Device::info(k).id,
-                    "id": i.id,
-                    "name": i.name,
-                    "vid": format!("{:04X}", i.vid),
-                    "pid": format!("{:04X}", i.pid),
-                    "device_index": format!("0x{:02X}", i.device_index),
-                    "proto_version": i.proto_version,
-                    "firmware": i.firmware,
-                    "battery": i.battery.as_ref().map(|b| json!({
-                        "percent": b.percent,
-                        "state": b.state.label(),
-                        "is_charging": battery_is_charging(b.state),
-                    })),
-                    "supports_rgb_effects": i.supports_rgb_effects,
-                    "supports_brightness": i.supports_brightness,
-                    "brightness_pct": i.brightness_pct,
-                    "supports_game_mode": i.supports_game_mode,
-                })
-            })
-            .collect();
         let logi_headsets_list: Vec<Value> = self
-            .logi_headsets
-            .iter()
+            .typed_devices::<LogitechHeadset>()
+            .into_iter()
             .enumerate()
             .map(|(i, h)| self.serialize_logi_headset(h, i))
             .collect();
@@ -514,7 +426,7 @@ impl BackendEngine {
                 let is_logi = d.vid == 0x046D
                     && ((d.usage_page == 0xFF00 && d.usage == 0x0002)
                         || (d.usage_page == 0xFF43 && d.usage == 0x0202));
-                let is_asus = d.vid == 0x0B05 && d.pid == 0x19AF && d.usage_page == 0xFF72;
+                let is_asus = d.vid == 0x0B05 && d.usage_page == 0xFF72;
                 let (status, driver_supported) = if is_asus {
                     ("Supporté (ASUS Aura USB)".to_string(), true)
                 } else if is_logi {
@@ -547,44 +459,26 @@ impl BackendEngine {
             "official_url": if self.hp_omen.detected { "https://support.hp.com/" } else { "https://rog.asus.com/support/" },
             "status": "Lecture BIOS directe"
         })];
-        if let Some(aura) = self.asus_aura.as_ref() {
+        for dev in &self.driver_devices {
+            let info = dev.info();
+            let official_url = match info.vendor.as_str() {
+                "Corsair" => "https://www.corsair.com/web-hub/",
+                "Logitech" => "https://support.logi.com/",
+                "ASUS" => "https://rog.asus.com/support/",
+                "HP" => "https://support.hp.com/",
+                _ => "",
+            };
             fw_inventory.push(json!({
-                "device": "ASUS AURA LED Controller (0B05:19AF)",
-                "vendor": "ASUS ROG",
-                "version": aura.info.firmware_version,
-                "official_url": "https://rog.asus.com/support/",
-                "status": "MCU USB vérifié"
-            }));
-        }
-        for d in &self.corsair_devices {
-            fw_inventory.push(json!({
-                "device": format!("{} ({:04X}:{:04X})", d.info.product_name, d.info.vid, d.info.pid),
-                "vendor": "Corsair",
-                "version": d.info.firmware_version,
-                "official_url": "https://www.corsair.com/web-hub/",
-                "status": "Bragi v2 vérifié"
-            }));
-        }
-        for m in &self.logi_mice {
-            fw_inventory.push(json!({
-                "device": format!("{} ({:04X}:{:04X})", m.info.name, m.info.vid, m.info.pid),
-                "vendor": "Logitech G",
-                "version": if m.info.firmware.is_empty() { "HID++ 2.0".to_string() } else { m.info.firmware.join(" • ") },
-                "official_url": "https://support.logi.com/hc/articles/360035037273",
-                "status": "HID++ 2.0 vérifié"
-            }));
-        }
-        for h in &self.logi_headsets {
-            fw_inventory.push(json!({
-                "device": format!("{} ({:04X}:{:04X})", h.info.name, h.info.vid, h.info.pid),
-                "vendor": "Logitech G",
-                "version": if h.info.firmware.is_empty() { "USB Audio".to_string() } else { h.info.firmware.join(" • ") },
-                "official_url": "https://support.logi.com/",
-                "status": "HID++ Audio vérifié"
+                "device": info.model,
+                "vendor": info.vendor,
+                "version": info.firmware.unwrap_or_else(|| "—".to_string()),
+                "official_url": official_url,
+                "status": "Pilote natif OpenGear",
             }));
         }
 
         let catalog = Self::catalog_json();
+        let device_list = self.device_list_json();
 
         let mut root = json!({
             "static_info": {
@@ -628,20 +522,19 @@ impl BackendEngine {
             "config": {
                 "active_profile": self.config.active_profile,
                 "profiles": profile_names,
+                "device_placements": self.config.device_placements,
                 "profile": {
                     "name": active_profile.name,
                     "polling_rate_hz": active_profile.polling_rate.hz(),
                     "hw_brightness_pct": active_profile.hw_brightness_pct,
                     "enable_rgb": active_profile.enable_rgb,
-                    "sync_asus_aura": active_profile.sync_asus_aura,
                     "win_lock": active_profile.win_lock,
                     "bindings": active_profile.bindings,
                     "socd": active_profile.socd,
                     "key_chatter_ms": active_profile.key_chatter_ms,
                     "mouse_debounce_ms": active_profile.mouse_debounce_ms,
                     "linked_apps": active_profile.linked_apps,
-                    "silent_loop3_argb_channel": active_profile.silent_loop3_argb_channel,
-                    "silent_loop3_thermal_rgb": active_profile.silent_loop3_thermal_rgb,
+                    "device_lighting": active_profile.device_lighting,
                     "rgb": {
                         "kind": format!("{:?}", active_profile.rgb.kind),
                         "primary": active_profile.rgb.primary.to_hex(),
@@ -649,7 +542,7 @@ impl BackendEngine {
                         "speed": active_profile.rgb.speed,
                         "brightness": active_profile.rgb.brightness,
                         "reverse": active_profile.rgb.reverse,
-                        "per_key": active_profile.rgb.per_key.iter().map(|(k, v)| (k.to_string(), v.to_hex())).collect::<std::collections::BTreeMap<_, _>>(),
+                        "per_key": active_profile.rgb.per_key.iter().map(|(k, v)| (k.clone(), v.to_hex())).collect::<std::collections::BTreeMap<_, _>>(),
                     }
                 }
             },
@@ -657,10 +550,6 @@ impl BackendEngine {
             "bindable_keys": catalog["bindable_keys"],
             "keyboard": self.keyboard_view().to_json(),
             "effects": catalog["effects"],
-            "hwp_lighting_kinds": catalog["hwp_lighting_kinds"],
-            "aura_modes": catalog["aura_modes"],
-            "ram_rgb": self.ram_rgb,
-            "ram_rgb_modes": catalog["ram_rgb_modes"],
             "button_presets": catalog["button_presets"],
             "power_plans": self.power_plans.iter().map(|p| json!({
                 "guid": p.guid,
@@ -669,16 +558,10 @@ impl BackendEngine {
             })).collect::<Vec<_>>(),
             "corsair": corsair_primary,
             "corsair_devices": corsair_list,
-            "corsair_err": if self.corsair_devices.is_empty() { Some("Aucun périphérique Corsair Bragi v2 détecté") } else { None },
-            "asus": asus_json,
-            "asus_err": self.asus_err,
             "logi_mouse": logi_mice_list.first().cloned(),
             "logi_mice": logi_mice_list,
-            "logi_keyboards": logi_kbs_list,
             "logi_headset": logi_headsets_list.first().cloned(),
             "logi_headsets": logi_headsets_list,
-            "logi_mouse_err": if self.logi_mice.is_empty() { Some("Aucune souris Logitech détectée (en veille ?)") } else { None },
-            "logi_headset_err": if self.logi_headsets.is_empty() { Some("Aucun casque Logitech détecté") } else { None },
             "cooling": {
                 "is_admin": self.cooling_status.is_admin,
                 "wmi_available": self.cooling_status.wmi_available,
@@ -688,7 +571,7 @@ impl BackendEngine {
             },
             "selftest": self.last_selftest,
             "devices": devices,
-            "device_list": self.device_list_json(),
+            "device_list": device_list,
         });
         root["is_laptop"] = json!(self.is_laptop);
         root["laptop_battery"] = json!(&self.laptop_battery);

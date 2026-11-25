@@ -1,6 +1,7 @@
 use crate::color::RgbEffectConfig;
 use crate::device::{KeyboardLayout, PollingRate};
 use crate::keyboard::FormFactor;
+use crate::lighting::{DeviceLightingConfig, Placement};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -113,6 +114,12 @@ pub struct KeyboardProfile {
     /// Executables that trigger automatic switching to this profile (e.g. ["VALORANT-Win64-Shipping.exe"])
     #[serde(default)]
     pub linked_apps: Vec<String>,
+    /// Generic per-device and per-zone lighting overrides and resizable zone LED counts.
+    #[serde(default)]
+    pub device_lighting: BTreeMap<String, DeviceLightingConfig>,
+    /// Whether legacy vendor lighting fields (Aura/OMEN/numeric per-key) have been migrated.
+    #[serde(default)]
+    pub lighting_migrated: bool,
 }
 
 impl Default for KeyboardProfile {
@@ -133,6 +140,8 @@ impl Default for KeyboardProfile {
             key_chatter_ms: 0,
             mouse_debounce_ms: 0,
             linked_apps: Vec::new(),
+            device_lighting: BTreeMap::new(),
+            lighting_migrated: true,
         }
     }
 }
@@ -189,6 +198,9 @@ pub struct AppConfig {
     /// Automatically drop to 60 Hz, Cool thermal mode, and keyboard backlight off on battery.
     #[serde(default)]
     pub laptop_auto_battery_saver: bool,
+    /// Placement of each lighting device on the shared desk canvas (`device_id -> Placement`).
+    #[serde(default)]
+    pub device_placements: BTreeMap<String, Placement>,
     pub profiles: Vec<KeyboardProfile>,
 }
 
@@ -213,6 +225,7 @@ impl Default for AppConfig {
             omen_sync_rgb: false,
             omen_zone_colors: default_omen_zones(),
             laptop_auto_battery_saver: false,
+            device_placements: BTreeMap::new(),
             profiles: vec![KeyboardProfile::default()],
         }
     }
@@ -340,6 +353,29 @@ impl AppConfig {
         Ok(())
     }
 
+    pub fn placement_for(&self, device_id: &str) -> Placement {
+        self.device_placements
+            .get(device_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn set_placement(&mut self, device_id: impl Into<String>, p: Placement) {
+        let w = p.width.clamp(0.05, 1.0);
+        let h = p.height.clamp(0.05, 1.0);
+        let x = p.x.clamp(0.0, 1.0 - w);
+        let y = p.y.clamp(0.0, 1.0 - h);
+        self.device_placements.insert(
+            device_id.into(),
+            Placement {
+                x,
+                y,
+                width: w,
+                height: h,
+            },
+        );
+    }
+
     pub fn active_profile_mut(&mut self) -> &mut KeyboardProfile {
         let idx = self
             .profiles
@@ -376,11 +412,33 @@ mod tests {
         let dir = temp_dir("roundtrip");
         let path = dir.join(CONFIG_FILE_NAME);
         let mut cfg = AppConfig::default();
+        cfg.set_placement(
+            "corsair:k70",
+            Placement {
+                x: 0.1,
+                y: 0.5,
+                width: 0.6,
+                height: 0.4,
+            },
+        );
         {
             let p = cfg.active_profile_mut();
             p.rgb.kind = EffectKind::PerKey;
-            p.rgb.per_key.insert(42, Rgb::new(1, 2, 3));
+            p.rgb.per_key.insert("Escape".into(), Rgb::new(1, 2, 3));
             p.asus_argb_led_counts.insert(1, 60);
+            let mut dev_cfg = DeviceLightingConfig::default();
+            dev_cfg.zone_led_counts.insert("ch_1".into(), 60);
+            dev_cfg.zones.insert(
+                "ch_1".into(),
+                crate::lighting::LightingOverride::Software {
+                    effect: RgbEffectConfig {
+                        kind: EffectKind::Thermal,
+                        ..Default::default()
+                    },
+                },
+            );
+            p.device_lighting
+                .insert("asus_aura:0B05:19AF".into(), dev_cfg);
         }
         cfg.save(&path)
             .expect("config with per-key colors must save");
@@ -391,8 +449,76 @@ mod tests {
 
         let back = AppConfig::load(&path).unwrap();
         let p = &back.profiles[0];
-        assert_eq!(p.rgb.per_key.get(&42), Some(&Rgb::new(1, 2, 3)));
+        assert_eq!(p.rgb.per_key.get("Escape"), Some(&Rgb::new(1, 2, 3)));
         assert_eq!(p.asus_argb_led_counts.get(&1), Some(&60));
+        assert_eq!(
+            p.device_lighting["asus_aura:0B05:19AF"]
+                .zone_led_counts
+                .get("ch_1"),
+            Some(&60)
+        );
+        assert_eq!(back.placement_for("corsair:k70").width, 0.6);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_profile_loads_and_migrates_cleanly() {
+        let dir = temp_dir("legacy-profile");
+        let path = dir.join(CONFIG_FILE_NAME);
+        let legacy_toml = r##"
+active_profile = "Jeu"
+omen_sync_rgb = true
+omen_zone_colors = ["#112233", "#445566", "#778899", "#AABBCC"]
+
+[[profiles]]
+name = "Jeu"
+polling_rate = "Hz4000"
+hw_brightness_pct = 80
+enable_rgb = true
+win_lock = false
+sync_asus_aura = true
+silent_loop3_argb_channel = 1
+silent_loop3_thermal_rgb = true
+
+[profiles.rgb]
+kind = "PerKey"
+primary = { r = 0, g = 210, b = 255 }
+secondary = { r = 255, g = 0, b = 140 }
+speed = 1.5
+brightness = 0.8
+reverse = false
+
+[profiles.rgb.per_key]
+41 = { r = 255, g = 0, b = 0 }
+4 = { r = 0, g = 255, b = 0 }
+
+[profiles.bindings]
+CAPS = { type = "Remap", target = "F13" }
+
+[profiles.asus_argb_led_counts]
+1 = 42
+"##;
+        fs::write(&path, legacy_toml).unwrap();
+        let mut cfg = AppConfig::load(&path).unwrap();
+        assert_eq!(cfg.active_profile, "Jeu");
+        assert!(cfg.omen_sync_rgb);
+        let prof = cfg.active_profile_mut();
+        assert!(!prof.lighting_migrated);
+        assert!(prof.sync_asus_aura);
+        assert!(prof.silent_loop3_thermal_rgb);
+        assert_eq!(prof.silent_loop3_argb_channel, Some(1));
+        assert_eq!(prof.asus_argb_led_counts.get(&1), Some(&42));
+        assert_eq!(prof.rgb.per_key.get("41"), Some(&Rgb::new(255, 0, 0)));
+
+        let migrated = prof.rgb.migrate_per_key_codes(|idx| match idx {
+            41 => Some("Escape"),
+            4 => Some("KeyA"),
+            _ => None,
+        });
+        assert!(migrated);
+        assert_eq!(prof.rgb.per_key.get("Escape"), Some(&Rgb::new(255, 0, 0)));
+        assert_eq!(prof.rgb.per_key.get("KeyA"), Some(&Rgb::new(0, 255, 0)));
+        assert!(!prof.rgb.per_key.contains_key("41"));
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -168,8 +168,9 @@ pub struct LogitechMouseInfo {
 }
 
 pub struct LogitechMouse {
-    transport: HidppTransport,
+    pub(crate) transport: HidppTransport,
     pub info: LogitechMouseInfo,
+    pub(crate) last_frame: Vec<Rgb>,
 }
 
 impl LogitechMouse {
@@ -245,7 +246,40 @@ impl LogitechMouse {
             info.features.len()
         );
 
-        Self { transport, info }
+        Self {
+            transport,
+            info,
+            last_frame: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_transport(
+        transport: HidppTransport,
+        led_zones: Vec<LedZoneInfo>,
+    ) -> Self {
+        let info = LogitechMouseInfo {
+            vid: transport.vid,
+            pid: transport.pid,
+            device_index: transport.device_index,
+            name: "Mock Logitech Mouse".into(),
+            proto_version: "4.5".into(),
+            firmware: Vec::new(),
+            features: transport.features.clone(),
+            battery: None,
+            dpi: None,
+            report_rate: None,
+            onboard: None,
+            onboard_desc: None,
+            onboard_profiles: Vec::new(),
+            angle_snapping: None,
+            led_zones,
+        };
+        Self {
+            transport,
+            info,
+            last_frame: Vec::new(),
+        }
     }
 
     /// Flash an onboard hardware macro into a free flash sector and bind it to `button_idx` in `profile_idx`!

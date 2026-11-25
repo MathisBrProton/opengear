@@ -13,7 +13,7 @@ use crate::tray_icon::{
     release_single_instance, start_system_tray, stop_system_tray, trim_working_set,
 };
 use anyhow::Result;
-use opengear_core::{AppConfig, EffectKind};
+use opengear_core::AppConfig;
 use opengear_mainboard::{HardwareSensorsSnapshot, read_hardware_sensors};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -491,13 +491,4 @@ pub(crate) fn send_reply(
         Err(e) => err_reply(&e),
     };
     let _ = proxy.send_event(UserEvent::Reply(id, payload));
-}
-
-pub(crate) fn should_use_live_rgb(
-    prof: &opengear_core::KeyboardProfile,
-    is_corsair_kb_sw: bool,
-    omen_sync_rgb: bool,
-) -> bool {
-    let _ = EffectKind::Static;
-    (prof.enable_rgb && is_corsair_kb_sw) || prof.sync_asus_aura || omen_sync_rgb
 }
