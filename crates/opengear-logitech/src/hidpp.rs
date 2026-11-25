@@ -119,21 +119,21 @@ pub(crate) fn estimate_rated_battery_hours(
         return Some(((874.0 * pct) / total_mw).round() as u16);
     }
     let rated_hours: f32 = match pid {
-        0x407F | 0x408E => 60.0,               // G502 LIGHTSPEED / G502 X LIGHTSPEED
-        0x4067 | 0x4086 => 140.0,              // G903 / G903 HERO (LED off nominal)
-        0x4070 | 0x4088 => 35.0,               // G703 / G703 LIGHTSPEED HERO
-        0x4079 => 24.0,                        // G PRO WIRELESS (RGB default)
-        0x4074 => 250.0,                       // G305 / G304
-        0x408A => 240.0,                       // G604 LIGHTSPEED
-        0x4092 | 0x4096 => 145.0,              // G303 Shroud Edition
-        0x0ABA => 20.0,                        // PRO X WIRELESS Headset (depots powermodel)
-        0x0AB5 => 29.0,                        // G733 LIGHTSPEED Headset
-        0x0AB7 => 56.0,                        // G735 Wireless Headset
-        0x0AC4 => 33.0,                        // G535 Wireless Headset
-        0x0A66 => 15.0,                        // G533 Wireless Headset
-        0x0A5B | 0x0A89 => 12.0,               // G933 / G935 Wireless Headset
-        0xB357 => 30.0,                        // G915 LIGHTSPEED
-        0xB35E => 40.0,                        // G915 TKL LIGHTSPEED
+        0x407F | 0x408E => 60.0,  // G502 LIGHTSPEED / G502 X LIGHTSPEED
+        0x4067 | 0x4086 => 140.0, // G903 / G903 HERO (LED off nominal)
+        0x4070 | 0x4088 => 35.0,  // G703 / G703 LIGHTSPEED HERO
+        0x4079 => 24.0,           // G PRO WIRELESS (RGB default)
+        0x4074 => 250.0,          // G305 / G304
+        0x408A => 240.0,          // G604 LIGHTSPEED
+        0x4092 | 0x4096 => 145.0, // G303 Shroud Edition
+        0x0ABA => 20.0,           // PRO X WIRELESS Headset (depots powermodel)
+        0x0AB5 => 29.0,           // G733 LIGHTSPEED Headset
+        0x0AB7 => 56.0,           // G735 Wireless Headset
+        0x0AC4 => 33.0,           // G535 Wireless Headset
+        0x0A66 => 15.0,           // G533 Wireless Headset
+        0x0A5B | 0x0A89 => 12.0,  // G933 / G935 Wireless Headset
+        0xB357 => 30.0,           // G915 LIGHTSPEED
+        0xB35E => 40.0,           // G915 TKL LIGHTSPEED
         _ if upper.contains("G502") => 60.0,
         _ if upper.contains("G903") => 140.0,
         _ if upper.contains("G703") => 35.0,

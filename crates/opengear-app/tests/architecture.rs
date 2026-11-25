@@ -23,8 +23,14 @@ const VENDOR_MARKERS: &[(&str, &[&str])] = &[
     ("opengear-logitech", &["hidpp", "hid++"]),
     ("opengear-openrgb", &["orgb"]),
     ("opengear-razer", &["rzreport"]),
-    ("opengear-steelseries", &["rival3_color_pkt", "apex_direct_frame_pkt"]),
-    ("opengear-hyperx", &["origins_core_packets", "pulsefire_dart_pkt"]),
+    (
+        "opengear-steelseries",
+        &["rival3_color_pkt", "apex_direct_frame_pkt"],
+    ),
+    (
+        "opengear-hyperx",
+        &["origins_core_packets", "pulsefire_dart_pkt"],
+    ),
 ];
 
 /// Low-level I/O that only driver crates may perform.

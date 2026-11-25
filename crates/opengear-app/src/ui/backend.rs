@@ -979,7 +979,10 @@ impl BackendEngine {
                 };
                 any_live = true;
                 match kind {
-                    EffectKind::Static | EffectKind::PerKey | EffectKind::Gradient | EffectKind::Off => {}
+                    EffectKind::Static
+                    | EffectKind::PerKey
+                    | EffectKind::Gradient
+                    | EffectKind::Off => {}
                     EffectKind::Thermal => any_thermal = true,
                     _ => any_animated = true,
                 }

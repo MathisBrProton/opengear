@@ -869,7 +869,11 @@ pub fn try_launch_via_elevated_task(minimized: bool) -> bool {
         }
         release_single_instance();
 
-        let primary = if minimized { TASK_AUTOSTART } else { TASK_LAUNCH };
+        let primary = if minimized {
+            TASK_AUTOSTART
+        } else {
+            TASK_LAUNCH
+        };
         for tn in [primary, TASK_LAUNCH] {
             if let Ok(out) = std::process::Command::new("schtasks")
                 .args(["/Run", "/TN", tn])
@@ -939,8 +943,8 @@ fn set_run_autostart_enabled(enabled: bool, start_minimized: bool) -> Result<()>
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::Registry::{
-        HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_SZ, RegCloseKey, RegDeleteValueW,
-        RegOpenKeyExW, RegSetValueExW,
+        HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_SZ, RegCloseKey, RegDeleteValueW, RegOpenKeyExW,
+        RegSetValueExW,
     };
     let subkey: Vec<u16> = OsStr::new("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
         .encode_wide()
@@ -951,8 +955,7 @@ fn set_run_autostart_enabled(enabled: bool, start_minimized: bool) -> Result<()>
         .chain(Some(0))
         .collect();
     let mut hkey: HKEY = std::ptr::null_mut();
-    let rc =
-        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_WRITE, &mut hkey) };
+    let rc = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_WRITE, &mut hkey) };
     if rc != 0 {
         anyhow::bail!("Impossible d'ouvrir HKCU\\...\\Run (code {rc})");
     }
@@ -999,14 +1002,8 @@ pub fn set_autostart_enabled(enabled: bool, start_minimized: bool) -> Result<()>
                 "--elevated-entry"
             };
             register_elevated_task(TASK_AUTOSTART, &exe, args, None, true, enabled)?;
-            let _ = register_elevated_task(
-                TASK_LAUNCH,
-                &exe,
-                "--elevated-entry",
-                None,
-                false,
-                true,
-            );
+            let _ =
+                register_elevated_task(TASK_LAUNCH, &exe, "--elevated-entry", None, false, true);
             return Ok(());
         }
         if task_enabled_state(TASK_AUTOSTART).is_some() {

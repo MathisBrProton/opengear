@@ -8,7 +8,7 @@
 
 use crate::proto::{
     HidSsIo, SsIo, aerox_reactive_pkt, aerox_wired_color_pkt, aerox_wireless_zone_pkt,
-    apex3_colors_pkt, apex3_tkl_colors_pkt, apex_direct_frame_pkt, apex_onboard_pkt,
+    apex_direct_frame_pkt, apex_onboard_pkt, apex3_colors_pkt, apex3_tkl_colors_pkt,
     qck_prism_frame_pkt, rival3_color_pkt, rival3_effect_pkt, rival3_wireless_color_pkt,
     rival5_colors_pkt,
 };
@@ -139,10 +139,9 @@ impl Drop for SteelSeriesDevice {
 
 impl Device for SteelSeriesDevice {
     fn info(&self) -> DeviceInfo {
-        let slug: u32 = self
-            .path_tag
-            .bytes()
-            .fold(0x811C_9DC5u32, |h, b| h.wrapping_mul(0x0100_0193) ^ u32::from(b));
+        let slug: u32 = self.path_tag.bytes().fold(0x811C_9DC5u32, |h, b| {
+            h.wrapping_mul(0x0100_0193) ^ u32::from(b)
+        });
         DeviceInfo {
             id: format!("{DRIVER_NAME}:1038:{:04x}:{slug:08x}", self.def.pid),
             vendor: "SteelSeries".into(),
@@ -391,10 +390,30 @@ impl Lighting for SteelSeriesDevice {
                 for z in 0..2 {
                     let c = colors.get(z).copied().unwrap_or(first);
                     if matches!(self.def.family, ProtocolFamily::Rival300) {
-                        self.io
-                            .write_output(&[0x00, 0x08, (z + 1) as u8, c.r, c.g, c.b, 0, 0, 0, 0])?;
-                        self.io
-                            .write_output(&[0x00, 0x07, (z + 1) as u8, 0x01, 0, 0, 0, 0, 0, 0])?;
+                        self.io.write_output(&[
+                            0x00,
+                            0x08,
+                            (z + 1) as u8,
+                            c.r,
+                            c.g,
+                            c.b,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ])?;
+                        self.io.write_output(&[
+                            0x00,
+                            0x07,
+                            (z + 1) as u8,
+                            0x01,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ])?;
                     } else {
                         let mut pkt = [0u8; 66];
                         pkt[1] = 0x5B;
@@ -409,10 +428,18 @@ impl Lighting for SteelSeriesDevice {
             }
             ProtocolFamily::Siberia350 => {
                 for cmd in [
-                    [0x01, 0x00, 0x95, 2, 0x80, 0xBF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                    [0x01, 0x00, 0x80, 2, 0x52, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                    [0x01, 0x00, 0x83, 3, first.r, first.g, first.b, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                    [0x01, 0x00, 0x93, 2, 0x03, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [
+                        0x01, 0x00, 0x95, 2, 0x80, 0xBF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    ],
+                    [
+                        0x01, 0x00, 0x80, 2, 0x52, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    ],
+                    [
+                        0x01, 0x00, 0x83, 3, first.r, first.g, first.b, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    ],
+                    [
+                        0x01, 0x00, 0x93, 2, 0x03, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    ],
                 ] {
                     self.io.write_output(&cmd)?;
                 }
@@ -514,9 +541,10 @@ impl Lighting for SteelSeriesDevice {
                 let (report_id, short_frame) = match self.def.family {
                     ProtocolFamily::ApexG1 => (0x3A, false),
                     ProtocolFamily::ApexG2 { short_frame } => (0x40, short_frame),
-                    ProtocolFamily::ApexG3 { wireless, short_frame } => {
-                        (if wireless { 0x61 } else { 0x40 }, short_frame)
-                    }
+                    ProtocolFamily::ApexG3 {
+                        wireless,
+                        short_frame,
+                    } => (if wireless { 0x61 } else { 0x40 }, short_frame),
                     _ => unreachable!(),
                 };
                 let entries: Vec<(u8, Rgb)> = APEX_KEYS
@@ -712,7 +740,12 @@ mod tests {
     fn all_pid_entries_are_unique_or_explicitly_documented() {
         let mut seen = HashSet::new();
         for d in crate::tables::DEVICES {
-            assert!(seen.insert((d.pid, d.interface)), "Duplicate PID:IF {:04X}:{}", d.pid, d.interface);
+            assert!(
+                seen.insert((d.pid, d.interface)),
+                "Duplicate PID:IF {:04X}:{}",
+                d.pid,
+                d.interface
+            );
         }
     }
 }

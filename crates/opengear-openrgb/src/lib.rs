@@ -249,8 +249,16 @@ pub fn parse_controller(data: &[u8]) -> Option<ParsedController> {
                     if let Some(&idx) = map.get(row * w + col)
                         && (idx as usize) < leds_count
                     {
-                        let x = if w <= 1 { 0.5 } else { col as f32 / (w - 1) as f32 };
-                        let y = if h <= 1 { 0.5 } else { row as f32 / (h - 1) as f32 };
+                        let x = if w <= 1 {
+                            0.5
+                        } else {
+                            col as f32 / (w - 1) as f32
+                        };
+                        let y = if h <= 1 {
+                            0.5
+                        } else {
+                            row as f32 / (h - 1) as f32
+                        };
                         coords[idx as usize] = (x, y);
                     }
                 }
@@ -289,7 +297,11 @@ pub fn parse_controller(data: &[u8]) -> Option<ParsedController> {
 
     let reported_leds = r.u16().map(|v| v as usize).unwrap_or(0);
     let zone_sum: usize = parsed_zones.iter().map(|z| z.leds.len()).sum();
-    let total_leds = if zone_sum > 0 { zone_sum } else { reported_leds };
+    let total_leds = if zone_sum > 0 {
+        zone_sum
+    } else {
+        reported_leds
+    };
     if total_leds == 0 {
         return None;
     }
@@ -590,7 +602,14 @@ mod tests {
         };
         let mut d = vec![0u8; 4];
         d.extend_from_slice(&4u32.to_le_bytes()); // Ledstrip
-        for t in ["Lian Li Strimer", "ARGB Controller", "desc", "2.1", "sn", "USB"] {
+        for t in [
+            "Lian Li Strimer",
+            "ARGB Controller",
+            "desc",
+            "2.1",
+            "sn",
+            "USB",
+        ] {
             s(&mut d, t);
         }
         d.extend_from_slice(&0u16.to_le_bytes()); // modes

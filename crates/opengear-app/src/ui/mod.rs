@@ -168,9 +168,7 @@ pub(crate) fn resolve_static_asset(path: &str) -> Option<(&'static [u8], &'stati
         "/assets/headset.webp" | "/assets/headset_prox.jpg" => {
             Some((IMG_HEADSET, "image/webp", false))
         }
-        "/assets/aio.webp" | "/assets/aio_silentloop3.jpg" => {
-            Some((IMG_AIO, "image/webp", false))
-        }
+        "/assets/aio.webp" | "/assets/aio_silentloop3.jpg" => Some((IMG_AIO, "image/webp", false)),
         "/assets/ram.webp" => Some((IMG_RAM, "image/webp", false)),
         "/assets/laptop.webp" => Some((IMG_LAPTOP, "image/webp", false)),
         "/assets/generic_device.webp" => Some((IMG_GENERIC, "image/webp", false)),

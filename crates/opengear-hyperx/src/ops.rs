@@ -5,38 +5,38 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use hidapi::HidApi;
-use opengear_core::driver::{
-    polling_rate_options, setting_ids, ChoiceOption, Device, DeviceKind, DeviceStatus, Section,
-    Setting, Value,
-};
 use opengear_core::Rgb;
+use opengear_core::driver::{
+    ChoiceOption, Device, DeviceKind, DeviceStatus, Section, Setting, Value, polling_rate_options,
+    setting_ids,
+};
 use tracing::{debug, warn};
 
 use crate::model::HyperXDevice;
 use crate::proto::{HidHxIo, HxIo};
 use crate::proto_ngenuity::{
-    angle_tune_wire_byte, cloud2_dts_pkt, cloud2_wireless_pkt, cloud3_wireless_pkt,
-    cloud3s_auto_sleep_pkt, cloud3s_eq_band_pkt, cloud3s_eq_index_pkt, cloud3s_wireless_pkt,
-    cloud_alpha_wireless_pkt, cloud_flight_battery_pct, cloud_flight_wireless_battery_req,
-    cloud_stinger_core_wireless_battery_req, cloud_tune_eq_pkts, duocast_set_gain_pkt,
-    duocast_set_highpass_pkt, duocast_set_lights_info_pkt, duocast_set_polar_pkt,
-    duocast_set_sidetone_pkt, fury_ultra_brightness_pkts, legacy_haste_wired_profile_pkts,
-    legacy_mouse_battery_req, legacy_mouse_dpi_pkts, legacy_mouse_low_battery_pkt,
-    legacy_mouse_polling_pkt, parse_cloud2_dts_resp, parse_cloud2_wireless_resp,
-    parse_cloud3_wireless_resp, parse_cloud_alpha_wireless_resp,
-    parse_cloud_stinger_core_wireless_battery, parse_legacy_mouse_battery, parse_univ_battery,
-    parse_univ_device_info, quadcast2_set_highpass_pkt, quadcast2_set_mute_pkt,
-    quadcast2_set_polar_pkt, quadcast2s_set_balance_pkt, quadcast2s_set_mix_pkt,
-    solocast_set_mute_pkt, univ_frame_light_pkts, univ_get_battery_pkt, univ_get_device_info_pkt,
+    EQ_10_FREQS, UnivAudioConfig, UnivDeviceInfo, angle_tune_wire_byte, cloud_alpha_wireless_pkt,
+    cloud_flight_battery_pct, cloud_flight_wireless_battery_req,
+    cloud_stinger_core_wireless_battery_req, cloud_tune_eq_pkts, cloud2_dts_pkt,
+    cloud2_wireless_pkt, cloud3_wireless_pkt, cloud3s_auto_sleep_pkt, cloud3s_eq_band_pkt,
+    cloud3s_eq_index_pkt, cloud3s_wireless_pkt, duocast_set_gain_pkt, duocast_set_highpass_pkt,
+    duocast_set_lights_info_pkt, duocast_set_polar_pkt, duocast_set_sidetone_pkt,
+    fury_ultra_brightness_pkts, legacy_haste_wired_profile_pkts, legacy_mouse_battery_req,
+    legacy_mouse_dpi_pkts, legacy_mouse_low_battery_pkt, legacy_mouse_polling_pkt,
+    parse_cloud_alpha_wireless_resp, parse_cloud_stinger_core_wireless_battery,
+    parse_cloud2_dts_resp, parse_cloud2_wireless_resp, parse_cloud3_wireless_resp,
+    parse_legacy_mouse_battery, parse_univ_battery, parse_univ_device_info,
+    quadcast2_set_highpass_pkt, quadcast2_set_mute_pkt, quadcast2_set_polar_pkt,
+    quadcast2s_set_balance_pkt, quadcast2s_set_mix_pkt, solocast_set_mute_pkt,
+    univ_frame_light_pkts, univ_get_battery_pkt, univ_get_device_info_pkt,
     univ_set_ambient_brightness_pkt, univ_set_auto_sleep_pkt, univ_set_backlight_fade_pkt,
     univ_set_brightness_pkt, univ_set_game_mode_bits_pkt, univ_set_generic_audio_full_pkt,
     univ_set_low_battery_pkt, univ_set_mouse_dpi_pkt, univ_set_mouse_sensor_full_pkt,
-    univ_set_noise_gate_pkt, univ_set_onboard_eq_pkt, univ_set_voice_prompt_pkt, UnivAudioConfig,
-    UnivDeviceInfo, EQ_10_FREQS,
+    univ_set_noise_gate_pkt, univ_set_onboard_eq_pkt, univ_set_voice_prompt_pkt,
 };
 use crate::tables::{
-    find_device, match_score, tio_child_name, EqHwMode, HxCapabilities, HxDeviceDef,
-    ProtocolFamily, HP_HYPERX_VID, KINGSTON_VID,
+    EqHwMode, HP_HYPERX_VID, HxCapabilities, HxDeviceDef, KINGSTON_VID, ProtocolFamily,
+    find_device, match_score, tio_child_name,
 };
 
 /// Mutable device state cached across UI renders and incremental setting updates.
@@ -134,19 +134,31 @@ pub struct SharedHxIo(pub Arc<Mutex<HidHxIo>>);
 
 impl HxIo for SharedHxIo {
     fn write_output(&mut self, data: &[u8]) -> Result<()> {
-        let mut guard = self.0.lock().map_err(|_| anyhow::anyhow!("TIO mutex poisoned"))?;
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("TIO mutex poisoned"))?;
         guard.write_output(data)
     }
     fn send_feature(&mut self, data: &[u8]) -> Result<()> {
-        let mut guard = self.0.lock().map_err(|_| anyhow::anyhow!("TIO mutex poisoned"))?;
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("TIO mutex poisoned"))?;
         guard.send_feature(data)
     }
     fn read_input(&mut self, buf: &mut [u8], timeout_ms: i32) -> Result<usize> {
-        let mut guard = self.0.lock().map_err(|_| anyhow::anyhow!("TIO mutex poisoned"))?;
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("TIO mutex poisoned"))?;
         guard.read_input(buf, timeout_ms)
     }
     fn get_feature(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let mut guard = self.0.lock().map_err(|_| anyhow::anyhow!("TIO mutex poisoned"))?;
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("TIO mutex poisoned"))?;
         guard.get_feature(buf)
     }
 }
@@ -159,7 +171,11 @@ fn exchange_out(io: &mut dyn HxIo, req: &[u8], resp: &mut [u8]) -> Option<usize>
 }
 
 /// Read-only status & device identity probe executed at discovery and refresh.
-pub fn probe_and_refresh(io: &mut dyn HxIo, def: &'static HxDeviceDef, st: &mut HxState) -> DeviceStatus {
+pub fn probe_and_refresh(
+    io: &mut dyn HxIo,
+    def: &'static HxDeviceDef,
+    st: &mut HxState,
+) -> DeviceStatus {
     let caps = def.caps();
     let mut buf = [0u8; 65];
     if caps.universal {
@@ -270,7 +286,10 @@ pub fn probe_and_refresh(io: &mut dyn HxIo, def: &'static HxDeviceDef, st: &mut 
             }
         }
         ProtocolFamily::CloudStingerCoreWireless => {
-            if io.send_feature(&cloud_stinger_core_wireless_battery_req()).is_ok() {
+            if io
+                .send_feature(&cloud_stinger_core_wireless_battery_req())
+                .is_ok()
+            {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 if let Ok(n) = io.get_feature(&mut buf) {
                     if let Some((pct, chg)) = parse_cloud_stinger_core_wireless_battery(&buf[..n]) {
@@ -324,7 +343,12 @@ fn append_mouse_settings(caps: &HxCapabilities, st: &HxState, out: &mut Vec<Sett
     if caps.dpi_stages > 0 {
         let count = st.dpi_count.clamp(1, caps.dpi_stages) as usize;
         let stage_opts: Vec<ChoiceOption> = (0..count)
-            .map(|i| ChoiceOption::new(i.to_string(), format!("Palier {} ({} DPI)", i + 1, st.dpi_stages[i])))
+            .map(|i| {
+                ChoiceOption::new(
+                    i.to_string(),
+                    format!("Palier {} ({} DPI)", i + 1, st.dpi_stages[i]),
+                )
+            })
             .collect();
         out.push(
             Setting::choice(
@@ -473,8 +497,13 @@ fn append_keyboard_settings(caps: &HxCapabilities, st: &HxState, out: &mut Vec<S
             ("hyperx.gm_ctrl_esc", "Mode Jeu : bloquer Ctrl + Échap", 4u8),
         ] {
             out.push(
-                Setting::toggle(id, label, Section::Input, (st.game_mode_mask & (1 << bit)) != 0)
-                    .expert(),
+                Setting::toggle(
+                    id,
+                    label,
+                    Section::Input,
+                    (st.game_mode_mask & (1 << bit)) != 0,
+                )
+                .expert(),
             );
         }
     }
@@ -619,7 +648,11 @@ fn append_audio_and_mic_settings(caps: &HxCapabilities, st: &HxState, out: &mut 
                 st.polar_pattern,
             )
         } else {
-            let cur = if st.polar_pattern == "omni" { "omni" } else { "cardioid" };
+            let cur = if st.polar_pattern == "omni" {
+                "omni"
+            } else {
+                "cardioid"
+            };
             (
                 vec![
                     ChoiceOption::new("cardioid", "Cardioïde"),
@@ -772,7 +805,9 @@ pub fn apply_device_setting(
     let caps = def.caps();
     match id {
         "hyperx.active_dpi_stage" => {
-            let s = value.as_str().ok_or_else(|| anyhow::anyhow!("valeur palier attendue"))?;
+            let s = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("valeur palier attendue"))?;
             let max_idx = st.dpi_count.clamp(1, caps.dpi_stages).saturating_sub(1);
             st.active_dpi_stage = s.parse::<u8>()?.min(max_idx);
             flush_mouse_dpi(io, def, st)?;
@@ -783,7 +818,10 @@ pub fn apply_device_setting(
             flush_mouse_dpi(io, def, st)?;
         }
         "hyperx.dpi_count" => {
-            let c = value.as_f64().ok_or_else(|| anyhow::anyhow!("entier attendu"))?.round() as u8;
+            let c = value
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("entier attendu"))?
+                .round() as u8;
             st.dpi_count = c.clamp(1, caps.dpi_stages.max(1));
             st.active_dpi_stage = st.active_dpi_stage.min(st.dpi_count - 1);
             flush_mouse_dpi(io, def, st)?;
@@ -793,36 +831,47 @@ pub fn apply_device_setting(
             st.dpi_stages[idx] = snap_dpi(value, caps.max_dpi)?;
             flush_mouse_dpi(io, def, st)?;
         }
-        "hyperx.dpi_color_1"
-        | "hyperx.dpi_color_2"
-        | "hyperx.dpi_color_3"
-        | "hyperx.dpi_color_4"
-        | "hyperx.dpi_color_5" => {
+        "hyperx.dpi_color_1" | "hyperx.dpi_color_2" | "hyperx.dpi_color_3"
+        | "hyperx.dpi_color_4" | "hyperx.dpi_color_5" => {
             let idx = id[16..].parse::<usize>()? - 1;
-            let hex = value.as_str().ok_or_else(|| anyhow::anyhow!("couleur #RRGGBB attendue"))?;
+            let hex = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("couleur #RRGGBB attendue"))?;
             st.dpi_colors[idx] = parse_hex_rgb(hex)?;
             flush_mouse_dpi(io, def, st)?;
         }
         setting_ids::POLLING_RATE => {
-            let hz = value.as_str().ok_or_else(|| anyhow::anyhow!("fréquence attendue"))?.parse::<u16>()?;
+            let hz = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("fréquence attendue"))?
+                .parse::<u16>()?;
             st.polling_hz = hz;
             flush_polling_rate(io, def, st)?;
         }
         "hyperx.lod" => {
-            st.lod_2mm = value.as_str().ok_or_else(|| anyhow::anyhow!("LOD attendu"))? == "2";
+            st.lod_2mm = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("LOD attendu"))?
+                == "2";
             flush_mouse_sensor(io, st)?;
         }
         setting_ids::ANGLE_SNAPPING => {
-            st.angle_snap = value.as_bool().ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
+            st.angle_snap = value
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
             flush_mouse_sensor(io, st)?;
         }
         "hyperx.angle_tuning" => {
-            let s = value.as_str().ok_or_else(|| anyhow::anyhow!("angle attendu"))?;
+            let s = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("angle attendu"))?;
             st.angle_tune_deg = s.parse::<i16>()?;
             flush_mouse_sensor(io, st)?;
         }
         "hyperx.save_onboard" => {
-            if value.as_bool().unwrap_or(false) && matches!(def.family, ProtocolFamily::PulsefireDart) {
+            if value.as_bool().unwrap_or(false)
+                && matches!(def.family, ProtocolFamily::PulsefireDart)
+            {
                 let mut sv = [0u8; 65];
                 sv[1] = 0xDE;
                 sv[2] = 0xFF;
@@ -830,7 +879,9 @@ pub fn apply_device_setting(
             }
         }
         setting_ids::WIN_LOCK => {
-            st.win_lock = value.as_bool().ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
+            st.win_lock = value
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
             if st.win_lock {
                 st.game_mode_mask |= 1;
             } else {
@@ -839,7 +890,9 @@ pub fn apply_device_setting(
             flush_game_mode(io, st)?;
         }
         "hyperx.gm_alt_tab" | "hyperx.gm_alt_f4" | "hyperx.gm_shift_tab" | "hyperx.gm_ctrl_esc" => {
-            let on = value.as_bool().ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
+            let on = value
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
             let bit = match id {
                 "hyperx.gm_alt_tab" => 1u8,
                 "hyperx.gm_alt_f4" => 2u8,
@@ -854,23 +907,48 @@ pub fn apply_device_setting(
             flush_game_mode(io, st)?;
         }
         "hyperx.backlight_fade" => {
-            st.backlight_fade_secs = value.as_str().ok_or_else(|| anyhow::anyhow!("durée attendue"))?.parse::<u16>()?;
-            io.write_output(&univ_set_backlight_fade_pkt(st.tio_slot, 1, st.backlight_fade_secs))?;
+            st.backlight_fade_secs = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("durée attendue"))?
+                .parse::<u16>()?;
+            io.write_output(&univ_set_backlight_fade_pkt(
+                st.tio_slot,
+                1,
+                st.backlight_fade_secs,
+            ))?;
         }
         "hyperx.ambient_brightness" => {
-            st.ambient_brightness = value.as_bool().ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
-            io.write_output(&univ_set_ambient_brightness_pkt(st.tio_slot, 1, st.ambient_brightness))?;
+            st.ambient_brightness = value
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
+            io.write_output(&univ_set_ambient_brightness_pkt(
+                st.tio_slot,
+                1,
+                st.ambient_brightness,
+            ))?;
         }
         "hyperx.reverse_lights" => {
-            st.reverse_lights = value.as_bool().ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
+            st.reverse_lights = value
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
             if caps.universal {
-                io.write_output(&univ_set_generic_audio_full_pkt(st.tio_slot, &univ_audio_cfg(st)))?;
+                io.write_output(&univ_set_generic_audio_full_pkt(
+                    st.tio_slot,
+                    &univ_audio_cfg(st),
+                ))?;
             } else if matches!(def.family, ProtocolFamily::DuoCast) {
-                io.send_feature(&duocast_set_lights_info_pkt(st.brightness_pct, st.reverse_lights))?;
+                io.send_feature(&duocast_set_lights_info_pkt(
+                    st.brightness_pct,
+                    st.reverse_lights,
+                ))?;
             }
         }
         "hyperx.low_battery" => {
-            let pct = value.as_f64().ok_or_else(|| anyhow::anyhow!("seuil attendu"))?.round().clamp(5.0, 25.0) as u8;
+            let pct = value
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("seuil attendu"))?
+                .round()
+                .clamp(5.0, 25.0) as u8;
             st.low_battery_pct = pct;
             if caps.universal {
                 io.write_output(&univ_set_low_battery_pkt(st.tio_slot, pct, true))?;
@@ -882,30 +960,45 @@ pub fn apply_device_setting(
             }
         }
         setting_ids::SIDETONE => {
-            let pct = value.as_f64().ok_or_else(|| anyhow::anyhow!("niveau attendu"))?.round() as u8;
+            let pct = value
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("niveau attendu"))?
+                .round() as u8;
             st.sidetone_enabled = pct > 0;
             st.sidetone_pct = pct.min(100);
             st.sidetone_db = ((pct.min(100) as i32 / 10) - 5).clamp(-5, 5) as i8;
             flush_headset_sidetone(io, def, st)?;
         }
         "hyperx.sidetone_enable" => {
-            st.sidetone_enabled = value.as_bool().ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
+            st.sidetone_enabled = value
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
             flush_headset_sidetone(io, def, st)?;
         }
         "hyperx.mic_mute" => {
-            st.mic_muted = value.as_bool().ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
+            st.mic_muted = value
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
             flush_mic_mute(io, def, st)?;
         }
         "hyperx.mic_gain" => {
-            st.mic_level = value.as_f64().ok_or_else(|| anyhow::anyhow!("niveau attendu"))?.round().clamp(0.0, 100.0) as u8;
+            st.mic_level = value
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("niveau attendu"))?
+                .round()
+                .clamp(0.0, 100.0) as u8;
             flush_mic_gain(io, def, st)?;
         }
         "hyperx.polar_pattern" => {
-            let s = value.as_str().ok_or_else(|| anyhow::anyhow!("directivité attendue"))?;
+            let s = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("directivité attendue"))?;
             flush_polar_pattern(io, def, st, s)?;
         }
         "hyperx.high_pass" => {
-            st.high_pass = value.as_bool().ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
+            st.high_pass = value
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
             match def.family {
                 ProtocolFamily::QuadCast2 | ProtocolFamily::QuadCast2S => {
                     io.write_output(&quadcast2_set_highpass_pkt(st.high_pass))?;
@@ -917,35 +1010,66 @@ pub fn apply_device_setting(
             }
         }
         "hyperx.mic_balance" => {
-            st.balance_pct = value.as_f64().ok_or_else(|| anyhow::anyhow!("balance attendue"))?.round().clamp(0.0, 100.0) as u8;
+            st.balance_pct = value
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("balance attendue"))?
+                .round()
+                .clamp(0.0, 100.0) as u8;
             if caps.universal {
-                io.write_output(&univ_set_generic_audio_full_pkt(st.tio_slot, &univ_audio_cfg(st)))?;
+                io.write_output(&univ_set_generic_audio_full_pkt(
+                    st.tio_slot,
+                    &univ_audio_cfg(st),
+                ))?;
             } else if matches!(def.family, ProtocolFamily::QuadCast2S) {
                 io.write_output(&quadcast2s_set_balance_pkt(st.balance_pct))?;
             }
         }
         "hyperx.playback_level" => {
-            st.playback_pct = value.as_f64().ok_or_else(|| anyhow::anyhow!("volume attendu"))?.round().clamp(0.0, 100.0) as u8;
-            io.write_output(&univ_set_generic_audio_full_pkt(st.tio_slot, &univ_audio_cfg(st)))?;
+            st.playback_pct = value
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("volume attendu"))?
+                .round()
+                .clamp(0.0, 100.0) as u8;
+            io.write_output(&univ_set_generic_audio_full_pkt(
+                st.tio_slot,
+                &univ_audio_cfg(st),
+            ))?;
         }
         "hyperx.chatmix" => {
-            st.chatmix_pct = value.as_f64().ok_or_else(|| anyhow::anyhow!("mix attendu"))?.round().clamp(0.0, 100.0) as u8;
-            io.write_output(&univ_set_generic_audio_full_pkt(st.tio_slot, &univ_audio_cfg(st)))?;
+            st.chatmix_pct = value
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("mix attendu"))?
+                .round()
+                .clamp(0.0, 100.0) as u8;
+            io.write_output(&univ_set_generic_audio_full_pkt(
+                st.tio_slot,
+                &univ_audio_cfg(st),
+            ))?;
         }
         "hyperx.noise_gate" => {
-            st.noise_gate = value.as_bool().ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
+            st.noise_gate = value
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("booléen attendu"))?;
             io.write_output(&univ_set_noise_gate_pkt(st.tio_slot, st.noise_gate))?;
         }
         "hyperx.voice_prompt" => {
-            st.voice_prompt = value.as_str().ok_or_else(|| anyhow::anyhow!("choix attendu"))? == "voice";
+            st.voice_prompt = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("choix attendu"))?
+                == "voice";
             io.write_output(&univ_set_voice_prompt_pkt(st.tio_slot, st.voice_prompt))?;
         }
         "hyperx.eq_preset" => {
-            let s = value.as_str().ok_or_else(|| anyhow::anyhow!("EQ attendu"))?;
+            let s = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("EQ attendu"))?;
             st.eq_preset = s.parse::<u8>()?.min(3);
             st.eq_bands = eq_preset_curve(st.eq_preset);
             if caps.universal {
-                io.write_output(&univ_set_generic_audio_full_pkt(st.tio_slot, &univ_audio_cfg(st)))?;
+                io.write_output(&univ_set_generic_audio_full_pkt(
+                    st.tio_slot,
+                    &univ_audio_cfg(st),
+                ))?;
             } else {
                 flush_eq_bands(io, def, st, None, true)?;
             }
@@ -955,12 +1079,17 @@ pub fn apply_device_setting(
             if k >= 10 {
                 anyhow::bail!("Bande EQ hors limites : {k}");
             }
-            let db = value.as_f64().ok_or_else(|| anyhow::anyhow!("dB numérique attendu"))?;
+            let db = value
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("dB numérique attendu"))?;
             st.eq_bands[k] = ((db * 2.0).round() as f32 / 2.0).clamp(-12.0, 12.0);
             flush_eq_bands(io, def, st, Some(k), false)?;
         }
         "hyperx.auto_sleep" => {
-            st.auto_sleep_min = value.as_str().ok_or_else(|| anyhow::anyhow!("délai attendu"))?.parse::<u16>()?;
+            st.auto_sleep_min = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("délai attendu"))?
+                .parse::<u16>()?;
             flush_auto_sleep(io, def, st)?;
         }
         _ => anyhow::bail!("Réglage HyperX inconnu : {id}"),
@@ -969,7 +1098,9 @@ pub fn apply_device_setting(
 }
 
 fn snap_dpi(value: &Value, max_dpi: u16) -> Result<u16> {
-    let v = value.as_f64().ok_or_else(|| anyhow::anyhow!("DPI numérique attendu"))?;
+    let v = value
+        .as_f64()
+        .ok_or_else(|| anyhow::anyhow!("DPI numérique attendu"))?;
     Ok((((v.round() as i32).clamp(100, max_dpi as i32) / 50) * 50) as u16)
 }
 
@@ -997,12 +1128,20 @@ fn flush_polling_rate(io: &mut dyn HxIo, def: &'static HxDeviceDef, st: &HxState
         if def.kind == DeviceKind::Mouse {
             return flush_mouse_dpi(io, def, st);
         }
-        return io.write_output(&univ_set_mouse_dpi_pkt(st.tio_slot, 1, st.polling_hz, &[], 0));
+        return io.write_output(&univ_set_mouse_dpi_pkt(
+            st.tio_slot,
+            1,
+            st.polling_hz,
+            &[],
+            0,
+        ));
     }
     match def.family {
         ProtocolFamily::PulsefireDart
         | ProtocolFamily::PulsefireFpsPro2
-        | ProtocolFamily::PulsefireHasteWireless => io.write_output(&legacy_mouse_polling_pkt(st.polling_hz)),
+        | ProtocolFamily::PulsefireHasteWireless => {
+            io.write_output(&legacy_mouse_polling_pkt(st.polling_hz))
+        }
         ProtocolFamily::PulsefireHaste => flush_mouse_dpi(io, def, st),
         _ => Ok(()),
     }
@@ -1010,7 +1149,13 @@ fn flush_polling_rate(io: &mut dyn HxIo, def: &'static HxDeviceDef, st: &HxState
 
 fn flush_mouse_dpi(io: &mut dyn HxIo, def: &'static HxDeviceDef, st: &HxState) -> Result<()> {
     let count = st.dpi_count.clamp(1, 5) as usize;
-    let stages: Vec<(u16, Rgb)> = st.dpi_stages.iter().copied().zip(st.dpi_colors).take(count).collect();
+    let stages: Vec<(u16, Rgb)> = st
+        .dpi_stages
+        .iter()
+        .copied()
+        .zip(st.dpi_colors)
+        .take(count)
+        .collect();
     if def.caps().universal {
         return io.write_output(&univ_set_mouse_dpi_pkt(
             st.tio_slot,
@@ -1044,10 +1189,17 @@ fn flush_mouse_dpi(io: &mut dyn HxIo, def: &'static HxDeviceDef, st: &HxState) -
     Ok(())
 }
 
-fn flush_headset_sidetone(io: &mut dyn HxIo, def: &'static HxDeviceDef, st: &HxState) -> Result<()> {
+fn flush_headset_sidetone(
+    io: &mut dyn HxIo,
+    def: &'static HxDeviceDef,
+    st: &HxState,
+) -> Result<()> {
     let on = u8::from(st.sidetone_enabled);
     if def.caps().universal {
-        return io.write_output(&univ_set_generic_audio_full_pkt(st.tio_slot, &univ_audio_cfg(st)));
+        return io.write_output(&univ_set_generic_audio_full_pkt(
+            st.tio_slot,
+            &univ_audio_cfg(st),
+        ));
     }
     match def.family {
         ProtocolFamily::CloudAlphaWireless => {
@@ -1071,11 +1223,17 @@ fn flush_headset_sidetone(io: &mut dyn HxIo, def: &'static HxDeviceDef, st: &HxS
         ProtocolFamily::CloudIII | ProtocolFamily::CloudAlphaS => {
             let mut pkt = [0u8; 65];
             pkt[0] = 0x06;
-            pkt[1] = if matches!(def.family, ProtocolFamily::CloudIII) { 0x01 } else { 0x00 };
+            pkt[1] = if matches!(def.family, ProtocolFamily::CloudIII) {
+                0x01
+            } else {
+                0x00
+            };
             pkt[2] = on;
             let _ = io.write_output(&pkt);
         }
-        ProtocolFamily::DuoCast => io.send_feature(&duocast_set_sidetone_pkt(st.sidetone_enabled))?,
+        ProtocolFamily::DuoCast => {
+            io.send_feature(&duocast_set_sidetone_pkt(st.sidetone_enabled))?
+        }
         _ => {}
     }
     Ok(())
@@ -1084,10 +1242,15 @@ fn flush_headset_sidetone(io: &mut dyn HxIo, def: &'static HxDeviceDef, st: &HxS
 fn flush_mic_mute(io: &mut dyn HxIo, def: &'static HxDeviceDef, st: &HxState) -> Result<()> {
     let m = u8::from(st.mic_muted);
     if def.caps().universal {
-        return io.write_output(&univ_set_generic_audio_full_pkt(st.tio_slot, &univ_audio_cfg(st)));
+        return io.write_output(&univ_set_generic_audio_full_pkt(
+            st.tio_slot,
+            &univ_audio_cfg(st),
+        ));
     }
     match def.family {
-        ProtocolFamily::CloudAlphaWireless => io.write_output(&cloud_alpha_wireless_pkt(0x15, m))?,
+        ProtocolFamily::CloudAlphaWireless => {
+            io.write_output(&cloud_alpha_wireless_pkt(0x15, m))?
+        }
         ProtocolFamily::CloudIIICoreWireless => io.write_output(&cloud3_wireless_pkt(0x03, m))?,
         ProtocolFamily::CloudIIISWireless => io.write_output(&cloud3s_wireless_pkt(0x01, m, 0))?,
         ProtocolFamily::QuadCast2 | ProtocolFamily::QuadCast2S => {
@@ -1101,7 +1264,10 @@ fn flush_mic_mute(io: &mut dyn HxIo, def: &'static HxDeviceDef, st: &HxState) ->
 
 fn flush_mic_gain(io: &mut dyn HxIo, def: &'static HxDeviceDef, st: &HxState) -> Result<()> {
     if def.caps().universal {
-        return io.write_output(&univ_set_generic_audio_full_pkt(st.tio_slot, &univ_audio_cfg(st)));
+        return io.write_output(&univ_set_generic_audio_full_pkt(
+            st.tio_slot,
+            &univ_audio_cfg(st),
+        ));
     }
     match def.family {
         ProtocolFamily::QuadCast2S => io.write_output(&quadcast2s_set_mix_pkt(st.mic_level)),
@@ -1140,15 +1306,13 @@ fn flush_eq_bands(
     is_preset_select: bool,
 ) -> Result<()> {
     match def.caps().eq_10band {
-        EqHwMode::Universal0x66 => {
-            io.write_output(&univ_set_onboard_eq_pkt(
-                st.tio_slot,
-                1,
-                true,
-                st.eq_preset,
-                &st.eq_bands,
-            ))
-        }
+        EqHwMode::Universal0x66 => io.write_output(&univ_set_onboard_eq_pkt(
+            st.tio_slot,
+            1,
+            true,
+            st.eq_preset,
+            &st.eq_bands,
+        )),
         EqHwMode::Cloud3S => {
             if is_preset_select {
                 io.write_output(&cloud3s_eq_index_pkt(st.eq_preset))
@@ -1191,9 +1355,10 @@ pub fn apply_legacy_brightness_hw(
             pkt[4] = raw;
             io.write_output(&pkt)
         }
-        ProtocolFamily::DuoCast => {
-            io.send_feature(&duocast_set_lights_info_pkt(st.brightness_pct, st.reverse_lights))
-        }
+        ProtocolFamily::DuoCast => io.send_feature(&duocast_set_lights_info_pkt(
+            st.brightness_pct,
+            st.reverse_lights,
+        )),
         ProtocolFamily::Mat0x81 { .. } if def.caps().brightness_feature_pad => {
             for pkt in fury_ultra_brightness_pkts(st.brightness_pct) {
                 io.send_feature(&pkt)?;
@@ -1211,7 +1376,9 @@ fn flush_auto_sleep(io: &mut dyn HxIo, def: &'static HxDeviceDef, st: &HxState) 
         return io.write_output(&univ_set_auto_sleep_pkt(st.tio_slot, 1, st.auto_sleep_min));
     }
     match def.family {
-        ProtocolFamily::CloudAlphaWireless => io.write_output(&cloud_alpha_wireless_pkt(0x12, min))?,
+        ProtocolFamily::CloudAlphaWireless => {
+            io.write_output(&cloud_alpha_wireless_pkt(0x12, min))?
+        }
         ProtocolFamily::CloudIIWirelessDts | ProtocolFamily::CloudStinger2Wireless => {
             io.write_output(&cloud2_dts_pkt(0x22, min))?;
         }
@@ -1219,7 +1386,9 @@ fn flush_auto_sleep(io: &mut dyn HxIo, def: &'static HxDeviceDef, st: &HxState) 
             io.write_output(&cloud2_wireless_pkt(0x18, min))?;
         }
         ProtocolFamily::CloudIIICoreWireless => io.write_output(&cloud3_wireless_pkt(0x02, min))?,
-        ProtocolFamily::CloudIIISWireless => io.write_output(&cloud3s_auto_sleep_pkt(st.auto_sleep_min))?,
+        ProtocolFamily::CloudIIISWireless => {
+            io.write_output(&cloud3s_auto_sleep_pkt(st.auto_sleep_min))?
+        }
         _ => {}
     }
     Ok(())
@@ -1282,7 +1451,9 @@ pub fn discover_hyperx_devices() -> Vec<Box<dyn Device>> {
                     .to_string()
             });
         let key = (d.vendor_id(), d.product_id(), dev_group);
-        let replace = best.get(&key).is_none_or(|&(old_score, _, _)| score > old_score);
+        let replace = best
+            .get(&key)
+            .is_none_or(|&(old_score, _, _)| score > old_score);
         if replace {
             best.insert(key, (score, *d, def));
         }
@@ -1328,7 +1499,11 @@ fn spawn_tio_children(
                         Box::new(SharedHxIo(shared.clone())),
                         format!("{path_tag}#slot{slot}"),
                     );
-                    dev.set_tio_slot(slot, tio_child_name(info.primary_pid).map(ToOwned::to_owned), info);
+                    dev.set_tio_slot(
+                        slot,
+                        tio_child_name(info.primary_pid).map(ToOwned::to_owned),
+                        info,
+                    );
                     let _ = dev.probe_on_discover();
                     out.push(Box::new(dev));
                     found_child = true;
@@ -1344,9 +1519,16 @@ fn spawn_tio_children(
 }
 
 /// Format diagnostic lines for UI expert view cleanly.
-pub fn build_diagnostic_lines(def: &'static HxDeviceDef, st: &HxState, path_tag: &str) -> Vec<String> {
+pub fn build_diagnostic_lines(
+    def: &'static HxDeviceDef,
+    st: &HxState,
+    path_tag: &str,
+) -> Vec<String> {
     let mut lines = vec![
-        format!("USB {:04X}:{:04X} (interface {})", def.vid, def.pid, def.interface),
+        format!(
+            "USB {:04X}:{:04X} (interface {})",
+            def.vid, def.pid, def.interface
+        ),
         format!("Protocole : {:?}", def.family),
         format!("Chemin HID : {path_tag}"),
     ];

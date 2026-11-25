@@ -30,7 +30,16 @@ impl SsIo for HidSsIo {
 
 /// §3.1 Rival 3 color packet (8 bytes, `zone` in 1..=4).
 pub fn rival3_color_pkt(zone: u8, color: Rgb, brightness: u8) -> [u8; 8] {
-    [0x00, 0x05, 0x00, zone, color.r, color.g, color.b, brightness.min(100)]
+    [
+        0x00,
+        0x05,
+        0x00,
+        zone,
+        color.r,
+        color.g,
+        color.b,
+        brightness.min(100),
+    ]
 }
 
 /// §3.1 Rival 3 effect packet (4 bytes; excludes unsafe 0x06 disco mode).

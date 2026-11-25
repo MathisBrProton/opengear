@@ -385,9 +385,7 @@ impl Device for LogitechKeyboard {
             setting_ids::WIN_LOCK => {
                 self.set_game_mode(value.as_bool().context("booléen attendu")?)?
             }
-            FN_INVERSION => {
-                self.set_fn_inversion(value.as_bool().context("booléen attendu")?)?
-            }
+            FN_INVERSION => self.set_fn_inversion(value.as_bool().context("booléen attendu")?)?,
             POWER_OFF_MINUTES => {
                 let mins = value
                     .as_str()
@@ -455,10 +453,7 @@ impl Device for LogitechHeadset {
                 .iter()
                 .map(|p| ChoiceOption::new(p.name, p.name))
                 .collect();
-            let cur = i
-                .eq_preset
-                .as_deref()
-                .unwrap_or(crate::EQ_PRESETS[0].name);
+            let cur = i.eq_preset.as_deref().unwrap_or(crate::EQ_PRESETS[0].name);
             if opts.iter().any(|o| o.id == cur) {
                 out.push(Setting::choice(
                     HEADSET_EQ_PRESET,
@@ -496,9 +491,7 @@ impl Device for LogitechHeadset {
             setting_ids::SIDETONE => {
                 self.set_sidetone(value.as_f64().context("nombre attendu")? as u8)?
             }
-            HEADSET_MIC_MUTE => {
-                self.set_mic_mute(value.as_bool().context("booléen attendu")?)?
-            }
+            HEADSET_MIC_MUTE => self.set_mic_mute(value.as_bool().context("booléen attendu")?)?,
             HEADSET_BASS_TONE => {
                 self.set_bass_tone(value.as_f64().context("nombre attendu")? as u8)?
             }
@@ -765,7 +758,13 @@ impl Lighting for LogitechHeadset {
                 Some((1, 10)),
                 zids.clone(),
             ),
-            mouse_hw_effect("Cycle", "Cycle couleur", (0, 0), Some((1, 10)), zids.clone()),
+            mouse_hw_effect(
+                "Cycle",
+                "Cycle couleur",
+                (0, 0),
+                Some((1, 10)),
+                zids.clone(),
+            ),
             mouse_hw_effect("Off", "Éteint", (0, 0), None, zids),
         ]
     }
@@ -1066,13 +1065,18 @@ mod tests {
         assert_eq!(writes[2][2..7], [3, 0x5A, 0x00, 0x02, 30]); // 0x8103 fn 5 [0x0002, 30]
         assert_eq!(writes[3][2..9], [4, 0x4A, 0x00, 0x00, 10, 20, 30]); // 0x8080 fn 4 setAll
         assert_eq!(writes[4][2..5], [4, 0x5A, 0x00]); // 0x8080 fn 5 flush
-        assert_eq!(writes[5][2..12], [5, 0x1A, 0x04, 0x11, 0x22, 0x33, 0xFF, 0xFF, 0xFF, 0xFF]); // 0x8081 fn 1
+        assert_eq!(
+            writes[5][2..12],
+            [5, 0x1A, 0x04, 0x11, 0x22, 0x33, 0xFF, 0xFF, 0xFF, 0xFF]
+        ); // 0x8081 fn 1
         assert_eq!(writes[6][2..9], [5, 0x7A, 0x01, 0x00, 0x00, 0x00, 0x00]); // 0x8081 fn 7 FrameEnd
     }
 
     #[test]
     fn headset_ghub_parity_settings_and_lighting_work() {
-        use crate::features::{FEAT_BASS_TONE, FEAT_CENTURION_MIC_MUTE, FEAT_EQUALIZER, FEAT_SIDETONE};
+        use crate::features::{
+            FEAT_BASS_TONE, FEAT_CENTURION_MIC_MUTE, FEAT_EQUALIZER, FEAT_SIDETONE,
+        };
 
         let io = RecordingLogiIo::new();
         let mut t = HidppTransport::from_io(Box::new(io.clone()), 0xFF, true);
@@ -1097,7 +1101,8 @@ mod tests {
         hs.info.led_zones_count = 1;
         io.writes.lock().unwrap().clear();
 
-        hs.apply_setting(HEADSET_MIC_MUTE, &Value::Bool(true)).unwrap();
+        hs.apply_setting(HEADSET_MIC_MUTE, &Value::Bool(true))
+            .unwrap();
         hs.apply_setting(HEADSET_BASS_TONE, &Value::Number(60.0))
             .unwrap();
         hs.apply_setting(HEADSET_EQ_PRESET, &Value::Text("FPS (Pro G HUB)".into()))

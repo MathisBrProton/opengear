@@ -529,7 +529,11 @@ impl LogitechMouse {
     }
 
     fn switch_to_host_mode_if_onboard(&mut self) -> Result<bool, HidppError> {
-        if self.transport.get_feature_index(FEAT_ONBOARD_PROFILES).is_none() {
+        if self
+            .transport
+            .get_feature_index(FEAT_ONBOARD_PROFILES)
+            .is_none()
+        {
             return Ok(false);
         }
         if matches!(
@@ -691,7 +695,11 @@ impl LogitechMouse {
         None
     }
 
-    fn write_report_rate_raw(t: &HidppTransport, extended: bool, hz: u16) -> Result<(), HidppError> {
+    fn write_report_rate_raw(
+        t: &HidppTransport,
+        extended: bool,
+        hz: u16,
+    ) -> Result<(), HidppError> {
         if extended {
             let idx =
                 Self::hz_to_ext_rate_idx(hz).ok_or(HidppError::Protocol(0x02, "Hz invalide"))?;
@@ -911,7 +919,10 @@ impl LogitechMouse {
                 zone_idx, 0x0A, color.r, color.g, color.b, sp[0], sp[1], 0x01, 100, 0, 0, 0,
             ],
         };
-        if self.transport.get_feature_index(FEAT_COLOR_LED_EFFECTS).is_some()
+        if self
+            .transport
+            .get_feature_index(FEAT_COLOR_LED_EFFECTS)
+            .is_some()
             || self.transport.get_feature_index(FEAT_RGB_EFFECTS).is_some()
         {
             return write_led_zone_raw(&self.transport, true, &params);
@@ -970,8 +981,11 @@ impl LogitechMouse {
                 &[wheel_mode, auto_disengage, tq],
             )?;
         } else {
-            self.transport
-                .request_feature(FEAT_SMART_SHIFT, 0x10, &[wheel_mode, auto_disengage])?;
+            self.transport.request_feature(
+                FEAT_SMART_SHIFT,
+                0x10,
+                &[wheel_mode, auto_disengage],
+            )?;
         }
         if let Some(cur) = self.info.smart_shift.as_mut() {
             cur.wheel_mode = wheel_mode;

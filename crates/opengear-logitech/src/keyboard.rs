@@ -99,9 +99,7 @@ impl LogitechKeyboard {
         {
             b.estimated_hours = estimate_rated_battery_hours(transport.pid, &name, pct, None);
         }
-        let supports_per_key_rgb = transport
-            .get_feature_index(FEAT_PER_KEY_LIGHTING)
-            .is_some()
+        let supports_per_key_rgb = transport.get_feature_index(FEAT_PER_KEY_LIGHTING).is_some()
             || transport
                 .get_feature_index(FEAT_PER_KEY_LIGHTING_V1)
                 .is_some();
@@ -466,8 +464,11 @@ impl LogitechKeyboard {
             self.transport
                 .request_feature(FEAT_PER_KEY_LIGHTING_V1, 0x10, &params)?;
         }
-        self.transport
-            .request_feature(FEAT_PER_KEY_LIGHTING_V1, 0x70, &[0x01, 0x00, 0x00, 0x00, 0x00])?;
+        self.transport.request_feature(
+            FEAT_PER_KEY_LIGHTING_V1,
+            0x70,
+            &[0x01, 0x00, 0x00, 0x00, 0x00],
+        )?;
         Ok(())
     }
 }

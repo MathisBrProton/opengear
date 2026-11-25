@@ -1,6 +1,8 @@
 //! HyperX HID packet builders (clean-room from `docs/protocols/hyperx.md`).
 
-use crate::tables::{ALLOY_ELITE_EXT_OFFSETS, ALLOY_ELITE_KEY_OFFSETS, ORIGINS_CORE_KEYS, origins_core_offsets};
+use crate::tables::{
+    ALLOY_ELITE_EXT_OFFSETS, ALLOY_ELITE_KEY_OFFSETS, ORIGINS_CORE_KEYS, origins_core_offsets,
+};
 use anyhow::Result;
 use hidapi::HidDevice;
 use opengear_core::Rgb;
@@ -115,7 +117,12 @@ pub fn origins_core_packets(colors: &[Rgb]) -> Vec<Vec<u8>> {
 }
 
 /// §3.5 / §6.2 Report 0x44 start packet + color packets (20 LEDs per packet).
-pub fn report_0x44_packets(report_len: usize, start_arg: u8, colors: &[Rgb], total_slots: usize) -> Vec<Vec<u8>> {
+pub fn report_0x44_packets(
+    report_len: usize,
+    start_arg: u8,
+    colors: &[Rgb],
+    total_slots: usize,
+) -> Vec<Vec<u8>> {
     let mut start = vec![0u8; report_len];
     start[0] = 0x44;
     start[1] = 0x01;
@@ -180,11 +187,17 @@ mod tests {
     #[test]
     fn pulsefire_dart_and_0x44_packets_match_sheet() {
         let dart = pulsefire_dart_pkt(0x10, 0x00, Rgb::RED, 80, 0);
-        assert_eq!(&dart[1..13], &[0xD2, 0x10, 0x00, 0x08, 255, 0, 0, 255, 0, 0, 80, 0]);
+        assert_eq!(
+            &dart[1..13],
+            &[0xD2, 0x10, 0x00, 0x08, 255, 0, 0, 255, 0, 0, 80, 0]
+        );
 
         let pkts = report_0x44_packets(65, 0x04, &[Rgb::CYAN, Rgb::RED], 74);
         assert_eq!(pkts.len(), 5); // 1 start + 4 color chunks
         assert_eq!(&pkts[0][0..3], &[0x44, 0x01, 0x04]);
-        assert_eq!(&pkts[1][0..10], &[0x44, 0x02, 0x00, 0x00, 0, 210, 255, 255, 0, 0]);
+        assert_eq!(
+            &pkts[1][0..10],
+            &[0x44, 0x02, 0x00, 0x00, 0, 210, 255, 255, 0, 0]
+        );
     }
 }

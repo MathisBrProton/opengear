@@ -6,9 +6,9 @@
 //! - QuadCast 2 S implements the sheet's failure backoff (drain on 5 errors, pause 5s on 10 errors).
 
 use crate::ops::{
-    apply_device_setting, apply_legacy_brightness_hw, apply_universal_brightness,
+    HxState, apply_device_setting, apply_legacy_brightness_hw, apply_universal_brightness,
     build_diagnostic_lines, build_settings, discover_hyperx_devices, probe_and_refresh,
-    send_universal_frame, HxState,
+    send_universal_frame,
 };
 use crate::proto::{
     HxIo, alloy_elite_ext_channel, frame_0x81_chunk, frame_0x81_header, origins_core_packets,
@@ -19,7 +19,7 @@ use crate::proto_ngenuity::{
 };
 use crate::tables::{
     ALLOY_ELITE_EXT_OFFSETS, ALLOY_ELITE_KEY_OFFSETS, HP_HYPERX_VID, HxDeviceDef, KINGSTON_VID,
-    ORIGINS_60_SLOTS, ORIGINS_65_TAIL, ORIGINS_2_65_SLOTS, ORIGINS_CORE_KEYS, ProtocolFamily,
+    ORIGINS_2_65_SLOTS, ORIGINS_60_SLOTS, ORIGINS_65_TAIL, ORIGINS_CORE_KEYS, ProtocolFamily,
 };
 use anyhow::Result;
 use opengear_core::Rgb;
@@ -120,7 +120,8 @@ impl HyperXDevice {
         let ack_ok = n >= 16 && rx[14] == pkt[0] && rx[15] == pkt[1];
         if !ack_ok {
             let now = Instant::now();
-            self.qc2_errors.retain(|t| now.duration_since(*t) < Duration::from_secs(10));
+            self.qc2_errors
+                .retain(|t| now.duration_since(*t) < Duration::from_secs(10));
             self.qc2_errors.push(now);
             if self.qc2_errors.len() >= 10 {
                 self.qc2_backoff_until = Some(now + Duration::from_secs(5));
@@ -140,17 +141,19 @@ impl HyperXDevice {
 
 impl Device for HyperXDevice {
     fn info(&self) -> DeviceInfo {
-        let slug: u32 = self
-            .path_tag
-            .bytes()
-            .fold(0x811C_9DC5u32, |h, b| h.wrapping_mul(0x0100_0193) ^ u32::from(b));
+        let slug: u32 = self.path_tag.bytes().fold(0x811C_9DC5u32, |h, b| {
+            h.wrapping_mul(0x0100_0193) ^ u32::from(b)
+        });
         let fw = self
             .state
             .univ_info
             .as_ref()
             .map(|u| format!("{:#06X}", u.primary_fw));
         DeviceInfo {
-            id: format!("{DRIVER_NAME}:{:04x}:{:04x}:{slug:08x}", self.def.vid, self.def.pid),
+            id: format!(
+                "{DRIVER_NAME}:{:04x}:{:04x}:{slug:08x}",
+                self.def.vid, self.def.pid
+            ),
             vendor: "HyperX".into(),
             model: self
                 .state
@@ -185,7 +188,8 @@ impl Device for HyperXDevice {
 
     fn apply_setting(&mut self, id: &str, value: &Value) -> Result<()> {
         if id == setting_ids::HW_BRIGHTNESS {
-            self.state.brightness_pct = value.as_f64().unwrap_or(100.0).round().clamp(0.0, 100.0) as u8;
+            self.state.brightness_pct =
+                value.as_f64().unwrap_or(100.0).round().clamp(0.0, 100.0) as u8;
             return self.apply_brightness_hw();
         }
         apply_device_setting(self.io.as_mut(), self.def, &mut self.state, id, value)
@@ -233,8 +237,20 @@ impl Lighting for HyperXDevice {
                     })
                     .collect();
                 vec![
-                    Zone { id: "keys".into(), name: "Touches".into(), kind: ZoneKind::Matrix, leds: key_leds, resizable: None },
-                    Zone { id: "lightbar".into(), name: "Barre lumineuse & média".into(), kind: ZoneKind::Linear, leds: ext_leds, resizable: None },
+                    Zone {
+                        id: "keys".into(),
+                        name: "Touches".into(),
+                        kind: ZoneKind::Matrix,
+                        leds: key_leds,
+                        resizable: None,
+                    },
+                    Zone {
+                        id: "lightbar".into(),
+                        name: "Barre lumineuse & média".into(),
+                        kind: ZoneKind::Linear,
+                        leds: ext_leds,
+                        resizable: None,
+                    },
                 ]
             }
             ProtocolFamily::AlloyFps => {
@@ -242,7 +258,13 @@ impl Lighting for HyperXDevice {
                     .iter()
                     .map(|&(_, code, nx, ny)| Led::at(code, nx, ny).key(code))
                     .collect();
-                vec![Zone { id: "keys".into(), name: "Touches".into(), kind: ZoneKind::Matrix, leds, resizable: None }]
+                vec![Zone {
+                    id: "keys".into(),
+                    name: "Touches".into(),
+                    kind: ZoneKind::Matrix,
+                    leds,
+                    resizable: None,
+                }]
             }
             ProtocolFamily::Frame0x81Keyboard { slots, .. } => {
                 let leds = if slots == 71 {
@@ -253,17 +275,35 @@ impl Lighting for HyperXDevice {
                     slot_leds(&v)
                 } else {
                     (0..slots)
-                        .map(|i| Led::at(format!("LED {}", i + 1), (i % 16) as f32 / 15.0, (i / 16) as f32 / 8.0))
+                        .map(|i| {
+                            Led::at(
+                                format!("LED {}", i + 1),
+                                (i % 16) as f32 / 15.0,
+                                (i / 16) as f32 / 8.0,
+                            )
+                        })
                         .collect()
                 };
-                vec![Zone { id: "keys".into(), name: "Touches".into(), kind: ZoneKind::Matrix, leds, resizable: None }]
+                vec![Zone {
+                    id: "keys".into(),
+                    name: "Touches".into(),
+                    kind: ZoneKind::Matrix,
+                    leds,
+                    resizable: None,
+                }]
             }
             ProtocolFamily::OriginsCore => {
                 let leds = ORIGINS_CORE_KEYS
                     .iter()
                     .map(|&(_, r, c, w3c)| Led::at(w3c, c as f32 / 16.0, r as f32 / 5.0).key(w3c))
                     .collect();
-                vec![Zone { id: "keys".into(), name: "Touches".into(), kind: ZoneKind::Matrix, leds, resizable: None }]
+                vec![Zone {
+                    id: "keys".into(),
+                    name: "Touches".into(),
+                    kind: ZoneKind::Matrix,
+                    leds,
+                    resizable: None,
+                }]
             }
             ProtocolFamily::Report0x44Origins265 => vec![Zone {
                 id: "keys".into(),
@@ -277,17 +317,19 @@ impl Lighting for HyperXDevice {
     }
 
     fn hardware_effects(&self) -> Vec<HardwareEffect> {
-        let mk = |id: &str, label: &str, colors: (u8, u8), speed: bool, br: bool, savable: bool| HardwareEffect {
-            id: id.into(),
-            label: label.into(),
-            params: EffectParams {
-                colors,
-                speed: if speed { Some((0, 100)) } else { None },
-                brightness: if br { Some((0, 100)) } else { None },
-                savable,
-                ..Default::default()
-            },
-            zones: Vec::new(),
+        let mk = |id: &str, label: &str, colors: (u8, u8), speed: bool, br: bool, savable: bool| {
+            HardwareEffect {
+                id: id.into(),
+                label: label.into(),
+                params: EffectParams {
+                    colors,
+                    speed: if speed { Some((0, 100)) } else { None },
+                    brightness: if br { Some((0, 100)) } else { None },
+                    savable,
+                    ..Default::default()
+                },
+                zones: Vec::new(),
+            }
         };
         if self.def.caps().universal && self.def.led_count > 0 {
             return vec![
@@ -301,9 +343,30 @@ impl Lighting for HyperXDevice {
         }
         match self.def.family {
             ProtocolFamily::PulsefireDart | ProtocolFamily::PulsefireHasteWireless => vec![
-                mk("static", "Statique", (1, 2), false, true, matches!(self.def.family, ProtocolFamily::PulsefireDart)),
-                mk("breathing", "Respiration", (1, 2), true, true, matches!(self.def.family, ProtocolFamily::PulsefireDart)),
-                mk("spectrum", "Cycle spectral", (0, 0), true, true, matches!(self.def.family, ProtocolFamily::PulsefireDart)),
+                mk(
+                    "static",
+                    "Statique",
+                    (1, 2),
+                    false,
+                    true,
+                    matches!(self.def.family, ProtocolFamily::PulsefireDart),
+                ),
+                mk(
+                    "breathing",
+                    "Respiration",
+                    (1, 2),
+                    true,
+                    true,
+                    matches!(self.def.family, ProtocolFamily::PulsefireDart),
+                ),
+                mk(
+                    "spectrum",
+                    "Cycle spectral",
+                    (0, 0),
+                    true,
+                    true,
+                    matches!(self.def.family, ProtocolFamily::PulsefireDart),
+                ),
             ],
             _ => Vec::new(),
         }
@@ -344,14 +407,20 @@ impl Lighting for HyperXDevice {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
-            ProtocolFamily::Frame0x81Keyboard { slots, header_byte9 } => {
+            ProtocolFamily::Frame0x81Keyboard {
+                slots,
+                header_byte9,
+            } => {
                 self.state.last_frame = colors.to_vec();
                 let scaled: Vec<Rgb> = colors.iter().copied().map(scale).collect();
                 let pkt_count = slots.div_ceil(16);
-                self.io.send_feature(&frame_0x81_header(0x00, header_byte9))?;
+                self.io
+                    .send_feature(&frame_0x81_header(0x00, header_byte9))?;
                 for p in 0..pkt_count {
                     let start = p * 16;
-                    let slice = scaled.get(start..(start + 16).min(scaled.len())).unwrap_or(&[]);
+                    let slice = scaled
+                        .get(start..(start + 16).min(scaled.len()))
+                        .unwrap_or(&[]);
                     self.io.send_feature(&frame_0x81_chunk(slice))?;
                 }
             }
@@ -401,11 +470,25 @@ impl Lighting for HyperXDevice {
                 self.state.last_frame = colors.to_vec();
                 let logo = colors.first().copied().unwrap_or(first);
                 let wheel = colors.get(1).copied().unwrap_or(logo);
-                self.io.write_output(&pulsefire_dart_pkt(0x10, 0x00, wheel, self.state.brightness_pct, 0))?;
+                self.io.write_output(&pulsefire_dart_pkt(
+                    0x10,
+                    0x00,
+                    wheel,
+                    self.state.brightness_pct,
+                    0,
+                ))?;
                 std::thread::sleep(Duration::from_millis(2));
-                self.io.write_output(&pulsefire_dart_pkt(0x00, 0x00, logo, self.state.brightness_pct, 0))?;
+                self.io.write_output(&pulsefire_dart_pkt(
+                    0x00,
+                    0x00,
+                    logo,
+                    self.state.brightness_pct,
+                    0,
+                ))?;
             }
-            ProtocolFamily::PulsefireHaste | ProtocolFamily::PulsefireFpsPro2 | ProtocolFamily::PulsefireHasteWireless => {
+            ProtocolFamily::PulsefireHaste
+            | ProtocolFamily::PulsefireFpsPro2
+            | ProtocolFamily::PulsefireHasteWireless => {
                 self.io.send_feature(&frame_0x81_header(0x02, 0x00))?;
                 let mut pkt = [0u8; 65];
                 pkt[1] = 0x81;
@@ -419,7 +502,9 @@ impl Lighting for HyperXDevice {
                     .map(|i| colors.get(i).copied().unwrap_or(first))
                     .collect();
                 for p in 0..2 {
-                    let slice = bounded.get(p * 16..(p * 16 + 16).min(bounded.len())).unwrap_or(&[]);
+                    let slice = bounded
+                        .get(p * 16..(p * 16 + 16).min(bounded.len()))
+                        .unwrap_or(&[]);
                     self.io.send_feature(&frame_0x81_chunk(slice))?;
                 }
             }
@@ -427,7 +512,12 @@ impl Lighting for HyperXDevice {
                 let (top, bot) = if matches!(self.def.family, ProtocolFamily::QuadCastS) {
                     self.state.last_frame = colors.to_vec();
                     let t = scale(colors.first().copied().unwrap_or(first));
-                    let b = scale(colors.get(1).copied().unwrap_or(colors.first().copied().unwrap_or(first)));
+                    let b = scale(
+                        colors
+                            .get(1)
+                            .copied()
+                            .unwrap_or(colors.first().copied().unwrap_or(first)),
+                    );
                     (t, b)
                 } else {
                     let t = colors.first().copied().unwrap_or(first);
@@ -497,13 +587,21 @@ impl Lighting for HyperXDevice {
             ProtocolFamily::PulsefireDart => {
                 match req.effect.as_str() {
                     "spectrum" => {
-                        self.io.write_output(&pulsefire_dart_pkt(0x20, 0x12, Rgb::BLACK, br, spd_inv))?;
+                        self.io.write_output(&pulsefire_dart_pkt(
+                            0x20,
+                            0x12,
+                            Rgb::BLACK,
+                            br,
+                            spd_inv,
+                        ))?;
                     }
                     "static" | "breathing" => {
                         let mode = if req.effect == "static" { 0x00 } else { 0x20 };
-                        self.io.write_output(&pulsefire_dart_pkt(0x10, mode, c0, br, spd_inv))?;
+                        self.io
+                            .write_output(&pulsefire_dart_pkt(0x10, mode, c0, br, spd_inv))?;
                         std::thread::sleep(Duration::from_millis(2));
-                        self.io.write_output(&pulsefire_dart_pkt(0x00, mode, c1, br, spd_inv))?;
+                        self.io
+                            .write_output(&pulsefire_dart_pkt(0x00, mode, c1, br, spd_inv))?;
                     }
                     _ => anyhow::bail!("Effet Pulsefire Dart inconnu : {}", req.effect),
                 }
@@ -573,7 +671,8 @@ mod tests {
         let io = MockIo::default();
         let writes = io.writes.clone();
         let mut dev = HyperXDevice::new(def, Box::new(io), "mock".into());
-        dev.set_frame(&[Rgb::RED, Rgb::GREEN, Rgb::BLUE, Rgb::WHITE]).unwrap();
+        dev.set_frame(&[Rgb::RED, Rgb::GREEN, Rgb::BLUE, Rgb::WHITE])
+            .unwrap();
         let pkts = writes.lock().unwrap();
         // header + 2 chunks
         assert_eq!(pkts.len(), 3);
@@ -613,11 +712,16 @@ mod tests {
         let writes = io.writes.clone();
         let mut dev = HyperXDevice::new(def, Box::new(io), "mock-h2".into());
 
-        dev.apply_setting("hyperx.active_dpi_stage", &Value::Text("2".into())).unwrap();
-        dev.apply_setting("hyperx.dpi", &Value::Number(1600.0)).unwrap();
-        dev.apply_setting(setting_ids::POLLING_RATE, &Value::Text("8000".into())).unwrap();
-        dev.apply_setting("hyperx.lod", &Value::Text("2".into())).unwrap();
-        dev.apply_setting(setting_ids::ANGLE_SNAPPING, &Value::Bool(true)).unwrap();
+        dev.apply_setting("hyperx.active_dpi_stage", &Value::Text("2".into()))
+            .unwrap();
+        dev.apply_setting("hyperx.dpi", &Value::Number(1600.0))
+            .unwrap();
+        dev.apply_setting(setting_ids::POLLING_RATE, &Value::Text("8000".into()))
+            .unwrap();
+        dev.apply_setting("hyperx.lod", &Value::Text("2".into()))
+            .unwrap();
+        dev.apply_setting(setting_ids::ANGLE_SNAPPING, &Value::Bool(true))
+            .unwrap();
 
         let pkts = writes.lock().unwrap();
         assert_eq!(pkts.len(), 5);
@@ -642,9 +746,12 @@ mod tests {
         let writes = io.writes.clone();
         let mut dev = HyperXDevice::new(def, Box::new(io), "mock-c3w".into());
 
-        dev.apply_setting(setting_ids::SIDETONE, &Value::Number(80.0)).unwrap();
-        dev.apply_setting("hyperx.mic_mute", &Value::Bool(true)).unwrap();
-        dev.apply_setting("hyperx.auto_sleep", &Value::Text("30".into())).unwrap();
+        dev.apply_setting(setting_ids::SIDETONE, &Value::Number(80.0))
+            .unwrap();
+        dev.apply_setting("hyperx.mic_mute", &Value::Bool(true))
+            .unwrap();
+        dev.apply_setting("hyperx.auto_sleep", &Value::Text("30".into()))
+            .unwrap();
 
         let pkts = writes.lock().unwrap();
         assert_eq!(pkts.len(), 4);
@@ -662,12 +769,18 @@ mod tests {
         let writes = io.writes.clone();
         let mut dev = HyperXDevice::new(def, Box::new(io), "mock-cf2".into());
 
-        dev.apply_setting(setting_ids::SIDETONE, &Value::Number(60.0)).unwrap();
-        dev.apply_setting("hyperx.mic_mute", &Value::Bool(true)).unwrap();
-        dev.apply_setting("hyperx.noise_gate", &Value::Bool(true)).unwrap();
-        dev.apply_setting("hyperx.voice_prompt", &Value::Text("beep".into())).unwrap();
-        dev.apply_setting("hyperx.eq_preset", &Value::Text("2".into())).unwrap();
-        dev.apply_setting("hyperx.auto_sleep", &Value::Text("10".into())).unwrap();
+        dev.apply_setting(setting_ids::SIDETONE, &Value::Number(60.0))
+            .unwrap();
+        dev.apply_setting("hyperx.mic_mute", &Value::Bool(true))
+            .unwrap();
+        dev.apply_setting("hyperx.noise_gate", &Value::Bool(true))
+            .unwrap();
+        dev.apply_setting("hyperx.voice_prompt", &Value::Text("beep".into()))
+            .unwrap();
+        dev.apply_setting("hyperx.eq_preset", &Value::Text("2".into()))
+            .unwrap();
+        dev.apply_setting("hyperx.auto_sleep", &Value::Text("10".into()))
+            .unwrap();
 
         let pkts = writes.lock().unwrap();
         assert_eq!(pkts.len(), 6);
@@ -680,16 +793,34 @@ mod tests {
         drop(pkts);
 
         for d in crate::tables::DEVICES {
-            let mut dev = HyperXDevice::new(d, Box::new(MockIo::default()), format!("mock:{:04x}", d.pid));
+            let mut dev = HyperXDevice::new(
+                d,
+                Box::new(MockIo::default()),
+                format!("mock:{:04x}", d.pid),
+            );
             let mut seen_ids = std::collections::BTreeSet::new();
             for s in dev.settings() {
-                assert!(seen_ids.insert(s.id.clone()), "Duplicate setting {} on {}", s.id, d.name);
-                assert!(s.validate(&s.value).is_ok(), "Default setting invalid: {} on {}", s.id, d.name);
+                assert!(
+                    seen_ids.insert(s.id.clone()),
+                    "Duplicate setting {} on {}",
+                    s.id,
+                    d.name
+                );
+                assert!(
+                    s.validate(&s.value).is_ok(),
+                    "Default setting invalid: {} on {}",
+                    s.id,
+                    d.name
+                );
             }
             if d.led_count > 0 {
                 assert!(dev.lighting().is_some(), "Expected Lighting on {}", d.name);
             } else {
-                assert!(dev.lighting().is_none(), "Expected no Lighting on {}", d.name);
+                assert!(
+                    dev.lighting().is_none(),
+                    "Expected no Lighting on {}",
+                    d.name
+                );
             }
         }
     }
@@ -713,7 +844,8 @@ mod tests {
         let io = MockIo::default();
         let writes = io.writes.clone();
         let mut dev = HyperXDevice::new(c3s, Box::new(io), "mock-c3s".into());
-        dev.apply_setting("hyperx.eq_band_3", &Value::Number(4.5)).unwrap();
+        dev.apply_setting("hyperx.eq_band_3", &Value::Number(4.5))
+            .unwrap();
         let pkts = writes.lock().unwrap();
         assert_eq!(pkts[0].1[5..=6], [0x5F, 3]);
 
@@ -727,7 +859,12 @@ mod tests {
         };
         let io = MockIo::default();
         let dev = HyperXDevice::new(alpha, Box::new(io), "mock-alpha".into());
-        assert_eq!(dev.def.rated_battery_hours().map(|h| (40u32 * u32::from(h)) / 100), Some(120));
+        assert_eq!(
+            dev.def
+                .rated_battery_hours()
+                .map(|h| (40u32 * u32::from(h)) / 100),
+            Some(120)
+        );
         status.battery_hours = Some(120);
         assert_eq!(status.battery_hours, Some(120));
     }
@@ -738,10 +875,14 @@ mod tests {
         let io = MockIo::default();
         let writes = io.writes.clone();
         let mut dev = HyperXDevice::new(qc2s, Box::new(io), "mock-qc2s".into());
-        dev.apply_setting("hyperx.polar_pattern", &Value::Text("omni".into())).unwrap();
-        dev.apply_setting("hyperx.high_pass", &Value::Bool(true)).unwrap();
-        dev.apply_setting("hyperx.mic_gain", &Value::Number(75.0)).unwrap();
-        dev.apply_setting("hyperx.mic_balance", &Value::Number(40.0)).unwrap();
+        dev.apply_setting("hyperx.polar_pattern", &Value::Text("omni".into()))
+            .unwrap();
+        dev.apply_setting("hyperx.high_pass", &Value::Bool(true))
+            .unwrap();
+        dev.apply_setting("hyperx.mic_gain", &Value::Number(75.0))
+            .unwrap();
+        dev.apply_setting("hyperx.mic_balance", &Value::Number(40.0))
+            .unwrap();
         let pkts = writes.lock().unwrap();
         assert_eq!(&pkts[0].1[..3], &[0x77, 0x05, 1]);
         assert_eq!(&pkts[1].1[..3], &[0x77, 0x07, 1]);
@@ -753,9 +894,12 @@ mod tests {
         let io = MockIo::default();
         let writes = io.writes.clone();
         let mut dev = HyperXDevice::new(duocast, Box::new(io), "mock-duo".into());
-        dev.apply_setting(setting_ids::HW_BRIGHTNESS, &Value::Number(50.0)).unwrap();
-        dev.apply_setting("hyperx.reverse_lights", &Value::Bool(true)).unwrap();
-        dev.apply_setting("hyperx.polar_pattern", &Value::Text("omni".into())).unwrap();
+        dev.apply_setting(setting_ids::HW_BRIGHTNESS, &Value::Number(50.0))
+            .unwrap();
+        dev.apply_setting("hyperx.reverse_lights", &Value::Bool(true))
+            .unwrap();
+        dev.apply_setting("hyperx.polar_pattern", &Value::Text("omni".into()))
+            .unwrap();
         let pkts = writes.lock().unwrap();
         assert_eq!(pkts[0].0, "feat");
         assert_eq!(pkts[1].1[17], 1);
@@ -766,9 +910,12 @@ mod tests {
         let io = MockIo::default();
         let writes = io.writes.clone();
         let mut dev = HyperXDevice::new(rise, Box::new(io), "mock-rise".into());
-        dev.apply_setting("hyperx.gm_alt_f4", &Value::Bool(true)).unwrap();
-        dev.apply_setting("hyperx.backlight_fade", &Value::Text("30".into())).unwrap();
-        dev.apply_setting("hyperx.ambient_brightness", &Value::Bool(true)).unwrap();
+        dev.apply_setting("hyperx.gm_alt_f4", &Value::Bool(true))
+            .unwrap();
+        dev.apply_setting("hyperx.backlight_fade", &Value::Text("30".into()))
+            .unwrap();
+        dev.apply_setting("hyperx.ambient_brightness", &Value::Bool(true))
+            .unwrap();
         dev.apply_hardware_effect(&EffectRequest {
             effect: "wave".into(),
             zone: None,

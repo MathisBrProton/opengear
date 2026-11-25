@@ -1,9 +1,9 @@
+use crate::MouseLedMode;
 use crate::features::*;
 use crate::hidpp::{
     BatteryInfo, HidppError, HidppTransport, TAG_POWER_OFF_TIMEOUT, estimate_rated_battery_hours,
     read_battery_info, read_global_setting_u8, write_global_setting_u8, write_led_zone_raw,
 };
-use crate::MouseLedMode;
 use opengear_core::Rgb;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -116,8 +116,7 @@ impl LogitechHeadset {
             || t.get_feature_index(FEAT_EQUALIZER).is_some();
         has_hs_feat
             || (t.proto_major == 0
-                && (t.pid == 0x0AAA
-                    || t.product_string.to_ascii_lowercase().contains("headset")))
+                && (t.pid == 0x0AAA || t.product_string.to_ascii_lowercase().contains("headset")))
     }
 
     /// Discover and connect to ALL Logitech HID++ headsets on UsagePage `0xFF43`.
@@ -169,9 +168,7 @@ impl LogitechHeadset {
             .get_feature_index(FEAT_CENTURION_MIC_MUTE)
             .is_some()
             || (transport.get_feature_index(FEAT_SIDETONE).is_some()
-                && transport
-                    .request_feature(FEAT_SIDETONE, 0x20, &[])
-                    .is_ok());
+                && transport.request_feature(FEAT_SIDETONE, 0x20, &[]).is_ok());
         let mic_muted = Self::read_mic_mute_inner(&transport);
         let bass_tone = Self::read_bass_tone_inner(&transport);
         let power_off_minutes = read_global_setting_u8(&transport, TAG_POWER_OFF_TIMEOUT)
@@ -430,11 +427,8 @@ impl LogitechHeadset {
             .get_feature_index(FEAT_CENTURION_MIC_MUTE)
             .is_some()
         {
-            self.transport.request_feature(
-                FEAT_CENTURION_MIC_MUTE,
-                0x10,
-                &[u8::from(muted)],
-            )?;
+            self.transport
+                .request_feature(FEAT_CENTURION_MIC_MUTE, 0x10, &[u8::from(muted)])?;
         } else if self.transport.get_feature_index(FEAT_SIDETONE).is_some() {
             self.transport
                 .request_feature(FEAT_SIDETONE, 0x30, &[u8::from(muted)])?;
@@ -516,11 +510,13 @@ impl LogitechHeadset {
         let sp = speed_ms.to_be_bytes();
         let params: [u8; 12] = match mode {
             MouseLedMode::Off => [zone_idx, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            MouseLedMode::Fixed => [zone_idx, 0x01, color.r, color.g, color.b, 0, 0, 0, 0, 0, 0, 0],
+            MouseLedMode::Fixed => [
+                zone_idx, 0x01, color.r, color.g, color.b, 0, 0, 0, 0, 0, 0, 0,
+            ],
             MouseLedMode::Cycle => [zone_idx, 0x03, 0, 0, 0, 0, 0, sp[0], sp[1], 100, 0, 0],
-            MouseLedMode::Breathing => {
-                [zone_idx, 0x0A, color.r, color.g, color.b, sp[0], sp[1], 0x01, 100, 0, 0, 0]
-            }
+            MouseLedMode::Breathing => [
+                zone_idx, 0x0A, color.r, color.g, color.b, sp[0], sp[1], 0x01, 100, 0, 0, 0,
+            ],
         };
         write_led_zone_raw(&self.transport, true, &params)
     }

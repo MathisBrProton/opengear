@@ -347,7 +347,8 @@ mod win_sio {
                     let _ = sio_outb(&sess, 0x07, 0x04);
                     let hwm_base = sio_inw(&sess, 0x60).unwrap_or(0);
                     exit_ite(&sess);
-                    if hwm_base >= 0x100 && hwm_base != 0xFFFF && verify_ite_vendor(&sess, hwm_base) {
+                    if hwm_base >= 0x100 && hwm_base != 0xFFFF && verify_ite_vendor(&sess, hwm_base)
+                    {
                         return Ok((
                             sess,
                             DetectedChip {
@@ -365,7 +366,9 @@ mod win_sio {
                 }
             }
         }
-        anyhow::bail!("Aucune puce SuperIO Nuvoton NCT679xD / ITE IT86xx-IT87xx détectée sur 0x2E/0x4E")
+        anyhow::bail!(
+            "Aucune puce SuperIO Nuvoton NCT679xD / ITE IT86xx-IT87xx détectée sur 0x2E/0x4E"
+        )
     }
 
     static SNAPSHOT_SESSION: OnceLock<Mutex<Option<(PawnIoSession, DetectedChip)>>> =
@@ -504,10 +507,12 @@ mod win_sio {
                         lsb as u32
                     };
                     let rpm = ite_rpm_from_count(count);
-                    let ctrl = ite_ec_read(sess, chip.hwm_base, ITE_PWM_CTRL_REGS[i]).unwrap_or(0x80);
+                    let ctrl =
+                        ite_ec_read(sess, chip.hwm_base, ITE_PWM_CTRL_REGS[i]).unwrap_or(0x80);
                     let is_manual = (ctrl & 0x80) == 0;
                     let pwm_pct = if pwm_8bit {
-                        let raw = ite_ec_read(sess, chip.hwm_base, ITE_PWM_DUTY_REGS[i]).unwrap_or(0);
+                        let raw =
+                            ite_ec_read(sess, chip.hwm_base, ITE_PWM_DUTY_REGS[i]).unwrap_or(0);
                         ((raw as u32 * 100 + 127) / 255).min(100) as u8
                     } else if is_manual {
                         (((ctrl & 0x7F) as u32 * 100 + 63) / 127).min(100) as u8
@@ -628,7 +633,8 @@ mod win_sio {
                             cmd: cur_duty,
                         });
                     }
-                    let (target_ctrl, target_duty) = ite_manual_target(cur_ctrl, duty_pct, pwm_8bit);
+                    let (target_ctrl, target_duty) =
+                        ite_manual_target(cur_ctrl, duty_pct, pwm_8bit);
                     ite_ec_write(&sess, chip.hwm_base, ctrl_reg, target_ctrl)?;
                     if pwm_8bit
                         && let Err(e) = ite_ec_write(&sess, chip.hwm_base, duty_reg, target_duty)
@@ -700,9 +706,19 @@ mod win_sio {
             }
             ChipFamily::Ite { pwm_8bit } => {
                 if pwm_8bit {
-                    ite_ec_write(&sess, chip.hwm_base, ITE_PWM_DUTY_REGS[channel_idx], saved.cmd)?;
+                    ite_ec_write(
+                        &sess,
+                        chip.hwm_base,
+                        ITE_PWM_DUTY_REGS[channel_idx],
+                        saved.cmd,
+                    )?;
                 }
-                ite_ec_write(&sess, chip.hwm_base, ITE_PWM_CTRL_REGS[channel_idx], saved.mode)?;
+                ite_ec_write(
+                    &sess,
+                    chip.hwm_base,
+                    ITE_PWM_CTRL_REGS[channel_idx],
+                    saved.mode,
+                )?;
             }
         }
         if let Ok(mut guard) = saved_states().lock() {
@@ -735,7 +751,9 @@ mod win_sio {
                 let r = match chip.family {
                     ChipFamily::Nuvoton { .. } => {
                         hwm_write(&sess, chip.hwm_base, FAN_PWM_CMD_REGS[s.index], s.cmd).and_then(
-                            |_| hwm_write(&sess, chip.hwm_base, FAN_CTRL_MODE_REGS[s.index], s.mode),
+                            |_| {
+                                hwm_write(&sess, chip.hwm_base, FAN_CTRL_MODE_REGS[s.index], s.mode)
+                            },
                         )
                     }
                     ChipFamily::Ite { pwm_8bit } => {

@@ -1017,7 +1017,13 @@ mod tests {
         assert_eq!(light[5], 80);
         assert_eq!(light[8..=11], [1, 10, 20, 30]);
 
-        let eq = univ_set_onboard_eq_pkt(0, 1, true, 2, &[6.0, -3.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let eq = univ_set_onboard_eq_pkt(
+            0,
+            1,
+            true,
+            2,
+            &[6.0, -3.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
         assert_eq!(eq[0], 0x66);
         assert_eq!(eq[1], 0x01);
         assert_eq!(eq[2], 1);
@@ -1084,12 +1090,24 @@ mod tests {
 
     #[test]
     fn battery_parsers_decode_known_frames() {
-        assert_eq!(parse_univ_battery(&[0x51, 0x02, 87, 1]), Some((87, Some(true))));
-        assert_eq!(parse_legacy_mouse_battery(&[0, 0x51, 0, 0, 0, 64, 0]), Some((64, Some(false))));
-        assert_eq!(parse_cloud_alpha_wireless_resp(&[0x21, 0xBB, 0x0B, 92]), (Some(92), None));
+        assert_eq!(
+            parse_univ_battery(&[0x51, 0x02, 87, 1]),
+            Some((87, Some(true)))
+        );
+        assert_eq!(
+            parse_legacy_mouse_battery(&[0, 0x51, 0, 0, 0, 64, 0]),
+            Some((64, Some(false)))
+        );
+        assert_eq!(
+            parse_cloud_alpha_wireless_resp(&[0x21, 0xBB, 0x0B, 92]),
+            (Some(92), None)
+        );
         assert_eq!(cloud_flight_battery_pct(15, 55), (80, false));
         assert_eq!(cloud_flight_battery_pct(20, 1), (100, true));
-        assert_eq!(parse_cloud3_wireless_resp(&[0x66, 0x07, 1, 1, 75]), (Some(75), None));
+        assert_eq!(
+            parse_cloud3_wireless_resp(&[0x66, 0x07, 1, 1, 75]),
+            (Some(75), None)
+        );
     }
 
     #[test]
