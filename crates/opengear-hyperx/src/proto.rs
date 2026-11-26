@@ -179,7 +179,7 @@ mod tests {
         assert_eq!(pkts.len(), 7);
         assert_eq!(pkts[0].len(), 65);
         assert_eq!(pkts[6].len(), 25); // 5 + 20 remaining bytes
-        assert_eq!(pkts[0][5 + 0], 20); // G of Escape at img[0]
+        assert_eq!(pkts[0][5], 20); // G of Escape at img[0]
         assert_eq!(pkts[0][5 + 16], 10); // R of Escape at img[16]
         assert_eq!(pkts[0][5 + 32], 30); // B of Escape at img[32]
     }

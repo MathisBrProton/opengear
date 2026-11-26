@@ -639,9 +639,11 @@ mod tests {
     use crate::tables::find_device;
     use std::sync::{Arc, Mutex};
 
+    type Writes = Arc<Mutex<Vec<(&'static str, Vec<u8>)>>>;
+
     #[derive(Clone, Default)]
     struct MockIo {
-        writes: Arc<Mutex<Vec<(&'static str, Vec<u8>)>>>,
+        writes: Writes,
         feature_resp: Arc<Mutex<Vec<u8>>>,
     }
 
