@@ -8,11 +8,15 @@ télémétrie et sans compte.
 > [Matériel supporté](#matériel-supporté)). OpenGear écrit dans la mémoire flash de certains
 > appareils : lis la section [Sécurité](#sécurité) avant d'utiliser le mode Expert.
 
-> **English summary.** OpenGear is a free, open-source Windows app (Rust) that controls RGB
-> lighting, mouse and keyboard settings, fans and pumps, macros and key remapping, from one
-> lightweight program. No account, no telemetry. It is tested on a few specific devices;
-> drivers marked *experimental* have not been tested on real hardware yet. Contributions are
-> welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+> **English summary.** OpenGear is a free, open-source Windows app, written in Rust, that
+> controls all your gaming hardware from one lightweight program: RGB lighting, mouse,
+> keyboard, headset, fans and liquid cooling, plus macros and key remapping. No iCUE, G HUB or
+> Armoury Crate needed, no telemetry and no account. It has been tested on a specific setup;
+> drivers marked *experimental* have not been tested on real hardware yet and are disabled by
+> default. OpenGear writes to the flash memory of some devices: read the
+> [Sécurité](#sécurité) (safety) section before using Expert mode. The rest of the
+> documentation is in French. Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md),
+> [SECURITY.md](SECURITY.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## Démarrage rapide
 
