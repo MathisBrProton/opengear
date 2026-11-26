@@ -18,7 +18,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: "1.99.1-x86_64-pc-windows-gnu"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check tag matches the workspace version
         if: github.ref_type == 'tag'
