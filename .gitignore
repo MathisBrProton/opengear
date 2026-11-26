@@ -8,3 +8,7 @@ target/
 # Local user data written next to a dev build
 opengear_profiles.toml
 opengear_profiles.toml.*
+
+# Python bytecode caches
+__pycache__/
+*.pyc
