@@ -12,7 +12,7 @@ use crate::tray_icon::{
     create_windows_shortcuts, is_autostart_enabled, release_single_instance, set_autostart_enabled,
 };
 use opengear_core::cooling::{
-    CurvePoint, FanPolicyMode, FanTempSource, SensorKind, TempMixConfig, TempMixOp,
+    CurvePoint, FanHeaderKind, FanPolicyMode, FanTempSource, SensorKind, TempMixConfig, TempMixOp,
 };
 use opengear_core::driver::{DeviceKind, Value as DriverValue, setting_ids};
 use opengear_core::fans::FanTarget;
@@ -37,6 +37,16 @@ const UNDO_DEPTH: usize = 20;
 const POWER_PLAN_BALANCED: &str = "381b4222-f694-41f0-9685-ff5bb260df2e";
 const POWER_PLAN_HIGH_PERF: &str = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
 const POWER_PLAN_ULTIMATE: &str = "e9a42b02-d5df-448d-aa00-03f14749eb61";
+
+/// Index of the pump channel, the only header the pump presets may be written to.
+///
+/// The pump is not always the first channel: on most boards `CPU_FAN` comes first and
+/// `AIO_PUMP` sits further down, so the index has to be looked up by header, never assumed.
+fn pump_channel_index(channels: &[opengear_core::cooling::FanChannelConfig]) -> Option<usize> {
+    channels
+        .iter()
+        .position(|c| c.header == FanHeaderKind::AioPump)
+}
 
 fn undo_label_for(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
@@ -1419,14 +1429,17 @@ impl BackendEngine {
             }
             "cooling_sl3_preset" => {
                 let preset = p["preset"].as_str().unwrap_or("default");
+                // These curves are tuned for a pump (45 % floor): they belong to the pump header,
+                // which is not always channel 0 — writing them blindly to `channels[0]` applied a
+                // pump curve to the CPU fan on every board where the pump sits elsewhere.
+                let idx = pump_channel_index(&self.cooling_channels)
+                    .ok_or("Aucun canal de pompe sur cette carte mère")?;
                 let mut to_apply = None;
-                if let Some(ch) = self.cooling_channels.get_mut(0) {
-                    ch.policy = FanPolicyMode::Manual;
-                    ch.curve =
-                        opengear_core::cooling::FanChannelConfig::silent_loop3_preset(preset);
-                    if self.cooling_status.is_admin {
-                        to_apply = Some(ch.clone());
-                    }
+                let ch = &mut self.cooling_channels[idx];
+                ch.policy = FanPolicyMode::Manual;
+                ch.curve = opengear_core::cooling::FanChannelConfig::silent_loop3_preset(preset);
+                if self.cooling_status.is_admin {
+                    to_apply = Some(ch.clone());
                 }
                 if let Some(cfg) = to_apply
                     && let Some(fc) = self.curve_cooling_mut()
@@ -2094,9 +2107,38 @@ mod tests {
     use super::super::{is_allowed_origin, resolve_static_asset};
     use super::{
         battery_alert_step, changed_vendors, check_import_size, is_valid_power_guid,
-        mask_sensitive_data, mask_user_profile, parse_temp_source,
+        mask_sensitive_data, mask_user_profile, parse_temp_source, pump_channel_index,
     };
-    use opengear_core::cooling::FanTempSource;
+    use opengear_core::cooling::{FanChannelConfig, FanHeaderKind, FanTempSource};
+
+    /// Pump presets carry a 45 % floor: written to any other header they would drive a plain
+    /// fan with a pump curve. The target is found by header, never by position.
+    #[test]
+    fn pump_presets_target_the_pump_header_wherever_it_sits() {
+        let channels: Vec<FanChannelConfig> = [
+            FanHeaderKind::CpuFan,
+            FanHeaderKind::ChassisFan1,
+            FanHeaderKind::AioPump,
+            FanHeaderKind::ChassisFan2,
+        ]
+        .into_iter()
+        .map(FanChannelConfig::default_for)
+        .collect();
+        let idx = pump_channel_index(&channels).expect("canal de pompe");
+        assert_eq!(idx, 2);
+        assert_eq!(channels[idx].header, FanHeaderKind::AioPump);
+    }
+
+    /// A board with no pump must refuse the preset rather than fall back to another header.
+    #[test]
+    fn a_board_without_a_pump_has_no_target() {
+        let channels: Vec<FanChannelConfig> = [FanHeaderKind::CpuFan, FanHeaderKind::ChassisFan1]
+            .into_iter()
+            .map(FanChannelConfig::default_for)
+            .collect();
+        assert_eq!(pump_channel_index(&channels), None);
+        assert_eq!(pump_channel_index(&[]), None);
+    }
 
     #[test]
     fn battery_alerts_fire_once_at_15_then_once_at_5() {

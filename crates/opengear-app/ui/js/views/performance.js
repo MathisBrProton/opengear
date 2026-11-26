@@ -181,6 +181,8 @@ function viewCooling() {
     return emptyState("Ventilation non pilotable", c.message || "Aucun canal de ventilation n'a été trouvé sur cette carte mère.");
   }
   const ch = c.channels[local.selectedCoolingIdx] || c.channels[0];
+  // Pump presets drive a pump channel only: hide them on boards without one.
+  const hasPump = c.channels.some((x) => x.is_pump);
   const pols = ex ? POLICIES : POLICIES.filter(([id]) => id !== "Manual");
   const curSrc = normTempSource(ch.source);
   return `
@@ -194,7 +196,8 @@ function viewCooling() {
       <div class="card-head"><div><h2 class="card-title">Capteurs en direct</h2>${ex ? `<div class="card-desc">${esc((S.telemetry.sensors && S.telemetry.sensors.source) || "")}</div>` : ""}</div></div>
       <div class="sensor-chip-row" id="cool-live">${sensorChips(S.telemetry)}</div>
     </div>
-    <div class="grid-stage">
+    <div class="grid-stage${hasPump ? "" : " one-col"}">
+      ${hasPump ? `
       <div class="stack">
         <div class="card accent-amber">
           <div class="card-head"><div><h2 class="card-title">Pompe du watercooling</h2><div class="card-desc">Un plancher de sécurité est toujours conservé.</div></div></div>
@@ -204,7 +207,7 @@ function viewCooling() {
             <button type="button" class="btn btn-secondary" data-act="sl3-preset" data-preset="max_perf">Performance (75–100 %)</button>
           </div>
         </div>
-      </div>
+      </div>` : ""}
       <div class="card">
         <div class="card-head">
           <div><h2 class="card-title">Ventilateurs</h2><div class="card-desc">Choisis un canal puis un mode.</div></div>
@@ -259,7 +262,7 @@ function viewCooling() {
           <div class="curve-pts" id="curve-pts">${curvePointsHtml(ch)}</div>
           <div class="row mt-16">
             <button type="button" class="btn btn-ok" data-act="cool-apply">Appliquer à la carte mère</button>
-            <button type="button" class="btn btn-secondary" data-act="sl3-preset" data-preset="default">Réinitialiser la pompe</button>
+            ${ch.is_pump ? `<button type="button" class="btn btn-secondary" data-act="sl3-preset" data-preset="default">Réinitialiser la pompe</button>` : ""}
           </div>` : `
           <div class="row mt-16">
             <button type="button" class="btn btn-ok" data-act="cool-apply">Appliquer à la carte mère</button>

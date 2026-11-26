@@ -300,7 +300,10 @@ export function devicesList() {
       key: "cooling", vendor: "Refroidissement", kind: "Cooling", name: "Ventilation & watercooling", type: `${c.channels.length} canaux`,
       img: "/assets/aio.webp", imgCls: "cutout", icon: "fan",
       status: c.is_admin ? { label: c.wmi_available ? "Pilotable" : "Lecture seule", cls: c.wmi_available ? "emerald" : "amber" } : { label: "Admin requis", cls: "amber" },
-      quick: [qa("Silence", "sl3-preset", { preset: "ultra_silent" }), qa("Équilibré", "sl3-preset", { preset: "default" }), qa("Performance", "sl3-preset", { preset: "max_perf" })],
+      // Pump presets only: a board without a pump channel gets no quick action here.
+      quick: c.channels.some((x) => x.is_pump)
+        ? [qa("Silence", "sl3-preset", { preset: "ultra_silent" }), qa("Équilibré", "sl3-preset", { preset: "default" }), qa("Performance", "sl3-preset", { preset: "max_perf" })]
+        : [],
     });
   }
   return out;

@@ -1,7 +1,7 @@
 import { ICONS, LABEL_FMT, MACRO_PRESETS, arr, clamp, clone, devId, domId, downloadText, esc, inputVal, num, plural, safeHex, throttled, updateLabel } from "./utils.js";
 import { call, doUndo, humanError, rpc, setBusy, setStatus, toast } from "./ipc.js";
 import { modalStack, trapFocus } from "./modals.js";
-import { S, applyState, deviceById, getDraftFor, getEq, local, registerHooks, ui, updateChrome } from "./state.js";
+import { S, applyState, deviceById, devicesList, getDraftFor, getEq, local, registerHooks, ui, updateChrome } from "./state.js";
 import { curLang, t, translateChrome, translateDom } from "./i18n.js";
 import { seg, updateTelemetryDom } from "./components.js";
 import { startRgbPreviewLoop } from "./rgb-preview.js";
@@ -462,7 +462,12 @@ const ACT = {
   },
 
   "relaunch-admin": (el) => call("cooling_relaunch_admin", {}, { btn: el, ok: "Relance en administrateur…" }),
-  "sl3-preset": (el) => { local.selectedCoolingIdx = 0; call("cooling_sl3_preset", { preset: el.dataset.preset }, { btn: el, ok: `Pompe : ${el.textContent.trim()}` }); },
+  // The backend writes the pump channel, wherever it sits: show that one, not channel 0.
+  "sl3-preset": (el) => {
+    const idx = arr(S.cooling && S.cooling.channels).findIndex((c) => c.is_pump);
+    if (idx >= 0) local.selectedCoolingIdx = idx;
+    call("cooling_sl3_preset", { preset: el.dataset.preset }, { btn: el, ok: `Pompe : ${el.textContent.trim()}` });
+  },
 
   // Cooling
   "cool-ch": (el) => { local.selectedCoolingIdx = Number(el.dataset.val); render(); },
@@ -1053,7 +1058,7 @@ async function bootWithRetry(retriesLeft = 2) {
   try {
     const st = await rpc("get_state", {}, 25_000);
     applyState(st);
-    const n = arr(S.device_list).length;
+    const n = devicesList().length;
     setStatus(n ? `Prêt : ${plural(n, "appareil actif", "appareils actifs")}.` : "Prêt : aucun appareil détecté pour l'instant.");
     loadDiagnostics();
     if (!ui().onboarding_done) openWizard();

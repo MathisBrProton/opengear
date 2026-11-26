@@ -110,7 +110,20 @@ export function esc(s) {
 }
 
 export const arr = (x) => (Array.isArray(x) ? x : []);
-export const num = (x, d = 0) => (typeof x === "number" && Number.isFinite(x) ? x : d);
+/**
+ * Finite number carried by `x`, else `d`.
+ *
+ * Choice and colour setting values travel as text (`Setting`/`Value::Text` in
+ * `opengear_core::driver`), so a numeric string such as `"1000"` is a number here.
+ */
+export const num = (x, d = 0) => {
+  if (typeof x === "number") return Number.isFinite(x) ? x : d;
+  if (typeof x === "string" && x.trim() !== "") {
+    const n = Number(x);
+    return Number.isFinite(n) ? n : d;
+  }
+  return d;
+};
 export const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 export const clone = (o) => JSON.parse(JSON.stringify(o));
 
