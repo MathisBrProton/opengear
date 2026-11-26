@@ -52,6 +52,8 @@ struct MockDevState {
 struct MockAuditDriver {
     id: String,
     state: Arc<Mutex<MockDevState>>,
+    periph_id: String,
+    periph_state: Arc<Mutex<MockPeriphState>>,
 }
 
 impl Driver for MockAuditDriver {
@@ -60,10 +62,16 @@ impl Driver for MockAuditDriver {
     }
 
     fn discover(&self) -> Vec<Box<dyn Device>> {
-        vec![Box::new(MockFullDevice {
-            id: self.id.clone(),
-            state: Arc::clone(&self.state),
-        })]
+        vec![
+            Box::new(MockFullDevice {
+                id: self.id.clone(),
+                state: Arc::clone(&self.state),
+            }),
+            Box::new(MockPeriphDevice {
+                id: self.periph_id.clone(),
+                state: Arc::clone(&self.periph_state),
+            }),
+        ]
     }
 }
 
@@ -647,6 +655,8 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
     eng.drivers.push(Box::new(MockAuditDriver {
         id: "audit:mock_0".into(),
         state: Arc::clone(&mock_state),
+        periph_id: "audit:mock_periph".into(),
+        periph_state: Arc::clone(&periph_state),
     }));
     eng.drivers.push(Box::new(MockExpDriver));
 
@@ -675,7 +685,6 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
             "devices",
             "device_list",
             "telemetry",
-            "cooling",
             "keyboard",
             "power_plans",
             "experimental_drivers",
@@ -683,6 +692,17 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
             if st.get(key).is_none() {
                 return Err(format!("Champ manquant dans get_state : {key}"));
             }
+        }
+        if st.get("cooling").is_some() {
+            return Err("Champ hérité cooling encore présent dans get_state".into());
+        }
+        let periph_has_curves = st["device_list"]
+            .as_array()
+            .and_then(|arr| arr.iter().find(|d| d["info"]["id"] == "audit:mock_periph"))
+            .and_then(|d| d.get("curves"))
+            .is_some_and(|c| c.is_object() && c["channels"].is_array());
+        if !periph_has_curves {
+            return Err("device_list[audit:mock_periph].curves manquant".into());
         }
         if st["config"]["profiles"].is_null() || st["config"]["active_profile"].is_null() {
             return Err("config.profiles ou config.active_profile absent".into());
@@ -698,7 +718,6 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
         "input_socd_live",
         "device_list_backups",
         "scan_hid",
-        "superio_refresh",
     ] {
         check(&mut results, read_cmd, || {
             let v = cmd_ok(&mut eng, read_cmd, json!({}))?;
@@ -756,6 +775,16 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
             &mut eng,
             "device_fan_set",
             json!({ "device": "audit:missing", "target": "auto" }),
+        )?;
+        cmd_ok(
+            &mut eng,
+            "device_fan_refresh",
+            json!({ "device": "audit:mock_0" }),
+        )?;
+        cmd_err(
+            &mut eng,
+            "device_fan_refresh",
+            json!({ "device": "audit:missing" }),
         )?;
         let st = mock_state.lock().unwrap();
         if st.fan_targets.first().map(|t| t.1) != Some(FanTarget::Fixed(25)) {
@@ -971,6 +1000,16 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
         )?;
         let after_poll_frames = mock_state.lock().unwrap().frames.len();
         cmd_ok(&mut eng, "lighting_sync_all", json!({ "enabled": false }))?;
+        cmd_ok(
+            &mut eng,
+            "device_fan_refresh",
+            json!({ "device": "audit:mock_0" }),
+        )?;
+        cmd_err(
+            &mut eng,
+            "device_fan_refresh",
+            json!({ "device": "audit:missing" }),
+        )?;
         let st = mock_state.lock().unwrap();
         let has_preserved = st
             .frames
@@ -1095,8 +1134,9 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
         )?;
         cmd_ok(
             &mut eng,
-            "cooling_update_channel",
+            "device_curve_set",
             json!({
+                "device": "audit:mock_periph",
                 "index": 0,
                 "policy": "Silent",
                 "source": "MaxCpuGpu",
@@ -1108,11 +1148,40 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
         )?;
         cmd_ok(
             &mut eng,
-            "cooling_sl3_preset",
-            json!({ "preset": "ultra_silent" }),
+            "device_curve_set",
+            json!({
+                "device": "audit:mock_periph",
+                "index": 0,
+                "policy": "Standard",
+                "source": "CpuBios",
+                "apply": true
+            }),
         )?;
-        cmd_err(&mut eng, "cooling_update_channel", json!({ "index": 99 }))?;
-        cmd_err(&mut eng, "cooling_read_bios_curves", json!({}))?;
+        cmd_ok(
+            &mut eng,
+            "device_pump_preset",
+            json!({ "device": "audit:mock_periph", "preset": "ultra_silent" }),
+        )?;
+        cmd_ok(
+            &mut eng,
+            "device_curve_read",
+            json!({ "device": "audit:mock_periph" }),
+        )?;
+        cmd_err(
+            &mut eng,
+            "device_curve_set",
+            json!({ "device": "audit:mock_periph", "index": 99 }),
+        )?;
+        cmd_err(
+            &mut eng,
+            "device_curve_read",
+            json!({ "device": "audit:missing" }),
+        )?;
+        cmd_err(
+            &mut eng,
+            "device_pump_preset",
+            json!({ "device": "audit:missing", "preset": "default" }),
+        )?;
         cmd_err(
             &mut eng,
             "set_power_plan",

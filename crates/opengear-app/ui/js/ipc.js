@@ -42,9 +42,13 @@ export function rpc(cmd, payload = {}, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
   });
 }
 
-export function setStatus(txt) {
+export function setStatus(txt, kind = "") {
   const el = document.getElementById("status-text");
   if (el) el.textContent = t(txt);
+  const dot = document.querySelector(".status-dot");
+  if (dot && kind) {
+    dot.classList.toggle("err", kind === "err");
+  }
 }
 
 export function toast(msg, kind = "info", opts = {}) {

@@ -29,23 +29,23 @@ function sysPrefs() {
     <div class="grid-2 grid-balanced">
       <div class="card">
         <div class="card-head"><h2 class="card-title">Interface</h2></div>
-        <div class="row-between">
-          <div><div style="font-weight:600">Mode d'affichage</div><div class="muted">Simple masque les réglages avancés ou risqués. Expert affiche tout.</div></div>
+        <div class="row-between pair-row">
+          <div><div class="fw-600">Mode d'affichage</div><div class="muted">Simple masque les réglages avancés ou risqués. Expert affiche tout.</div></div>
           ${seg([["simple", "Simple"], ["expert", "Expert"]], mode, "set-mode-seg")}
         </div>
         <div class="divider"></div>
-        <div class="row-between">
-          <div><div style="font-weight:600">Langue de l'interface</div><div class="muted">Français ou English en direct.</div></div>
+        <div class="row-between pair-row">
+          <div><div class="fw-600">Langue de l'interface</div><div class="muted">Français ou English en direct.</div></div>
           ${seg([["fr", "Français"], ["en", "English"]], lang, "set-lang-seg")}
         </div>
         <div class="divider"></div>
-        <div class="row-between"><span class="muted">Clavier affiché : disposition Windows <strong>${esc((S.keyboard.os_layout || {}).top_row || "?")}</strong>, format réglable dans Touches &amp; macros.</span><button type="button" class="btn btn-sm btn-secondary" data-act="nav" data-tab="input">Ouvrir</button></div>
+        <div class="row-between pair-row"><span class="muted">Clavier affiché : disposition Windows <strong>${esc((S.keyboard.os_layout || {}).top_row || "?")}</strong>, format réglable dans Touches &amp; macros.</span><button type="button" class="btn btn-sm btn-secondary" data-act="nav" data-tab="input">Ouvrir</button></div>
         <div class="divider"></div>
-        <div class="row-between"><span class="muted">Revoir la présentation de démarrage.</span><button type="button" class="btn btn-sm btn-secondary" data-act="wizard-open">Relancer l'assistant</button></div>
+        <div class="row-between pair-row"><span class="muted">Revoir la présentation de démarrage.</span><button type="button" class="btn btn-sm btn-secondary" data-act="wizard-open">Relancer l'assistant</button></div>
       </div>
       <div class="card">
         <div class="card-head"><h2 class="card-title">Démarrage et zone de notification</h2></div>
-        <div class="stack" style="gap:12px">
+        <div class="stack gap-3">
           ${sw(sp.minimize_to_tray !== false, "Fermer la fenêtre garde OpenGear actif dans la zone de notification", "sys-pref", { key: "minimize_to_tray" })}
           ${sw(!!sp.autostart, "Démarrer avec Windows", "sys-pref", { key: "autostart" })}
           ${sw(!!sp.start_minimized, "Démarrer réduit dans la zone de notification", "sys-pref", { key: "start_minimized" })}
@@ -59,10 +59,10 @@ function sysPrefs() {
       </div>
       <div class="card">
         <div class="card-head"><div><h2 class="card-title">Éclairage automatique et alertes</h2><div class="card-desc">OpenGear coupe la lumière quand tu n'es pas là et la rallume exactement comme elle était.</div></div></div>
-        <div class="stack" style="gap:12px">
+        <div class="stack gap-3">
           ${sw(sp.lights_off_on_lock !== false, "Éteindre l'éclairage quand la session Windows est verrouillée", "sys-pref", { key: "lights_off_on_lock" })}
-          <div class="row-between">
-            <label for="idle-off" style="font-weight:600">Éteindre après une période d'inactivité</label>
+          <div class="row-between pair-row">
+            <label for="idle-off" class="fw-600">Éteindre après une période d'inactivité</label>
             <select id="idle-off" class="og-select auto" data-change="sys-pref-num" data-key="idle_lights_off_min">
               ${[[0, "Jamais"], [5, "5 minutes"], [10, "10 minutes"], [15, "15 minutes"], [30, "30 minutes"], [60, "1 heure"]]
                 .map(([v, l]) => `<option value="${v}" ${num(sp.idle_lights_off_min) === v ? "selected" : ""}>${l}</option>`).join("")}
@@ -82,10 +82,10 @@ function cardOpenRgbServer(sp) {
     <div class="card expert-card mt-16">
       <div class="card-head">
         <div><h2 class="card-title">Pont serveur OpenRGB SDK ${expertTag()}</h2><div class="card-desc">Expose les appareils lumineux d'OpenGear en local (127.0.0.1:6742) pour SignalRGB, Artemis ou Wallpaper Engine (désactivé par défaut).</div></div>
-        ${sp.openrgb_server ? `<span class="pill cyan">${num(sp.openrgb_clients)} client(s) connecté(s)</span>` : ""}
+        ${sp.openrgb_server ? `<span class="pill cyan">${plural(num(sp.openrgb_clients), "client connecté", "clients connectés")}</span>` : ""}
       </div>
       ${sw(!!sp.openrgb_server, "Activer le serveur OpenRGB SDK (localhost uniquement)", "sys-pref", { key: "openrgb_server" })}
-      ${sp.openrgb_server_error ? `<div class="muted small mt-8" style="color:var(--rog)">${esc(sp.openrgb_server_error)}</div>` : ""}
+      ${sp.openrgb_server_error ? `<div class="muted small mt-8 txt-rog">${esc(sp.openrgb_server_error)}</div>` : ""}
     </div>`;
 }
 
@@ -97,7 +97,7 @@ function cardExperimentalDrivers() {
     <div class="card mt-16">
       <div class="card-head"><div><h2 class="card-title">Pilotes expérimentaux <span class="pill amber">Non testés</span></h2>
         <div class="card-desc">Écrits à partir de fiches de protocole, sans avoir pu être essayés sur un vrai appareil. Ils ne pilotent que l'éclairage, sans rien enregistrer dans l'appareil. Active-les seulement si tu possèdes ce matériel, et signale tout comportement anormal.</div></div></div>
-      <div class="stack" style="gap:10px">
+      <div class="stack gap-10px">
         ${list.map((d) => sw(!!d.enabled, esc(d.label), "exp-driver", { name: d.name })).join("")}
       </div>
     </div>`;
@@ -160,7 +160,7 @@ function sysDiag() {
           <div class="row">${st ? `<span class="pill ${num(st.failed) ? "rog" : "emerald"}">${num(st.passed)} réussis · ${num(st.warned)} avertissements · ${num(st.failed)} échecs</span>` : ""}<button type="button" class="btn btn-sm btn-primary" data-act="selftest">Lancer l'auto-test</button></div>
         </div>
         ${st ? `<div class="table-scroll"><table class="meta-table"><thead><tr><th>Résultat</th><th>Composant</th><th>Détail</th></tr></thead><tbody>
-          ${arr(st.checks).map((c) => `<tr><td><span class="pill ${c.status === "PASS" ? "emerald" : c.status === "FAIL" ? "rog" : "amber"}">${esc(c.status)}</span></td><td style="font-weight:600">${esc(c.name)}</td><td class="mono small selectable">${esc(c.detail)}</td></tr>`).join("")}
+          ${arr(st.checks).map((c) => `<tr><td><span class="pill ${c.status === "PASS" ? "emerald" : c.status === "FAIL" ? "rog" : "amber"}">${esc(c.status)}</span></td><td class="fw-600">${esc(c.name)}</td><td class="mono small selectable">${esc(c.detail)}</td></tr>`).join("")}
         </tbody></table></div><div class="muted small mt-8 mono selectable">Rapport : ${esc(st.report_path)}</div>` : ""}
       </div>
       <div class="card expert-card mt-16">
@@ -171,8 +171,8 @@ function sysDiag() {
         ${allVendors.map((v) => {
           const list2 = S.devices.filter((x) => (x.vendor || "Autre") === v);
           if (!list2.length) return "";
-          return `<div class="card-eyebrow mt-12" style="margin-bottom:6px">${esc(v)} · ${list2.length}</div><div class="table-scroll"><table class="meta-table"><thead><tr><th>VID:PID</th><th>IF</th><th>UsagePage</th><th>Usage</th><th>Produit</th><th>Statut</th></tr></thead><tbody>
-            ${list2.map((x) => `<tr><td class="mono">${esc(x.vid_pid)}</td><td class="mono">${esc(x.interface)}</td><td class="mono">${esc(x.usage_page)}</td><td class="mono">${esc(x.usage)}</td><td>${esc(x.product)}</td><td style="color:${x.driver_supported ? "var(--emerald)" : "var(--text-2)"}">${esc(x.status)}</td></tr>`).join("")}
+          return `<div class="card-eyebrow mt-12 mb-6">${esc(v)} · ${list2.length}</div><div class="table-scroll"><table class="meta-table"><thead><tr><th>VID:PID</th><th>IF</th><th>UsagePage</th><th>Usage</th><th>Produit</th><th>Statut</th></tr></thead><tbody>
+            ${list2.map((x) => `<tr><td class="mono">${esc(x.vid_pid)}</td><td class="mono">${esc(x.interface)}</td><td class="mono">${esc(x.usage_page)}</td><td class="mono">${esc(x.usage)}</td><td>${esc(x.product)}</td><td class="${x.driver_supported ? "txt-emerald" : "muted"}">${esc(x.status)}</td></tr>`).join("")}
           </tbody></table></div>`;
         }).join("")}
       </div>` : advancedHint("L'auto-test complet et la liste brute des interfaces USB/HID sont en mode Expert.")}`;
@@ -205,7 +205,7 @@ function sysBackups() {
             <td>${esc(TAG_LABEL[b.tag] || b.tag || "—")}</td>
             <td class="mono">${esc(b.sector_hex)}</td>
             <td>${esc(fmtSize(b.size))}</td>
-            <td style="text-align:right"><button type="button" class="btn btn-sm btn-secondary" data-act="ob-backup-restore" data-id="${esc(targetId)}" data-file="${esc(b.file)}" data-label="${esc(`${b.device_model || ""} · ${TAG_LABEL[b.tag] || b.tag || "Sauvegarde"} · ${b.sector_hex} · ${fmtDate(b.created_ms)}`)}" ${canRestore ? "" : "disabled"}>Restaurer</button></td>
+            <td class="txt-r"><button type="button" class="btn btn-sm btn-secondary" data-act="ob-backup-restore" data-id="${esc(targetId)}" data-file="${esc(b.file)}" data-label="${esc(`${b.device_model || ""} · ${TAG_LABEL[b.tag] || b.tag || "Sauvegarde"} · ${b.sector_hex} · ${fmtDate(b.created_ms)}`)}" ${canRestore ? "" : "disabled"}>Restaurer</button></td>
           </tr>`;
       }).join("")}</tbody>
     </table></div>`;
@@ -215,7 +215,7 @@ function sysBackups() {
       <div class="card-head">
         <div><h2 class="card-title">Sauvegardes de la mémoire flash ${expertTag()}</h2><div class="card-desc">Copies faites automatiquement avant chaque écriture de profil, macro ou éclairage matériel dans la flash d'un appareil.</div></div>
         <div class="row">
-          ${obDevs.length > 1 ? `<label class="field-label" for="bk-dev" style="min-width:0">Appareil</label><select id="bk-dev" class="og-select auto" data-change="bk-dev">${obDevs.map((d) => `<option value="${esc(d.info.id)}" ${d.info.id === local.backups.deviceId ? "selected" : ""}>${esc(d.info.model)}</option>`).join("")}</select>` : ""}
+          ${obDevs.length > 1 ? `<label class="field-label min-w-0" for="bk-dev">Appareil</label><select id="bk-dev" class="og-select auto" data-change="bk-dev">${obDevs.map((d) => `<option value="${esc(d.info.id)}" ${d.info.id === local.backups.deviceId ? "selected" : ""}>${esc(d.info.model)}</option>`).join("")}</select>` : ""}
           <button type="button" class="btn btn-sm btn-secondary" data-act="backups-refresh">${ICONS.refresh}Actualiser</button>
         </div>
       </div>
@@ -227,6 +227,8 @@ function sysBackups() {
 function sysAbout() {
   const si = S.static_info;
   const la = S.local_assets;
+  const sp = S.system_prefs || {};
+  const tel = S.telemetry || {};
   return `
     <div class="grid-2 grid-balanced">
       <div class="card">
@@ -237,7 +239,28 @@ function sysAbout() {
       </div>
       <div class="card">
         <div class="card-head"><h2 class="card-title">Ce PC</h2></div>
-        ${infoTable([["Carte mère", si.motherboard], ["BIOS", si.bios_version], ["Processeur", si.cpu_name], ["Carte graphique", si.gpu_name]])}
+        ${infoTable([
+          ["Carte mère", si.motherboard],
+          ["BIOS", si.bios_version],
+          ["Processeur", si.cpu_name],
+          ["Carte graphique", si.gpu_name],
+          tel.ram_total_gb ? ["Mémoire vive", `${Math.round(num(tel.ram_total_gb))} Go`] : null,
+          S.keyboard && S.keyboard.os_layout ? ["Disposition clavier active", `${S.keyboard.os_layout.top_row || "?"} (${String(S.keyboard.standard || "").toUpperCase()})`] : null,
+        ])}
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <div><h2 class="card-title">Sécurité matérielle &amp; état local</h2><div class="card-desc">Stockage hors ligne des profils, protection des ventilateurs et diagnostic rapide.</div></div>
+          <div class="row">
+            <button type="button" class="btn btn-sm btn-secondary" data-act="nav" data-tab="system" data-sub="diag">Diagnostic</button>
+            <button type="button" class="btn btn-sm btn-secondary" data-act="diag-export">Exporter rapport anonyme (.txt)</button>
+          </div>
+        </div>
+        ${infoTable([
+          ["Droits Windows", sp.is_admin ? "Administrateur (tous capteurs et carte mère actifs)" : "Standard (ventilation carte mère verrouillée)"],
+          ["Pilote matériel PawnIO", sp.pawnio_ready ? "Prêt" : sp.is_admin ? "Non installé" : "Requiert administrateur / installation"],
+          ["Appareils détectés", plural(arr(S.device_list).length, "appareil", "appareils")],
+        ])}
       </div>
     </div>`;
 }

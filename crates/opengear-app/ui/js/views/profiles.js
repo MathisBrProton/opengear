@@ -1,7 +1,6 @@
-import { arr, esc, num, plural } from "../utils.js";
+import { arr, esc, num } from "../utils.js";
 import { S } from "../state.js";
 import { pageHeader, seg, settingInline, sw } from "../components.js";
-import { presetCard } from "./home.js";
 
 export function viewProfiles() {
   const prof = S.config.profile;
@@ -20,10 +19,9 @@ export function viewProfiles() {
   });
   return `
     ${pageHeader("Profils", "Un profil regroupe éclairage, touches et réglages de jeu. Bascule à la main ou automatiquement selon le jeu lancé.",
-      `<button type="button" class="btn btn-secondary btn-sm" data-act="save-config">Enregistrer sur le disque</button>
+      `<button type="button" class="btn btn-primary btn-sm" data-act="save-config">Enregistrer sur le disque</button>
        <button type="button" class="btn btn-secondary btn-sm" data-act="export-profile">Exporter</button>
        <button type="button" class="btn btn-secondary btn-sm" data-act="import-profile">Importer…</button>`, "emerald")}
-    ${S.presets.length ? `<section class="section"><h2 class="section-title">Préréglages en un clic</h2><div class="preset-strip">${S.presets.map((p) => presetCard(p)).join("")}</div></section>` : ""}
     <div class="grid-2">
       <div class="card">
         <div class="card-head"><h2 class="card-title">Mes profils</h2><span class="pill">${S.config.profiles.length}</span></div>
@@ -51,8 +49,8 @@ export function viewProfiles() {
           <button type="button" class="btn btn-sm btn-primary" data-act="linked-save">Enregistrer</button>
         </div>
         ${arr(sp.visible_apps).length ? `
-          <div class="muted small mt-12" style="margin-bottom:6px">Programmes ouverts (clic pour les lier à ce profil) :</div>
-          <div class="row" style="gap:6px">${arr(sp.visible_apps).slice(0, 10).map((a) => `<button type="button" class="btn btn-sm btn-secondary mono" data-act="link-app" data-app="${esc(a)}">+ ${esc(a)}</button>`).join("")}</div>` : ""}
+          <div class="muted small mt-12 mb-6">Programmes ouverts (clic pour les lier à ce profil) :</div>
+          <div class="row gap-6px">${arr(sp.visible_apps).slice(0, 10).map((a) => `<button type="button" class="btn btn-sm btn-secondary mono" data-act="link-app" data-app="${esc(a)}">+ ${esc(a)}</button>`).join("")}</div>` : ""}
       </div>
     </div>
     <div class="card mt-16">

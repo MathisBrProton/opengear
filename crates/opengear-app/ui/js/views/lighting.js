@@ -95,7 +95,7 @@ export function viewLighting() {
   const devs = lightingDevices();
   const items = [
     { id: "global", label: "Effet global" },
-    { id: "devices", label: `Appareils & zones${devs.length ? ` (${devs.length})` : ""}` },
+    { id: "devices", label: `Appareils & zones (${devs.length})` },
     { id: "canvas", label: "Disposition bureau" },
   ];
   const validIds = new Set(items.map((x) => x.id));
@@ -111,6 +111,13 @@ export function viewLighting() {
 }
 
 function lightingGlobal(devs) {
+  if (!devs.length) {
+    return emptyState(
+      "Aucun appareil RGB détecté",
+      "Branche un clavier, une souris, une carte mère ou des barrettes RAM compatibles puis relance la détection.",
+      `<button type="button" class="btn btn-primary" data-act="rescan">Relancer la détection</button>`,
+    );
+  }
   const prof = S.config.profile;
   const rgb = prof.rgb;
   const syncedCount = devs.filter((d) => deviceCfg(d.info.id).enabled).length;
@@ -124,7 +131,7 @@ function lightingGlobal(devs) {
       <div class="card-head">
         <div>
           <h2 class="card-title">Effet logiciel OpenGear</h2>
-          <div class="card-desc">${devs.length ? `${syncedCount} / ${devs.length} appareil(s) actif(s) en direct` : "Aucun appareil RGB détecté"}</div>
+          <div class="card-desc">${syncedCount} / ${devs.length} ${syncedCount > 1 ? "appareils actifs" : "appareil actif"} en direct</div>
         </div>
         <div class="row">
           ${devs.length ? sw(allEnabled, "Tout synchroniser", "lighting-sync-all") : ""}
@@ -144,7 +151,7 @@ function lightingGlobal(devs) {
         <input type="color" class="og-color" id="rgb-secondary" value="${safeHex(rgb.secondary, "#9B3CFF")}" data-input="rgb-live" data-change="rgb-commit" data-field="secondary" />
         <label class="mini-check"><input type="checkbox" ${rgb.reverse ? "checked" : ""} data-change="rgb-reverse" /> Inverser le sens</label>
       </div>
-      <div class="stack mt-16" style="gap:10px">
+      <div class="stack mt-16 gap-10px">
         ${sliderRow("Luminosité", { id: "rgb-brightness", min: 0, max: 1, step: 0.05, value: br, input: "rgb-live", change: "rgb-commit", data: { field: "brightness", fmt: "pct" }, display: `${Math.round(br * 100)} %` })}
         ${sliderRow("Vitesse", { id: "rgb-speed", min: 0.2, max: 4.5, step: 0.1, value: sp, input: "rgb-live", change: "rgb-commit", data: { field: "speed", fmt: "x" }, display: `${sp.toFixed(1)}×` })}
       </div>
@@ -159,7 +166,7 @@ function lightingGlobal(devs) {
         <button type="button" class="btn btn-sm btn-primary" data-act="rgb-layer-add">+ Ajouter un calque</button>
       </div>
       ${arr(prof.rgb_layers).length === 0 ? `<div class="muted">Aucun calque superposé. Ajoute un calque pour combiner plusieurs effets en temps réel.</div>` : `
-        <div class="stack" style="gap:10px">
+        <div class="stack gap-10px">
           ${arr(prof.rgb_layers).map((layer, li) => {
             const ef = layer.effect || {};
             const opPct = Math.round(num(layer.opacity, 1) * 100);
@@ -182,7 +189,7 @@ function lightingGlobal(devs) {
                     <button type="button" class="btn btn-sm btn-ghost" data-act="rgb-layer-del" data-idx="${li}">Supprimer</button>
                   </div>
                 </div>
-                <div class="row" style="gap:8px;flex-wrap:wrap">
+                <div class="row gap-2 flex-wrap">
                   <select class="og-select auto" data-change="rgb-layer-kind" data-idx="${li}" aria-label="Effet du calque">
                     ${S.effects.map((e) => `<option value="${esc(e.id)}" ${ef.kind === e.id ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
                   </select>
@@ -210,7 +217,7 @@ function lightingGlobal(devs) {
           </div>
         </div>
         ${renderKeyboard("paint", { product_name: d.info.model })}
-        <div class="stack mt-16" style="gap:10px">
+        <div class="stack mt-16 gap-10px">
           ${deviceSettings(d.info.id, { sections: ["lighting"], bare: true })}
         </div>
       </div>`).join("")}`;
@@ -233,8 +240,8 @@ function renderOverrideEditor(devId, zoneId, hwEffects, existingOverride) {
   const dataAttr = `data-dev-id="${esc(devId)}" ${isZone ? `data-zone-id="${esc(zoneId)}"` : ""}`;
 
   return `
-    <div class="stack" style="gap:10px">
-      <div class="row-between">
+    <div class="stack gap-10px">
+      <div class="row-between pair-row">
         <span class="field-label">${isZone ? "Source de la zone" : "Mode d'éclairage"}</span>
         ${seg(modeOpts, d.mode, "lgt-mode", isZone ? { devId, zoneId } : { devId })}
       </div>
@@ -244,13 +251,12 @@ function renderOverrideEditor(devId, zoneId, hwEffects, existingOverride) {
         </div>
         <div class="color-row">
           <span class="field-label">Couleurs</span>
-          <input type="color" class="og-color" value="${safeHex(d.swPrimary)}" data-input="lgt-draft" ${dataAttr} data-field="swPrimary" />
-          <input type="color" class="og-color" value="${safeHex(d.swSecondary)}" data-input="lgt-draft" ${dataAttr} data-field="swSecondary" />
+          <input type="color" class="og-color" value="${safeHex(d.swPrimary)}" data-input="lgt-draft" data-change="lgt-commit" ${dataAttr} data-field="swPrimary" />
+          <input type="color" class="og-color" value="${safeHex(d.swSecondary)}" data-input="lgt-draft" data-change="lgt-commit" ${dataAttr} data-field="swSecondary" />
           <label class="mini-check"><input type="checkbox" ${d.swReverse ? "checked" : ""} data-change="lgt-draft-chk" ${dataAttr} data-field="swReverse" /> Inverser</label>
         </div>
-        ${sliderRow("Luminosité", { min: 0, max: 1, step: 0.05, value: d.swBrightness, input: "lgt-draft", data: { devId, ...(isZone ? { zoneId } : {}), field: "swBrightness", fmt: "pct" }, display: `${Math.round(d.swBrightness * 100)} %` })}
-        ${sliderRow("Vitesse", { min: 0.2, max: 4.5, step: 0.1, value: d.swSpeed, input: "lgt-draft", data: { devId, ...(isZone ? { zoneId } : {}), field: "swSpeed", fmt: "x" }, display: `${num(d.swSpeed, 1).toFixed(1)}×` })}
-        <div class="row"><button type="button" class="btn btn-primary btn-sm" data-act="lgt-apply" ${dataAttr} data-save="0">Appliquer l'effet</button></div>` : ""}
+        ${sliderRow("Luminosité", { min: 0, max: 1, step: 0.05, value: d.swBrightness, input: "lgt-draft", change: "lgt-commit", data: { devId, ...(isZone ? { zoneId } : {}), field: "swBrightness", fmt: "pct" }, display: `${Math.round(d.swBrightness * 100)} %` })}
+        ${sliderRow("Vitesse", { min: 0.2, max: 4.5, step: 0.1, value: d.swSpeed, input: "lgt-draft", change: "lgt-commit", data: { devId, ...(isZone ? { zoneId } : {}), field: "swSpeed", fmt: "x" }, display: `${num(d.swSpeed, 1).toFixed(1)}×` })}` : ""}
       ${d.mode === "hardware" && curDef ? `
         <div class="chip-grid">
           ${zoneHwEffects.map((e) => `<button type="button" class="chip ${curDef.id === e.id ? "active" : ""}" data-act="lgt-hw-pick" ${dataAttr} data-effect="${esc(e.id)}">${esc(e.label)}</button>`).join("")}
@@ -258,17 +264,15 @@ function renderOverrideEditor(devId, zoneId, hwEffects, existingOverride) {
         ${cMax >= 1 ? `
           <div class="color-row">
             <span class="field-label">${cMax > 1 ? "Couleurs" : "Couleur"}</span>
-            <input type="color" class="og-color" value="${safeHex(d.hwColor1)}" data-input="lgt-draft" ${dataAttr} data-field="hwColor1" />
-            ${cMax >= 2 ? `<input type="color" class="og-color" value="${safeHex(d.hwColor2)}" data-input="lgt-draft" ${dataAttr} data-field="hwColor2" />` : ""}
+            <input type="color" class="og-color" value="${safeHex(d.hwColor1)}" data-input="lgt-draft" data-change="lgt-commit" ${dataAttr} data-field="hwColor1" />
+            ${cMax >= 2 ? `<input type="color" class="og-color" value="${safeHex(d.hwColor2)}" data-input="lgt-draft" data-change="lgt-commit" ${dataAttr} data-field="hwColor2" />` : ""}
             ${curDef.params.direction ? `<label class="mini-check"><input type="checkbox" ${d.hwReverse ? "checked" : ""} data-change="lgt-draft-chk" ${dataAttr} data-field="hwReverse" /> Inverser</label>` : ""}
           </div>` : (curDef.params.direction ? `<label class="mini-check"><input type="checkbox" ${d.hwReverse ? "checked" : ""} data-change="lgt-draft-chk" ${dataAttr} data-field="hwReverse" /> Inverser le sens</label>` : "")}
-        ${spdRange ? sliderRow("Vitesse", { min: spdRange[0], max: spdRange[1], step: 1, value: clamp(num(d.hwSpeed, spdRange[0]), spdRange[0], spdRange[1]), input: "lgt-draft", data: { devId, ...(isZone ? { zoneId } : {}), field: "hwSpeed" }, display: String(clamp(num(d.hwSpeed, spdRange[0]), spdRange[0], spdRange[1])) }) : ""}
-        <div class="row">
-          <button type="button" class="btn btn-primary btn-sm" data-act="lgt-apply" ${dataAttr} data-save="0">Appliquer</button>
-          ${curDef.params.savable ? `<button type="button" class="btn btn-secondary btn-sm" data-act="lgt-apply" ${dataAttr} data-save="1">Enregistrer en mémoire (flash)</button>` : ""}
-        </div>` : ""}
-      ${d.mode === "global" || d.mode === "off" || d.mode === "inherit" ? `
-        <div class="row"><button type="button" class="btn btn-secondary btn-sm" data-act="lgt-apply" ${dataAttr} data-save="0">${d.mode === "inherit" ? "Suivre l'appareil" : "Appliquer ce choix"}</button></div>` : ""}
+        ${spdRange ? sliderRow("Vitesse", { min: spdRange[0], max: spdRange[1], step: 1, value: clamp(num(d.hwSpeed, spdRange[0]), spdRange[0], spdRange[1]), input: "lgt-draft", change: "lgt-commit", data: { devId, ...(isZone ? { zoneId } : {}), field: "hwSpeed" }, display: String(clamp(num(d.hwSpeed, spdRange[0]), spdRange[0], spdRange[1])) }) : ""}
+        ${curDef.params.savable && isExpert() ? `
+          <div class="row">
+            <button type="button" class="btn btn-secondary btn-sm" data-act="lgt-apply" ${dataAttr} data-save="1">Enregistrer en mémoire (flash) ${expertTag()}</button>
+          </div>` : ""}` : ""}
     </div>`;
 }
 
@@ -277,7 +281,7 @@ function lightingDevicesView(devs) {
     return emptyState("Aucun appareil RGB détecté", "Branche un clavier, une souris, une carte mère ou des barrettes RAM compatibles puis relance la détection.", `<button type="button" class="btn btn-primary" data-act="rescan">Relancer la détection</button>`);
   }
   return `
-    <div class="stack" style="gap:16px">
+    <div class="stack gap-4">
       ${devs.map((d) => {
         const l = d.lighting;
         const cfg = deviceCfg(d.info.id);
@@ -331,7 +335,7 @@ function lightingCanvas(devs) {
   const selPl = placements[selectedId] || selDev.lighting.placement || { x: 0, y: 0, width: 1, height: 1, rotation_deg: 0 };
 
   return `
-    <div class="grid-stage">
+    <div class="grid-stage canvas-layout">
       <div class="card accent-cyan">
         <div class="card-head">
           <div>
@@ -372,7 +376,7 @@ function lightingCanvas(devs) {
             <div class="card-desc">Position normalisée sur le bureau (0 à 100 %).</div>
           </div>
         </div>
-        <div class="stack" style="gap:10px">
+        <div class="stack gap-10px">
           ${sliderRow("Position X", { min: 0, max: 95, step: 1, value: Math.round(selPl.x * 100), input: "label", change: "canvas-coord", data: { devId: selectedId, field: "x", fmt: "pct100" }, display: `${Math.round(selPl.x * 100)} %` })}
           ${sliderRow("Position Y", { min: 0, max: 95, step: 1, value: Math.round(selPl.y * 100), input: "label", change: "canvas-coord", data: { devId: selectedId, field: "y", fmt: "pct100" }, display: `${Math.round(selPl.y * 100)} %` })}
           ${sliderRow("Largeur", { min: 5, max: 100, step: 1, value: Math.round(selPl.width * 100), input: "label", change: "canvas-coord", data: { devId: selectedId, field: "width", fmt: "pct100" }, display: `${Math.round(selPl.width * 100)} %` })}

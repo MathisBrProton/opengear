@@ -1,5 +1,5 @@
-import { ICONS, POLICIES, arr, clamp, domId, esc, fmtHz, num } from "../utils.js";
-import { S, deviceById, isExpert, local } from "../state.js";
+import { ICONS, POLICIES, arr, clamp, cssVar, domId, esc, fmtHz, num } from "../utils.js";
+import { S, curveDevice, deviceById, isExpert, local } from "../state.js";
 import { advancedHint, coolingDeviceIds, deviceFans, deviceSettings, emptyState, expertTag, pageHeader, seg, sensorChips, sliderRow, subtabs, sw } from "../components.js";
 
 export function viewPerformance() {
@@ -76,23 +76,22 @@ export function cardPointer(dev) {
         <div class="row" role="group" aria-label="DPI rapides">
           ${presets.map((v) => `<button type="button" class="btn btn-sm ${num(dpi.dpi_x) === v ? "btn-primary" : "btn-secondary"}" data-act="ptr-dpi" data-id="${esc(id)}" data-dpi="${v}" aria-pressed="${num(dpi.dpi_x) === v}">${v}</button>`).join("")}
         </div>
-        <div class="stack mt-12" style="gap:10px">
-          ${sliderRow(ex && dpi.independent_xy ? "DPI horizontal (X)" : "DPI précis", { id: `pdpi-${did}`, min: num(dpi.min_dpi, 100), max: num(dpi.max_dpi, 25600), step: num(dpi.step_dpi, 50) || 50, value: num(dpi.dpi_x, 800), input: "label", data: { fmt: "dpi" }, display: `${num(dpi.dpi_x, 800)} DPI` })}
-          ${ex && dpi.independent_xy ? sliderRow("DPI vertical (Y)", { id: `pdpiy-${did}`, min: num(dpi.min_dpi, 100), max: num(dpi.max_dpi, 25600), step: num(dpi.step_dpi, 50) || 50, value: num(dpi.dpi_y, dpi.dpi_x), input: "label", data: { fmt: "dpi" }, display: `${num(dpi.dpi_y, dpi.dpi_x)} DPI` }) : ""}
+        <div class="stack mt-12 gap-10px">
+          ${sliderRow(ex && dpi.independent_xy ? "DPI horizontal (X)" : "DPI précis", { id: `pdpi-${did}`, min: num(dpi.min_dpi, 100), max: num(dpi.max_dpi, 25600), step: num(dpi.step_dpi, 50) || 50, value: num(dpi.dpi_x, 800), input: "label", change: "ptr-dpi-slider", data: { device: id, fmt: "dpi" }, display: `${num(dpi.dpi_x, 800)} DPI` })}
+          ${ex && dpi.independent_xy ? sliderRow("DPI vertical (Y)", { id: `pdpiy-${did}`, min: num(dpi.min_dpi, 100), max: num(dpi.max_dpi, 25600), step: num(dpi.step_dpi, 50) || 50, value: num(dpi.dpi_y, dpi.dpi_x), input: "label", change: "ptr-dpi-slider", data: { device: id, fmt: "dpi" }, display: `${num(dpi.dpi_y, dpi.dpi_x)} DPI` }) : ""}
         </div>
-        <div class="row mt-12"><button type="button" class="btn btn-sm btn-primary" data-act="ptr-dpi-apply" data-id="${esc(id)}">Appliquer le DPI précis</button></div>
       ` : ""}
       ${stages.length ? `
-        <div class="stack mt-12" style="gap:8px">
+        <div class="stack mt-12 gap-2">
           ${stages.map((v, s) => `
             <div class="row-nowrap">
-              <button type="button" class="btn btn-sm ${activeStage === s ? "btn-primary" : "btn-secondary"}" data-act="ptr-stage" data-id="${esc(id)}" data-stage="${s}" aria-pressed="${activeStage === s}" style="min-width:96px">Palier ${s + 1}${activeStage === s ? " (actif)" : ""}</button>
+              <button type="button" class="btn btn-sm ${activeStage === s ? "btn-primary" : "btn-secondary"} min-w-96" data-act="ptr-stage" data-id="${esc(id)}" data-stage="${s}" aria-pressed="${activeStage === s}">Palier ${s + 1}${activeStage === s ? " (actif)" : ""}</button>
               <input type="number" class="og-input narrow" min="100" max="30000" step="50" value="${num(v)}" id="pstage-${did}-${s}" aria-label="DPI du palier ${s + 1}" />
               <button type="button" class="btn btn-sm btn-secondary" data-act="ptr-stage-save" data-id="${esc(id)}" data-stage="${s}">Enregistrer</button>
             </div>`).join("")}
         </div>` : ""}
       ${dpi.supports_lod ? `
-        <div class="row-between mt-12">
+        <div class="row-between pair-row mt-12">
           <span class="field-label">Distance de décrochage</span>
           ${seg([["Low", "Basse"], ["Medium", "Moyenne"], ["High", "Haute"]], dpi.lod, "ptr-lod", { id })}
         </div>` : ""}
@@ -102,22 +101,42 @@ export function cardPointer(dev) {
 
 function cardPowerPlans() {
   const showLaptop = !!(S.is_laptop || (S.laptop_battery && S.laptop_battery.present));
-  return `
-    ${showLaptop ? cardLaptopPower() : ""}
-    ${!S.power_plans.length ? emptyState("Aucun mode d'alimentation trouvé", "Windows n'a renvoyé aucun mode d'alimentation.") : `
+  const tel = S.telemetry || {};
+  const gpu = tel.gpu || {};
+  const sensors = tel.sensors || {};
+  const sp = S.system_prefs || {};
+  const plansCard = !S.power_plans.length
+    ? emptyState("Aucun mode d'alimentation trouvé", "Windows n'a renvoyé aucun mode d'alimentation.")
+    : `
       <div class="card">
         <div class="card-head"><div><h2 class="card-title">Mode d'alimentation Windows</h2><div class="card-desc">Choisis le compromis entre performances et consommation.</div></div></div>
         <div class="plan-grid">
           ${S.power_plans.map((p) => `
             <div class="plan-card ${p.active ? "active" : ""}">
               <div>
-                <div style="font-weight:650;color:#fff">${esc(p.name)}</div>
-                ${isExpert() ? `<div class="mono muted small" style="margin-top:3px">${esc(p.guid)}</div>` : ""}
+                <div class="fw-650 txt-white">${esc(p.name)}</div>
+                ${isExpert() ? `<div class="mono muted small mt-3">${esc(p.guid)}</div>` : ""}
               </div>
               <div>${p.active ? `<span class="pill cyan"><span class="dot"></span>Actif</span>` : `<button type="button" class="btn btn-sm btn-secondary" data-act="power-plan" data-guid="${esc(p.guid)}">Activer</button>`}</div>
             </div>`).join("")}
         </div>
-      </div>`}`;
+      </div>`;
+  const rightCard = showLaptop
+    ? cardLaptopPower()
+    : `
+      <div class="card accent-cyan">
+        <div class="card-head">
+          <div><h2 class="card-title">Consommation &amp; veille automatique</h2><div class="card-desc">Mesure en direct et économie d'éclairage configurée sur ce PC.</div></div>
+          <button type="button" class="btn btn-sm btn-ghost" data-act="nav" data-tab="system" data-sub="prefs">Réglages auto</button>
+        </div>
+        <div class="list">
+          <div class="list-row"><span class="muted">Processeur</span><strong class="mono">${Math.round(num(tel.cpu_usage_pct))} %${sensors.cpu_temp_c != null ? ` · ${Math.round(num(sensors.cpu_temp_c))} °C` : ""}</strong></div>
+          <div class="list-row"><span class="muted">Carte graphique</span><strong class="mono">${gpu.available && gpu.power_watts != null ? `${Math.round(num(gpu.power_watts))} W` : gpu.available && gpu.temp_c != null ? `${Math.round(num(gpu.temp_c))} °C` : "—"}</strong></div>
+          <div class="list-row"><span class="muted">Coupure RGB sur verrouillage</span><strong>${sp.lights_off_on_lock !== false ? "Activée" : "Désactivée"}</strong></div>
+          <div class="list-row"><span class="muted">Coupure RGB sur inactivité</span><strong>${num(sp.idle_lights_off_min) > 0 ? `${num(sp.idle_lights_off_min)} min` : "Jamais"}</strong></div>
+        </div>
+      </div>`;
+  return `<div class="grid-2 grid-balanced">${plansCard}${rightCard}</div>`;
 }
 
 function cardLaptopPower() {
@@ -166,27 +185,85 @@ function normTempSource(src) {
   return src || "CpuBios";
 }
 
+function directCoolingCard(sp, superioDev) {
+  if (superioDev) {
+    const id = superioDev.info.id;
+    const fans = arr(superioDev.cooling && superioDev.cooling.fans);
+    const chipSpec = arr(superioDev.specs).find((x) => x.label === "Diagnostic SuperIO");
+    return `
+      <div class="card expert-card mt-16">
+        <div class="card-head">
+          <div><h2 class="card-title">Contrôle direct des ventilateurs ${expertTag()}</h2><div class="card-desc">${esc((chipSpec && chipSpec.value) || `${superioDev.info.model} (PawnIO)`)}</div></div>
+          <div class="row">
+            <span class="pill emerald"><span class="dot"></span>${esc(superioDev.info.model.replace(/^SuperIO\s*/i, ""))}</span>
+            <button type="button" class="btn btn-sm btn-secondary" data-act="sio-refresh" data-device="${esc(id)}">Actualiser</button>
+          </div>
+        </div>
+        ${fans.length ? `
+          <div class="stack gap-2">
+            ${fans.map((f, idx) => {
+              const duty = num(f.manual_pct, 50);
+              const dom = `sio-${domId(id)}-${idx}`;
+              return `
+                <div class="list-row">
+                  <div class="min-w-140"><strong>${esc(f.name)}</strong><div class="muted small">${f.manual_pct != null ? "Vitesse forcée" : "Automatique (BIOS)"}</div></div>
+                  <span class="pill ${num(f.rpm) > 0 ? "amber" : ""}">${f.rpm != null ? `${num(f.rpm)} tr/min` : "—"}</span>
+                  <input type="range" class="og-range grow" min="${num(f.min_pct, 30)}" max="100" value="${clamp(duty, num(f.min_pct, 30), 100)}" id="${dom}" data-input="label" data-label="${dom}-val" data-fmt="pct100" aria-label="Vitesse ${esc(f.name)}" />
+                  <span class="mono w-44 txt-r" id="${dom}-val">${clamp(duty, num(f.min_pct, 30), 100)} %</span>
+                  <button type="button" class="btn btn-sm btn-primary" data-act="sio-apply" data-device="${esc(id)}" data-fan="${esc(f.id)}" data-target="${dom}">Forcer</button>
+                  <button type="button" class="btn btn-sm btn-secondary" data-act="sio-auto" data-device="${esc(id)}" data-fan="${esc(f.id)}">Auto BIOS</button>
+                </div>`;
+            }).join("")}
+          </div>` : ""}
+      </div>`;
+  }
+  if (S.is_laptop) return "";
+  return `
+    <div class="card expert-card mt-16">
+      <div class="card-head">
+        <div><h2 class="card-title">Contrôle direct des ventilateurs ${expertTag()}</h2><div class="card-desc">Pilote directement la puce de contrôle de la carte mère (SuperIO) via le pilote PawnIO.</div></div>
+        <div class="row">
+          <span class="pill amber"><span class="dot"></span>${sp.is_admin ? (sp.pawnio_ready ? "Aucune puce SuperIO supportée" : "Pilote PawnIO absent") : "Administrateur requis"}</span>
+          ${!sp.pawnio_ready ? `<button type="button" class="btn btn-sm btn-warn" data-act="pawnio-install">Installer / réparer PawnIO</button>` : ""}
+        </div>
+      </div>
+    </div>`;
+}
+
 function viewCooling() {
-  const c = S.cooling;
+  const sp = S.system_prefs || {};
+  const cd = curveDevice();
+  const crv = cd && cd.curves;
   const ex = isExpert();
-  const sio = c.superio || { detected: false, fans: [], diagnostic: "" };
+  const superioDev = arr(S.device_list).find((d) => d.info.id === "superio:mainboard") || null;
   const deviceIds = coolingDeviceIds().filter((id) => {
     const dev = deviceById(id);
-    if (dev && dev.has_curves && c.wmi_available) return false;
-    if (id === "superio:mainboard" && ex && sio.detected) return false;
+    if (dev && dev.curves && crv && crv.available) return false;
+    if (id === "superio:mainboard" && ex) return false;
     return true;
   });
-  if (!c.channels.length) {
-    if (deviceIds.length) return viewDeviceCooling(deviceIds);
-    return emptyState("Ventilation non pilotable", c.message || "Aucun canal de ventilation n'a été trouvé sur cette carte mère.");
+  if (!cd) {
+    if (deviceIds.length) {
+      return `${viewDeviceCooling(deviceIds)}${ex && !superioDev ? directCoolingCard(sp, null) : ""}`;
+    }
+    return `
+      ${emptyState("Ventilation non pilotable", sp.is_admin ? "Aucun contrôleur de ventilation compatible n'a été détecté sur cette carte mère." : "Lance OpenGear en administrateur pour accéder aux réglages de ventilation de la carte mère.", !sp.is_admin ? `<button type="button" class="btn btn-warn" data-act="relaunch-admin">Relancer en administrateur</button>` : "")}
+      ${ex ? directCoolingCard(sp, null) : ""}`;
   }
-  const ch = c.channels[local.selectedCoolingIdx] || c.channels[0];
+  const channels = arr(crv.channels);
+  const ch = channels[local.selectedCoolingIdx] || channels[0];
   // Pump presets drive a pump channel only: hide them on boards without one.
-  const hasPump = c.channels.some((x) => x.is_pump);
-  const pols = ex ? POLICIES : POLICIES.filter(([id]) => id !== "Manual");
+  const hasPump = channels.some((x) => x.is_pump);
+  const pols = ex
+    ? POLICIES
+    : [
+        ...POLICIES.filter(([id]) => id !== "Manual"),
+        ...(ch.policy === "Manual" ? [["Manual", "Courbe perso.", true]] : []),
+      ];
   const curSrc = normTempSource(ch.source);
+  const cdId = cd.info.id;
   return `
-    ${!c.is_admin ? `
+    ${!crv.is_admin ? `
       <div class="alert warn">
         <span class="alert-icon">${ICONS.lock}</span>
         <div class="grow"><div class="alert-title">Droits administrateur nécessaires pour modifier la ventilation</div><div class="muted">Windows protège l'accès aux réglages de ventilation de la carte mère. Tu peux préparer tes réglages ici, puis relancer OpenGear en administrateur pour les appliquer.</div></div>
@@ -201,28 +278,28 @@ function viewCooling() {
       <div class="stack">
         <div class="card accent-amber">
           <div class="card-head"><div><h2 class="card-title">Pompe du watercooling</h2><div class="card-desc">Un plancher de sécurité est toujours conservé.</div></div></div>
-          <div class="stack" style="gap:8px">
-            <button type="button" class="btn btn-secondary" data-act="sl3-preset" data-preset="ultra_silent">Silence (45–95 %)</button>
-            <button type="button" class="btn btn-secondary" data-act="sl3-preset" data-preset="default">Équilibré (55–100 %)</button>
-            <button type="button" class="btn btn-secondary" data-act="sl3-preset" data-preset="max_perf">Performance (75–100 %)</button>
+          <div class="stack gap-2">
+            <button type="button" class="btn btn-secondary" data-act="sl3-preset" data-device="${esc(cdId)}" data-preset="ultra_silent">Silence (45–95 %)</button>
+            <button type="button" class="btn btn-secondary" data-act="sl3-preset" data-device="${esc(cdId)}" data-preset="default">Équilibré (55–100 %)</button>
+            <button type="button" class="btn btn-secondary" data-act="sl3-preset" data-device="${esc(cdId)}" data-preset="max_perf">Performance (75–100 %)</button>
           </div>
         </div>
       </div>` : ""}
       <div class="card">
         <div class="card-head">
           <div><h2 class="card-title">Ventilateurs</h2><div class="card-desc">Choisis un canal puis un mode.</div></div>
-          ${ex && c.wmi_available ? `<button type="button" class="btn btn-sm btn-secondary" data-act="cool-read-bios">Relire le BIOS</button>` : ""}
+          ${ex && crv.available ? `<button type="button" class="btn btn-sm btn-secondary" data-act="cool-read-bios" data-device="${esc(cdId)}">Relire le BIOS</button>` : ""}
         </div>
-        ${seg(c.channels.map((x) => [x.index, x.short_label || x.label]), local.selectedCoolingIdx, "cool-ch", {}, "amber")}
+        ${seg(channels.map((x) => [x.index, x.short_label || x.label]), local.selectedCoolingIdx, "cool-ch", {}, "amber")}
         <div class="row-between mt-12">
-          <div style="font-weight:650">${esc(ch.label)}</div>
-          ${!ex && ch.policy === "Manual" ? `<span class="pill purple">Courbe personnalisée</span>` : ""}
+          <div class="fw-650">${esc(ch.label)}</div>
+          ${!ex && ch.policy === "Manual" ? `<span class="pill purple">Courbe personnalisée (mode Expert)</span>` : ""}
         </div>
-        <div class="mt-8">${seg(pols, ch.policy, "cool-pol")}</div>
+        <div class="mt-8">${seg(pols, ch.policy, "cool-pol", { device: cdId })}</div>
         ${ex ? `
-          <div class="row mt-12">
+          <div class="row mt-12 pair-row">
             <label class="field-label" for="cool-src">Température de référence</label>
-            <select id="cool-src" class="og-select auto" data-change="cool-src">
+            <select id="cool-src" class="og-select auto" data-change="cool-src" data-device="${esc(cdId)}">
               <option value="CpuBios" ${curSrc === "CpuBios" ? "selected" : ""}>Processeur (régulation BIOS)</option>
               <option value="GpuEdge" ${curSrc === "GpuEdge" ? "selected" : ""}>Carte graphique (cœur)</option>
               <option value="GpuHotspot" ${curSrc === "GpuHotspot" ? "selected" : ""}>Carte graphique (point chaud)</option>
@@ -244,76 +321,60 @@ function viewCooling() {
               { id: "Nvme", label: "SSD NVMe" },
             ];
             return `
-              <div class="row mt-8" style="gap:8px">
-                <select id="cool-mix-op" class="og-select auto" data-change="cool-mix" aria-label="Opération thermique">
+              <div class="row mt-8 gap-2">
+                <select id="cool-mix-op" class="og-select auto" data-change="cool-mix" data-device="${esc(cdId)}" aria-label="Opération thermique">
                   <option value="Max" ${mix.op === "Max" ? "selected" : ""}>Max(A, B)</option>
                   <option value="Avg" ${mix.op === "Avg" ? "selected" : ""}>Moyenne(A, B)</option>
                   <option value="Delta" ${mix.op === "Delta" ? "selected" : ""}>Écart |A − B|</option>
                 </select>
-                <select id="cool-mix-a" class="og-select auto" data-change="cool-mix" aria-label="Capteur A">${sensors.map((s) => `<option value="${esc(s.id)}" ${mixA === s.id ? "selected" : ""}>${esc(s.label)}</option>`).join("")}</select>
-                <select id="cool-mix-b" class="og-select auto" data-change="cool-mix" aria-label="Capteur B">${sensors.map((s) => `<option value="${esc(s.id)}" ${mixB === s.id ? "selected" : ""}>${esc(s.label)}</option>`).join("")}</select>
+                <select id="cool-mix-a" class="og-select auto" data-change="cool-mix" data-device="${esc(cdId)}" aria-label="Capteur A">${sensors.map((s) => `<option value="${esc(s.id)}" ${mixA === s.id ? "selected" : ""}>${esc(s.label)}</option>`).join("")}</select>
+                <select id="cool-mix-b" class="og-select auto" data-change="cool-mix" data-device="${esc(cdId)}" aria-label="Capteur B">${sensors.map((s) => `<option value="${esc(s.id)}" ${mixB === s.id ? "selected" : ""}>${esc(s.label)}</option>`).join("")}</select>
               </div>`;
           })() : ""}
-          <div class="stack mt-12" style="gap:10px">
-            ${sliderRow("Hystérésis anti-yoyo", { id: "cool-hyst", min: 0, max: 10, value: num(ch.hysteresis_c, 3), input: "label", change: "cool-hyst", data: { fmt: "deg" }, display: `${num(ch.hysteresis_c, 3)} °C` })}
-            ${sliderRow("Lissage anti-pics", { id: "cool-smooth", min: 0, max: 20, value: num(ch.smoothing_secs, 0), input: "label", change: "cool-smooth", data: { fmt: "sec" }, display: num(ch.smoothing_secs, 0) ? `${num(ch.smoothing_secs, 0)} s` : "Instantané" })}
+          <div class="stack mt-12 gap-10px">
+            ${sliderRow("Hystérésis anti-yoyo", { id: "cool-hyst", min: 0, max: 10, value: num(ch.hysteresis_c, 3), input: "label", change: "cool-hyst", data: { device: cdId, fmt: "deg" }, display: `${num(ch.hysteresis_c, 3)} °C` })}
+            ${sliderRow("Lissage anti-pics", { id: "cool-smooth", min: 0, max: 20, value: num(ch.smoothing_secs, 0), input: "label", change: "cool-smooth", data: { device: cdId, fmt: "sec" }, display: num(ch.smoothing_secs, 0) ? `${num(ch.smoothing_secs, 0)} s` : "Instantané" })}
           </div>
           <div class="curve-wrap mt-12"><svg id="fan-curve-svg" class="curve-svg" viewBox="0 0 680 250" role="img" aria-label="Courbe de ventilation"></svg></div>
-          <div class="curve-pts" id="curve-pts">${curvePointsHtml(ch)}</div>
+          <div class="curve-pts" id="curve-pts">${curvePointsHtml(ch, cdId)}</div>
           <div class="row mt-16">
-            <button type="button" class="btn btn-ok" data-act="cool-apply">Appliquer à la carte mère</button>
-            ${ch.is_pump ? `<button type="button" class="btn btn-secondary" data-act="sl3-preset" data-preset="default">Réinitialiser la pompe</button>` : ""}
+            <button type="button" class="btn btn-primary" data-act="cool-apply" data-device="${esc(cdId)}">Appliquer à la carte mère</button>
+            ${ch.is_pump ? `<button type="button" class="btn btn-secondary" data-act="sl3-preset" data-device="${esc(cdId)}" data-preset="default">Réinitialiser la pompe</button>` : ""}
           </div>` : `
           <div class="row mt-16">
-            <button type="button" class="btn btn-ok" data-act="cool-apply">Appliquer à la carte mère</button>
+            <button type="button" class="btn btn-primary" data-act="cool-apply" data-device="${esc(cdId)}">Appliquer à la carte mère</button>
           </div>`}
       </div>
     </div>
-    ${ex ? `
-      <div class="card expert-card mt-16">
-        <div class="card-head">
-          <div><h2 class="card-title">Contrôle direct des ventilateurs ${expertTag()}</h2><div class="card-desc">${esc(sio.diagnostic || "Pilote directement la puce de contrôle de la carte mère (SuperIO).")}</div></div>
-          <div class="row">
-            <span class="pill ${sio.detected ? "emerald" : "amber"}"><span class="dot"></span>${sio.detected ? esc(sio.chip_name) : c.is_admin ? "Pilote PawnIO absent" : "Administrateur requis"}</span>
-            ${!sio.detected ? `<button type="button" class="btn btn-sm btn-warn" data-act="pawnio-install">Installer / réparer PawnIO</button>` : ""}
-            <button type="button" class="btn btn-sm btn-secondary" data-act="sio-refresh">Actualiser</button>
-          </div>
-        </div>
-        ${sio.detected && arr(sio.fans).length ? `
-          <div class="stack" style="gap:8px">
-            ${arr(sio.fans).map((f) => `
-              <div class="list-row">
-                <div style="min-width:140px"><strong>${esc(f.label)}</strong><div class="muted small">${f.is_manual ? "Vitesse forcée" : "Automatique (BIOS)"}</div></div>
-                <span class="pill ${num(f.rpm) > 0 ? "amber" : ""}">${num(f.rpm)} tr/min</span>
-                <input type="range" class="og-range grow" min="0" max="100" value="${num(f.pwm_pct)}" id="sio-${num(f.index)}" data-input="label" data-label="sio-${num(f.index)}-val" data-fmt="pct100" aria-label="Vitesse ${esc(f.label)}" />
-                <span class="mono" id="sio-${num(f.index)}-val" style="width:44px;text-align:right">${num(f.pwm_pct)} %</span>
-                <button type="button" class="btn btn-sm btn-primary" data-act="sio-apply" data-ch="${num(f.index)}">Forcer</button>
-                <button type="button" class="btn btn-sm btn-secondary" data-act="sio-auto" data-ch="${num(f.index)}">Auto BIOS</button>
-              </div>`).join("")}
-          </div>` : ""}
-      </div>` : advancedHint("Courbes 8 points, source de température et contrôle direct des ventilateurs sont en mode Expert.")}
-    ${deviceIds.length && !c.wmi_available ? `<div class="stack mt-16">${deviceIds.map((id) => {
+    ${ex ? directCoolingCard(sp, superioDev) : advancedHint("Courbes 8 points, source de température et contrôle direct des ventilateurs sont en mode Expert.")}
+    ${deviceIds.length && !crv.available ? `<div class="stack mt-16">${deviceIds.map((id) => {
       const d = deviceById(id);
       const name = d ? d.info.model : id;
       return deviceFans(id, { title: `Ventilateurs · ${name}` });
     }).join("")}</div>` : ""}`;
 }
 
-function curvePointsHtml(ch) {
+function curvePointsHtml(ch, cdId) {
   return arr(ch.curve).map((pt, i) => `
     <div class="curve-pt">
       <span>P${i + 1}</span>
-      <input type="number" min="20" max="100" value="${num(pt.temp_c)}" data-change="curve-pt" data-pt="${i}" data-field="temp_c" aria-label="Point ${i + 1} : température °C" />
-      <input type="number" min="0" max="100" value="${num(pt.duty_pct)}" data-change="curve-pt" data-pt="${i}" data-field="duty_pct" aria-label="Point ${i + 1} : vitesse %" />
+      <input type="number" min="20" max="100" value="${num(pt.temp_c)}" data-change="curve-pt" data-device="${esc(cdId)}" data-pt="${i}" data-field="temp_c" aria-label="Point ${i + 1} : température °C" />
+      <input type="number" min="0" max="100" value="${num(pt.duty_pct)}" data-change="curve-pt" data-device="${esc(cdId)}" data-pt="${i}" data-field="duty_pct" aria-label="Point ${i + 1} : vitesse %" />
     </div>`).join("");
 }
 
 export function renderFanCurve() {
   const svg = document.getElementById("fan-curve-svg");
-  if (!svg || !S) return;
-  const ch = S.cooling.channels[local.selectedCoolingIdx];
+  const cd = curveDevice();
+  if (!svg || !S || !cd) return;
+  const ch = cd.curves.channels[local.selectedCoolingIdx];
   if (!ch || arr(ch.curve).length < 2) return;
-  const accent = ch.is_pump ? "#FFA53D" : "#00D4FF";
+  const amber = cssVar("--amber", "#FFA53D");
+  const cyan = cssVar("--cyan", "#00D4FF");
+  const muted = cssVar("--text-3", "#8592AB");
+  const bg = cssVar("--bg-app", "#090B10");
+  const rog = cssVar("--rog", "#FF3D63");
+  const accent = ch.is_pump ? amber : cyan;
   const padL = 44, padR = 18, padT = 18, padB = 30, W = 680, H = 250;
   const pw = W - padL - padR, ph = H - padT - padB;
   const tx = (t) => padL + ((t - 20) / 80) * pw;
@@ -331,11 +392,11 @@ export function renderFanCurve() {
   let html = `<defs><linearGradient id="cg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="${accent}" stop-opacity="0.32"/><stop offset="100%" stop-color="${accent}" stop-opacity="0.02"/></linearGradient></defs>`;
   for (const d of [0, 25, 50, 75, 100]) {
     const y = dy(d);
-    html += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="rgba(255,255,255,0.06)"/><text x="${padL - 8}" y="${y + 4}" fill="#8592ab" font-size="10.5" text-anchor="end" font-family="Consolas,monospace">${d}%</text>`;
+    html += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="rgba(255,255,255,0.06)"/><text x="${padL - 8}" y="${y + 4}" fill="${muted}" font-size="10.5" text-anchor="end" font-family="Consolas,monospace">${d}%</text>`;
   }
   for (let t = 20; t <= 100; t += 10) {
     const x = tx(t);
-    html += `<line x1="${x}" y1="${padT}" x2="${x}" y2="${H - padB}" stroke="rgba(255,255,255,0.06)"/><text x="${x}" y="${H - 10}" fill="#8592ab" font-size="10.5" text-anchor="middle" font-family="Consolas,monospace">${t}°C</text>`;
+    html += `<line x1="${x}" y1="${padT}" x2="${x}" y2="${H - padB}" stroke="rgba(255,255,255,0.06)"/><text x="${x}" y="${H - 10}" fill="${muted}" font-size="10.5" text-anchor="middle" font-family="Consolas,monospace">${t}°C</text>`;
   }
   if (ch.is_pump) {
     const fy = dy(45);
@@ -345,12 +406,12 @@ export function renderFanCurve() {
   const liveT = sensors.cpu_temp_c != null ? sensors.cpu_temp_c : S.telemetry.gpu && S.telemetry.gpu.temp_c;
   if (liveT != null) {
     const lx = tx(clamp(liveT, 20, 100));
-    html += `<line x1="${lx}" y1="${padT}" x2="${lx}" y2="${H - padB}" stroke="#FF3D63" stroke-width="1.4" stroke-dasharray="3 3"/><text x="${lx + 5}" y="${padT + 12}" fill="#FF7a93" font-size="10.5" font-family="Consolas,monospace">${sensors.cpu_temp_c != null ? "CPU" : "GPU"} ${Math.round(liveT)}°C</text>`;
+    html += `<line x1="${lx}" y1="${padT}" x2="${lx}" y2="${H - padB}" stroke="${rog}" stroke-width="1.4" stroke-dasharray="3 3"/><text x="${lx + 5}" y="${padT + 12}" fill="${rog}" font-size="10.5" font-family="Consolas,monospace">${sensors.cpu_temp_c != null ? "CPU" : "GPU"} ${Math.round(liveT)}°C</text>`;
   }
   html += `<path id="fc-fill" d="${fillD}" fill="url(#cg)"/><path id="fc-line" d="${lineD}" fill="none" stroke="${accent}" stroke-width="2.6" stroke-linejoin="round"/>`;
   pts.forEach(([x, y], i) => {
     const p = ch.curve[i];
-    html += `<g class="curve-node" data-pt="${i}" style="cursor:grab"><circle class="fc-hit" cx="${x}" cy="${y}" r="12" fill="transparent"/><circle class="fc-dot" cx="${x}" cy="${y}" r="6.5" fill="${accent}" stroke="#090b10" stroke-width="2"/><title>Point ${i + 1} : ${num(p.temp_c)} °C → ${num(p.duty_pct)} %</title></g>`;
+    html += `<g class="curve-node" data-pt="${i}"><circle class="fc-hit" cx="${x}" cy="${y}" r="12" fill="transparent"/><circle class="fc-dot" cx="${x}" cy="${y}" r="6.5" fill="${accent}" stroke="${bg}" stroke-width="2"/><title>Point ${i + 1} : ${num(p.temp_c)} °C → ${num(p.duty_pct)} %</title></g>`;
   });
   svg.innerHTML = html;
 

@@ -2,7 +2,7 @@
 //! controller via Microsoft WHQL-signed **PawnIO** (`LpcIO.bin`).
 
 use anyhow::{Context, Result};
-use opengear_core::driver::{Connection, Device, DeviceInfo, DeviceKind, Driver};
+use opengear_core::driver::{Connection, Device, DeviceInfo, DeviceKind, DeviceSpec, Driver};
 use opengear_core::fans::{Cooling, FanInfo, FanTarget, clamp_target};
 #[cfg(windows)]
 use opengear_platform::PawnIoAvailability;
@@ -915,6 +915,18 @@ impl Device for SuperIoCoolingDevice {
             connection: Connection::Internal,
             firmware: Some(self.snap.chip_id_hex.clone()),
         }
+    }
+
+    fn specs(&self) -> Vec<DeviceSpec> {
+        vec![
+            DeviceSpec::expert(
+                "Puce de contrôle",
+                format!("{} ({})", self.snap.chip_name, self.snap.chip_id_hex),
+                true,
+            ),
+            DeviceSpec::simple("Canaux PWM", self.snap.fans.len().to_string()),
+            DeviceSpec::simple("Diagnostic SuperIO", self.snap.diagnostic.clone()),
+        ]
     }
 
     fn cooling(&mut self) -> Option<&mut dyn Cooling> {

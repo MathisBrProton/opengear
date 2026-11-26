@@ -131,10 +131,12 @@ La CI exécute exactement ces commandes. Si `cargo fmt` ou `cargo clippy` est in
   de surveillance (`cooling_devices` du marqueur `fan_override.json`). Les préréglages et
   l'économie sur batterie n'utilisent que les ids partagés.
 - Tous les réglages et capacités transverses passent par les traits de `opengear-core` (`Device`, `Lighting`, `Cooling`, `CurveCooling`, `PointerDevice`, `Equalizer`, `OnboardMemory`) avec zéro `as_any`/downcast dans le workspace et zéro import marque dans `opengear-app` hors `src/drivers.rs` (sauf pont serveur TCP `opengear_openrgb::server` dans `ui/backend.rs`).
-- Ventilateurs carte mère : côté pilotes, les courbes WMI (`CurveCooling`) et le contrôle direct
-  SuperIO (`Cooling`) passent déjà par les traits de `opengear-core` et `src/drivers.rs` ; seul
-  l'état/IPC de `opengear-app` conserve encore `cooling_channels` / `cooling_*` / `superio_*`
-  en parallèle de `Device::cooling()` et `device_fan_set`.
+- Ventilateurs carte mère : les courbes WMI (`CurveCooling`), le contrôle direct SuperIO
+  (`Cooling`), et leur surface IPC/UI (`S.device_list[].curves` / `cooling`, `device_curve_*`,
+  `device_pump_preset`, `device_fan_set`, `device_fan_refresh`) sont entièrement unifiés sur les
+  traits de `opengear-core`. Seul le marqueur `fan_override.json` du watchdog conserve un snapshot
+  de restauration SuperIO (`superio_restore`) car la table de registres initiaux en mémoire vit par
+  processus.
 - `opengear-core::profile` conserve quelques champs hérités (`sync_asus_aura`, `asus_argb_led_counts`,
   `silent_loop3_*`, `omen_sync_rgb`) uniquement pour la rétro-compatibilité au chargement des anciens
   fichiers ; la configuration active vit dans `device_lighting` et `device_placements`.

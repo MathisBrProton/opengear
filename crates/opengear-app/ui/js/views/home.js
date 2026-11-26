@@ -6,8 +6,9 @@ export function alertBanner(alerts) {
   const errs = alerts.filter((a) => a.status === "error");
   const sorted = [...errs, ...alerts.filter((a) => a.status !== "error")];
   const cls = errs.length ? "err" : "warn";
+  const warns = alerts.length - errs.length;
   const title = errs.length
-    ? `${plural(errs.length, "problème détecté", "problèmes détectés")}${alerts.length > errs.length ? ` et ${plural(alerts.length - errs.length, "avertissement", "avertissements")}` : ""}`
+    ? `${plural(errs.length, "problème détecté", "problèmes détectés")}${warns ? ` et ${plural(warns, "avertissement", "avertissements")}` : ""}`
     : plural(alerts.length, "point à vérifier", "points à vérifier");
   return `
     <div class="alert ${cls}" role="${errs.length ? "alert" : "status"}">
@@ -36,7 +37,7 @@ export function deviceCard(d) {
         <span class="pill ${d.status.cls}"><span class="dot"></span>${esc(d.status.label)}</span>
         ${d.battery != null ? batteryBadge(d.battery, d.charging) : ""}
       </div>
-      <button type="button" class="dc-thumb" data-act="open-device" data-key="${esc(d.key)}" tabindex="-1" aria-hidden="true">${deviceVisual(d)}</button>
+      <button type="button" class="dc-thumb" data-act="open-device" data-key="${esc(d.key)}" data-kind="${esc(d.kind)}" tabindex="-1" aria-hidden="true">${deviceVisual(d)}</button>
       <div class="dc-name" title="${esc(d.name)}">${esc(d.name)}</div>
       <div class="dc-meta">${esc(d.type)}</div>
       ${d.quick.length ? `<div class="dc-quick">${d.quick.slice(0, 3).map(quickBtn).join("")}</div>` : ""}
@@ -51,7 +52,7 @@ export function viewHome() {
   const alerts = checks.filter((c) => c.status === "error" || c.status === "warn");
   return `
     ${pageHeader("Accueil", esc([si.motherboard, si.cpu_name].filter(Boolean).join(" · ")),
-      `<span class="pill emerald"><span class="dot"></span>${devs.length ? plural(devs.length, "appareil connecté", "appareils connectés") : "Aucun appareil"}</span>`)}
+      `<span class="pill ${devs.length ? "emerald" : ""}"><span class="dot"></span>${devs.length ? plural(devs.length, "appareil connecté", "appareils connectés") : "Aucun appareil"}</span>`)}
     ${alerts.length ? alertBanner(alerts) : ""}
     ${S.presets.length ? `
       <section class="section" aria-labelledby="h-presets">

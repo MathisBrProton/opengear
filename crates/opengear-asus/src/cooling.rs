@@ -2,9 +2,9 @@
 
 use anyhow::Result;
 use opengear_core::cooling::{CurvePoint, FanChannelConfig, FanHeaderKind, FanPolicyMode};
-use opengear_core::driver::{Connection, Device, DeviceInfo, DeviceKind, Driver};
+use opengear_core::driver::{Connection, Device, DeviceInfo, DeviceKind, DeviceSpec, Driver};
 use opengear_core::fans::{Cooling, CurveCooling, FanInfo, FanTarget, clamp_target};
-use opengear_platform::is_elevated;
+use opengear_platform::{is_elevated, is_laptop_chassis};
 
 /// ASUS `ASUSManagement` WMI FanType IDs (verified on ASUS ROG desktop boards).
 fn asus_fan_type(header: FanHeaderKind) -> u8 {
@@ -299,17 +299,21 @@ impl Driver for AsusWmiCoolingDriver {
 
     fn discover(&self) -> Vec<Box<dyn Device>> {
         let status = probe_asus_wmi_cooling();
-        if !status.wmi_available {
+        if !status.wmi_available && (status.is_admin || is_laptop_chassis()) {
             return Vec::new();
         }
         let initial: Vec<FanChannelConfig> = FanHeaderKind::ALL
             .iter()
             .map(|&h| {
-                read_asus_wmi_channel(h).unwrap_or_else(|| {
-                    let mut c = FanChannelConfig::default_for(h);
-                    c.policy = FanPolicyMode::Standard;
-                    c
-                })
+                if status.wmi_available {
+                    read_asus_wmi_channel(h).unwrap_or_else(|| {
+                        let mut c = FanChannelConfig::default_for(h);
+                        c.policy = FanPolicyMode::Standard;
+                        c
+                    })
+                } else {
+                    FanChannelConfig::default_for(h)
+                }
             })
             .collect();
         vec![Box::new(AsusWmiCoolingDevice {
@@ -380,6 +384,13 @@ impl Device for AsusWmiCoolingDevice {
             connection: Connection::Internal,
             firmware: None,
         }
+    }
+
+    fn specs(&self) -> Vec<DeviceSpec> {
+        vec![DeviceSpec::simple(
+            "Interface BIOS",
+            self.status.message.clone(),
+        )]
     }
 
     fn cooling(&mut self) -> Option<&mut dyn Cooling> {

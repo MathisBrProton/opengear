@@ -72,11 +72,15 @@ function inputKeys() {
   const layerMap = layer === "base" ? (prof.bindings || {}) : ((prof.layers && prof.layers[layer]) || {});
   const bindings = Object.entries(layerMap);
   const kb = arr(S.device_list).find((d) => d.info.kind === "keyboard") || null;
+  if (!arr(S.keyboard && S.keyboard.keys).length) {
+    return `${keyboardSetup()}${emptyState("Disposition du clavier indisponible", "Sélectionne un format de clavier ci-dessus ou branche un clavier puis relance la recherche.", `<button type="button" class="btn btn-primary" data-act="rescan">Relancer la recherche</button>`)}`;
+  }
+  const ex = isExpert();
   const keyOpts = (sel) => S.bindable_keys.map((k) => `<option value="${esc(k)}" ${k === sel ? "selected" : ""}>${esc(keyLabel(k))}</option>`).join("");
   return `
     <div class="card mb-16">
       <div class="row-between">
-        <div><strong>Couche active (Layers QMK/Fn)</strong><div class="muted small">Édite la couche principale ou la couche secondaire Fn, activable par maintien/bascule d'une touche ou d'un bouton souris.</div></div>
+        <div><strong>${ex ? "Couche active (Layers QMK/Fn)" : "Couche active (Fn)"}</strong><div class="muted small">Édite la couche principale ou la couche secondaire Fn, activable par maintien/bascule d'une touche ou d'un bouton souris.</div></div>
         ${seg([["base", "Couche Base"], ["fn", "Couche Fn"]], layer, "input-layer", {}, "purple")}
       </div>
     </div>
@@ -104,8 +108,8 @@ function inputKeys() {
           <span class="field-label">Appui court / Maintien</span>
           <select id="mac-th-tap" class="og-select auto" aria-label="Touche appui court">${keyOpts("ESC")}</select>
           <select id="mac-th-hold" class="og-select auto" aria-label="Touche maintien">${keyOpts("LCTRL")}</select>
-          <input id="mac-th-ms" type="number" class="og-input" style="width:68px" min="50" max="1000" value="200" aria-label="Seuil ms" />
-          <button type="button" class="btn btn-secondary btn-sm" data-act="bind-taphold">Tap-Hold</button>
+          <input id="mac-th-ms" type="number" class="og-input w-68" min="50" max="1000" value="200" aria-label="Seuil ms" />
+          <button type="button" class="btn btn-secondary btn-sm" data-act="bind-taphold">${ex ? "Tap-Hold" : "Appui court / long"}</button>
         </div>
         <div class="divider"></div>
         <div class="row">
@@ -121,20 +125,20 @@ function inputKeys() {
             : `<button type="button" class="btn btn-sm btn-primary" data-act="rec-start">Enregistrer en direct</button>`}
         </div>
         <div class="row mt-8">
-          <input id="mac-name" class="og-input" style="width:120px" value="Macro 1" aria-label="Nom de la macro" />
+          <input id="mac-name" class="og-input w-120" value="Macro 1" aria-label="Nom de la macro" />
           <select id="mac-mode" class="og-select auto" aria-label="Mode de lecture">
             <option value="once">Une fois</option>
             <option value="while_held">Tant que maintenu</option>
             <option value="toggle">Bascule On/Off</option>
           </select>
           <select id="mac-step-key" class="og-select auto" aria-label="Touche à ajouter">${keyOpts("")}</select>
-          <input id="mac-step-ms" type="number" class="og-input" style="width:70px" value="15" min="0" aria-label="Délai en millisecondes" />
+          <input id="mac-step-ms" type="number" class="og-input w-70" value="15" min="0" aria-label="Délai en millisecondes" />
           <button type="button" class="btn btn-secondary btn-sm" data-act="macro-add">Ajouter</button>
           <button type="button" class="btn btn-ghost btn-sm" data-act="macro-clear">Vider</button>
         </div>
         <div class="mono muted mt-12 scroll-y selectable macro-log" aria-live="polite">
           ${sp.macro_recording
-            ? `<span style="color:#ff8aa2;font-weight:700">Enregistrement en cours… tape ta combinaison puis clique sur « Arrêter l'enregistrement ».</span>`
+            ? `<span class="txt-rog-soft fw-700">Enregistrement en cours… tape ta combinaison puis clique sur « Arrêter l'enregistrement ».</span>`
             : local.macroSteps.map((st, i) => `${i + 1}. ${st.down ? "Appui  " : "Relâche"} ${esc(st.key)} (${num(st.delay_ms)} ms)`).join("<br/>") || "Aucune étape pour l'instant."}
         </div>
         <button type="button" class="btn btn-primary btn-sm mt-12" data-act="bind-macro">Assigner la macro à ${esc(keyLabel(local.selectedKeyId))}</button>
@@ -145,7 +149,7 @@ function inputKeys() {
           <div class="table-scroll"><table class="meta-table">
             <thead><tr><th>Touche</th><th>Action</th><th><span class="sr-only">Supprimer</span></th></tr></thead>
             <tbody>
-              ${bindings.map(([k, act]) => `<tr><td class="mono" style="color:var(--cyan);font-weight:700" title="${esc(k)}">${esc(keyLabel(k))}</td><td>${esc(describeAction(act))}</td><td style="text-align:right"><button type="button" class="btn btn-sm btn-secondary" data-act="bind-remove" data-key="${esc(k)}" aria-label="Supprimer la règle ${esc(keyLabel(k))}">Supprimer</button></td></tr>`).join("")}
+              ${bindings.map(([k, act]) => `<tr><td class="mono txt-cyan fw-700" title="${esc(k)}">${esc(keyLabel(k))}</td><td>${esc(describeAction(act))}</td><td class="txt-r"><button type="button" class="btn btn-sm btn-secondary" data-act="bind-remove" data-key="${esc(k)}" aria-label="Supprimer la règle ${esc(keyLabel(k))}">Supprimer</button></td></tr>`).join("")}
             </tbody>
           </table></div>`}
       </div>
@@ -191,7 +195,7 @@ function flashtapCard() {
           <div class="card-desc">La priorité entre touches opposées est gérée <strong>dans le clavier</strong> : rien n'est injecté dans Windows, donc invisible pour les anti-triche (contrairement au Snap Tap logiciel ci-dessous). Les touches concernées sont celles définies par le firmware du clavier.</div>
         </div>
       </div>
-      <div class="stack" style="gap:10px">
+      <div class="stack gap-10px">
         ${kbs.map((d) => {
           const s = d.settings.find((x) => x.id === "hw_socd");
           return `
@@ -240,7 +244,7 @@ function inputEsports() {
     <div class="grid-2">
       <div class="card accent-purple">
         <div class="card-head">
-          <div><h2 class="card-title">Snap Tap (SOCD)</h2><div class="card-desc">Quand deux touches opposées sont enfoncées, seule la dernière compte : contre-déplacements instantanés (${esc(pairLabel)}).</div></div>
+          <div><h2 class="card-title">${isExpert() ? "Snap Tap (SOCD)" : "Snap Tap (touches opposées)"}</h2><div class="card-desc">Quand deux touches opposées sont enfoncées, seule la dernière compte : contre-déplacements instantanés (${esc(pairLabel)}).</div></div>
           <span class="pill ${socd.enabled ? (sp.socd_suspended ? "amber" : "emerald") : ""}"><span class="dot"></span>${socd.enabled ? (sp.socd_suspended ? "En pause (jeu protégé)" : "Actif") : "Désactivé"}</span>
         </div>
         <div class="row-between">
@@ -251,7 +255,7 @@ function inputEsports() {
           </select>
         </div>
         <div class="divider"></div>
-        <div class="muted" style="margin-bottom:6px">Mis en pause automatiquement dans ces jeux (anti-triche) :</div>
+        <div class="muted mb-6">Mis en pause automatiquement dans ces jeux (anti-triche) :</div>
         <div class="row">
           <input id="socd-blocked" class="og-input mono grow" value="${esc(arr(socd.blocked_apps).join(", "))}" placeholder="cs2.exe" aria-label="Jeux protégés" />
           <button type="button" class="btn btn-sm btn-secondary" data-act="socd-blocked">Enregistrer</button>
@@ -262,14 +266,14 @@ function inputEsports() {
           <div><h2 class="card-title">Anti-rebond</h2><div class="card-desc">Filtre les doubles appuis involontaires (touches ou clics usés).</div></div>
           <span class="pill cyan">Filtrés : ${num(sp.chatter_blocked)} touches · ${num(sp.mouse_dblclick_blocked)} clics</span>
         </div>
-        <div class="stack" style="gap:10px">
+        <div class="stack gap-10px">
           ${sliderRow("Clavier", { id: "es-chatter", min: 0, max: 60, value: chatter, input: "label", change: "es-chatter", data: { fmt: "ms" }, display: chatter ? `${chatter} ms` : "Désactivé" })}
           ${sliderRow("Clic souris", { id: "es-mdeb", min: 0, max: 60, value: mdeb, input: "label", change: "es-mdeb", data: { fmt: "ms" }, display: mdeb ? `${mdeb} ms` : "Désactivé" })}
         </div>
         <div class="divider"></div>
         <div class="row-nowrap">
-          <button type="button" class="btn btn-secondary btn-wrap grow" data-act="click-test" style="padding:10px 14px">Clique ici rapidement pour mesurer l'intervalle entre deux clics</button>
-          <span class="pill mono" id="es-click-res" style="min-width:110px;justify-content:center" aria-live="polite">Prêt</span>
+          <button type="button" class="btn btn-secondary btn-wrap grow btn-pad-lg" data-act="click-test">Clique ici rapidement pour mesurer l'intervalle entre deux clics</button>
+          <span class="pill mono min-w-110 justify-center" id="es-click-res" aria-live="polite">Prêt</span>
         </div>
       </div>
     </div>`;
@@ -338,7 +342,7 @@ function softwareMouseCard() {
           <div class="table-scroll"><table class="meta-table">
             <thead><tr><th>Bouton</th><th>Action</th><th><span class="sr-only">Supprimer</span></th></tr></thead>
             <tbody>
-              ${mb.map(([btn, act]) => `<tr><td><strong>${esc(btnLabel(btn))}</strong></td><td>${esc(describeAction(act))}</td><td style="text-align:right"><button type="button" class="btn btn-sm btn-secondary" data-act="m-bind-remove" data-button="${esc(btn)}">Supprimer</button></td></tr>`).join("")}
+              ${mb.map(([btn, act]) => `<tr><td><strong>${esc(btnLabel(btn))}</strong></td><td>${esc(describeAction(act))}</td><td class="txt-r"><button type="button" class="btn btn-sm btn-secondary" data-act="m-bind-remove" data-button="${esc(btn)}">Supprimer</button></td></tr>`).join("")}
             </tbody>
           </table></div>`}
       </div>
@@ -372,7 +376,7 @@ function mouseStage(dev, buttons, btnCount) {
     { idx: 3, id: "M4 · Arrière", ...proj(3, 33.5, 53), lx: 2, ly: 66 },
   ].filter((c) => c.idx < btnCount);
   return `
-    <div class="hero-stage" style="padding:0">
+    <div class="hero-stage p-0">
       <div class="mouse-stage-inner">
         <img src="${esc(imgInfo.url)}" class="cutout" alt="${esc(dev.info.model)}" />
         <svg class="mouse-svg-overlay" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
@@ -431,7 +435,7 @@ export function cardOnboard(dev) {
   return `
     <div class="card expert-card">
       <div class="card-head">
-        <div><h2 class="card-title">${esc(dev.info.model)} — mémoire embarquée ${expertTag()}</h2><div class="card-desc">Les modifications restent en brouillon tant que tu ne les écris pas dans l'appareil.${d.dirty ? " <strong style='color:var(--amber)'>Brouillon modifié.</strong>" : ""}</div></div>
+        <div><h2 class="card-title">${esc(dev.info.model)} — mémoire embarquée ${expertTag()}</h2><div class="card-desc">Les modifications restent en brouillon tant que tu ne les écris pas dans l'appareil.${d.dirty ? ` <strong class="txt-amber">Brouillon modifié.</strong>` : ""}</div></div>
         ${settingInline(id, "logitech.onboard_mode", { label: "Mode" })}
       </div>
       <div class="grid-stage">
@@ -443,26 +447,26 @@ export function cardOnboard(dev) {
           </div>
           <div class="muted small">Emplacement ${esc(p.sector_addr || "—")} · ${p.from_rom ? "ROM d'usine" : "Flash"}${p.crc_valid != null ? (p.crc_valid ? " · intégrité vérifiée" : " · intégrité à vérifier") : ""}</div>
           <div>
-            <div class="field-label" style="margin-bottom:6px">Paliers DPI (le point indique le palier par défaut)</div>
-            <div class="stack" style="gap:6px">
+            <div class="field-label mb-6">Paliers DPI (le point indique le palier par défaut)</div>
+            <div class="stack gap-6px">
               ${p.dpi_stages.map((v, st) => `
                 <div class="row-nowrap">
-                  <input type="radio" name="def-dpi-${did}" value="${st}" ${num(p.default_dpi_idx) === st ? "checked" : ""} data-change="draft-def-dpi" data-id="${esc(id)}" aria-label="Palier ${st + 1} par défaut" style="accent-color:var(--cyan)" />
-                  <span class="muted" style="width:60px">Palier ${st + 1}</span>
+                  <input type="radio" class="accent-cyan-ctl" name="def-dpi-${did}" value="${st}" ${num(p.default_dpi_idx) === st ? "checked" : ""} data-change="draft-def-dpi" data-id="${esc(id)}" aria-label="Palier ${st + 1} par défaut" />
+                  <span class="muted w-60">Palier ${st + 1}</span>
                   <input type="number" class="og-input narrow" min="100" max="32000" step="50" value="${num(v)}" data-change="draft-stage-dpi" data-id="${esc(id)}" data-stage="${st}" aria-label="DPI du palier ${st + 1}" />
                   <button type="button" class="btn btn-sm btn-secondary" data-act="ob-test-stage" data-id="${esc(id)}" data-stage="${st}">Tester</button>
                 </div>`).join("")}
             </div>
           </div>
           <div>
-            <div class="field-label" style="margin-bottom:6px">Boutons</div>
-            <div class="stack" style="gap:6px">
+            <div class="field-label mb-6">Boutons</div>
+            <div class="stack gap-6px">
               ${Array.from({ length: btnCount }, (_, b) => {
                 const cur = btns[b] || { hex: "", label: "Standard" };
                 const known = presets.some((bp) => bp.hex === cur.hex);
                 return `
-                  <div class="row-nowrap" style="${sel === b ? "background:rgba(0,212,255,0.08);border-radius:6px;padding:2px 4px" : ""}">
-                    <label class="muted" style="width:110px;font-size:12px" for="btn-${did}-${b}">${esc(BTN_NAMES[b] || `Bouton M${b + 1}`)}</label>
+                  <div class="row-nowrap ${sel === b ? "row-highlight" : ""}">
+                    <label class="muted small w-110" for="btn-${did}-${b}">${esc(BTN_NAMES[b] || `Bouton M${b + 1}`)}</label>
                     <select id="btn-${did}-${b}" class="og-select grow" data-change="draft-btn" data-id="${esc(id)}" data-btn="${b}">
                       ${!known ? `<option value="${esc(cur.hex)}" selected>${esc(cur.label)}</option>` : ""}
                       ${presets.map((bp) => `<option value="${esc(bp.hex)}" ${bp.hex === cur.hex ? "selected" : ""}>${esc(bp.label)}</option>`).join("")}
@@ -471,7 +475,7 @@ export function cardOnboard(dev) {
               }).join("")}
             </div>
           </div>
-          <div class="row-between">
+          <div class="row-between pair-row">
             <span class="field-label">Fréquence du profil</span>
             ${seg([125, 250, 500, 1000].map((hz) => [hz, fmtHz(hz)]), p.report_rate_hz, "draft-hz", { id })}
           </div>
@@ -480,7 +484,7 @@ export function cardOnboard(dev) {
             <button type="button" class="btn btn-secondary btn-sm" data-act="ob-reload" data-id="${esc(id)}">Relire la souris</button>
           </div>
           ${ob.macros_supported ? `
-            <div class="divider" style="margin:4px 0"></div>
+            <div class="divider divider-tight"></div>
             <div class="row">
               <label class="field-label" for="macro-preset-${did}">Macro matérielle sur M${sel + 1}</label>
               <select id="macro-preset-${did}" class="og-select auto">${Object.entries(MACRO_PRESETS).map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`).join("")}</select>

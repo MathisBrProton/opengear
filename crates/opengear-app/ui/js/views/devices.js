@@ -1,4 +1,4 @@
-import { ICONS, arr, domId, esc, fmtHz, num, plural } from "../utils.js";
+import { ICONS, arr, cssVar, domId, esc, fmtHz, num, plural } from "../utils.js";
 import { S, deviceById, devicesList, getEq, headsetImage, isExpert, local } from "../state.js";
 import { advancedHint, batteryBadge, deviceBlueprintSvg, deviceFans, deviceSettings, deviceVisual, emptyState, pageHeader, sensorChips, sliderRow } from "../components.js";
 import { cardPointer } from "./performance.js";
@@ -19,7 +19,7 @@ export function viewDevices() {
         ${devs.map((x) => `
           <button type="button" class="dev-item ${x.key === local.deviceKey ? "active" : ""}" data-act="select-device" data-key="${esc(x.key)}" ${x.key === local.deviceKey ? 'aria-current="true"' : ""}>
             <span class="glyph">${ICONS[x.icon] || ICONS.chip}</span>
-            <span style="min-width:0"><span class="dev-item-name" style="display:block">${esc(x.name)}</span><span class="dev-item-sub">${esc(x.vendor)} · ${esc(x.type)}</span></span>
+            <span class="min-w-0"><span class="dev-item-name d-block">${esc(x.name)}</span><span class="dev-item-sub">${esc(x.vendor)} · ${esc(x.type)}</span></span>
           </button>`).join("")}
       </nav>
       <div class="stack">${fiche(d)}</div>
@@ -50,21 +50,6 @@ function linkCard(text, tabId, subId, label) {
 
 function fiche(d) {
   const ex = isExpert();
-  if (d.key === "cooling") {
-    const c = S.cooling;
-    return `
-      ${ficheHead(d)}
-      ${linkCard("Modes de ventilation, pompe et courbes se règlent dans Performances.", "performance", "cooling", "Ventilation")}
-      ${linkCard("L'éclairage par zone / température se règle dans Éclairage.", "lighting", "devices", "Éclairage")}
-      <div class="card"><div class="card-head"><h2 class="card-title">État</h2></div>${infoTable([
-        ["Droits administrateur", c.is_admin ? "Oui" : "Non (lecture seule)"],
-        ["Accès BIOS (ASUS WMI)", c.wmi_available ? "Disponible" : "Indisponible"],
-        ["Message", c.message],
-        ["Canaux", c.channels.map((x) => x.short_label || x.label).join(", ")],
-        ex && c.superio ? ["Puce de contrôle", c.superio.detected ? `${c.superio.chip_name} (${c.superio.chip_id_hex || "?"})` : "Non détectée", true] : null,
-      ])}</div>
-      <div class="card"><div class="card-head"><h2 class="card-title">Capteurs en direct</h2></div><div class="sensor-chip-row" id="cool-live">${sensorChips(S.telemetry)}</div></div>`;
-  }
   const dev = deviceById(d.deviceId);
   if (!dev) return ficheHead(d);
   const id = dev.info.id;
@@ -91,8 +76,8 @@ function fiche(d) {
       <div class="card">
         <div class="card-head"><h2 class="card-title">Autonomie</h2>${d.battery != null ? `<span class="pill emerald">${d.charging ? "En charge" : "Sur batterie"}</span>` : ""}</div>
         <div class="row-between">
-          <div><div style="font-size:26px;font-weight:750;color:var(--emerald)">≈ ${num(pm.estimated_hours).toFixed(1)} h</div><div class="muted">Estimation à ${fmtHz(num(rrHz, 1000))}. Baisser la fréquence d'envoi allonge l'autonomie.</div></div>
-          ${ex ? `<div class="mono muted small" style="text-align:right">Capteur ${num(pm.sensor_mw).toFixed(2)} mW<br/>Microcontrôleur ${num(pm.mcu_mw).toFixed(2)} mW<br/>Radio ${num(pm.radio_mw).toFixed(2)} mW<br/>Capacité ${Math.round(num(pm.capacity_mwh))} mWh</div>` : ""}
+          <div><div class="stat-big">≈ ${num(pm.estimated_hours).toFixed(1)} h</div><div class="muted">Estimation à ${fmtHz(num(rrHz, 1000))}. Baisser la fréquence d'envoi allonge l'autonomie.</div></div>
+          ${ex ? `<div class="mono muted small txt-r">Capteur ${num(pm.sensor_mw).toFixed(2)} mW<br/>Microcontrôleur ${num(pm.mcu_mw).toFixed(2)} mW<br/>Radio ${num(pm.radio_mw).toFixed(2)} mW<br/>Capacité ${Math.round(num(pm.capacity_mwh))} mWh</div>` : ""}
         </div>
       </div>` : ""}
     ${dev.onboard ? cardOnboard(dev) : ""}
@@ -100,7 +85,7 @@ function fiche(d) {
     ${eq ? `
       <div class="card">
         <div class="card-head"><div><h2 class="card-title">Égaliseur</h2><div class="card-desc">Appliqué directement dans le casque.</div></div>${e.dirty ? `<span class="pill amber">Non appliqué</span>` : ""}</div>
-        <div class="row" style="margin-bottom:10px">${arr(eq.presets).map((p) => `<button type="button" class="btn btn-sm btn-secondary" data-act="eq-preset" data-id="${esc(id)}" data-preset="${esc(p.id)}">${esc(p.name)}</button>`).join("")}</div>
+        <div class="row mb-10">${arr(eq.presets).map((p) => `<button type="button" class="btn btn-sm btn-secondary" data-act="eq-preset" data-id="${esc(id)}" data-preset="${esc(p.id)}">${esc(p.name)}</button>`).join("")}</div>
         <svg class="eq-graph" data-eq-svg="${esc(id)}" viewBox="0 0 560 108" role="img" aria-label="Courbe de l'égaliseur"></svg>
         <div class="eq-faders">
           ${freqs.slice(0, 5).map((f, b) => `
@@ -115,6 +100,7 @@ function fiche(d) {
           <button type="button" class="btn btn-secondary" data-act="eq-reset" data-id="${esc(id)}">Remettre à plat</button>
         </div>
       </div>` : ""}
+    ${dev.cooling && dev.curves ? linkCard("Modes de ventilation, pompe et courbes se règlent dans Performances.", "performance", "cooling", "Ventilation") : ""}
     ${dev.lighting ? linkCard("Effets logiciels, effets matériels et placement bureau se règlent dans Éclairage.", "lighting", "devices", "Éclairage") : ""}
     ${kind === "headset" ? deviceSettings(id, { sections: ["audio"], title: "Audio" }) : ""}
     ${deviceSettings(id, { sections: kind === "headset" ? ["general", "performance", "input", "power"] : ["general", "performance", "input", "audio", "power"] })}
@@ -132,7 +118,7 @@ function fiche(d) {
     ])}
       ${ex && bv.length ? `<div class="note mt-12">Les filtres micro Blue VO!CE et le son surround DTS sont des traitements Windows du pilote Logitech, pas des réglages du casque : OpenGear ne les pilote pas. ${plural(bv.length, "préréglage Blue VO!CE trouvé", "préréglages Blue VO!CE trouvés")} sur ce PC.</div>` : ""}
     </div>
-    ${dev.cooling ? `<div class="card"><div class="card-head"><h2 class="card-title">Capteurs en direct</h2></div><div class="sensor-chip-row" id="cool-live">${sensorChips(S.telemetry)}</div></div>` : ""}`;
+    ${dev.cooling || dev.curves ? `<div class="card"><div class="card-head"><h2 class="card-title">Capteurs en direct</h2></div><div class="sensor-chip-row" id="cool-live">${sensorChips(S.telemetry)}</div></div>` : ""}`;
 }
 
 function cardWasapi() {
@@ -167,13 +153,15 @@ export function renderEqSvg(id) {
   let d = `M ${xs[0]},${ys[0]}`;
   for (let b = 0; b < 4; b++) d += ` Q ${xs[b]},${ys[b]} ${(xs[b] + xs[b + 1]) / 2},${(ys[b] + ys[b + 1]) / 2}`;
   d += ` T ${xs[4]},${ys[4]}`;
+  const purple = cssVar("--purple", "#AD80FF");
+  const muted = cssVar("--text-3", "#8592AB");
   svg.innerHTML = `
-    <defs><linearGradient id="eqg${did}" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#AD80FF" stop-opacity="0.38"/><stop offset="100%" stop-color="#AD80FF" stop-opacity="0.02"/></linearGradient></defs>
+    <defs><linearGradient id="eqg${did}" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="${purple}" stop-opacity="0.38"/><stop offset="100%" stop-color="${purple}" stop-opacity="0.02"/></linearGradient></defs>
     <line x1="12" y1="${midY}" x2="${W - 12}" y2="${midY}" stroke="rgba(255,255,255,0.12)" stroke-dasharray="4 4"/>
-    <text x="14" y="16" fill="#8592ab" font-size="9.5" font-family="Consolas">+12 dB</text>
-    <text x="14" y="${midY - 4}" fill="#8592ab" font-size="9.5" font-family="Consolas">0 dB</text>
-    <text x="14" y="${H - 8}" fill="#8592ab" font-size="9.5" font-family="Consolas">-12 dB</text>
+    <text x="14" y="16" fill="${muted}" font-size="9.5" font-family="Consolas">+12 dB</text>
+    <text x="14" y="${midY - 4}" fill="${muted}" font-size="9.5" font-family="Consolas">0 dB</text>
+    <text x="14" y="${H - 8}" fill="${muted}" font-size="9.5" font-family="Consolas">-12 dB</text>
     <path d="${d} L ${xs[4]},${H} L ${xs[0]},${H} Z" fill="url(#eqg${did})"/>
-    <path d="${d}" fill="none" stroke="#AD80FF" stroke-width="2.6" stroke-linecap="round"/>
-    ${xs.map((x, b) => `<circle cx="${x}" cy="${ys[b]}" r="4.5" fill="#fff" stroke="#AD80FF" stroke-width="2.2"/>`).join("")}`;
+    <path d="${d}" fill="none" stroke="${purple}" stroke-width="2.6" stroke-linecap="round"/>
+    ${xs.map((x, b) => `<circle cx="${x}" cy="${ys[b]}" r="4.5" fill="#fff" stroke="${purple}" stroke-width="2.2"/>`).join("")}`;
 }

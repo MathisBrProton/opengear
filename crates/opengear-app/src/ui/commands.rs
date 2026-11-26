@@ -12,7 +12,7 @@ use crate::tray_icon::{
     create_windows_shortcuts, is_autostart_enabled, release_single_instance, set_autostart_enabled,
 };
 use opengear_core::cooling::{
-    CurvePoint, FanHeaderKind, FanPolicyMode, FanTempSource, SensorKind, TempMixConfig, TempMixOp,
+    CurvePoint, FanPolicyMode, FanTempSource, SensorKind, TempMixConfig, TempMixOp,
 };
 use opengear_core::driver::{DeviceKind, Value as DriverValue, setting_ids};
 use opengear_core::fans::FanTarget;
@@ -23,7 +23,6 @@ use opengear_core::{
     RgbLayer, SocdPair, scan_hid_devices,
 };
 use opengear_input::movement_keys_effective;
-use opengear_mainboard::{read_superio_snapshot, restore_superio_fan_auto, set_superio_fan_pwm};
 use opengear_platform::pawnio::install_official_pawnio;
 use opengear_platform::{is_elevated, list_power_plans, relaunch_as_admin, set_active_power_plan};
 use serde_json::{Value, json};
@@ -45,7 +44,7 @@ const POWER_PLAN_ULTIMATE: &str = "e9a42b02-d5df-448d-aa00-03f14749eb61";
 fn pump_channel_index(channels: &[opengear_core::cooling::FanChannelConfig]) -> Option<usize> {
     channels
         .iter()
-        .position(|c| c.header == FanHeaderKind::AioPump)
+        .position(|c| c.header == opengear_core::cooling::FanHeaderKind::AioPump)
 }
 
 fn undo_label_for(cmd: &str) -> Option<&'static str> {
@@ -376,49 +375,67 @@ impl BackendEngine {
                         Err(e) => summary.push(format!("{label} ({model}) inchangé ({e})")),
                     }
                 }
-            } else if self.cooling_status.wmi_available && is_elevated() {
-                let pending: Vec<(usize, opengear_core::cooling::FanChannelConfig)> = self
-                    .cooling_channels
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, ch)| ch.source == FanTempSource::CpuBios)
-                    .map(|(i, ch)| {
-                        let mut cfg = ch.clone();
-                        cfg.policy = policy;
-                        (i, cfg)
-                    })
-                    .collect();
+            } else {
                 let mut applied = 0usize;
                 let mut failed = 0usize;
-                let mut ok_indices = Vec::new();
-                if let Some(fc) = self.curve_cooling_mut() {
-                    for (i, cfg) in pending {
-                        if fc.apply_channel_curve(&cfg).is_ok() {
-                            ok_indices.push(i);
-                            applied += 1;
+                let curve_ids: Vec<String> = self
+                    .curve_states
+                    .iter()
+                    .filter(|(_, st)| st.available && st.is_admin)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                if curve_ids.is_empty() {
+                    summary.push(
+                        "Ventilateurs inchangés (droits administrateur + contrôleur WMI requis)"
+                            .into(),
+                    );
+                } else {
+                    for dev_id in curve_ids {
+                        let pending: Vec<(usize, opengear_core::cooling::FanChannelConfig)> = self
+                            .curve_states
+                            .get(&dev_id)
+                            .map(|st| {
+                                st.channels
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, ch)| ch.source == FanTempSource::CpuBios)
+                                    .map(|(i, ch)| {
+                                        let mut cfg = ch.clone();
+                                        cfg.policy = policy;
+                                        (i, cfg)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let mut ok_indices = Vec::new();
+                        if let Some(fc) = self.curve_cooling_for_mut(&dev_id) {
+                            for (i, cfg) in pending {
+                                if fc.apply_channel_curve(&cfg).is_ok() {
+                                    ok_indices.push(i);
+                                    applied += 1;
+                                } else {
+                                    failed += 1;
+                                }
+                            }
                         } else {
-                            failed += 1;
+                            failed += pending.len();
+                        }
+                        if let Some(st) = self.curve_states.get_mut(&dev_id) {
+                            for i in ok_indices {
+                                st.channels[i].policy = policy;
+                            }
                         }
                     }
-                } else {
-                    failed = pending.len();
+                    summary.push(format!(
+                        "Ventilateurs : profil {} sur {applied} canal(aux){}",
+                        policy.label(),
+                        if failed > 0 {
+                            format!(", {failed} refusé(s) par le BIOS")
+                        } else {
+                            String::new()
+                        }
+                    ));
                 }
-                for i in ok_indices {
-                    self.cooling_channels[i].policy = policy;
-                }
-                summary.push(format!(
-                    "Ventilateurs : profil {} sur {applied} canal(aux){}",
-                    policy.label(),
-                    if failed > 0 {
-                        format!(", {failed} refusé(s) par le BIOS")
-                    } else {
-                        String::new()
-                    }
-                ));
-            } else {
-                summary.push(
-                    "Ventilateurs inchangés (droits administrateur + ASUS WMI requis)".into(),
-                );
             }
         }
 
@@ -479,7 +496,7 @@ impl BackendEngine {
             if admin {
                 Value::Null
             } else {
-                json!({ "label": "Relancer en administrateur", "cmd": "cooling_relaunch_admin", "payload": {} })
+                json!({ "label": "Relancer en administrateur", "cmd": "relaunch_admin", "payload": {} })
             },
         );
 
@@ -506,16 +523,24 @@ impl BackendEngine {
                 format!("Ventilateurs pilotés par « {model} »."),
                 Value::Null,
             );
+        } else if let Some(cs) = self.curve_states.values().next() {
+            push(
+                "asus_wmi",
+                "Interface ventilateurs carte mère (WMI)",
+                if cs.available { "ok" } else { "warn" },
+                cs.message.clone(),
+                Value::Null,
+            );
         } else {
             push(
                 "asus_wmi",
-                "Interface ventilateurs ASUS (WMI)",
-                if self.cooling_status.wmi_available {
-                    "ok"
+                "Interface ventilateurs carte mère (WMI)",
+                "warn",
+                if admin {
+                    "Aucun contrôleur de courbes carte mère détecté.".into()
                 } else {
-                    "warn"
+                    "Droits administrateur requis pour le contrôle WMI carte mère.".into()
                 },
-                self.cooling_status.message.clone(),
                 Value::Null,
             );
         }
@@ -1327,39 +1352,37 @@ impl BackendEngine {
                 self.persist_config();
                 Ok(self.full_state_json())
             }
-            "cooling_read_bios_curves" => {
-                if !self.cooling_status.wmi_available {
+            "device_curve_read" => {
+                let device = p["device"].as_str().ok_or("device manquant")?.to_string();
+                let st = self
+                    .curve_states
+                    .get(&device)
+                    .ok_or_else(|| format!("Contrôleur de courbes introuvable : {device}"))?;
+                if !st.available {
                     return Err(
-                        "Droits Admin + ASUSManagement WMI requis pour relire les courbes BIOS"
-                            .into(),
+                        "Droits Admin + interface BIOS WMI requis pour relire les courbes".into(),
                     );
                 }
                 let read = self
-                    .curve_cooling_mut()
-                    .ok_or("Contrôleur de courbes carte mère absent")?
+                    .curve_cooling_for_mut(&device)
+                    .ok_or_else(|| format!("Contrôleur de courbes absent : {device}"))?
                     .read_firmware_curves()
                     .map_err(|e| e.to_string())?;
-                self.cooling_channels = opengear_core::cooling::FanHeaderKind::ALL
-                    .iter()
-                    .map(|&h| {
-                        read.iter()
-                            .find(|c| c.header == h)
-                            .cloned()
-                            .unwrap_or_else(|| {
-                                opengear_core::cooling::FanChannelConfig::default_for(h)
-                            })
-                    })
-                    .collect();
+                if let Some(entry) = self.curve_states.get_mut(&device) {
+                    entry.channels = read;
+                }
                 Ok(self.full_state_json())
             }
-            "cooling_update_channel" => {
+            "device_curve_set" => {
+                let device = p["device"].as_str().ok_or("device manquant")?.to_string();
                 let idx = p["index"].as_u64().ok_or("index manquant")? as usize;
                 let apply = p["apply"].as_bool().unwrap_or(false);
-                {
-                    let ch = self
-                        .cooling_channels
-                        .get_mut(idx)
-                        .ok_or("Canal PWM invalide")?;
+                let (cfg_to_apply, tracker_reset) = {
+                    let st = self
+                        .curve_states
+                        .get_mut(&device)
+                        .ok_or_else(|| format!("Contrôleur de courbes introuvable : {device}"))?;
+                    let ch = st.channels.get_mut(idx).ok_or("Canal PWM invalide")?;
 
                     if let Some(pol) = p["policy"].as_str() {
                         ch.policy = match pol {
@@ -1380,11 +1403,10 @@ impl BackendEngine {
                             };
                         }
                     }
+                    let mut reset = false;
                     if let Some(src) = p["source"].as_str() {
                         ch.source = parse_temp_source(src);
-                        if idx < 5 {
-                            self.smart_fan_trackers[idx].reset();
-                        }
+                        reset = true;
                     }
                     if let Some(mix) = p.get("custom_mix").filter(|v| v.is_object()) {
                         let op = match mix["op"].as_str().unwrap_or("Max") {
@@ -1405,9 +1427,7 @@ impl BackendEngine {
                                 .unwrap_or("GpuEdge"),
                         );
                         ch.custom_mix = Some(TempMixConfig { op, a, b });
-                        if idx < 5 {
-                            self.smart_fan_trackers[idx].reset();
-                        }
+                        reset = true;
                     } else if ch.source == FanTempSource::CustomMix && ch.custom_mix.is_none() {
                         ch.custom_mix = Some(TempMixConfig::default());
                     }
@@ -1417,38 +1437,49 @@ impl BackendEngine {
                     if let Some(sm) = p["smoothing_secs"].as_u64() {
                         ch.smoothing_secs = (sm as u8).min(20);
                     }
+                    let cfg = (apply && ch.source == FanTempSource::CpuBios).then(|| ch.clone());
+                    (cfg, reset)
+                };
+                if tracker_reset
+                    && let Some(st) = self.curve_states.get_mut(&device)
+                    && let Some(tr) = st.trackers.get_mut(idx)
+                {
+                    tr.reset();
                 }
-                if apply && self.cooling_channels[idx].source == FanTempSource::CpuBios {
-                    let cfg = self.cooling_channels[idx].clone();
-                    self.curve_cooling_mut()
-                        .ok_or("Contrôleur de courbes carte mère absent")?
+                if let Some(cfg) = cfg_to_apply {
+                    self.curve_cooling_for_mut(&device)
+                        .ok_or_else(|| format!("Contrôleur de courbes absent : {device}"))?
                         .apply_channel_curve(&cfg)
                         .map_err(|e| e.to_string())?;
                 }
                 Ok(self.full_state_json())
             }
-            "cooling_sl3_preset" => {
+            "device_pump_preset" => {
+                let device = p["device"].as_str().ok_or("device manquant")?.to_string();
                 let preset = p["preset"].as_str().unwrap_or("default");
-                // These curves are tuned for a pump (45 % floor): they belong to the pump header,
-                // which is not always channel 0 — writing them blindly to `channels[0]` applied a
-                // pump curve to the CPU fan on every board where the pump sits elsewhere.
-                let idx = pump_channel_index(&self.cooling_channels)
-                    .ok_or("Aucun canal de pompe sur cette carte mère")?;
-                let mut to_apply = None;
-                let ch = &mut self.cooling_channels[idx];
-                ch.policy = FanPolicyMode::Manual;
-                ch.curve = opengear_core::cooling::FanChannelConfig::silent_loop3_preset(preset);
-                if self.cooling_status.is_admin {
-                    to_apply = Some(ch.clone());
-                }
+                // These curves are tuned for a pump (45 % floor): find the pump header by kind,
+                // never assume channel 0.
+                let to_apply = {
+                    let st = self
+                        .curve_states
+                        .get_mut(&device)
+                        .ok_or_else(|| format!("Contrôleur de courbes introuvable : {device}"))?;
+                    let idx = pump_channel_index(&st.channels)
+                        .ok_or("Aucun canal de pompe sur cette carte mère")?;
+                    let ch = &mut st.channels[idx];
+                    ch.policy = FanPolicyMode::Manual;
+                    ch.curve =
+                        opengear_core::cooling::FanChannelConfig::silent_loop3_preset(preset);
+                    (st.is_admin && st.available).then(|| ch.clone())
+                };
                 if let Some(cfg) = to_apply
-                    && let Some(fc) = self.curve_cooling_mut()
+                    && let Some(fc) = self.curve_cooling_for_mut(&device)
                 {
                     let _ = fc.apply_channel_curve(&cfg);
                 }
                 Ok(self.full_state_json())
             }
-            "cooling_relaunch_admin" => {
+            "relaunch_admin" => {
                 release_single_instance();
                 relaunch_as_admin().map_err(|e| e.to_string())?;
                 if let Some(px) = proxy {
@@ -1733,43 +1764,10 @@ impl BackendEngine {
                 self.persist_config();
                 Ok(self.full_state_json())
             }
-            "superio_refresh" => {
-                self.superio = read_superio_snapshot();
-                if let Some(d) = self.device_mut("superio:mainboard")
-                    && let Some(c) = d.cooling()
-                {
-                    c.refresh();
-                }
+            "device_fan_refresh" => {
+                let device = p["device"].as_str().ok_or("device manquant")?;
+                self.refresh_device_fans(device)?;
                 Ok(self.full_state_json())
-            }
-            "superio_set_pwm" => {
-                let ch = p["channel"].as_u64().ok_or("channel manquant")? as usize;
-                let duty = p["duty_pct"].as_u64().ok_or("duty_pct manquant")?.min(100) as u8;
-                let msg = set_superio_fan_pwm(ch, duty).map_err(|e| e.to_string())?;
-                self.sync_fan_marker();
-                self.superio = read_superio_snapshot();
-                if let Some(d) = self.device_mut("superio:mainboard")
-                    && let Some(c) = d.cooling()
-                {
-                    c.refresh();
-                }
-                let mut st = self.full_state_json();
-                st["last_action_msg"] = json!(msg);
-                Ok(st)
-            }
-            "superio_restore_auto" => {
-                let ch = p["channel"].as_u64().ok_or("channel manquant")? as usize;
-                let msg = restore_superio_fan_auto(ch).map_err(|e| e.to_string())?;
-                self.sync_fan_marker();
-                self.superio = read_superio_snapshot();
-                if let Some(d) = self.device_mut("superio:mainboard")
-                    && let Some(c) = d.cooling()
-                {
-                    c.refresh();
-                }
-                let mut st = self.full_state_json();
-                st["last_action_msg"] = json!(msg);
-                Ok(st)
             }
             "audio_set_volume" => {
                 let is_mic = p["is_mic"].as_bool().unwrap_or(false);
@@ -1818,9 +1816,6 @@ impl BackendEngine {
                 let target: FanTarget =
                     serde_json::from_value(p["target"].clone()).map_err(|e| e.to_string())?;
                 self.set_device_fan(device, fan, target)?;
-                if device == "superio:mainboard" {
-                    self.superio = read_superio_snapshot();
-                }
                 Ok(self.full_state_json())
             }
             "laptop_set_auto_battery" => {

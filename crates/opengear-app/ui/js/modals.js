@@ -135,14 +135,15 @@ export function riskOf(cmd, p = {}) {
         };
       }
       return null;
-    case "superio_set_pwm":
+    case "device_fan_set":
+      if (p.device !== "superio:mainboard" || p.target === "auto") return null;
       return {
         title: "Forcer la vitesse de ce ventilateur ?",
-        body: `OpenGear va fixer ce ventilateur à ${num(p.duty_pct)} % en écrivant directement dans la puce de contrôle de la carte mère. La régulation automatique du BIOS sera désactivée pour ce ventilateur jusqu'à « Auto BIOS » ou au redémarrage.`,
+        body: `OpenGear va fixer ce ventilateur à ${num(p.target)} % en écrivant directement dans la puce de contrôle de la carte mère. La régulation automatique du BIOS sera désactivée pour ce ventilateur jusqu'à « Auto BIOS » ou au redémarrage.`,
         details: ["Une vitesse trop basse peut faire chauffer le composant refroidi (processeur, pompe…)."],
         confirm: "Forcer la vitesse",
       };
-    case "cooling_update_channel":
+    case "device_curve_set":
       if (!p.apply) return null;
       return {
         title: "Appliquer ce réglage à la carte mère ?",
@@ -150,7 +151,7 @@ export function riskOf(cmd, p = {}) {
         details: ["Vérifie que la pompe et les ventilateurs gardent une vitesse suffisante en charge."],
         confirm: "Appliquer au BIOS",
       };
-    case "cooling_sl3_preset":
+    case "device_pump_preset":
       return {
         title: "Changer le réglage de la pompe ?",
         body: "Ce préréglage remplace la courbe actuelle de la pompe du watercooling. Si OpenGear tourne en administrateur, il est aussi écrit dans la carte mère.",
@@ -164,7 +165,7 @@ export function riskOf(cmd, p = {}) {
         confirm: "Installer le pilote",
         note: "Un pilote système s'installe au niveau de Windows : n'accepte que si tu fais confiance à cette source.",
       };
-    case "cooling_relaunch_admin":
+    case "relaunch_admin":
       return {
         title: "Relancer OpenGear en administrateur ?",
         body: "OpenGear va se fermer puis redémarrer avec les droits administrateur (fenêtre d'autorisation Windows). Les réglages non enregistrés de la session pourraient être perdus.",

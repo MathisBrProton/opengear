@@ -1,7 +1,7 @@
 import { ICONS, LABEL_FMT, MACRO_PRESETS, arr, clamp, clone, devId, domId, downloadText, esc, inputVal, num, plural, safeHex, throttled, updateLabel } from "./utils.js";
 import { call, doUndo, humanError, rpc, setBusy, setStatus, toast } from "./ipc.js";
 import { modalStack, trapFocus } from "./modals.js";
-import { S, applyState, deviceById, devicesList, getDraftFor, getEq, local, registerHooks, ui, updateChrome } from "./state.js";
+import { S, applyState, curveDevice, deviceById, devicesList, getDraftFor, getEq, local, registerHooks, ui, updateChrome } from "./state.js";
 import { curLang, t, translateChrome, translateDom } from "./i18n.js";
 import { seg, updateTelemetryDom } from "./components.js";
 import { startRgbPreviewLoop } from "./rgb-preview.js";
@@ -146,9 +146,16 @@ function renderWizard() {
   const chosen = presets.find((p) => p.id === wiz.preset);
   let body = "";
   if (step === 0) {
+    const devRows = devicesList();
+    const n = devRows.length;
     body = `
       <h2 class="wizard-title" id="wiz-title">Bienvenue dans OpenGear</h2>
-      <p class="wizard-lead">${devs ? `OpenGear a trouvé ${plural(devs, "appareil", "appareils")} sur ce PC :` : "Aucun appareil compatible n'est branché pour l'instant."}</p>
+      <p class="wizard-lead">${n ? `OpenGear a trouvé ${plural(n, "appareil", "appareils")} sur ce PC :` : "Aucun appareil compatible n'est branché pour l'instant."}</p>
+      ${n ? `<div class="wiz-dev-list mb-16">${devRows.map((d) => `
+        <div class="wiz-dev">
+          <span class="glyph">${ICONS[d.icon] || ICONS.chip}</span>
+          <div class="min-w-0"><div class="dev-item-name">${esc(d.name)}</div><div class="dev-item-sub">${esc(d.vendor)} · ${esc(d.type)}</div></div>
+        </div>`).join("")}</div>` : ""}
       <div class="note">Tu pourras configurer l'éclairage, la ventilation et les macros hors ligne sans compte ni télémétrie.</div>`;
   } else if (step === 1) {
     body = `
@@ -309,28 +316,46 @@ const ACT = {
   "clear-per-key": (el) => call("clear_per_key", {}, { btn: el, ok: "Peinture par touche effacée" }),
   "kb-view": (el) => { local.kbViewMode = el.dataset.val; render(); },
   "lgt-mode": (el) => {
-    const k = `${el.dataset.devId}|${el.dataset.zoneId || ""}`;
+    const devId = el.dataset.devId;
+    const zoneId = el.dataset.zoneId || null;
+    const k = `${devId}|${zoneId || ""}`;
     local.lightingDrafts[k] = Object.assign(local.lightingDrafts[k] || {}, { mode: el.dataset.val });
-    render();
+    const ov = buildOverridePayload(devId, zoneId);
+    call("lighting_set_device", {
+      device_id: devId,
+      ...(zoneId ? { zone_id: zoneId } : {}),
+      override: ov,
+    }, { btn: el, ok: "Éclairage mis à jour" });
   },
   "lgt-sw-kind": (el) => {
-    const k = `${el.dataset.devId}|${el.dataset.zoneId || ""}`;
+    const devId = el.dataset.devId;
+    const zoneId = el.dataset.zoneId || null;
+    const k = `${devId}|${zoneId || ""}`;
     local.lightingDrafts[k] = Object.assign(local.lightingDrafts[k] || {}, { swKind: el.dataset.kind });
-    render();
+    const ov = buildOverridePayload(devId, zoneId);
+    call("lighting_set_device", {
+      device_id: devId,
+      ...(zoneId ? { zone_id: zoneId } : {}),
+      override: ov,
+    }, { btn: el, ok: `Effet : ${el.textContent.trim()}` });
   },
   "lgt-hw-pick": (el) => {
-    const k = `${el.dataset.devId}|${el.dataset.zoneId || ""}`;
+    const devId = el.dataset.devId;
+    const zoneId = el.dataset.zoneId || null;
+    const k = `${devId}|${zoneId || ""}`;
     local.lightingDrafts[k] = Object.assign(local.lightingDrafts[k] || {}, { hwEffect: el.dataset.effect });
-    render();
+    const ov = buildOverridePayload(devId, zoneId);
+    call("lighting_set_device", {
+      device_id: devId,
+      ...(zoneId ? { zone_id: zoneId } : {}),
+      override: ov,
+    }, { btn: el, ok: `Effet : ${el.textContent.trim()}` });
   },
   "lgt-apply": (el) => {
     const devId = el.dataset.devId;
     const zoneId = el.dataset.zoneId || null;
     const ov = buildOverridePayload(devId, zoneId);
     const saveFlash = el.dataset.save === "1";
-    if (saveFlash && !confirm(t("Écrire cet effet directement dans la mémoire flash / EEPROM de l'appareil ?"))) {
-      return;
-    }
     if (ov && ov.mode === "hardware" && ov.request) {
       ov.request.save = saveFlash;
     }
@@ -461,30 +486,43 @@ const ACT = {
     if (r) { delete local.drafts[id]; local.backups.data = null; render(); }
   },
 
-  "relaunch-admin": (el) => call("cooling_relaunch_admin", {}, { btn: el, ok: "Relance en administrateur…" }),
+  "relaunch-admin": (el) => call("relaunch_admin", {}, { btn: el, ok: "Relance en administrateur…" }),
   // The backend writes the pump channel, wherever it sits: show that one, not channel 0.
   "sl3-preset": (el) => {
-    const idx = arr(S.cooling && S.cooling.channels).findIndex((c) => c.is_pump);
+    const cd = curveDevice();
+    if (!cd) return;
+    const idx = arr(cd.curves && cd.curves.channels).findIndex((c) => c.is_pump);
     if (idx >= 0) local.selectedCoolingIdx = idx;
-    call("cooling_sl3_preset", { preset: el.dataset.preset }, { btn: el, ok: `Pompe : ${el.textContent.trim()}` });
+    call("device_pump_preset", { device: cd.info.id, preset: el.dataset.preset }, { btn: el, ok: `Pompe : ${el.textContent.trim()}` });
   },
 
   // Cooling
   "cool-ch": (el) => { local.selectedCoolingIdx = Number(el.dataset.val); render(); },
   "cool-pol": (el) => {
-    const ch = S.cooling.channels[local.selectedCoolingIdx];
+    const cd = curveDevice();
+    const ch = cd && cd.curves.channels[local.selectedCoolingIdx];
     if (ch) ch.policy = el.dataset.val;
     render();
   },
-  "cool-read-bios": (el) => call("cooling_read_bios_curves", {}, { btn: el, ok: "Réglages relus depuis le BIOS" }),
-  "cool-apply": (el) => {
-    const ch = S.cooling.channels[local.selectedCoolingIdx];
-    if (!ch) return;
-    call("cooling_update_channel", { index: local.selectedCoolingIdx, policy: ch.policy, source: ch.source || "CpuBios", hysteresis_c: num(ch.hysteresis_c, 3), smoothing_secs: num(ch.smoothing_secs, 0), curve: ch.curve, apply: true }, { btn: el, ok: `${ch.short_label || ch.label} : réglage appliqué à la carte mère` });
+  "cool-read-bios": (el) => {
+    const cd = curveDevice();
+    const id = el.dataset.device || (cd && cd.info.id);
+    if (!id) return;
+    call("device_curve_read", { device: id }, { btn: el, ok: "Réglages relus depuis le BIOS" });
   },
-  "sio-refresh": (el) => call("superio_refresh", {}, { btn: el, ok: "Vitesses actualisées" }),
-  "sio-apply": (el) => call("superio_set_pwm", { channel: Number(el.dataset.ch), duty_pct: Number(inputVal(`sio-${el.dataset.ch}`) ?? 50) }, { btn: el }),
-  "sio-auto": (el) => call("superio_restore_auto", { channel: Number(el.dataset.ch) }, { btn: el }),
+  "cool-apply": (el) => {
+    const cd = curveDevice();
+    const id = el.dataset.device || (cd && cd.info.id);
+    const ch = cd && cd.curves.channels[local.selectedCoolingIdx];
+    if (!id || !ch) return;
+    call("device_curve_set", { device: id, index: local.selectedCoolingIdx, policy: ch.policy, source: ch.source || "CpuBios", hysteresis_c: num(ch.hysteresis_c, 3), smoothing_secs: num(ch.smoothing_secs, 0), curve: ch.curve, apply: true }, { btn: el, ok: `${ch.short_label || ch.label} : réglage appliqué à la carte mère` });
+  },
+  "sio-refresh": (el) => call("device_fan_refresh", { device: el.dataset.device }, { btn: el, ok: "Vitesses actualisées" }),
+  "sio-apply": (el) => {
+    const pct = Number(inputVal(el.dataset.target) ?? 50);
+    call("device_fan_set", { device: el.dataset.device, fan: el.dataset.fan, target: pct }, { btn: el, ok: `Ventilateurs forcés à ${pct} %` });
+  },
+  "sio-auto": (el) => call("device_fan_set", { device: el.dataset.device, fan: el.dataset.fan, target: "auto" }, { btn: el, ok: "Ventilateurs rendus au BIOS" }),
   "pawnio-install": (el) => call("pawnio_install", {}, { btn: el }),
   "power-plan": (el) => call("set_power_plan", { guid: el.dataset.guid }, { btn: el, ok: "Mode d'alimentation activé" }),
 
@@ -748,6 +786,13 @@ function setDeviceSetting(el, value, btn = null) {
 
 const CHANGE = {
   "exp-driver": (el) => call("set_experimental_driver", { name: el.dataset.name, enabled: el.checked }, { ok: el.checked ? "Pilote expérimental activé" : "Pilote expérimental désactivé" }).then((r) => { if (r === null) el.checked = !el.checked; }),
+  "ptr-dpi-slider": (el) => {
+    const id = el.dataset.device || devId(el);
+    const did = domId(id);
+    const x = Number(inputVal(`pdpi-${did}`));
+    const yv = inputVal(`pdpiy-${did}`);
+    call("device_set_dpi", { device_id: id, x, y: yv != null ? Number(yv) : x }, { ok: `Sensibilité : ${x} DPI` });
+  },
   "dev-set": (el) => setDeviceSetting(el, el.type === "checkbox" ? el.checked : el.type === "range" ? Number(el.value) : el.value),
   "switch-profile": (el) => call("switch_profile", { name: el.value }, { ok: `Profil « ${el.value} » activé` }),
   "rgb-commit": (el) => {
@@ -759,8 +804,27 @@ const CHANGE = {
   "lgt-dev-en": (el) => call("lighting_set_device", { device_id: el.dataset.devId, enabled: el.checked }, { ok: el.checked ? "Appareil synchronisé" : "Appareil en mode autonome" }),
   "lgt-resize-zone": (el) => call("lighting_resize_zone", { device_id: el.dataset.devId, zone_id: el.dataset.zoneId, led_count: Number(el.value) }, { ok: `Zone réglée sur ${el.value} LEDs` }),
   "lgt-draft-chk": (el) => {
-    const k = `${el.dataset.devId}|${el.dataset.zoneId || ""}`;
+    const devId = el.dataset.devId;
+    const zoneId = el.dataset.zoneId || null;
+    const k = `${devId}|${zoneId || ""}`;
     local.lightingDrafts[k] = Object.assign(local.lightingDrafts[k] || {}, { [el.dataset.field]: el.checked });
+    call("lighting_set_device", {
+      device_id: devId,
+      ...(zoneId ? { zone_id: zoneId } : {}),
+      override: buildOverridePayload(devId, zoneId),
+    }, { silent: true });
+  },
+  "lgt-commit": (el) => {
+    const devId = el.dataset.devId;
+    const zoneId = el.dataset.zoneId || null;
+    const k = `${devId}|${zoneId || ""}`;
+    const v = el.type === "range" ? parseFloat(el.value) : el.value;
+    local.lightingDrafts[k] = Object.assign(local.lightingDrafts[k] || {}, { [el.dataset.field]: v });
+    call("lighting_set_device", {
+      device_id: devId,
+      ...(zoneId ? { zone_id: zoneId } : {}),
+      override: buildOverridePayload(devId, zoneId),
+    }, { silent: true });
   },
   "canvas-coord": (el) => {
     const devId = el.dataset.devId;
@@ -807,35 +871,44 @@ const CHANGE = {
   },
   "rgb-reverse": (el) => call("set_rgb_config", { reverse: el.checked, commit: true }, { silent: true }),
   "cool-src": (el) => {
-    const ch = S.cooling.channels[local.selectedCoolingIdx];
-    if (!ch) return;
+    const cd = curveDevice();
+    const id = el.dataset.device || (cd && cd.info.id);
+    const ch = cd && cd.curves.channels[local.selectedCoolingIdx];
+    if (!id || !ch) return;
     ch.source = el.value;
-    call("cooling_update_channel", { index: local.selectedCoolingIdx, source: ch.source, ...(ch.custom_mix ? { custom_mix: ch.custom_mix } : {}), hysteresis_c: num(ch.hysteresis_c, 3), smoothing_secs: num(ch.smoothing_secs, 0), apply: false }, { ok: "Température de référence modifiée" });
+    call("device_curve_set", { device: id, index: local.selectedCoolingIdx, source: ch.source, ...(ch.custom_mix ? { custom_mix: ch.custom_mix } : {}), hysteresis_c: num(ch.hysteresis_c, 3), smoothing_secs: num(ch.smoothing_secs, 0), apply: false }, { ok: "Température de référence modifiée" });
   },
-  "cool-mix": () => {
-    const ch = S.cooling.channels[local.selectedCoolingIdx];
-    if (!ch) return;
+  "cool-mix": (el) => {
+    const cd = curveDevice();
+    const id = el.dataset.device || (cd && cd.info.id);
+    const ch = cd && cd.curves.channels[local.selectedCoolingIdx];
+    if (!id || !ch) return;
     ch.custom_mix = {
       op: inputVal("cool-mix-op") || "Max",
       a: inputVal("cool-mix-a") || "Cpu",
       b: inputVal("cool-mix-b") || "GpuEdge",
     };
-    call("cooling_update_channel", { index: local.selectedCoolingIdx, source: "CustomMix", custom_mix: ch.custom_mix, hysteresis_c: num(ch.hysteresis_c, 3), smoothing_secs: num(ch.smoothing_secs, 0), apply: false }, { ok: "Source composée mise à jour" });
+    call("device_curve_set", { device: id, index: local.selectedCoolingIdx, source: "CustomMix", custom_mix: ch.custom_mix, hysteresis_c: num(ch.hysteresis_c, 3), smoothing_secs: num(ch.smoothing_secs, 0), apply: false }, { ok: "Source composée mise à jour" });
   },
   "cool-hyst": (el) => {
-    const ch = S.cooling.channels[local.selectedCoolingIdx];
-    if (!ch) return;
+    const cd = curveDevice();
+    const id = el.dataset.device || (cd && cd.info.id);
+    const ch = cd && cd.curves.channels[local.selectedCoolingIdx];
+    if (!id || !ch) return;
     ch.hysteresis_c = Number(el.value);
-    call("cooling_update_channel", { index: local.selectedCoolingIdx, source: ch.source || "CpuBios", hysteresis_c: ch.hysteresis_c, smoothing_secs: num(ch.smoothing_secs, 0), apply: false }, { ok: `Hystérésis : ${ch.hysteresis_c} °C` });
+    call("device_curve_set", { device: id, index: local.selectedCoolingIdx, source: ch.source || "CpuBios", hysteresis_c: ch.hysteresis_c, smoothing_secs: num(ch.smoothing_secs, 0), apply: false }, { ok: `Hystérésis : ${ch.hysteresis_c} °C` });
   },
   "cool-smooth": (el) => {
-    const ch = S.cooling.channels[local.selectedCoolingIdx];
-    if (!ch) return;
+    const cd = curveDevice();
+    const id = el.dataset.device || (cd && cd.info.id);
+    const ch = cd && cd.curves.channels[local.selectedCoolingIdx];
+    if (!id || !ch) return;
     ch.smoothing_secs = Number(el.value);
-    call("cooling_update_channel", { index: local.selectedCoolingIdx, source: ch.source || "CpuBios", hysteresis_c: num(ch.hysteresis_c, 3), smoothing_secs: ch.smoothing_secs, apply: false }, { ok: ch.smoothing_secs ? `Lissage : ${ch.smoothing_secs} s` : "Lissage désactivé" });
+    call("device_curve_set", { device: id, index: local.selectedCoolingIdx, source: ch.source || "CpuBios", hysteresis_c: num(ch.hysteresis_c, 3), smoothing_secs: ch.smoothing_secs, apply: false }, { ok: ch.smoothing_secs ? `Lissage : ${ch.smoothing_secs} s` : "Lissage désactivé" });
   },
   "curve-pt": (el) => {
-    const ch = S.cooling.channels[local.selectedCoolingIdx];
+    const cd = curveDevice();
+    const ch = cd && cd.curves.channels[local.selectedCoolingIdx];
     if (!ch) return;
     const i = Number(el.dataset.pt);
     const pt = Object.assign({}, ch.curve[i]);
@@ -1055,11 +1128,14 @@ startSocdPolling();
 startRgbPreviewLoop();
 
 async function bootWithRetry(retriesLeft = 2) {
+  const shell = document.querySelector(".app-shell");
+  if (shell) shell.classList.add("is-offline");
   try {
     const st = await rpc("get_state", {}, 25_000);
     applyState(st);
+    if (shell) shell.classList.remove("is-offline");
     const n = devicesList().length;
-    setStatus(n ? `Prêt : ${plural(n, "appareil actif", "appareils actifs")}.` : "Prêt : aucun appareil détecté pour l'instant.");
+    setStatus(n ? `Prêt : ${plural(n, "appareil actif", "appareils actifs")}.` : "Prêt : aucun appareil détecté pour l'instant.", "ok");
     loadDiagnostics();
     if (!ui().onboarding_done) openWizard();
   } catch (e) {
@@ -1068,11 +1144,25 @@ async function bootWithRetry(retriesLeft = 2) {
       setTimeout(() => bootWithRetry(retriesLeft - 1), 1500);
       return;
     }
-    document.getElementById("main-content").innerHTML = `
-      <div class="alert err" role="alert"><span class="alert-icon">${ICONS.warn}</span>
-        <div><div class="alert-title">OpenGear n'a pas pu démarrer l'interface</div><div class="muted">${esc(humanError(e && e.message))}</div></div>
+    const main = document.getElementById("main-content");
+    main.innerHTML = `
+      <div class="alert err" role="alert">
+        <span class="alert-icon">${ICONS.warn}</span>
+        <div class="grow">
+          <div class="alert-title">OpenGear n'a pas pu démarrer l'interface</div>
+          <div class="muted">${esc(humanError(e && e.message))}</div>
+        </div>
+        <button type="button" class="btn btn-primary btn-sm" id="btn-retry-boot">Réessayer</button>
       </div>`;
-    setStatus("Erreur de démarrage");
+    translateDom(main);
+    const retryBtn = document.getElementById("btn-retry-boot");
+    if (retryBtn) {
+      retryBtn.onclick = () => {
+        setStatus("Reconnexion au moteur OpenGear…", "ok");
+        bootWithRetry(1);
+      };
+    }
+    setStatus("Erreur de démarrage", "err");
   }
 }
 

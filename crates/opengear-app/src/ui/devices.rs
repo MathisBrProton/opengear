@@ -128,8 +128,20 @@ impl BackendEngine {
             .map(|d| d.as_mut())
     }
 
-    pub(crate) fn curve_cooling_mut(&mut self) -> Option<&mut dyn CurveCooling> {
-        self.driver_devices.iter_mut().find_map(|d| d.fan_curves())
+    pub(crate) fn curve_cooling_for_mut(&mut self, id: &str) -> Option<&mut dyn CurveCooling> {
+        self.device_mut(id).and_then(|d| d.fan_curves())
+    }
+
+    pub(crate) fn refresh_device_fans(&mut self, device_id: &str) -> Result<(), String> {
+        let device = self
+            .device_mut(device_id)
+            .ok_or_else(|| format!("Appareil introuvable : {device_id}"))?;
+        let cooling = device
+            .cooling()
+            .ok_or_else(|| format!("Ventilateurs non pilotables sur {device_id}"))?;
+        cooling.refresh();
+        self.sync_cooling_marker();
+        Ok(())
     }
 
     pub(crate) fn find_pointer_mut(
@@ -194,6 +206,7 @@ impl BackendEngine {
 
     pub(crate) fn device_list_json(&mut self) -> Json {
         let placements = self.config.device_placements.clone();
+        let curves_snapshot = self.curve_states.clone();
         let mut out = Vec::with_capacity(self.driver_devices.len());
         for d in &mut self.driver_devices {
             let info = d.info();
@@ -201,7 +214,34 @@ impl BackendEngine {
             let status = d.status();
             let settings = d.settings();
             let specs = d.specs();
-            let has_curves = d.fan_curves().is_some();
+            let curves = curves_snapshot.get(&info.id).map(|cs| {
+                let channels: Vec<Json> = cs
+                    .channels
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, c)| {
+                        json!({
+                            "index": idx,
+                            "header": format!("{:?}", c.header),
+                            "label": c.header.label(),
+                            "short_label": super::state::fan_short_label(c.header),
+                            "is_pump": c.header == opengear_core::cooling::FanHeaderKind::AioPump,
+                            "policy": format!("{:?}", c.policy),
+                            "source": format!("{:?}", c.source),
+                            "custom_mix": c.custom_mix,
+                            "hysteresis_c": c.hysteresis_c,
+                            "smoothing_secs": c.smoothing_secs,
+                            "curve": c.curve,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "is_admin": cs.is_admin,
+                    "available": cs.available,
+                    "message": cs.message,
+                    "channels": channels,
+                })
+            });
             let cooling = d.cooling().map(|c| cooling_json(c));
             let lighting = d.lighting().map(|l| {
                 json!({
@@ -243,7 +283,7 @@ impl BackendEngine {
                 "status": status,
                 "settings": settings,
                 "specs": specs,
-                "has_curves": has_curves,
+                "curves": curves,
                 "lighting": lighting,
                 "cooling": cooling,
                 "pointer": pointer,

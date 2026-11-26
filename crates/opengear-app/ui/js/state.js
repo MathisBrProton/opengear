@@ -73,8 +73,6 @@ export function normalizeState() {
   S.keyboard.form_factors = arr(S.keyboard.form_factors);
   S.keyboard.os_layout = S.keyboard.os_layout || {};
   S.telemetry = S.telemetry || {};
-  S.cooling = S.cooling || {};
-  S.cooling.channels = arr(S.cooling.channels);
   S.static_info = S.static_info || {};
   S.system_prefs = S.system_prefs || {};
   S.local_assets = S.local_assets || {};
@@ -98,7 +96,14 @@ export function syncDrafts() {
   Object.keys(local.eqDrafts).forEach((k) => {
     if (!local.eqDrafts[k].dirty) delete local.eqDrafts[k];
   });
-  if (local.selectedCoolingIdx >= S.cooling.channels.length) local.selectedCoolingIdx = 0;
+  const cd = curveDevice();
+  const len = cd ? arr(cd.curves && cd.curves.channels).length : 0;
+  if (local.selectedCoolingIdx >= len) local.selectedCoolingIdx = 0;
+}
+
+/** Primary motherboard/cooling device carrying firmware fan curves (`S.device_list[].curves`). */
+export function curveDevice() {
+  return arr(S && S.device_list).find((d) => d.curves && arr(d.curves.channels).length) || null;
 }
 
 export function getDraft(dev) {
@@ -268,7 +273,8 @@ export function devicesList() {
     if (hwBr) {
       const br = num(hwBr.value, 100);
       const next = br >= 100 ? 50 : br >= 50 ? 0 : 100;
-      quick.push(qa(`Luminosité ${next} %`, "dev-set", { device: id, setting: hwBr.id, json: next }));
+      const lbl = next === 0 ? "Couper le rétroéclairage" : next === 100 ? "Rétroéclairage max" : "Rétroéclairage 50 %";
+      quick.push(qa(lbl, "dev-set", { device: id, setting: hwBr.id, json: next }));
     }
     const winLock = findS("win_lock");
     if (winLock) {
@@ -276,8 +282,29 @@ export function devicesList() {
     }
 
     const pollVal = findS("polling_rate") && num(findS("polling_rate").value, 0);
+    const crv = d.curves;
+    const cool = d.cooling;
+    const isCurveBoard = !!(crv && arr(crv.channels).length);
+    const hasPump = isCurveBoard && crv.channels.some((x) => x.is_pump);
+    if (isCurveBoard && hasPump) {
+      img = "/assets/aio.webp";
+      quick.push(
+        qa("Silence", "sl3-preset", { preset: "ultra_silent" }),
+        qa("Équilibré", "sl3-preset", { preset: "default" }),
+        qa("Performance", "sl3-preset", { preset: "max_perf" }),
+      );
+    }
+
+    let devType = KIND_LABEL[kind] || "Appareil";
+    if (isCurveBoard) devType = plural(arr(crv.channels).length, "canal", "canaux");
+    else if (kind === "motherboard" && cool) devType = plural(arr(cool.fans).length, "canal PWM", "canaux PWM");
+
     let status;
-    if (forced) status = { label: "Ventilation forcée", cls: "amber" };
+    if (isCurveBoard) {
+      status = crv.is_admin
+        ? { label: crv.available ? "Pilotable" : "Lecture seule", cls: crv.available ? "emerald" : "amber" }
+        : { label: "Admin requis", cls: "amber" };
+    } else if (forced) status = { label: "Ventilation forcée", cls: "amber" };
     else if (ptr) status = { label: `${num(ptr.dpi_x, arr(ptr.stages)[num(ptr.active_stage)] || 0)} DPI`, cls: "cyan" };
     else if (curProf) status = { label: curProf.label, cls: "emerald" };
     else if (kind === "keyboard" && pollVal) status = { label: fmtHzShort(pollVal), cls: "emerald" };
@@ -286,7 +313,7 @@ export function devicesList() {
 
     out.push({
       key: `dev:${id}`, deviceId: id, vendor: d.info.vendor, kind, name: d.info.model,
-      type: KIND_LABEL[kind] || "Appareil", icon, img, imgCls: "cutout",
+      type: devType, icon: isCurveBoard ? "fan" : icon, img, imgCls: "cutout",
       battery: sysBat ? sysBat.percent : bat != null ? bat : null,
       charging: sysBat ? !!sysBat.charging : !!d.status.charging,
       batteryHours: !sysBat && d.status.battery_hours != null ? d.status.battery_hours : null,
@@ -294,18 +321,6 @@ export function devicesList() {
     });
   });
 
-  if (!S.is_laptop && S.cooling.channels.length) {
-    const c = S.cooling;
-    out.push({
-      key: "cooling", vendor: "Refroidissement", kind: "Cooling", name: "Ventilation & watercooling", type: `${c.channels.length} canaux`,
-      img: "/assets/aio.webp", imgCls: "cutout", icon: "fan",
-      status: c.is_admin ? { label: c.wmi_available ? "Pilotable" : "Lecture seule", cls: c.wmi_available ? "emerald" : "amber" } : { label: "Admin requis", cls: "amber" },
-      // Pump presets only: a board without a pump channel gets no quick action here.
-      quick: c.channels.some((x) => x.is_pump)
-        ? [qa("Silence", "sl3-preset", { preset: "ultra_silent" }), qa("Équilibré", "sl3-preset", { preset: "default" }), qa("Performance", "sl3-preset", { preset: "max_perf" })]
-        : [],
-    });
-  }
   return out;
 }
 
@@ -334,9 +349,9 @@ export function updateChrome() {
     bs.textContent = errs ? String(errs) : warns ? String(warns) : "";
     bs.className = "nav-badge" + (errs ? " err" : warns ? " warn" : "");
     bs.title = errs
-      ? (isEn ? `${errs} diagnostic error(s)` : `${errs} erreur(s) au diagnostic`)
+      ? (isEn ? `${errs} diagnostic ${errs > 1 ? "errors" : "error"}` : `${plural(errs, "erreur", "erreurs")} au diagnostic`)
       : warns
-        ? (isEn ? `${warns} diagnostic warning(s)` : `${warns} avertissement(s) au diagnostic`)
+        ? (isEn ? `${warns} diagnostic ${warns > 1 ? "warnings" : "warning"}` : `${plural(warns, "avertissement", "avertissements")} au diagnostic`)
         : "";
   }
   const sel = document.getElementById("profile-select");

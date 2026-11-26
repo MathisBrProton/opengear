@@ -258,27 +258,6 @@ impl BackendEngine {
             })
             .unwrap_or_default();
 
-        let cooling_channels: Vec<Value> = self
-            .cooling_channels
-            .iter()
-            .enumerate()
-            .map(|(idx, c)| {
-                json!({
-                    "index": idx,
-                    "header": format!("{:?}", c.header),
-                    "label": c.header.label(),
-                    "short_label": fan_short_label(c.header),
-                    "is_pump": c.header == FanHeaderKind::AioPump,
-                    "policy": format!("{:?}", c.policy),
-                    "source": format!("{:?}", c.source),
-                    "custom_mix": c.custom_mix,
-                    "hysteresis_c": c.hysteresis_c,
-                    "smoothing_secs": c.smoothing_secs,
-                    "curve": c.curve,
-                })
-            })
-            .collect();
-
         let devices: Vec<Value> = self
             .scanned_devices
             .iter()
@@ -399,6 +378,12 @@ impl BackendEngine {
                 "mouse_dblclick_blocked": mouse_dblclick_blocked,
                 "macro_recording": self.input_engine.is_recording_macro(),
                 "visible_apps": visible_apps,
+                "is_admin": opengear_platform::is_elevated(),
+                "pawnio_ready": !self.headless
+                    && matches!(
+                        opengear_platform::pawnio::pawnio_availability(),
+                        opengear_platform::PawnIoAvailability::Ready
+                    ),
             },
             "firmware_inventory": fw_inventory,
             "local_assets": self.local_assets.summary(),
@@ -448,13 +433,6 @@ impl BackendEngine {
                 "name": p.name,
                 "active": p.active,
             })).collect::<Vec<_>>(),
-            "cooling": {
-                "is_admin": self.cooling_status.is_admin,
-                "wmi_available": self.cooling_status.wmi_available,
-                "message": self.cooling_status.message,
-                "channels": cooling_channels,
-                "superio": self.superio,
-            },
             "selftest": self.last_selftest,
             "devices": devices,
             "device_list": device_list,

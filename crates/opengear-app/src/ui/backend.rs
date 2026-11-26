@@ -13,16 +13,14 @@ use crate::system_ext::{
 };
 use crate::tray_icon::{TrayMenuState, tray_notify, update_tray_state};
 use opengear_core::cooling::{
-    FanChannelConfig, FanCurveTracker, FanHeaderKind, FanPolicyMode, FanTempSource, SensorReadings,
+    FanChannelConfig, FanCurveTracker, FanPolicyMode, FanTempSource, SensorReadings,
     resolve_temp_reading,
 };
 use opengear_core::driver::{Control, Device, DeviceKind, Setting, Value, setting_ids};
 use opengear_core::lighting::{
     DeviceLightingConfig, EffectRequest, LightingOverride, Zone, frame_len, render_frame,
 };
-use opengear_mainboard::{
-    HardwareSensorsSnapshot, SuperIoSnapshot, read_superio_snapshot, restore_all_superio_fans_auto,
-};
+use opengear_mainboard::HardwareSensorsSnapshot;
 use opengear_platform::{
     LaptopBatteryInfo, PowerPlan, SystemTelemetry, TelemetryCollector, is_elevated,
     is_laptop_chassis, list_power_plans, read_laptop_battery,
@@ -35,7 +33,7 @@ use opengear_core::{
 use opengear_input::{InputEngine, reset_held_state};
 use opengear_openrgb::server::{OpenRgbSdkServer, OpenRgbServerEvent, SdkController};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
@@ -43,11 +41,14 @@ use std::time::{Duration, Instant};
 use tao::event_loop::EventLoopProxy;
 use tracing::{error, info};
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct MainboardCoolingStatus {
+#[derive(Debug, Clone)]
+pub(crate) struct CurveDeviceState {
     pub is_admin: bool,
-    pub wmi_available: bool,
+    pub available: bool,
     pub message: String,
+    pub channels: Vec<FanChannelConfig>,
+    pub initial: Vec<FanChannelConfig>,
+    pub trackers: Vec<FanCurveTracker>,
 }
 
 pub(crate) struct BackendEngine {
@@ -64,9 +65,7 @@ pub(crate) struct BackendEngine {
     pub telemetry: TelemetryCollector,
     pub last_tel: SystemTelemetry,
     pub power_plans: Vec<PowerPlan>,
-    pub cooling_status: MainboardCoolingStatus,
-    pub cooling_channels: Vec<FanChannelConfig>,
-    pub initial_cooling_channels: Vec<Option<FanChannelConfig>>,
+    pub curve_states: BTreeMap<String, CurveDeviceState>,
     pub input_engine: InputEngine,
     pub scanned_devices: Vec<DetectedDevice>,
     pub start_time: Instant,
@@ -78,8 +77,6 @@ pub(crate) struct BackendEngine {
     pub last_device_frame_at: HashMap<String, Instant>,
     pub last_device_frames: HashMap<String, Vec<Rgb>>,
     pub live_active_devices: HashSet<String>,
-    pub smart_fan_trackers: [FanCurveTracker; 5],
-    pub superio: SuperIoSnapshot,
     pub last_selftest: Option<SelfTestReport>,
     pub undo_stack: Vec<(String, AppConfig)>,
     pub visible_apps_cache: Option<(Instant, Vec<String>)>,
@@ -275,13 +272,7 @@ impl BackendEngine {
         } else {
             None
         };
-        let (cooling_status, initial_cooling_channels, cooling_channels) =
-            collect_curve_cooling_state(&mut driver_devices, is_laptop);
-        let superio = if is_laptop {
-            SuperIoSnapshot::default()
-        } else {
-            read_superio_snapshot()
-        };
+        let curve_states = collect_curve_states(&mut driver_devices);
 
         let mut eng = Self {
             config_path,
@@ -295,9 +286,7 @@ impl BackendEngine {
             telemetry,
             last_tel,
             power_plans,
-            cooling_status,
-            cooling_channels,
-            initial_cooling_channels,
+            curve_states,
             input_engine: InputEngine::new(),
             scanned_devices,
             start_time: Instant::now(),
@@ -309,8 +298,6 @@ impl BackendEngine {
             last_device_frame_at: HashMap::new(),
             last_device_frames: HashMap::new(),
             live_active_devices: HashSet::new(),
-            smart_fan_trackers: [FanCurveTracker::new(); 5],
-            superio,
             last_selftest: None,
             undo_stack: Vec::new(),
             visible_apps_cache: None,
@@ -360,10 +347,7 @@ impl BackendEngine {
     ) -> Self {
         migrate_legacy_profiles(&mut config, &mut driver_devices);
         seed_and_resize_device_lighting(&mut config, &mut driver_devices);
-        let cooling_channels: Vec<FanChannelConfig> = FanHeaderKind::ALL
-            .iter()
-            .map(|&h| FanChannelConfig::default_for(h))
-            .collect();
+        let curve_states = collect_curve_states(&mut driver_devices);
         let manual_profile_name = config.active_profile.clone();
         Self {
             config_path,
@@ -377,13 +361,7 @@ impl BackendEngine {
             telemetry: TelemetryCollector::new(),
             last_tel: SystemTelemetry::default(),
             power_plans: Vec::new(),
-            cooling_status: MainboardCoolingStatus {
-                is_admin: false,
-                wmi_available: false,
-                message: "Audit headless".into(),
-            },
-            cooling_channels,
-            initial_cooling_channels: vec![None; FanHeaderKind::ALL.len()],
+            curve_states,
             input_engine: InputEngine::new(),
             scanned_devices: Vec::new(),
             start_time: Instant::now(),
@@ -395,8 +373,6 @@ impl BackendEngine {
             last_device_frame_at: HashMap::new(),
             last_device_frames: HashMap::new(),
             live_active_devices: HashSet::new(),
-            smart_fan_trackers: [FanCurveTracker::new(); 5],
-            superio: SuperIoSnapshot::default(),
             last_selftest: None,
             undo_stack: Vec::new(),
             visible_apps_cache: None,
@@ -499,30 +475,42 @@ impl BackendEngine {
             .unwrap_or_default()
     }
 
-    fn wmi_restore_config(&self, idx: usize) -> Option<FanChannelConfig> {
-        let header = FanHeaderKind::ALL.get(idx).copied()?;
-        Some(
-            match self.initial_cooling_channels.get(idx).cloned().flatten() {
-                Some(original) => original,
-                None => {
-                    let mut auto = FanChannelConfig::default_for(header);
-                    auto.policy = FanPolicyMode::Standard;
-                    auto
+    fn curve_restore_configs(&self) -> Vec<(String, FanChannelConfig)> {
+        let mut out = Vec::new();
+        for (dev_id, st) in &self.curve_states {
+            for (idx, tracker) in st.trackers.iter().enumerate() {
+                if tracker.last_duty().is_none() {
+                    continue;
                 }
-            },
-        )
+                let Some(cur) = st.channels.get(idx) else {
+                    continue;
+                };
+                let mut restore = st
+                    .initial
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| FanChannelConfig::default_for(cur.header));
+                if restore.policy == FanPolicyMode::Manual {
+                    restore.policy = FanPolicyMode::Standard;
+                }
+                out.push((dev_id.clone(), restore));
+            }
+        }
+        out
     }
 
     pub(crate) fn sync_fan_marker(&mut self) {
         if self.headless {
             return;
         }
+        let wmi_restore: Vec<FanChannelConfig> = self
+            .curve_restore_configs()
+            .into_iter()
+            .map(|(_, cfg)| cfg)
+            .collect();
         let marker = fan_watchdog::FanOverrideMarker {
             pid: std::process::id(),
-            wmi_restore: (0..self.smart_fan_trackers.len())
-                .filter(|&i| self.smart_fan_trackers[i].last_duty().is_some())
-                .filter_map(|i| self.wmi_restore_config(i))
-                .collect(),
+            wmi_restore,
             superio_restore: opengear_mainboard::saved_superio_states(),
             cooling_devices: self.overridden_cooling_ids(),
         };
@@ -606,44 +594,27 @@ impl BackendEngine {
             }
         }
 
-        let to_restore: Vec<FanChannelConfig> = (0..self.smart_fan_trackers.len())
-            .filter_map(|i| {
-                self.smart_fan_trackers[i]
-                    .last_duty()
-                    .is_some()
-                    .then(|| self.wmi_restore_config(i))
-                    .flatten()
-            })
-            .collect();
+        let to_restore = self.curve_restore_configs();
         let mut remaining_wmi = Vec::new();
-        if !to_restore.is_empty() {
-            if let Some(fc) = self.curve_cooling_mut() {
-                for cfg in to_restore {
-                    if let Err(e) = fc.apply_channel_curve(&cfg) {
-                        error!(
-                            "Restauration ventilateur {:?} impossible à la fermeture : {e}",
-                            cfg.header
-                        );
-                        remaining_wmi.push(cfg);
-                    }
-                }
-            } else {
-                remaining_wmi = to_restore;
+        for (dev_id, cfg) in to_restore {
+            let applied = self
+                .curve_cooling_for_mut(&dev_id)
+                .map(|fc| fc.apply_channel_curve(&cfg))
+                .unwrap_or_else(|| Err(anyhow::anyhow!("Contrôleur {dev_id} absent")));
+            if let Err(e) = applied {
+                error!(
+                    "Restauration ventilateur {:?} ({dev_id}) impossible à la fermeture : {e}",
+                    cfg.header
+                );
+                remaining_wmi.push(cfg);
             }
         }
-        for tracker in &mut self.smart_fan_trackers {
-            tracker.reset();
+        for st in self.curve_states.values_mut() {
+            for tracker in &mut st.trackers {
+                tracker.reset();
+            }
         }
-        let superio_logs = restore_all_superio_fans_auto();
-        let superio_failed = superio_logs.iter().any(|l| {
-            let low = l.to_ascii_lowercase();
-            low.contains("échou") || low.contains("erreur") || low.contains("impossible")
-        });
-        let remaining_superio = if superio_failed {
-            opengear_mainboard::saved_superio_states()
-        } else {
-            Vec::new()
-        };
+        let remaining_superio = opengear_mainboard::saved_superio_states();
         if remaining_wmi.is_empty() && remaining_superio.is_empty() && remaining_cooling.is_empty()
         {
             fan_watchdog::clear_marker();
@@ -684,12 +655,14 @@ impl BackendEngine {
             let (live_rgb_active, animated_rgb_active, thermal_rgb_active) =
                 self.lighting_activity_flags();
             let pending_static_rgb = live_rgb_active && self.has_pending_live_frame();
-            let smart_fan_active = self.cooling_status.is_admin
-                && self.cooling_status.wmi_available
-                && self
-                    .cooling_channels
-                    .iter()
-                    .any(|c| c.source != FanTempSource::CpuBios);
+            let smart_fan_active = self.curve_states.values().any(|st| {
+                st.is_admin
+                    && st.available
+                    && st
+                        .channels
+                        .iter()
+                        .any(|c| c.source != FanTempSource::CpuBios)
+            });
             THERMAL_RGB_ACTIVE.store(thermal_rgb_active, Ordering::Relaxed);
             SMART_FAN_ACTIVE.store(smart_fan_active, Ordering::Relaxed);
 
@@ -854,39 +827,42 @@ impl BackendEngine {
                     nvme: sensors.nvme_temp_c,
                     motherboard: sensors.motherboard_temp_c,
                 };
-                let mut pending_applies: Vec<(usize, u8, FanChannelConfig)> = Vec::new();
-                for (idx, ch) in self.cooling_channels.iter().enumerate() {
-                    if ch.source == FanTempSource::CpuBios || idx >= 5 {
+                let mut pending_applies: Vec<(String, usize, u8, FanChannelConfig)> = Vec::new();
+                for (dev_id, st) in &mut self.curve_states {
+                    if !st.is_admin || !st.available {
                         continue;
                     }
-                    let measured =
-                        resolve_temp_reading(ch.source, ch.custom_mix.as_ref(), &readings);
-                    if let Some(target_duty) =
-                        self.smart_fan_trackers[idx].evaluate(ch, measured, dt_secs, 3)
-                    {
-                        let mut flat = ch.clone();
-                        flat.policy = FanPolicyMode::Manual;
-                        for pt in &mut flat.curve {
-                            pt.duty_pct = target_duty;
+                    for (idx, ch) in st.channels.iter().enumerate() {
+                        if ch.source == FanTempSource::CpuBios {
+                            continue;
                         }
-                        pending_applies.push((idx, target_duty, flat));
+                        let Some(tracker) = st.trackers.get_mut(idx) else {
+                            continue;
+                        };
+                        let measured =
+                            resolve_temp_reading(ch.source, ch.custom_mix.as_ref(), &readings);
+                        if let Some(target_duty) = tracker.evaluate(ch, measured, dt_secs, 3) {
+                            let mut flat = ch.clone();
+                            flat.policy = FanPolicyMode::Manual;
+                            for pt in &mut flat.curve {
+                                pt.duty_pct = target_duty;
+                            }
+                            pending_applies.push((dev_id.clone(), idx, target_duty, flat));
+                        }
                     }
                 }
-                if !pending_applies.is_empty()
-                    && let Some(fc) = self.curve_cooling_mut()
-                {
-                    let mut applied = Vec::new();
-                    for (idx, target_duty, flat) in pending_applies {
-                        if fc.apply_channel_curve(&flat).is_ok() {
-                            applied.push((idx, target_duty));
-                        }
-                    }
-                    for (idx, target_duty) in applied {
-                        let newly_overridden = self.smart_fan_trackers[idx].last_duty().is_none();
-                        self.smart_fan_trackers[idx].mark_applied(target_duty);
-                        if newly_overridden {
+                for (dev_id, idx, target_duty, flat) in pending_applies {
+                    let ok = self
+                        .curve_cooling_for_mut(&dev_id)
+                        .is_some_and(|fc| fc.apply_channel_curve(&flat).is_ok());
+                    if ok
+                        && let Some(st) = self.curve_states.get_mut(&dev_id)
+                        && let Some(tracker) = st.trackers.get_mut(idx)
+                    {
+                        if tracker.last_duty().is_none() {
                             marker_dirty = true;
                         }
+                        tracker.mark_applied(target_duty);
                     }
                 }
                 if marker_dirty {
@@ -1061,12 +1037,12 @@ impl BackendEngine {
                 error,
             } => {
                 if refresh_hw {
-                    self.superio = read_superio_snapshot();
                     self.driver_devices = super::devices::discover_all(
                         &self.drivers,
                         &self.config.experimental_drivers,
                     );
                     seed_and_resize_device_lighting(&mut self.config, &mut self.driver_devices);
+                    self.refresh_curve_states();
                 }
                 if let Some(rep) = selftest {
                     self.last_selftest = Some(rep);
@@ -1104,8 +1080,10 @@ impl BackendEngine {
             SysEvent::Resume => {
                 info!("Sortie de veille — reconnexion planifiée");
                 self.suspended = false;
-                for tr in &mut self.smart_fan_trackers {
-                    tr.reset();
+                for st in self.curve_states.values_mut() {
+                    for tr in &mut st.trackers {
+                        tr.reset();
+                    }
                 }
                 self.resume_reconnect_at = Some(Instant::now() + Duration::from_millis(1200));
             }
@@ -1471,13 +1449,8 @@ impl BackendEngine {
         self.invalidate_keyboard_view();
 
         self.cooling_keepalive.clear();
+        self.refresh_curve_states();
         if !self.headless {
-            let (status, initial, _) =
-                collect_curve_cooling_state(&mut self.driver_devices, self.is_laptop);
-            self.cooling_status = status;
-            if self.cooling_status.wmi_available {
-                self.initial_cooling_channels = initial;
-            }
             self.sync_cooling_marker();
             self.power_plans = list_power_plans();
             self.scanned_devices = scan_hid_devices(false).unwrap_or_default();
@@ -1795,10 +1768,22 @@ impl BackendEngine {
         self.visible_apps_cache = Some((Instant::now(), apps.clone()));
         apps
     }
+    pub(crate) fn refresh_curve_states(&mut self) {
+        let fresh = collect_curve_states(&mut self.driver_devices);
+        let prev = std::mem::take(&mut self.curve_states);
+        for (id, mut st) in fresh {
+            if let Some(old) = prev.get(&id)
+                && old.channels.len() == st.channels.len()
+            {
+                st.channels = old.channels.clone();
+                st.trackers = old.trackers.clone();
+            }
+            self.curve_states.insert(id, st);
+        }
+    }
 }
 
 /// Model of the first laptop device whose fans OpenGear drives through `Cooling`, if any.
-/// Desktop motherboard drivers (`asus_wmi_cooling`, `superio`) coexist with `cooling_channels`.
 pub(crate) fn device_cooling_owner(devices: &mut [Box<dyn Device>]) -> Option<String> {
     devices.iter_mut().find_map(|d| {
         let info = d.info();
@@ -1806,80 +1791,37 @@ pub(crate) fn device_cooling_owner(devices: &mut [Box<dyn Device>]) -> Option<St
     })
 }
 
-/// Read motherboard firmware fan-curve capability through `CurveCooling` when no laptop driver
-/// owns the chassis fans.
-pub(crate) fn collect_curve_cooling_state(
+/// Read curve-cooling capability through `CurveCooling` for every motherboard controller when no
+/// laptop EC owns chassis cooling.
+pub(crate) fn collect_curve_states(
     devices: &mut [Box<dyn Device>],
-    is_laptop: bool,
-) -> (
-    MainboardCoolingStatus,
-    Vec<Option<FanChannelConfig>>,
-    Vec<FanChannelConfig>,
-) {
-    if let Some(model) = device_cooling_owner(devices) {
-        return (
-            MainboardCoolingStatus {
-                is_admin: is_elevated(),
-                wmi_available: false,
-                message: format!("Ventilateurs pilotés par l'appareil « {model} »."),
-            },
-            vec![None; FanHeaderKind::ALL.len()],
-            Vec::new(),
-        );
+) -> BTreeMap<String, CurveDeviceState> {
+    let mut out = BTreeMap::new();
+    if device_cooling_owner(devices).is_some() {
+        return out;
     }
-
-    if let Some(fc) = devices.iter_mut().find_map(|d| d.fan_curves()) {
-        let (wmi_available, message) = fc.cooling_diagnostic();
-        let read_list = if wmi_available {
-            fc.curve_channels()
-        } else {
-            Vec::new()
+    let admin = is_elevated();
+    for d in devices {
+        let id = d.info().id;
+        let Some(fc) = d.fan_curves() else {
+            continue;
         };
-        let initial: Vec<Option<FanChannelConfig>> = FanHeaderKind::ALL
-            .iter()
-            .map(|&h| read_list.iter().find(|c| c.header == h).cloned())
-            .collect();
-        let channels = if is_laptop && !wmi_available {
-            Vec::new()
-        } else {
-            FanHeaderKind::ALL
-                .iter()
-                .zip(&initial)
-                .map(|(&h, read)| {
-                    read.clone()
-                        .unwrap_or_else(|| FanChannelConfig::default_for(h))
-                })
-                .collect()
-        };
-        return (
-            MainboardCoolingStatus {
-                is_admin: is_elevated(),
-                wmi_available,
+        let (available, message) = fc.cooling_diagnostic();
+        let channels = fc.curve_channels();
+        let trackers = vec![FanCurveTracker::new(); channels.len()];
+        out.insert(
+            id,
+            CurveDeviceState {
+                is_admin: admin,
+                available,
                 message,
+                initial: channels.clone(),
+                channels,
+                trackers,
             },
-            initial,
-            channels,
         );
     }
-
-    let status = MainboardCoolingStatus {
-        is_admin: is_elevated(),
-        wmi_available: false,
-        message: if !is_elevated() {
-            "Droits administrateur requis pour le contrôle WMI carte mère.".into()
-        } else {
-            "Aucun contrôleur de courbes carte mère détecté.".into()
-        },
-    };
-    let channels = if is_laptop {
-        Vec::new()
-    } else {
-        FanHeaderKind::ALL
-            .iter()
-            .map(|&h| FanChannelConfig::default_for(h))
-            .collect()
-    };
-    (status, vec![None; FanHeaderKind::ALL.len()], channels)
+    out
 }
 
 pub(crate) fn migrate_legacy_profiles(config: &mut AppConfig, devices: &mut [Box<dyn Device>]) {

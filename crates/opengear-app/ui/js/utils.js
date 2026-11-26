@@ -163,6 +163,14 @@ export function fmtSize(b) {
   return `${(n / 1024 / 1024).toFixed(1)} ${en ? "MB" : "Mo"}`;
 }
 
+export function cssVar(name, fallback = "") {
+  try {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
+
 export const plural = (n, one, many) => `${n} ${n > 1 ? many : one}`;
 
 export function setTxt(id, txt) {

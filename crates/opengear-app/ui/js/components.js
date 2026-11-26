@@ -25,7 +25,7 @@ export function emptyState(title, text, actionHtml = "") {
       <div class="empty-icon">${ICONS.plug}</div>
       <div class="empty-title">${esc(title)}</div>
       <div class="empty-text">${esc(text)}</div>
-      ${actionHtml ? `<div class="row mt-8" style="justify-content:center">${actionHtml}</div>` : ""}
+      ${actionHtml ? `<div class="row mt-8 justify-center">${actionHtml}</div>` : ""}
     </div>`;
 }
 
@@ -39,6 +39,7 @@ export function advancedHint(text) {
 }
 
 export const expertTag = () => `<span class="expert-tag">Expert</span>`;
+export const memTag = () => `<span class="tag-meta" title="Enregistré dans la mémoire de l'appareil : conservé même débranché">mémorisé</span>`;
 
 export function sw(checked, labelHtml, change, data = {}, opts = {}) {
   return `
@@ -51,7 +52,11 @@ export function sw(checked, labelHtml, change, data = {}, opts = {}) {
 
 export function seg(items, current, act, data = {}, cls = "") {
   return `<div class="seg-group" role="group">${items
-    .map(([val, label]) => `<button type="button" class="seg-btn ${cls} ${String(val) === String(current) ? "active" : ""}" aria-pressed="${String(val) === String(current)}" data-act="${act}" ${dataAttrs(data)} data-val="${esc(val)}">${esc(label)}</button>`)
+    .map((item) => {
+      const [val, label, disabled] = Array.isArray(item) ? item : [item.val, item.label, item.disabled];
+      const on = String(val) === String(current);
+      return `<button type="button" class="seg-btn ${cls} ${on ? "active" : ""}" aria-pressed="${on}" ${disabled ? "disabled" : ""} ${disabled ? "" : `data-act="${act}"`} ${dataAttrs(data)} data-val="${esc(val)}">${esc(label)}</button>`;
+    })
     .join("")}</div>`;
 }
 
@@ -109,13 +114,13 @@ export function deviceBlueprintSvg(d, dev) {
       const pips = Math.min(n, 16);
       const pipHtml = Array.from({ length: pips }, (_, pi) => {
         const cx = 248 + pi * 12;
-        return `<circle cx="${cx}" cy="${y + 8}" r="3.2" fill="#00D4FF" fill-opacity="0.82"/>`;
+        return `<circle class="bp-pip" cx="${cx}" cy="${y + 8}" r="3.2"/>`;
       }).join("");
       rows.push(`
-        <rect x="8" y="${y}" width="524" height="17" rx="5" fill="rgba(255,255,255,0.035)" stroke="rgba(255,255,255,0.12)"/>
-        <text x="18" y="${y + 12}" fill="#e2e8f0" font-size="9.5" font-weight="600">${esc(cleanLabel(z.name || z.id, 30))}</text>
+        <rect class="bp-card" x="8" y="${y}" width="524" height="17" rx="5"/>
+        <text class="bp-label" x="18" y="${y + 12}" font-size="9.5" font-weight="600">${esc(cleanLabel(z.name || z.id, 30))}</text>
         ${pipHtml}
-        <text x="522" y="${y + 12}" text-anchor="end" fill="#7dd3fc" font-size="9">${n} LED${n > 1 ? "s" : ""}</text>`);
+        <text class="bp-accent" x="522" y="${y + 12}" text-anchor="end" font-size="9">${n} LED${n > 1 ? "s" : ""}</text>`);
     });
   } else if (ptr) {
     const stages = arr(ptr.stages).slice(0, 6);
@@ -126,8 +131,8 @@ export function deviceBlueprintSvg(d, dev) {
       const active = idx === num(ptr.active_stage);
       const h = Math.round(14 + Math.min(dpi / 26000, 1) * 44);
       rows.push(`
-        <rect x="${x.toFixed(1)}" y="${72 - h}" width="${w.toFixed(1)}" height="${h}" rx="4" fill="${active ? "rgba(0,212,255,0.35)" : "rgba(255,255,255,0.06)"}" stroke="${active ? "#00D4FF" : "rgba(255,255,255,0.15)"}"/>
-        <text x="${(x + w / 2).toFixed(1)}" y="86" text-anchor="middle" fill="${active ? "#00D4FF" : "#94a3b8"}" font-size="9">${dpi}</text>`);
+        <rect class="bp-bar ${active ? "active" : ""}" x="${x.toFixed(1)}" y="${72 - h}" width="${w.toFixed(1)}" height="${h}" rx="4"/>
+        <text class="${active ? "bp-accent" : "bp-sub"}" x="${(x + w / 2).toFixed(1)}" y="86" text-anchor="middle" font-size="9">${dpi}</text>`);
     });
   } else if (fans.length) {
     const list = fans.slice(0, 7);
@@ -143,10 +148,10 @@ export function deviceBlueprintSvg(d, dev) {
             ? "0"
             : "Auto";
       rows.push(`
-        <circle cx="${x}" cy="38" r="22" fill="rgba(255,255,255,0.03)" stroke="${active ? "#f59e0b" : "#10b981"}" stroke-width="1.6"/>
-        <circle cx="${x}" cy="38" r="6" fill="rgba(255,255,255,0.15)"/>
-        <text x="${x}" y="41" text-anchor="middle" fill="#f8fafc" font-size="8.5" font-weight="650">${esc(val)}</text>
-        <text x="${x}" y="76" text-anchor="middle" fill="#94a3b8" font-size="8.5">${esc(cleanLabel(f.name || f.id, 14))}</text>`);
+        <circle class="bp-fan ${active ? "manual" : ""}" cx="${x}" cy="38" r="22" stroke-width="1.6"/>
+        <circle class="bp-hub" cx="${x}" cy="38" r="6"/>
+        <text class="bp-label" x="${x}" y="41" text-anchor="middle" font-size="8.5" font-weight="650">${esc(val)}</text>
+        <text class="bp-sub" x="${x}" y="76" text-anchor="middle" font-size="8.5">${esc(cleanLabel(f.name || f.id, 14))}</text>`);
     });
   }
   const h = zones.length ? Math.max(58, 22 + Math.min(zones.length, 6) * 24) : 96;
@@ -166,10 +171,10 @@ export function quickBtn(q) {
 export function telemetryTiles() {
   return `
     <div class="tel-grid">
-      <div class="tel-tile"><div class="card-eyebrow">Processeur</div><div class="tel-val" id="tel-cpu-val">—</div><div class="tel-sub" id="tel-cpu-sub">${esc(S.static_info.cpu_name || "")}</div><div class="bar-track"><div class="bar-fill" id="tel-cpu-bar" style="width:0;background:var(--cyan)"></div></div></div>
-      <div class="tel-tile"><div class="card-eyebrow">Carte graphique</div><div class="tel-val" id="tel-gpu-val" style="color:#ff8aa2">—</div><div class="tel-sub" id="tel-gpu-sub">${esc(S.static_info.gpu_name || "")}</div><div class="bar-track"><div class="bar-fill" id="tel-gpu-bar" style="width:0;background:var(--rog)"></div></div></div>
-      <div class="tel-tile"><div class="card-eyebrow">Mémoire vive</div><div class="tel-val" id="tel-ram-val">—</div><div class="tel-sub" id="tel-ram-sub"></div><div class="bar-track"><div class="bar-fill" id="tel-ram-bar" style="width:0;background:var(--purple)"></div></div></div>
-      <div class="tel-tile"><div class="card-eyebrow">Températures</div><div class="tel-val" id="tel-temp-val" style="color:var(--amber)">—</div><div class="tel-sub" id="tel-temp-sub"></div><div class="bar-track"><div class="bar-fill" id="tel-temp-bar" style="width:0;background:var(--amber)"></div></div></div>
+      <div class="tel-tile"><div class="card-eyebrow">Processeur</div><div class="tel-val" id="tel-cpu-val">—</div><div class="tel-sub" id="tel-cpu-sub">${esc(S.static_info.cpu_name || "")}</div><div class="bar-track"><div class="bar-fill bg-cyan" id="tel-cpu-bar" style="width:0"></div></div></div>
+      <div class="tel-tile"><div class="card-eyebrow">Carte graphique</div><div class="tel-val txt-rog-soft" id="tel-gpu-val">—</div><div class="tel-sub" id="tel-gpu-sub">${esc(S.static_info.gpu_name || "")}</div><div class="bar-track"><div class="bar-fill bg-rog" id="tel-gpu-bar" style="width:0"></div></div></div>
+      <div class="tel-tile"><div class="card-eyebrow">Mémoire vive</div><div class="tel-val" id="tel-ram-val">—</div><div class="tel-sub" id="tel-ram-sub"></div><div class="bar-track"><div class="bar-fill bg-purple" id="tel-ram-bar" style="width:0"></div></div></div>
+      <div class="tel-tile"><div class="card-eyebrow">Températures</div><div class="tel-val txt-amber" id="tel-temp-val">—</div><div class="tel-sub" id="tel-temp-sub"></div><div class="bar-track"><div class="bar-fill bg-amber" id="tel-temp-bar" style="width:0"></div></div></div>
     </div>`;
 }
 
@@ -280,7 +285,7 @@ export function renderKeyboard(mode, kb) {
             : `<span class="muted">Clique sur une touche pour la configurer. Point orange = touche modifiée.</span>`}
       </div>
       ${showPhoto
-        ? `<div style="padding:8px 0"><img class="kb-real-photo cutout" src="${esc(photo.url)}" alt="Photo du clavier" /></div>`
+        ? `<div class="py-8"><img class="kb-real-photo cutout" src="${esc(photo.url)}" alt="Photo du clavier" /></div>`
         : `<div class="kb-canvas-wrap" role="group" aria-label="Touches du clavier" style="aspect-ratio:${maxX} / ${maxY};max-width:${Math.round((300 * maxX) / maxY)}px">
             ${kbv.keys.map((k) => {
               const left = (num(k.x) / maxX) * 100;
@@ -331,7 +336,7 @@ export function keyboardSetup() {
 export function settingControl(deviceId, s, opts = {}) {
   const data = { device: deviceId, setting: s.id };
   const label = opts.label || s.label;
-  const tags = `${s.level === "expert" ? ` ${expertTag()}` : ""}${s.persistence === "device" ? ` <span class="pill" title="Enregistré dans la mémoire de l'appareil : conservé même débranché">mémorisé</span>` : ""}`;
+  const tags = `${s.level === "expert" ? ` ${expertTag()}` : ""}${s.persistence === "device" ? ` ${memTag()}` : ""}`;
   const help = s.help ? `<div class="muted small">${esc(s.help)}</div>` : "";
   const c = s.control || {};
   const domId = `set-${deviceId}-${s.id}`.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -340,15 +345,15 @@ export function settingControl(deviceId, s, opts = {}) {
     ctl = sw(!!s.value, `${esc(label)}${tags}`, "dev-set", data);
   } else if (c.type === "slider") {
     const v = num(s.value, c.min);
-    ctl = `${sliderRow(label, { id: domId, min: c.min, max: c.max, step: c.step || 1, value: v, input: "label", change: "dev-set", data: { ...data, unit: c.unit || "" }, display: `${v}${c.unit ? ` ${c.unit}` : ""}` })}${tags ? `<div class="row">${tags}</div>` : ""}`;
+    ctl = sliderRow(label, { labelHtml: `${esc(t(label))}${tags}`, id: domId, min: c.min, max: c.max, step: c.step || 1, value: v, input: "label", change: "dev-set", data: { ...data, unit: c.unit || "" }, display: `${v}${c.unit ? ` ${c.unit}` : ""}` });
   } else if (c.type === "choice") {
     const opts2 = arr(c.options);
     const field = opts2.length <= 4
       ? seg(opts2.map((o) => [o.id, o.label]), s.value, "dev-set", data)
       : `<select id="${domId}" class="og-select auto" data-change="dev-set" ${dataAttrs(data)}>${opts2.map((o) => `<option value="${esc(o.id)}" ${String(o.id) === String(s.value) ? "selected" : ""}>${esc(o.label)}</option>`).join("")}</select>`;
-    ctl = `<div class="row-between"><span class="field-label">${esc(label)}${tags}</span>${field}</div>`;
+    ctl = `<div class="row-between pair-row"><span class="field-label">${esc(label)}${tags}</span>${field}</div>`;
   } else if (c.type === "color") {
-    ctl = `<div class="row-between"><label class="field-label" for="${domId}">${esc(label)}${tags}</label><input type="color" id="${domId}" class="og-color" value="${esc(s.value || "#000000")}" data-change="dev-set" ${dataAttrs(data)} /></div>`;
+    ctl = `<div class="row-between pair-row"><label class="field-label" for="${domId}">${esc(label)}${tags}</label><input type="color" id="${domId}" class="og-color" value="${esc(s.value || "#000000")}" data-change="dev-set" ${dataAttrs(data)} /></div>`;
   } else {
     return "";
   }
@@ -372,7 +377,7 @@ export function deviceSettings(deviceId, { sections = null, title = "Réglages",
   const ex = isExpert();
   const list = d.settings.filter((s) => (!sections || sections.includes(s.section)) && (ex || s.level === "simple"));
   if (!list.length) return "";
-  const body = `<div class="stack" style="gap:12px">${list.map((s) => settingControl(deviceId, s)).join("")}</div>`;
+  const body = `<div class="stack gap-3">${list.map((s) => settingControl(deviceId, s)).join("")}</div>`;
   return bare ? body : `<div class="card"><div class="card-head"><h2 class="card-title">${esc(title)}</h2></div>${body}</div>`;
 }
 
@@ -395,7 +400,7 @@ export function deviceFans(deviceId, { title = "Ventilateurs", bare = false } = 
     <div class="row mb-16" id="${domId}-live">${chips || `<span class="muted small">Vitesse non communiquée par l'appareil.</span>`}</div>
     ${c.overridden ? `<div class="row mb-16"><span class="pill amber"><span class="dot"></span>Ventilation forcée : le BIOS ne pilote plus les ventilateurs</span></div>` : ""}
     ${isExpert() ? `
-      <div class="stack" style="gap:10px">
+      <div class="stack gap-10px">
         ${sliderRow("Vitesse manuelle", { labelHtml: `${esc(t("Vitesse manuelle"))} ${expertTag()}`, id: domId, min: floor, max: 100, value, input: "label", data: { fmt: "pct100" }, display: `${value} %` })}
         <div class="row">
           <button type="button" class="btn btn-primary btn-sm" data-act="dev-fan-apply" data-device="${esc(deviceId)}" data-target="${domId}">Forcer la vitesse</button>
