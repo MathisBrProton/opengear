@@ -55,7 +55,7 @@ jobs:
           cargo build --release --manifest-path tools/opengear-setup/Cargo.toml --locked
 
       - name: Upload OpenGear artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: OpenGear-${{ github.sha }}
           path: |
