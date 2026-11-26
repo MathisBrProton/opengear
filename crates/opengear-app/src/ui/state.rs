@@ -520,6 +520,7 @@ impl BackendEngine {
             "config_warning": self.config_warning,
             "ui": {
                 "mode": self.config.ui_mode,
+                "language": self.config.language,
                 "onboarding_done": self.config.onboarding_done,
                 "can_undo": !self.undo_stack.is_empty(),
                 "undo_label": self.undo_stack.last().map(|(l, _)| l.clone()),
@@ -534,6 +535,9 @@ impl BackendEngine {
                 "idle_lights_off_min": self.config.idle_lights_off_min,
                 "battery_alerts": self.config.battery_alerts,
                 "laptop_auto_battery_saver": self.config.laptop_auto_battery_saver,
+                "openrgb_server": self.config.openrgb_server_enabled,
+                "openrgb_clients": self.openrgb_server.as_ref().map(|s| s.client_count()).unwrap_or(0),
+                "openrgb_server_error": self.openrgb_server_error,
                 "lights_blackout": self.blackout_lock || self.blackout_idle,
                 "foreground_app": self.foreground_app,
                 "auto_switched": self.auto_switched,

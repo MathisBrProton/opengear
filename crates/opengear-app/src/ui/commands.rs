@@ -676,7 +676,24 @@ impl BackendEngine {
             crate::app_log::log_path().display()
         );
         let _ = writeln!(r, "{}", crate::app_log::tail(60));
-        mask_user_profile(&r)
+        mask_sensitive_data(&r)
+    }
+
+    fn export_anonymous_report(&mut self) -> std::result::Result<Value, String> {
+        let mut text = self.diagnostic_report();
+        if let Ok(selftest) =
+            std::fs::read_to_string(std::env::temp_dir().join("opengear_selftest.txt"))
+        {
+            text.push_str("\n--- Dernier Auto-Test Matériel ---\n");
+            text.push_str(&mask_sensitive_data(&selftest));
+        }
+        let path = std::env::temp_dir().join("opengear_anonymous_report.txt");
+        std::fs::write(&path, &text)
+            .map_err(|e| format!("Écriture du rapport impossible : {e}"))?;
+        Ok(json!({
+            "path": mask_user_profile(&path.display().to_string()),
+            "text": text,
+        }))
     }
 
     fn handle_cmd_inner(
@@ -691,6 +708,7 @@ impl BackendEngine {
             "get_telemetry" => Ok(self.telemetry_json()),
             "get_diagnostics" => Ok(self.diagnostics_json()),
             "get_diagnostic_report" => Ok(json!({ "text": self.diagnostic_report() })),
+            "export_anonymous_report" => self.export_anonymous_report(),
             "open_test_window" => {
                 #[cfg(windows)]
                 {
@@ -727,6 +745,11 @@ impl BackendEngine {
                     && (m == "simple" || m == "expert")
                 {
                     self.config.ui_mode = m.to_string();
+                }
+                if let Some(lang) = p["language"].as_str()
+                    && (lang == "fr" || lang == "en")
+                {
+                    self.config.language = lang.to_string();
                 }
                 if let Some(done) = p["onboarding_done"].as_bool() {
                     self.config.onboarding_done = done;
@@ -1725,6 +1748,17 @@ impl BackendEngine {
                 if let Some(v) = p["auto_profile_switch"].as_bool() {
                     self.config.auto_profile_switch = v;
                 }
+                if let Some(v) = p["openrgb_server"].as_bool() {
+                    self.config.openrgb_server_enabled = v;
+                    self.sync_openrgb_server();
+                    if v && !self.headless
+                        && let Some(err) = self.openrgb_server_error.clone()
+                    {
+                        self.config.openrgb_server_enabled = false;
+                        self.persist_config();
+                        return Err(err);
+                    }
+                }
                 if let Some(v) = p["autostart"].as_bool() {
                     set_autostart_enabled(v, self.config.start_minimized)
                         .map_err(|e| e.to_string())?;
@@ -2027,12 +2061,52 @@ fn mask_user_profile(text: &str) -> String {
     }
 }
 
+/// Mask user home directories, OS username, and long hex serial substrings from shareable logs.
+fn mask_sensitive_data(text: &str) -> String {
+    let mut out = mask_user_profile(text);
+    if let Ok(user) = std::env::var("USERNAME")
+        && user.len() >= 3
+    {
+        out = out.replace(&format!("\\{user}\\"), "\\%USERNAME%\\");
+        out = out.replace(&format!("/{user}/"), "/%USERNAME%/");
+    }
+    // Redact long hex device serial tokens (>= 16 hex digits such as Corsair sub0_<SERIAL>).
+    let mut masked = String::with_capacity(out.len());
+    let mut run = 0usize;
+    let mut buf = String::new();
+    for ch in out.chars() {
+        if ch.is_ascii_hexdigit() {
+            run += 1;
+            buf.push(ch);
+        } else {
+            if run >= 16 {
+                masked.push_str(&buf[..4]);
+                masked.push_str("***");
+                masked.push_str(&buf[buf.len() - 4..]);
+            } else {
+                masked.push_str(&buf);
+            }
+            buf.clear();
+            run = 0;
+            masked.push(ch);
+        }
+    }
+    if run >= 16 {
+        masked.push_str(&buf[..4]);
+        masked.push_str("***");
+        masked.push_str(&buf[buf.len() - 4..]);
+    } else {
+        masked.push_str(&buf);
+    }
+    masked
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{is_allowed_origin, resolve_static_asset};
     use super::{
         battery_alert_step, changed_vendors, check_import_size, is_valid_power_guid,
-        mask_user_profile, parse_temp_source,
+        mask_sensitive_data, mask_user_profile, parse_temp_source,
     };
     use opengear_core::cooling::FanTempSource;
 
@@ -2090,6 +2164,7 @@ mod tests {
     fn static_routes_allow_known_modules_and_reject_unknown_or_external_origins() {
         assert!(resolve_static_asset("/").is_some());
         assert!(resolve_static_asset("/js/main.js").is_some());
+        assert!(resolve_static_asset("/js/i18n.js").is_some());
         assert!(resolve_static_asset("/assets/mouse.webp").is_some());
         assert!(resolve_static_asset("/assets/ram.webp").is_some());
         assert!(resolve_static_asset("/assets/laptop.webp").is_some());
@@ -2149,5 +2224,33 @@ mod tests {
 
         assert!(cfg.zones.is_empty());
         assert!(cfg.last_zone_hardware.contains_key("ch_0"));
+    }
+
+    #[test]
+    fn mask_sensitive_data_redacts_home_user_and_hex_serials() {
+        let mut sample =
+            String::from("dev serial F50019035FFDAB88AA17884605038014 ok; short ABCDEF01 kept");
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            sample.push_str(&format!(r"; cfg {home}\OpenGear"));
+        }
+        if let Ok(user) = std::env::var("USERNAME") {
+            sample.push_str(&format!(r"; extra D:\Tmp\{user}\logs"));
+        }
+        let masked = mask_sensitive_data(&sample);
+        assert!(!masked.contains("F50019035FFDAB88AA17884605038014"));
+        assert!(masked.contains("F500***8014"));
+        assert!(masked.contains("ABCDEF01"));
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            assert!(!masked.contains(&home));
+        }
+        if let Ok(user) = std::env::var("USERNAME")
+            && user.len() >= 3
+        {
+            assert!(!masked.contains(&format!(r"\{user}\")));
+            assert!(masked.contains(r"\%USERNAME%\"));
+        }
+        let defaults = opengear_core::profile::AppConfig::default();
+        assert_eq!(defaults.language, "fr");
+        assert!(!defaults.openrgb_server_enabled);
     }
 }

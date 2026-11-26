@@ -1,6 +1,6 @@
 import { ICONS, arr, esc, fmtHz, num, plural, safeHex } from "../utils.js";
 import { S, deviceById, devicesList, getEq, headsetImage, isExpert, local } from "../state.js";
-import { advancedHint, batteryBadge, deviceFans, deviceSettings, deviceVisual, emptyState, expertTag, pageHeader, sensorChips, sliderRow } from "../components.js";
+import { advancedHint, batteryBadge, deviceBlueprintSvg, deviceFans, deviceSettings, deviceVisual, emptyState, expertTag, pageHeader, sensorChips, sliderRow } from "../components.js";
 import { cardCorsairMouse, cardLogiDpi } from "./performance.js";
 import { cardLogiOnboard } from "./input.js";
 
@@ -103,6 +103,7 @@ function ficheGeneric(d) {
   const conn = { usb: "USB", wireless: "Sans fil", bluetooth: "Bluetooth", internal: "Interne" }[dev.info.connection];
   return `
     ${ficheHead(d)}
+    ${deviceBlueprintSvg(d, dev)}
     ${dev.lighting ? linkCard("Effets logiciels, effets matériels et placement bureau se règlent dans Éclairage.", "lighting", "devices", "Éclairage") : ""}
     ${deviceSettings(d.deviceId)}
     ${deviceFans(d.deviceId)}

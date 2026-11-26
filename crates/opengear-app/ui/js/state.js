@@ -49,6 +49,7 @@ export function ui() {
   const u = (S && S.ui) || {};
   return {
     mode: u.mode === "simple" || u.mode === "expert" ? u.mode : local.uiModeOverride || "expert",
+    language: u.language === "en" ? "en" : "fr",
     onboarding_done: S && S.ui ? u.onboarding_done !== false : true,
     can_undo: !!u.can_undo,
     undo_label: u.undo_label || null,
@@ -309,8 +310,9 @@ export function devicesList() {
 
 export function updateChrome() {
   if (!S) return;
+  const isEn = ui().language === "en";
   const verEl = document.getElementById("app-version");
-  if (verEl && S.app_version) verEl.textContent = `OpenGear v${S.app_version} · aucune télémétrie`;
+  if (verEl && S.app_version) verEl.textContent = `OpenGear v${S.app_version} · ${isEn ? "no telemetry" : "aucune télémétrie"}`;
   document.querySelectorAll(".nav-item").forEach((b) => {
     const on = b.dataset.tab === local.tab;
     b.classList.toggle("active", on);
@@ -330,7 +332,11 @@ export function updateChrome() {
     const warns = checks.filter((c) => c.status === "warn").length;
     bs.textContent = errs ? String(errs) : warns ? String(warns) : "";
     bs.className = "nav-badge" + (errs ? " err" : warns ? " warn" : "");
-    bs.title = errs ? `${errs} erreur(s) au diagnostic` : warns ? `${warns} avertissement(s) au diagnostic` : "";
+    bs.title = errs
+      ? (isEn ? `${errs} diagnostic error(s)` : `${errs} erreur(s) au diagnostic`)
+      : warns
+        ? (isEn ? `${warns} diagnostic warning(s)` : `${warns} avertissement(s) au diagnostic`)
+        : "";
   }
   const sel = document.getElementById("profile-select");
   if (sel && document.activeElement !== sel) {
@@ -344,12 +350,18 @@ export function updateChrome() {
   if (ms) ms.setAttribute("aria-pressed", String(mode === "simple"));
   if (me) me.setAttribute("aria-pressed", String(mode === "expert"));
   const mh = document.getElementById("mode-hint");
-  if (mh) mh.textContent = mode === "simple" ? "Réglages avancés masqués." : "Tous les réglages sont visibles.";
+  if (mh) {
+    mh.textContent = mode === "simple"
+      ? (isEn ? "Advanced settings hidden." : "Réglages avancés masqués.")
+      : (isEn ? "All settings visible." : "Tous les réglages sont visibles.");
+  }
   const u = ui();
   const ub = document.getElementById("btn-undo");
   if (ub) {
     ub.hidden = !u.can_undo;
-    ub.textContent = u.undo_label ? `Annuler : ${u.undo_label}` : "Annuler la dernière modification";
+    ub.textContent = u.undo_label
+      ? (isEn ? `Undo: ${u.undo_label}` : `Annuler : ${u.undo_label}`)
+      : (isEn ? "Undo last change" : "Annuler la dernière modification");
     ub.title = ub.textContent;
   }
 }

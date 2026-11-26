@@ -60,9 +60,13 @@ export const LABEL_FMT = {
   dpi: (v) => `${v} DPI`,
   deg: (v) => `${v} °C`,
   rot: (v) => `${v} °`,
-  sec: (v) => (Number(v) ? `${v} s` : "Instantané"),
-  ms: (v) => (Number(v) ? `${v} ms` : "Désactivé"),
-  ramspeed: (v) => ["Très rapide", "Rapide", "Normal", "Lent", "Très lent"][Number(v)] || "Normal",
+  sec: (v) => (Number(v) ? `${v} s` : document.documentElement.lang === "en" ? "Instant" : "Instantané"),
+  ms: (v) => (Number(v) ? `${v} ms` : document.documentElement.lang === "en" ? "Disabled" : "Désactivé"),
+  ramspeed: (v) => {
+    const en = ["Very fast", "Fast", "Normal", "Slow", "Very slow"];
+    const fr = ["Très rapide", "Rapide", "Normal", "Lent", "Très lent"];
+    return (document.documentElement.lang === "en" ? en : fr)[Number(v)] || "Normal";
+  },
 };
 
 export const MACRO_PRESETS = {
@@ -128,9 +132,10 @@ export const fmtHz = (hz) => (hz >= 1000 ? `${hz / 1000} kHz` : `${hz} Hz`);
 
 export function fmtDate(ms) {
   const n = Number(ms);
-  if (!Number.isFinite(n) || n <= 0) return "Date inconnue";
+  const en = document.documentElement.lang === "en";
+  if (!Number.isFinite(n) || n <= 0) return en ? "Unknown date" : "Date inconnue";
   try {
-    return new Date(n).toLocaleString("fr-FR", { day: "2-digit", month: "long", year: "numeric", hour: "2-digit", minute: "2-digit" });
+    return new Date(n).toLocaleString(en ? "en-US" : "fr-FR", { day: "2-digit", month: "long", year: "numeric", hour: "2-digit", minute: "2-digit" });
   } catch (_) {
     return new Date(n).toISOString();
   }
@@ -138,10 +143,11 @@ export function fmtDate(ms) {
 
 export function fmtSize(b) {
   const n = Number(b);
+  const en = document.documentElement.lang === "en";
   if (!Number.isFinite(n)) return "—";
-  if (n < 1024) return `${n} o`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} Ko`;
-  return `${(n / 1024 / 1024).toFixed(1)} Mo`;
+  if (n < 1024) return `${n} ${en ? "B" : "o"}`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} ${en ? "KB" : "Ko"}`;
+  return `${(n / 1024 / 1024).toFixed(1)} ${en ? "MB" : "Mo"}`;
 }
 
 export const plural = (n, one, many) => `${n} ${n > 1 ? many : one}`;

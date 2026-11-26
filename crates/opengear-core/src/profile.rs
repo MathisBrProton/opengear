@@ -227,9 +227,15 @@ pub struct AppConfig {
     /// Interface mode: "simple" (risky / advanced settings hidden) or "expert".
     #[serde(default = "default_ui_mode")]
     pub ui_mode: String,
+    /// Interface language ("fr" or "en").
+    #[serde(default = "default_language")]
+    pub language: String,
     /// First-run assistant completed (or skipped).
     #[serde(default)]
     pub onboarding_done: bool,
+    /// Expose OpenGear Lighting devices via a localhost OpenRGB SDK server (`127.0.0.1:6742`).
+    #[serde(default)]
+    pub openrgb_server_enabled: bool,
     /// Turn every OpenGear-controlled light off while the Windows session is locked.
     #[serde(default = "default_true")]
     pub lights_off_on_lock: bool,
@@ -261,6 +267,10 @@ fn default_ui_mode() -> String {
     "simple".to_string()
 }
 
+fn default_language() -> String {
+    "fr".to_string()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -271,7 +281,9 @@ impl Default for AppConfig {
             start_minimized: false,
             auto_profile_switch: true,
             ui_mode: default_ui_mode(),
+            language: default_language(),
             onboarding_done: false,
+            openrgb_server_enabled: false,
             lights_off_on_lock: true,
             idle_lights_off_min: 0,
             battery_alerts: true,

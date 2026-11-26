@@ -2,6 +2,7 @@ import { ICONS, LABEL_FMT, arr, clamp, devIdx, downloadText, esc, inputVal, num,
 import { call, doUndo, humanError, rpc, setBusy, setStatus, toast } from "./ipc.js";
 import { modalStack, trapFocus } from "./modals.js";
 import { S, applyState, getDraftFor, local, registerHooks, ui, updateChrome } from "./state.js";
+import { curLang, t, translateChrome, translateDom } from "./i18n.js";
 import { seg, updateTelemetryDom } from "./components.js";
 import { startRgbPreviewLoop } from "./rgb-preview.js";
 import { presetCard, viewHome } from "./views/home.js";
@@ -55,6 +56,8 @@ function render() {
     html = `<div class="alert err"><span class="alert-icon">${ICONS.warn}</span><div><div class="alert-title">Cette page n'a pas pu s'afficher</div><div class="muted">${esc(e && e.message)}</div></div></div>`;
   }
   main.innerHTML = html;
+  translateChrome();
+  translateDom(main);
   main.scrollTop = key === lastRenderKey ? scroll : 0;
   lastRenderKey = key;
   local.pendingRender = false;
@@ -184,6 +187,7 @@ function renderWizard() {
       </div>
     </div>`;
   const p = wiz.el.querySelector("#wiz-primary");
+  translateDom(wiz.el);
   setTimeout(() => p && p.focus(), 0);
 }
 
@@ -295,6 +299,7 @@ const ACT = {
   subtab: (el) => go(local.tab, { sub: el.dataset.id, keepFocus: true }),
   "set-mode": (el) => setMode(el.dataset.mode, el),
   "set-mode-seg": (el) => setMode(el.dataset.val, el),
+  "set-lang-seg": (el) => call("set_ui_prefs", { language: el.dataset.val }, { btn: el, ok: el.dataset.val === "en" ? "Language: English" : "Langue : Français" }),
   undo: (el) => doUndo(el),
   rescan: (el) => call("reconnect_all", {}, { btn: el, ok: "Recherche terminée : liste des appareils actualisée." }).then(() => loadDiagnostics()),
   "open-device": (el) => go("devices", { device: el.dataset.key }),
@@ -328,7 +333,7 @@ const ACT = {
     const zoneId = el.dataset.zoneId || null;
     const ov = buildOverridePayload(devId, zoneId);
     const saveFlash = el.dataset.save === "1";
-    if (saveFlash && !confirm("Écrire cet effet directement dans la mémoire flash / EEPROM de l'appareil ?")) {
+    if (saveFlash && !confirm(t("Écrire cet effet directement dans la mémoire flash / EEPROM de l'appareil ?"))) {
       return;
     }
     if (ov && ov.mode === "hardware" && ov.request) {
@@ -702,6 +707,18 @@ const ACT = {
       toast(String((e && e.message) || e), "err");
     } finally {
       el.disabled = false;
+    }
+  },
+  "diag-export": async (el) => {
+    setBusy(el, true);
+    try {
+      const res = await rpc("export_anonymous_report", {});
+      downloadText("opengear-anonymous-diagnostic.txt", (res && res.text) || "");
+      toast(curLang() === "en" ? "Anonymous report downloaded." : "Rapport anonyme téléchargé.", "ok");
+    } catch (e) {
+      toast(humanError(e && e.message), "err");
+    } finally {
+      setBusy(el, false);
     }
   },
   "diag-action": async (el) => {

@@ -1,5 +1,6 @@
 import { ICONS, SWATCHES, arr, clamp, dataAttrs, esc, fmtHz, num, setBar, setTxt } from "./utils.js";
 import { S, deviceById, isExpert, k70Image, local } from "./state.js";
+import { curLang, t, translateDom } from "./i18n.js";
 
 export function pageHeader(title, subHtml, actionsHtml = "", accent = "") {
   return `
@@ -61,10 +62,10 @@ export function swatches(act, current, data = {}) {
   ).join("")}</div>`;
 }
 
-export function sliderRow(label, { id, min, max, step = 1, value, input, change, data = {}, display }) {
+export function sliderRow(label, { id, min, max, step = 1, value, input, change, data = {}, display, labelHtml = null }) {
   return `
     <div class="slider-row">
-      <label class="field-label" for="${id}">${esc(label)}</label>
+      <label class="field-label" for="${id}">${labelHtml || esc(label)}</label>
       <input type="range" class="og-range" id="${id}" min="${min}" max="${max}" step="${step}" value="${esc(value)}" ${input ? `data-input="${input}"` : ""} ${change ? `data-change="${change}"` : ""} ${dataAttrs(data)} data-label="${id}-val" />
       <span class="val" id="${id}-val">${esc(display != null ? display : value)}</span>
     </div>`;
@@ -81,6 +82,81 @@ export function batteryBadge(pct, charging, hours = null) {
 export function deviceVisual(d, cls = "") {
   if (d.img) return `<img src="${esc(d.img)}" class="${cls} ${d.imgCls || ""}" alt="" />`;
   return `<span class="glyph">${ICONS[d.icon] || ICONS.chip}</span>`;
+}
+
+/** Parametric SVG schematic built exclusively from the device's reported model/capabilities. */
+export function deviceBlueprintSvg(d, dev) {
+  if (!dev) return "";
+  const zones = arr(dev.lighting && dev.lighting.zones);
+  const fans = arr(dev.cooling && dev.cooling.fans);
+  const ptr = dev.pointer;
+  if (!zones.length && !fans.length && !ptr) return "";
+
+  const cleanLabel = (raw, maxLen = 28) => {
+    let s = String(raw || "")
+      .replace(/^Fan Header /i, "Fan ")
+      .replace(/\s*\(pawnio_[^)]+\)$/i, "")
+      .replace(/\s*\([^)]{10,}\)$/, "");
+    s = t(s);
+    return s.length > maxLen ? `${s.slice(0, maxLen - 1)}…` : s;
+  };
+
+  const rows = [];
+  if (zones.length) {
+    zones.slice(0, 6).forEach((z, idx) => {
+      const y = 14 + idx * 24;
+      const n = arr(z.leds).length;
+      const pips = Math.min(n, 16);
+      const pipHtml = Array.from({ length: pips }, (_, pi) => {
+        const cx = 248 + pi * 12;
+        return `<circle cx="${cx}" cy="${y + 8}" r="3.2" fill="#00D4FF" fill-opacity="0.82"/>`;
+      }).join("");
+      rows.push(`
+        <rect x="8" y="${y}" width="524" height="17" rx="5" fill="rgba(255,255,255,0.035)" stroke="rgba(255,255,255,0.12)"/>
+        <text x="18" y="${y + 12}" fill="#e2e8f0" font-size="9.5" font-weight="600">${esc(cleanLabel(z.name || z.id, 30))}</text>
+        ${pipHtml}
+        <text x="522" y="${y + 12}" text-anchor="end" fill="#7dd3fc" font-size="9">${n} LED${n > 1 ? "s" : ""}</text>`);
+    });
+  } else if (ptr) {
+    const stages = arr(ptr.stages).slice(0, 6);
+    const step = 520 / Math.max(1, stages.length);
+    stages.forEach((dpi, idx) => {
+      const w = Math.min(72, step - 16);
+      const x = 10 + step * (idx + 0.5) - w / 2;
+      const active = idx === num(ptr.active_stage);
+      const h = Math.round(14 + Math.min(dpi / 26000, 1) * 44);
+      rows.push(`
+        <rect x="${x.toFixed(1)}" y="${72 - h}" width="${w.toFixed(1)}" height="${h}" rx="4" fill="${active ? "rgba(0,212,255,0.35)" : "rgba(255,255,255,0.06)"}" stroke="${active ? "#00D4FF" : "rgba(255,255,255,0.15)"}"/>
+        <text x="${(x + w / 2).toFixed(1)}" y="86" text-anchor="middle" fill="${active ? "#00D4FF" : "#94a3b8"}" font-size="9">${dpi}</text>`);
+    });
+  } else if (fans.length) {
+    const list = fans.slice(0, 7);
+    const step = 520 / Math.max(1, list.length);
+    list.forEach((f, idx) => {
+      const x = (10 + step * (idx + 0.5)).toFixed(1);
+      const active = f.manual_pct != null;
+      const val = f.rpm != null && f.rpm > 0
+        ? `${f.rpm}`
+        : f.manual_pct != null
+          ? `${f.manual_pct}%`
+          : f.rpm === 0
+            ? "0"
+            : "Auto";
+      rows.push(`
+        <circle cx="${x}" cy="38" r="22" fill="rgba(255,255,255,0.03)" stroke="${active ? "#f59e0b" : "#10b981"}" stroke-width="1.6"/>
+        <circle cx="${x}" cy="38" r="6" fill="rgba(255,255,255,0.15)"/>
+        <text x="${x}" y="41" text-anchor="middle" fill="#f8fafc" font-size="8.5" font-weight="650">${esc(val)}</text>
+        <text x="${x}" y="76" text-anchor="middle" fill="#94a3b8" font-size="8.5">${esc(cleanLabel(f.name || f.id, 14))}</text>`);
+    });
+  }
+  const h = zones.length ? Math.max(58, 22 + Math.min(zones.length, 6) * 24) : 96;
+  return `
+    <div class="card">
+      <div class="card-head"><h2 class="card-title">Schéma des capacités</h2><span class="muted small">${esc(d.type)}</span></div>
+      <svg class="blueprint-svg" viewBox="0 0 540 ${h}" role="img" aria-label="Schéma des capacités">
+        ${rows.join("")}
+      </svg>
+    </div>`;
 }
 
 export function quickBtn(q) {
@@ -117,6 +193,7 @@ export function sensorChips(tel) {
 export function updateTelemetryDom(tel) {
   if (!tel) return;
   updateDeviceFansDom(tel);
+  const isEn = curLang() === "en";
   const sensors = tel.sensors || {};
   const gpu = tel.gpu || {};
   const cpuPct = num(tel.cpu_usage_pct);
@@ -128,47 +205,50 @@ export function updateTelemetryDom(tel) {
   if (mini) {
     const parts = [`CPU ${Math.round(cpuPct)} %${cpuT != null ? ` · ${Math.round(cpuT)} °C` : ""}`];
     if (gpuT != null) parts.push(`GPU ${Math.round(gpuT)} °C${gpu.power_watts != null ? ` · ${Math.round(gpu.power_watts)}W` : ""}`);
-    if (sensors.aio_pump_rpm != null) parts.push(`Pompe ${num(sensors.aio_pump_rpm)} tr/min`);
+    if (sensors.aio_pump_rpm != null) parts.push(`${isEn ? "Pump" : "Pompe"} ${num(sensors.aio_pump_rpm)} ${isEn ? "RPM" : "tr/min"}`);
     const lb = tel.laptop_battery;
     if (lb && lb.present && lb.percent != null) parts.push(`Bat ${num(lb.percent)} %`);
-    parts.push(`RAM ${ramUsed.toFixed(1)} Go`);
+    parts.push(`RAM ${ramUsed.toFixed(1)} ${isEn ? "GB" : "Go"}`);
     mini.textContent = parts.join("  ·  ");
   }
   if (document.getElementById("tel-cpu-val")) {
     setTxt("tel-cpu-val", `${Math.round(cpuPct)} %`);
-    setTxt("tel-cpu-sub", `${cpuT != null ? `${Math.round(cpuT)} °C · ` : ""}${S.static_info.cpu_name || "Charge processeur"}`);
+    setTxt("tel-cpu-sub", `${cpuT != null ? `${Math.round(cpuT)} °C · ` : ""}${S.static_info.cpu_name || t("Charge processeur")}`);
     setBar("tel-cpu-bar", cpuPct);
     if (gpu.available && gpuT != null) {
       setTxt("tel-gpu-val", `${Math.round(gpuT)} °C`);
       const extra = gpu.power_watts != null ? ` · ${Math.round(gpu.power_watts)} W` : gpu.core_clock_mhz ? ` · ${gpu.core_clock_mhz} MHz` : "";
-      setTxt("tel-gpu-sub", `Charge ${num(gpu.activity_pct)} %${extra}`);
+      setTxt("tel-gpu-sub", `${isEn ? "Load" : "Charge"} ${num(gpu.activity_pct)} %${extra}`);
       setBar("tel-gpu-bar", (gpuT / 95) * 100);
     } else {
       setTxt("tel-gpu-val", "—");
-      setTxt("tel-gpu-sub", "Capteur GPU indisponible");
+      setTxt("tel-gpu-sub", t("Capteur GPU indisponible"));
     }
-    setTxt("tel-ram-val", `${ramUsed.toFixed(1)} Go`);
-    setTxt("tel-ram-sub", ramTot ? `sur ${Math.round(ramTot)} Go (${Math.round(num(tel.ram_usage_pct))} %)` : "");
+    setTxt("tel-ram-val", `${ramUsed.toFixed(1)} ${isEn ? "GB" : "Go"}`);
+    setTxt("tel-ram-sub", ramTot ? (isEn ? `of ${Math.round(ramTot)} GB (${Math.round(num(tel.ram_usage_pct))}%)` : `sur ${Math.round(ramTot)} Go (${Math.round(num(tel.ram_usage_pct))} %)`) : "");
     setBar("tel-ram-bar", tel.ram_usage_pct);
     const hot = [cpuT, sensors.motherboard_temp_c, sensors.nvme_temp_c, gpuT].filter((x) => x != null);
     if (hot.length) {
       const mx = Math.max(...hot);
       setTxt("tel-temp-val", `${Math.round(mx)} °C`);
       const sub2 = [];
-      if (sensors.motherboard_temp_c != null) sub2.push(`Carte mère ${Math.round(sensors.motherboard_temp_c)} °C`);
+      if (sensors.motherboard_temp_c != null) sub2.push(`${isEn ? "Motherboard" : "Carte mère"} ${Math.round(sensors.motherboard_temp_c)} °C`);
       if (sensors.nvme_temp_c != null) sub2.push(`NVMe ${Math.round(sensors.nvme_temp_c)} °C`);
-      if (sensors.aio_pump_rpm != null) sub2.push(`Pompe ${num(sensors.aio_pump_rpm)} tr/min`);
-      setTxt("tel-temp-sub", sub2.join(" · ") || "Composant le plus chaud");
+      if (sensors.aio_pump_rpm != null) sub2.push(`${isEn ? "Pump" : "Pompe"} ${num(sensors.aio_pump_rpm)} ${isEn ? "RPM" : "tr/min"}`);
+      setTxt("tel-temp-sub", sub2.join(" · ") || t("Composant le plus chaud"));
       setBar("tel-temp-bar", (mx / 95) * 100);
     } else {
       setTxt("tel-temp-val", "—");
-      setTxt("tel-temp-sub", "Capteurs de température indisponibles");
+      setTxt("tel-temp-sub", t("Capteurs de température indisponibles"));
     }
   }
   const live = document.getElementById("cool-live");
-  if (live) live.innerHTML = sensorChips(tel);
+  if (live) {
+    live.innerHTML = sensorChips(tel);
+    translateDom(live);
+  }
   const audioOut = document.getElementById("wa-out-state");
-  if (audioOut && tel.audio) audioOut.textContent = tel.audio.output_muted ? "Muet" : `${num(tel.audio.output_volume_pct)} %`;
+  if (audioOut && tel.audio) audioOut.textContent = tel.audio.output_muted ? t("Muet") : `${num(tel.audio.output_volume_pct)} %`;
 }
 
 export function renderKeyboard(mode, kb) {
@@ -312,7 +392,7 @@ export function deviceFans(deviceId, { title = "Ventilateurs", bare = false } = 
     ${c.overridden ? `<div class="row mb-16"><span class="pill amber"><span class="dot"></span>Ventilation forcée : le BIOS ne pilote plus les ventilateurs</span></div>` : ""}
     ${isExpert() ? `
       <div class="stack" style="gap:10px">
-        ${sliderRow(`Vitesse manuelle ${expertTag()}`, { id: domId, min: floor, max: 100, value, input: "label", data: { fmt: "pct100" }, display: `${value} %` })}
+        ${sliderRow("Vitesse manuelle", { labelHtml: `${esc(t("Vitesse manuelle"))} ${expertTag()}`, id: domId, min: floor, max: 100, value, input: "label", data: { fmt: "pct100" }, display: `${value} %` })}
         <div class="row">
           <button type="button" class="btn btn-primary btn-sm" data-act="dev-fan-apply" data-device="${esc(deviceId)}" data-target="${domId}">Forcer la vitesse</button>
           <button type="button" class="btn btn-secondary btn-sm" data-act="dev-fan-auto" data-device="${esc(deviceId)}">Automatique</button>
@@ -327,7 +407,8 @@ export function deviceFans(deviceId, { title = "Ventilateurs", bare = false } = 
 const fanDomId = (deviceId) => `fan-${deviceId}`.replace(/[^a-zA-Z0-9_-]/g, "_");
 
 function fanChips(fans) {
-  return arr(fans).map((f) => `<span class="pill ${num(f.rpm) > 0 ? "amber" : ""}">${esc(f.name)} ${f.rpm != null ? `${num(f.rpm)} tr/min` : "—"}${f.manual_pct != null ? ` · ${num(f.manual_pct)} %` : ""}</span>`).join("");
+  const unit = curLang() === "en" ? "RPM" : "tr/min";
+  return arr(fans).map((f) => `<span class="pill ${num(f.rpm) > 0 ? "amber" : ""}">${esc(f.name)} ${f.rpm != null ? `${num(f.rpm)} ${unit}` : "—"}${f.manual_pct != null ? ` · ${num(f.manual_pct)} %` : ""}</span>`).join("");
 }
 
 /** Live update of the fan chips rendered by `deviceFans` (telemetry push). */

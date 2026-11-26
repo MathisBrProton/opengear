@@ -1,6 +1,7 @@
 import { CONFIG_CMDS } from "./utils.js";
 import { S, applyState, updateChrome } from "./state.js";
 import { confirmDialog, riskOf } from "./modals.js";
+import { t } from "./i18n.js";
 
 const DEFAULT_RPC_TIMEOUT_MS = 15_000;
 let nextReqId = 1;
@@ -43,12 +44,13 @@ export function rpc(cmd, payload = {}, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
 
 export function setStatus(txt) {
   const el = document.getElementById("status-text");
-  if (el) el.textContent = txt;
+  if (el) el.textContent = t(txt);
 }
 
 export function toast(msg, kind = "info", opts = {}) {
   if (!msg) return null;
-  setStatus(msg);
+  const localized = t(msg);
+  setStatus(localized);
   const root = document.getElementById("toast-root");
   if (!root) return null;
   const el = document.createElement("div");
@@ -56,13 +58,13 @@ export function toast(msg, kind = "info", opts = {}) {
   el.setAttribute("role", kind === "err" ? "alert" : "status");
   const txt = document.createElement("span");
   txt.className = "toast-msg";
-  txt.textContent = msg;
+  txt.textContent = localized;
   el.appendChild(txt);
   if (opts.action) {
     const b = document.createElement("button");
     b.type = "button";
     b.className = "toast-btn";
-    b.textContent = opts.action.label;
+    b.textContent = t(opts.action.label);
     b.onclick = () => {
       clearTimeout(el._timer);
       el.remove();

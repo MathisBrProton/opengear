@@ -278,6 +278,7 @@ function softwareMouseCard() {
   const layerMap = layer === "base" ? (prof.mouse_bindings || {}) : ((prof.mouse_layers && prof.mouse_layers[layer]) || {});
   const mb = Object.entries(layerMap);
   const btns = arr(S.bindable_mouse_buttons);
+  const selBtn = (btns[0] && btns[0].id) || "Back";
   const targets = [
     ...arr(S.bindable_mouse_targets).map((t) => `<option value="${esc(t.id)}">${esc(t.label)}</option>`),
     ...arr(S.bindable_keys).map((k) => `<option value="${esc(k)}">${esc(keyLabel(k))}</option>`),
@@ -300,7 +301,7 @@ function softwareMouseCard() {
         </div>
         <div class="row">
           <label class="field-label" for="m-src-btn">Bouton</label>
-          <select id="m-src-btn" class="og-select grow">${btns.map((b) => `<option value="${esc(b.id)}">${esc(b.label)}</option>`).join("")}</select>
+          <select id="m-src-btn" class="og-select grow">${btns.map((b) => `<option value="${esc(b.id)}" ${b.id === selBtn ? "selected" : ""}>${esc(b.label)}</option>`).join("")}</select>
         </div>
         <div class="row mt-12">
           <label class="field-label" for="m-remap-target">Remplacer par</label>

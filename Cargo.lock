@@ -1608,6 +1608,7 @@ dependencies = [
  "anyhow",
  "opengear-core",
  "opengear-mainboard",
+ "tracing",
 ]
 
 [[package]]

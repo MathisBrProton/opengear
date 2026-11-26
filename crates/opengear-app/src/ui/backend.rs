@@ -37,6 +37,7 @@ use opengear_core::{
 };
 use opengear_corsair::key_code_for_led_index;
 use opengear_input::{InputEngine, reset_held_state};
+use opengear_openrgb::server::{OpenRgbSdkServer, OpenRgbServerEvent, SdkController};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -99,6 +100,9 @@ pub(crate) struct BackendEngine {
     pub ac_saved_settings: Vec<(String, String, Value)>,
     /// True in headless/selftest audits: suppresses OS tray/fan-watchdog side effects and live hooks.
     pub headless: bool,
+    /// Optional localhost OpenRGB SDK TCP bridge (`127.0.0.1:6742`).
+    pub openrgb_server: Option<OpenRgbSdkServer>,
+    pub openrgb_server_error: Option<String>,
 }
 
 /// One change made by the battery saver: `(setting, new value, previous value)`.
@@ -333,6 +337,8 @@ impl BackendEngine {
             last_ac_online,
             ac_saved_settings: Vec::new(),
             headless: false,
+            openrgb_server: None,
+            openrgb_server_error: None,
         };
         // A device may already be overridden (e.g. Max Fan left on): arm the crash safety net.
         eng.sync_cooling_marker();
@@ -348,6 +354,7 @@ impl BackendEngine {
         {
             let _ = eng.input_engine.start();
         }
+        eng.sync_openrgb_server();
         eng.sync_tray_state();
         eng
     }
@@ -416,6 +423,8 @@ impl BackendEngine {
             last_ac_online: None,
             ac_saved_settings: Vec::new(),
             headless: true,
+            openrgb_server: None,
+            openrgb_server_error: None,
         }
     }
 
@@ -582,6 +591,7 @@ impl BackendEngine {
     }
 
     pub(crate) fn restore_hardware_on_exit(&mut self) {
+        self.openrgb_server = None;
         self.input_engine.stop();
         reset_held_state();
 
@@ -677,8 +687,12 @@ impl BackendEngine {
             THERMAL_RGB_ACTIVE.store(thermal_rgb_active, Ordering::Relaxed);
             SMART_FAN_ACTIVE.store(smart_fan_active, Ordering::Relaxed);
 
-            let wait_ms = if live_rgb_active
-                && (animated_rgb_active || pending_static_rgb)
+            let openrgb_clients_active = self
+                .openrgb_server
+                .as_ref()
+                .is_some_and(|s| s.client_count() > 0);
+            let wait_ms = if ((live_rgb_active && (animated_rgb_active || pending_static_rgb))
+                || openrgb_clients_active)
                 && !self.blackout_applied
                 && !self.suspended
             {
@@ -947,7 +961,8 @@ impl BackendEngine {
                 }
             }
 
-            // 4. Live RGB streaming (fast 35ms only for animated effects or pending static flush)
+            // 4. External OpenRGB SDK bridge + Live RGB streaming
+            self.poll_openrgb_server();
             let rgb_interval = if live_rgb_active && pending_static_rgb {
                 Duration::ZERO
             } else if live_rgb_active && animated_rgb_active {
@@ -1446,7 +1461,68 @@ impl BackendEngine {
             self.power_plans = list_power_plans();
             self.scanned_devices = scan_hid_devices(false).unwrap_or_default();
             self.last_hid_sig = compute_hid_signature();
+            self.sync_openrgb_server();
             self.sync_tray_state();
+        }
+    }
+
+    pub(crate) fn sync_openrgb_server(&mut self) {
+        if self.headless || !self.config.openrgb_server_enabled {
+            self.openrgb_server = None;
+            self.openrgb_server_error = None;
+            return;
+        }
+        let controllers: Vec<SdkController> = self
+            .driver_devices
+            .iter_mut()
+            .filter_map(|d| {
+                let info = d.info();
+                d.lighting()
+                    .map(|l| SdkController::from_device(&info, l.zones()))
+            })
+            .collect();
+        if let Some(ref srv) = self.openrgb_server {
+            srv.set_controllers(controllers);
+            self.openrgb_server_error = None;
+            return;
+        }
+        match OpenRgbSdkServer::start("127.0.0.1:6742", controllers) {
+            Ok(srv) => {
+                self.openrgb_server = Some(srv);
+                self.openrgb_server_error = None;
+            }
+            Err(e) => {
+                tracing::warn!("Pont OpenRGB SDK non démarré : {e:#}");
+                self.openrgb_server = None;
+                self.openrgb_server_error = Some(e.to_string());
+            }
+        }
+    }
+
+    fn poll_openrgb_server(&mut self) {
+        let Some(ref srv) = self.openrgb_server else {
+            return;
+        };
+        let events = srv.poll_events();
+        if events.is_empty() || self.suspended || self.blackout_applied {
+            return;
+        }
+        // Keep only the latest frame per device in this tick.
+        let mut latest_frames: HashMap<String, Vec<Rgb>> = HashMap::new();
+        for ev in events {
+            if let OpenRgbServerEvent::UpdateLeds { device_id, colors } = ev {
+                latest_frames.insert(device_id, colors);
+            }
+        }
+        for dev in &mut self.driver_devices {
+            let id = dev.info().id;
+            if let Some(frame) = latest_frames.get(&id)
+                && let Some(lighting) = dev.lighting()
+                && lighting.set_frame(frame).is_ok()
+            {
+                self.live_active_devices.insert(id.clone());
+                self.last_device_frames.insert(id, frame.clone());
+            }
         }
     }
 

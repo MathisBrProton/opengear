@@ -7,5 +7,6 @@ description = "Client for the OpenRGB network SDK (own implementation of the pro
 
 [dependencies]
 anyhow.workspace = true
+tracing.workspace = true
 opengear-core.workspace = true
 opengear-mainboard.workspace = true

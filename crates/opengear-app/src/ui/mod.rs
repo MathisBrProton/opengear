@@ -31,6 +31,7 @@ use wry::{WebViewBuilder, http};
 const INDEX_HTML: &[u8] = include_bytes!("../../ui/index.html");
 const APP_CSS: &[u8] = include_bytes!("../../ui/app.css");
 const JS_MAIN: &[u8] = include_bytes!("../../ui/js/main.js");
+const JS_I18N: &[u8] = include_bytes!("../../ui/js/i18n.js");
 const JS_UTILS: &[u8] = include_bytes!("../../ui/js/utils.js");
 const JS_IPC: &[u8] = include_bytes!("../../ui/js/ipc.js");
 const JS_MODALS: &[u8] = include_bytes!("../../ui/js/modals.js");
@@ -111,6 +112,7 @@ pub(crate) fn resolve_static_asset(path: &str) -> Option<(&'static [u8], &'stati
         "/" | "/index.html" => Some((INDEX_HTML, "text/html; charset=utf-8", true)),
         "/app.css" => Some((APP_CSS, "text/css; charset=utf-8", false)),
         "/js/main.js" => Some((JS_MAIN, "application/javascript; charset=utf-8", false)),
+        "/js/i18n.js" => Some((JS_I18N, "application/javascript; charset=utf-8", false)),
         "/js/utils.js" => Some((JS_UTILS, "application/javascript; charset=utf-8", false)),
         "/js/ipc.js" => Some((JS_IPC, "application/javascript; charset=utf-8", false)),
         "/js/modals.js" => Some((JS_MODALS, "application/javascript; charset=utf-8", false)),

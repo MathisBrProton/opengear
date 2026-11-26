@@ -23,6 +23,8 @@ export function viewSystem() {
 function sysPrefs() {
   const sp = S.system_prefs;
   const mode = ui().mode;
+  const lang = ui().language;
+  const ex = isExpert();
   return `
     <div class="grid-2">
       <div class="card">
@@ -30,6 +32,11 @@ function sysPrefs() {
         <div class="row-between">
           <div><div style="font-weight:600">Mode d'affichage</div><div class="muted">Simple masque les réglages avancés ou risqués. Expert affiche tout.</div></div>
           ${seg([["simple", "Simple"], ["expert", "Expert"]], mode, "set-mode-seg")}
+        </div>
+        <div class="divider"></div>
+        <div class="row-between">
+          <div><div style="font-weight:600">Langue de l'interface</div><div class="muted">Français ou English en direct.</div></div>
+          ${seg([["fr", "Français"], ["en", "English"]], lang, "set-lang-seg")}
         </div>
         <div class="divider"></div>
         <div class="row-between"><span class="muted">Clavier affiché : disposition Windows <strong>${esc((S.keyboard.os_layout || {}).top_row || "?")}</strong>, format réglable dans Touches &amp; macros.</span><button type="button" class="btn btn-sm btn-secondary" data-act="nav" data-tab="input">Ouvrir</button></div>
@@ -66,7 +73,20 @@ function sysPrefs() {
         </div>
       </div>
     </div>
+    ${ex ? cardOpenRgbServer(sp) : ""}
     ${cardExperimentalDrivers()}`;
+}
+
+function cardOpenRgbServer(sp) {
+  return `
+    <div class="card expert-card mt-16">
+      <div class="card-head">
+        <div><h2 class="card-title">Pont serveur OpenRGB SDK ${expertTag()}</h2><div class="card-desc">Expose les appareils lumineux d'OpenGear en local (127.0.0.1:6742) pour SignalRGB, Artemis ou Wallpaper Engine (désactivé par défaut).</div></div>
+        ${sp.openrgb_server ? `<span class="pill cyan">${num(sp.openrgb_clients)} client(s) connecté(s)</span>` : ""}
+      </div>
+      ${sw(!!sp.openrgb_server, "Activer le serveur OpenRGB SDK (localhost uniquement)", "sys-pref", { key: "openrgb_server" })}
+      ${sp.openrgb_server_error ? `<div class="muted small mt-8" style="color:var(--rog)">${esc(sp.openrgb_server_error)}</div>` : ""}
+    </div>`;
 }
 
 /** Drivers written from protocol notes but never tested on real hardware: opt-in only. */
@@ -121,6 +141,7 @@ function sysDiag() {
           ${checks.length ? `<div class="diag-summary"><span class="pill emerald">${count("ok")} OK</span>${count("warn") ? `<span class="pill amber">${count("warn")} à vérifier</span>` : ""}${count("error") ? `<span class="pill rog">${plural(count("error"), "problème", "problèmes")}</span>` : ""}</div>` : ""}
           <button type="button" class="btn btn-sm btn-secondary" data-act="diag-refresh" ${local.diag.loading ? "disabled" : ""}>${ICONS.refresh}Relancer l'analyse</button>
           <button type="button" class="btn btn-sm btn-secondary" data-act="diag-report" title="Version, appareils, état et fin du journal — ton dossier utilisateur est masqué">Copier le rapport</button>
+          <button type="button" class="btn btn-sm btn-secondary" data-act="diag-export">Exporter rapport anonyme (.txt)</button>
         </div>
       </div>
       ${list}

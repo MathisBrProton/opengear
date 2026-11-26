@@ -701,8 +701,9 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
         cmd_ok(
             &mut eng,
             "set_ui_prefs",
-            json!({ "ui_mode": "expert", "onboarding_done": true }),
+            json!({ "ui_mode": "expert", "language": "en", "onboarding_done": true }),
         )?;
+        cmd_ok(&mut eng, "set_ui_prefs", json!({ "language": "fr" }))?;
         cmd_ok(
             &mut eng,
             "sys_set_prefs",
@@ -710,9 +711,15 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
                 "lights_off_on_lock": false,
                 "idle_lights_off_min": 15,
                 "battery_alerts": true,
-                "auto_profile_switch": false
+                "auto_profile_switch": false,
+                "openrgb_server": false
             }),
         )?;
+        let anon = cmd_ok(&mut eng, "export_anonymous_report", json!({}))?;
+        if anon["text"].as_str().is_none_or(|t| t.is_empty()) {
+            return Err("export_anonymous_report vide".into());
+        }
+        let _ = std::fs::remove_file(std::env::temp_dir().join("opengear_anonymous_report.txt"));
         cmd_ok(
             &mut eng,
             "laptop_set_auto_battery",

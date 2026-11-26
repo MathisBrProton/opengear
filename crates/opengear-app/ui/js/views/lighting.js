@@ -308,7 +308,7 @@ function lightingDevicesView(devs) {
                         <strong>${esc(z.name)}</strong>
                         <span class="pill">${plural(count, "LED", "LEDs")}</span>
                       </div>
-                      ${z.resizable ? sliderRow(`Nombre de LEDs ${isExpert() ? expertTag() : ""}`, { min: z.resizable[0], max: z.resizable[1], step: 1, value: count, input: "label", change: "lgt-resize-zone", data: { devId: d.info.id, zoneId: z.id, fmt: "leds" }, display: `${count} LEDs` }) : ""}
+                      ${z.resizable ? sliderRow("Nombre de LEDs", { labelHtml: `Nombre de LEDs ${isExpert() ? expertTag() : ""}`, min: z.resizable[0], max: z.resizable[1], step: 1, value: count, input: "label", change: "lgt-resize-zone", data: { devId: d.info.id, zoneId: z.id, fmt: "leds" }, display: `${count} LEDs` }) : ""}
                       ${arr(l.zones).length > 1 ? renderOverrideEditor(d.info.id, z.id, l.hardware_effects, zOv) : ""}
                     </div>`;
                 }).join("")}

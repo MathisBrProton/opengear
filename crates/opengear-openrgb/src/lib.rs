@@ -2,7 +2,9 @@
 //!
 //! Own implementation of the documented wire protocol: no OpenRGB (GPL) code is used. OpenRGB stays
 //! a separate program the user runs; OpenGear only talks to its SDK server, which works without
-//! administrator rights.
+//! administrator rights — or exposes OpenGear's own devices on localhost via [`server`].
+
+pub mod server;
 
 use anyhow::{Context, Result};
 use opengear_core::Rgb;
@@ -50,9 +52,14 @@ pub struct OrgbClient {
 }
 
 impl OrgbClient {
-    /// Connect quickly (the server is local or absent) and announce the client name.
+    /// Connect quickly (the server is local or absent) to `127.0.0.1:6742` and announce client name.
     pub fn connect() -> Option<Self> {
-        let addr: SocketAddr = SDK_ADDR.parse().ok()?;
+        Self::connect_addr(SDK_ADDR)
+    }
+
+    /// Connect to an explicit OpenRGB SDK socket address (used by server roundtrip tests).
+    pub fn connect_addr(addr_str: &str) -> Option<Self> {
+        let addr: SocketAddr = addr_str.parse().ok()?;
         let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(120)).ok()?;
         let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
         let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
@@ -83,13 +90,13 @@ impl OrgbClient {
         Ok(buf)
     }
 
-    fn controller_count(&mut self) -> Option<u32> {
+    pub fn controller_count(&mut self) -> Option<u32> {
         self.send(0, PKT_REQUEST_CONTROLLER_COUNT, &[]).ok()?;
         let buf = self.recv().ok()?;
         Some(u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?).min(32))
     }
 
-    fn controller_data(&mut self, idx: u32) -> Option<Vec<u8>> {
+    pub fn controller_data(&mut self, idx: u32) -> Option<Vec<u8>> {
         self.send(idx, PKT_REQUEST_CONTROLLER_DATA, &[]).ok()?;
         self.recv().ok()
     }
