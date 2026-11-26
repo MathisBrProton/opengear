@@ -1,7 +1,7 @@
-import { ICONS, LABEL_FMT, arr, clamp, devIdx, downloadText, esc, inputVal, num, plural, safeHex, throttled, updateLabel } from "./utils.js";
+import { ICONS, LABEL_FMT, MACRO_PRESETS, arr, clamp, clone, devId, domId, downloadText, esc, inputVal, num, plural, safeHex, throttled, updateLabel } from "./utils.js";
 import { call, doUndo, humanError, rpc, setBusy, setStatus, toast } from "./ipc.js";
 import { modalStack, trapFocus } from "./modals.js";
-import { S, applyState, getDraftFor, local, registerHooks, ui, updateChrome } from "./state.js";
+import { S, applyState, deviceById, getDraftFor, getEq, local, registerHooks, ui, updateChrome } from "./state.js";
 import { curLang, t, translateChrome, translateDom } from "./i18n.js";
 import { seg, updateTelemetryDom } from "./components.js";
 import { startRgbPreviewLoop } from "./rgb-preview.js";
@@ -75,7 +75,7 @@ function render() {
 function afterRender() {
   local.lastPreviewSig = "";
   renderFanCurve();
-  document.querySelectorAll("[data-eq-svg]").forEach((svg) => renderEqSvg(Number(svg.dataset.eqSvg)));
+  document.querySelectorAll("[data-eq-svg]").forEach((svg) => renderEqSvg(svg.dataset.eqSvg));
   updateTelemetryDom(S.telemetry);
 }
 
@@ -86,7 +86,7 @@ function go(newTab, opts = {}) {
   updateChrome();
   render();
   if (newTab === "system" && local.sub.system === "diag" && !local.diag.loading) loadDiagnostics();
-  if (newTab === "system" && local.sub.system === "backups" && !local.backups.loading && (!local.backups.data || !local.backups.corsairData)) {
+  if (newTab === "system" && local.sub.system === "backups" && !local.backups.loading && !local.backups.data) {
     loadBackups();
   }
   const main = document.getElementById("main-content");
@@ -276,12 +276,7 @@ async function loadBackups() {
   local.backups.loading = true;
   if (local.tab === "system") softRender();
   try {
-    const [logiRes, corsairRes] = await Promise.all([
-      rpc("list_backups", {}),
-      rpc("corsair_list_backups", {}).catch(() => ({ backups: [] })),
-    ]);
-    local.backups.data = logiRes;
-    local.backups.corsairData = corsairRes;
+    local.backups.data = await rpc("device_list_backups", {});
     local.backups.error = null;
   } catch (e) {
     local.backups.error = humanError(e && e.message);
@@ -375,90 +370,95 @@ const ACT = {
     }
   },
 
-  // Corsair
-  "cm-stage": (el) => call("corsair_mouse_set_active_stage", { device_index: devIdx(el), stage: Number(el.dataset.stage) }, { btn: el, ok: `Palier DPI ${Number(el.dataset.stage) + 1} activé` }),
-  "cm-dpi-save": (el) => {
-    const v = Number(inputVal(`cm-dpi-${devIdx(el)}-${el.dataset.stage}`));
+  // Pointer DPI & Stages
+  "ptr-stage": (el) => call("device_set_active_dpi_stage", { device_id: devId(el), stage: Number(el.dataset.stage) }, { btn: el, ok: `Palier DPI ${Number(el.dataset.stage) + 1} activé` }),
+  "ptr-stage-save": (el) => {
+    const id = devId(el);
+    const v = Number(inputVal(`pstage-${domId(id)}-${el.dataset.stage}`));
     if (!Number.isFinite(v) || v < 100 || v > 30000) { toast("Le DPI doit être compris entre 100 et 30 000.", "err"); return; }
-    call("corsair_mouse_set_dpi_stage", { device_index: devIdx(el), stage: Number(el.dataset.stage), dpi: v }, { btn: el, ok: `Palier ${Number(el.dataset.stage) + 1} : ${v} DPI` });
+    call("device_set_dpi_stage", { device_id: id, stage: Number(el.dataset.stage), dpi: v }, { btn: el, ok: `Palier ${Number(el.dataset.stage) + 1} : ${v} DPI` });
   },
-  "cs-ind": (el) => call("corsair_set_indicator_color", { device_index: devIdx(el), indicator: inputVal(`cs-ind-${devIdx(el)}`), color: safeHex(inputVal(`cs-ind-col-${devIdx(el)}`)) }, { btn: el, ok: "Couleur du voyant appliquée" }),
+  "ptr-dpi": (el) => call("device_set_dpi", { device_id: devId(el), x: Number(el.dataset.dpi), y: Number(el.dataset.dpi) }, { btn: el, ok: `Sensibilité : ${el.dataset.dpi} DPI` }),
+  "ptr-dpi-apply": (el) => {
+    const id = devId(el);
+    const did = domId(id);
+    const x = Number(inputVal(`pdpi-${did}`));
+    const yv = inputVal(`pdpiy-${did}`);
+    call("device_set_dpi", { device_id: id, x, y: yv != null ? Number(yv) : x }, { btn: el, ok: `Sensibilité : ${x} DPI` });
+  },
+  "ptr-lod": (el) => {
+    const id = devId(el);
+    const dev = deviceById(id);
+    if (!dev || !dev.pointer) return;
+    call("device_set_dpi", { device_id: id, x: dev.pointer.dpi_x, y: dev.pointer.dpi_y, lod: el.dataset.val }, { btn: el, ok: `Distance de décrochage : ${el.textContent.trim()}` });
+  },
 
-  // Logitech
-  "logi-dpi": (el) => call("logi_set_dpi", { device_index: devIdx(el), x: Number(el.dataset.dpi), y: Number(el.dataset.dpi) }, { btn: el, ok: `Sensibilité : ${el.dataset.dpi} DPI` }),
-  "logi-dpi-apply": (el) => {
-    const i = devIdx(el);
-    const x = Number(inputVal(`ldpi-${i}`));
-    const yv = inputVal(`ldpiy-${i}`);
-    call("logi_set_dpi", { device_index: i, x, y: yv != null ? Number(yv) : x }, { btn: el, ok: `Sensibilité : ${x} DPI` });
-  },
-  "logi-lod": (el) => {
-    const m = S.logi_mice[devIdx(el)];
-    if (!m || !m.dpi) return;
-    call("logi_set_dpi", { device_index: devIdx(el), x: m.dpi.dpi_x, y: m.dpi.dpi_y, lod: el.dataset.val }, { btn: el, ok: `Distance de décrochage : ${el.textContent.trim()}` });
-  },
+  // Audio Equalizer
   "eq-preset": (el) => {
-    const i = devIdx(el);
-    const h = S.logi_headsets[i];
-    const pr = h && arr(h.presets)[Number(el.dataset.idx)];
+    const id = devId(el);
+    const dev = deviceById(id);
+    const pr = dev && dev.equalizer && arr(dev.equalizer.presets).find((p) => p.id === el.dataset.preset);
     if (!pr) return;
-    local.eqDrafts[i] = { gains: arr(pr.gains).map((x) => num(x)), dirty: false };
-    call("logi_set_eq", { device_index: i, gains: local.eqDrafts[i].gains }, { btn: el, ok: `Égaliseur : ${pr.name}` });
+    local.eqDrafts[id] = { gains: arr(pr.gains_db).map((x) => num(x)), dirty: false };
+    call("device_set_eq", { device_id: id, preset: pr.id }, { btn: el, ok: `Égaliseur : ${pr.name}` });
   },
   "eq-apply": (el) => {
-    const i = devIdx(el);
-    const e = local.eqDrafts[i];
+    const id = devId(el);
+    const e = local.eqDrafts[id];
     if (!e) return;
     const g = e.gains.slice();
-    call("logi_set_eq", { device_index: i, gains: g }, { btn: el, ok: "Égaliseur appliqué" }).then((r) => { if (r && local.eqDrafts[i]) local.eqDrafts[i].dirty = false; });
+    call("device_set_eq", { device_id: id, gains: g }, { btn: el, ok: "Égaliseur appliqué" }).then((r) => { if (r && local.eqDrafts[id]) local.eqDrafts[id].dirty = false; });
   },
   "eq-reset": (el) => {
-    const i = devIdx(el);
-    local.eqDrafts[i] = { gains: [0, 0, 0, 0, 0], dirty: false };
-    call("logi_set_eq", { device_index: i, gains: [0, 0, 0, 0, 0] }, { btn: el, ok: "Égaliseur remis à plat" });
+    const id = devId(el);
+    local.eqDrafts[id] = { gains: [0, 0, 0, 0, 0], dirty: false };
+    call("device_set_eq", { device_id: id, gains: [0, 0, 0, 0, 0] }, { btn: el, ok: "Égaliseur remis à plat" });
   },
-  "mbtn-sel": (el) => { local.btnSel[devIdx(el)] = Number(el.dataset.btn); render(); },
+
+  // Onboard Memory & Backups
+  "mbtn-sel": (el) => { local.btnSel[devId(el)] = Number(el.dataset.btn); render(); },
   "mouse-variant": (el) => { local.selectedMouseVariant = Number(el.dataset.idx); render(); },
   "headset-variant": (el) => { local.selectedHeadsetVariant = Number(el.dataset.idx); render(); },
-  "logi-prof-sel": (el) => {
-    const i = devIdx(el);
-    if (local.drafts[i] && local.drafts[i].dirty) toast("Brouillon non écrit abandonné pour ce profil.", "info");
-    delete local.drafts[i];
-    local.profSel[i] = Number(el.dataset.val);
+  "ob-prof-sel": (el) => {
+    const id = devId(el);
+    if (local.drafts[id] && local.drafts[id].dirty) toast("Brouillon non écrit abandonné pour ce profil.", "info");
+    delete local.drafts[id];
+    local.profSel[id] = Number(el.dataset.val);
     render();
   },
-  "logi-activate": (el) => call("logi_set_active_profile", { device_index: devIdx(el), slot: Number(el.dataset.slot) }, { btn: el, ok: `Profil ${el.dataset.slot} activé sur la souris` }),
-  "logi-activate-seg": (el) => call("logi_set_active_profile", { device_index: devIdx(el), slot: Number(el.dataset.val) }, { btn: el, ok: `Profil ${el.dataset.val} activé sur la souris` }),
-  "logi-test-stage": (el) => call("logi_set_dpi_stage", { device_index: devIdx(el), stage: Number(el.dataset.stage) }, { btn: el, ok: `Palier ${Number(el.dataset.stage) + 1} activé pour essai` }),
+  "ob-activate": (el) => call("device_onboard_activate", { device_id: devId(el), slot: Number(el.dataset.slot) }, { btn: el, ok: `Profil ${el.dataset.slot} activé sur l'appareil` }),
+  "ob-activate-seg": (el) => call("device_onboard_activate", { device_id: devId(el), slot: Number(el.dataset.val) }, { btn: el, ok: `Profil ${el.dataset.val} activé sur l'appareil` }),
+  "ob-test-stage": (el) => call("device_set_active_dpi_stage", { device_id: devId(el), stage: Number(el.dataset.stage) }, { btn: el, ok: `Palier ${Number(el.dataset.stage) + 1} activé pour essai` }),
   "draft-hz": (el) => {
-    const d = getDraftFor(devIdx(el));
+    const d = getDraftFor(devId(el));
     if (!d) return;
     d.profile.report_rate_hz = Number(el.dataset.val);
     d.dirty = true;
     render();
   },
-  "logi-reload": (el) => {
-    delete local.drafts[devIdx(el)];
-    call("logi_reload_profiles", { device_index: devIdx(el) }, { btn: el, ok: "Profils relus depuis la souris" });
+  "ob-reload": (el) => {
+    const id = devId(el);
+    delete local.drafts[id];
+    call("device_onboard_reload", { device_id: id }, { btn: el, ok: "Profils relus depuis l'appareil" });
   },
-  "logi-flash": async (el) => {
-    const i = devIdx(el);
-    const d = getDraftFor(i);
+  "ob-flash": async (el) => {
+    const id = devId(el);
+    const d = getDraftFor(id);
     if (!d) return;
     const p = d.profile;
-    const r = await call("logi_flash_profile", {
-      device_index: i, index: d.idx, report_rate_hz: p.report_rate_hz, default_dpi_idx: p.default_dpi_idx,
+    const r = await call("device_onboard_flash_profile", {
+      device_id: id, index: d.idx, report_rate_hz: p.report_rate_hz, default_dpi_idx: p.default_dpi_idx,
       dpi_stages: p.dpi_stages, buttons: p.buttons.map((b) => b.hex),
-    }, { btn: el, ok: `Profil ${p.slot_index} écrit dans la souris et vérifié.` });
-    if (r) { delete local.drafts[i]; local.backups.data = null; render(); }
+    }, { btn: el, ok: `Profil ${p.slot} écrit et vérifié.` });
+    if (r) { delete local.drafts[id]; local.backups.data = null; render(); }
   },
-  "logi-flash-macro": async (el) => {
-    const i = devIdx(el);
-    const d = getDraftFor(i);
-    const preset = MACRO_PRESETS[inputVal(`macro-preset-${i}`)] || MACRO_PRESETS.double_click;
-    const b = local.btnSel[i] || 0;
-    const r = await call("logi_flash_macro", { device_index: i, profile_index: d ? d.idx : 0, button_index: b, steps: preset.steps }, { btn: el, ok: `Macro « ${preset.label} » écrite sur M${b + 1}.` });
-    if (r) { delete local.drafts[i]; local.backups.data = null; render(); }
+  "ob-flash-macro": async (el) => {
+    const id = devId(el);
+    const d = getDraftFor(id);
+    const preset = MACRO_PRESETS[inputVal(`macro-preset-${domId(id)}`)] || MACRO_PRESETS.double_click;
+    const b = local.btnSel[id] || 0;
+    const r = await call("device_onboard_flash_macro", { device_id: id, profile_index: d ? d.idx : 0, button_index: b, steps: preset.steps }, { btn: el, ok: `Macro « ${preset.label} » écrite sur M${b + 1}.` });
+    if (r) { delete local.drafts[id]; local.backups.data = null; render(); }
   },
 
   "relaunch-admin": (el) => call("cooling_relaunch_admin", {}, { btn: el, ok: "Relance en administrateur…" }),
@@ -730,13 +730,9 @@ const ACT = {
   selftest: (el) => call("run_selftest", {}, { btn: el, ok: "Auto-test terminé : rapport enregistré." }),
   "scan-hid": (el) => call("scan_hid", { all: el.dataset.all === "1" }, { btn: el, ok: "Bus HID analysé" }),
   "backups-refresh": () => loadBackups(),
-  "backup-restore": async (el) => {
-    const r = await call("logi_restore_backup", { device_index: local.backups.mouse, file: el.dataset.file, _label: el.dataset.label }, { btn: el });
+  "ob-backup-restore": async (el) => {
+    const r = await call("device_restore_backup", { device_id: devId(el), file: el.dataset.file, _label: el.dataset.label }, { btn: el });
     if (r) { Object.keys(local.drafts).forEach((k) => delete local.drafts[k]); loadBackups(); }
-  },
-  "corsair-backup-restore": async (el) => {
-    const r = await call("corsair_restore_backup", { device_index: local.backups.corsairDev, file: el.dataset.file, _label: el.dataset.label }, { btn: el });
-    if (r) loadBackups();
   },
 };
 
@@ -860,13 +856,13 @@ const CHANGE = {
   "es-chatter": (el) => call("input_set_esports", { key_chatter_ms: Number(el.value) }, { ok: `Anti-rebond clavier : ${LABEL_FMT.ms(el.value)}` }),
   "es-mdeb": (el) => call("input_set_esports", { mouse_debounce_ms: Number(el.value) }, { ok: `Anti-rebond clic : ${LABEL_FMT.ms(el.value)}` }),
   "draft-def-dpi": (el) => {
-    const d = getDraftFor(devIdx(el));
+    const d = getDraftFor(devId(el));
     if (!d) return;
     d.profile.default_dpi_idx = Number(el.value);
     d.dirty = true;
   },
   "draft-stage-dpi": (el) => {
-    const d = getDraftFor(devIdx(el));
+    const d = getDraftFor(devId(el));
     if (!d) return;
     const v = clamp(Math.round(Number(el.value) / 50) * 50 || 800, 100, 32000);
     el.value = v;
@@ -874,17 +870,16 @@ const CHANGE = {
     d.dirty = true;
   },
   "draft-btn": (el) => {
-    const i = devIdx(el);
-    const d = getDraftFor(i);
+    const id = devId(el);
+    const d = getDraftFor(id);
     if (!d) return;
     const b = Number(el.dataset.btn);
     d.profile.buttons[b] = { hex: el.value, label: el.options[el.selectedIndex].textContent };
     d.dirty = true;
-    local.btnSel[i] = b;
+    local.btnSel[id] = b;
     render();
   },
-  "bk-mouse": (el) => { local.backups.mouse = Number(el.value); },
-  "bk-corsair": (el) => { local.backups.corsairDev = Number(el.value); },
+  "bk-dev": (el) => { local.backups.deviceId = el.value; render(); },
   "laptop-auto-bat": (el) => call("laptop_set_auto_battery", { enabled: el.checked }, { ok: el.checked ? "Mode économie sur batterie activé" : "Mode économie sur batterie désactivé" }),
 };
 
@@ -904,16 +899,16 @@ const INPUT = {
   },
   "paint-color": (el) => { local.paintColor = el.value; },
   "eq-band": (el) => {
-    const i = devIdx(el);
-    const h = S.logi_headsets[i];
-    if (!h) return;
-    const e = getEq(h, i);
+    const id = devId(el);
+    const dev = deviceById(id);
+    if (!dev || !dev.equalizer) return;
+    const e = getEq(dev);
     const b = Number(el.dataset.band);
     e.gains[b] = Number(el.value);
     e.dirty = true;
-    const badge = document.getElementById(`eq-db-${i}-${b}`);
+    const badge = document.getElementById(`eq-db-${domId(id)}-${b}`);
     if (badge) badge.textContent = `${e.gains[b] > 0 ? "+" : ""}${e.gains[b]} dB`;
-    renderEqSvg(i);
+    renderEqSvg(id);
   },
 };
 

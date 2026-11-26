@@ -6,14 +6,21 @@
 //! path, and lighting/cooling invariant is verified and logged to `opengear.log`.
 
 use super::backend::BackendEngine;
+use opengear_core::audio::{EqInfo, EqPresetInfo, Equalizer};
+use opengear_core::cooling::{FanChannelConfig, FanHeaderKind};
 use opengear_core::driver::{
-    ChoiceOption, Connection, Control, Device, DeviceInfo, DeviceKind, DeviceStatus, Driver,
-    Section, Setting, Value as DriverValue, setting_ids,
+    ChoiceOption, Connection, Control, Device, DeviceInfo, DeviceKind, DeviceSpec, DeviceStatus,
+    Driver, Section, Setting, Value as DriverValue, setting_ids,
 };
-use opengear_core::fans::{Cooling, FanInfo, FanTarget};
+use opengear_core::fans::{Cooling, CurveCooling, FanInfo, FanTarget};
 use opengear_core::lighting::{
     EffectParams, EffectRequest, HardwareEffect, Led, Lighting, Zone, ZoneKind,
 };
+use opengear_core::onboard::{
+    OnboardBackupEntry, OnboardButtonBinding, OnboardMacroStep, OnboardMemory, OnboardMemoryInfo,
+    OnboardProfilePatch, OnboardProfileSummary,
+};
+use opengear_core::pointer::{PointerDevice, PointerDpiInfo};
 use opengear_core::{AppConfig, Rgb};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -284,6 +291,299 @@ impl Cooling for MockFullDevice {
     }
 }
 
+#[derive(Default)]
+struct MockPeriphState {
+    dpi_x: u16,
+    dpi_y: u16,
+    lod: String,
+    stages: Vec<u16>,
+    active_stage: usize,
+    eq_gains: Vec<i8>,
+    active_profile: u16,
+    flashed_profiles: usize,
+    flashed_macros: usize,
+    restored_backup: Option<String>,
+    reloaded: usize,
+    curves: Vec<FanChannelConfig>,
+    applied_curves: usize,
+}
+
+struct MockPeriphDevice {
+    id: String,
+    state: Arc<Mutex<MockPeriphState>>,
+}
+
+impl MockPeriphDevice {
+    fn build(id: &str) -> (Box<dyn Device>, Arc<Mutex<MockPeriphState>>) {
+        let state = Arc::new(Mutex::new(MockPeriphState {
+            dpi_x: 800,
+            dpi_y: 800,
+            lod: "Medium".into(),
+            stages: vec![400, 800, 1600],
+            active_stage: 1,
+            eq_gains: vec![0, 0, 0, 0, 0],
+            active_profile: 1,
+            curves: FanHeaderKind::ALL
+                .iter()
+                .map(|&h| FanChannelConfig::default_for(h))
+                .collect(),
+            ..Default::default()
+        }));
+        (
+            Box::new(Self {
+                id: id.to_string(),
+                state: Arc::clone(&state),
+            }),
+            state,
+        )
+    }
+}
+
+impl Device for MockPeriphDevice {
+    fn info(&self) -> DeviceInfo {
+        DeviceInfo {
+            id: self.id.clone(),
+            vendor: "Audit".into(),
+            model: "Mock Capability Mouse".into(),
+            kind: DeviceKind::Mouse,
+            connection: Connection::Wireless,
+            firmware: Some("2.0.0".into()),
+        }
+    }
+
+    fn specs(&self) -> Vec<DeviceSpec> {
+        vec![DeviceSpec::expert("Protocole", "Audit Trait Mock", true)]
+    }
+
+    fn fan_curves(&mut self) -> Option<&mut dyn CurveCooling> {
+        Some(self)
+    }
+
+    fn pointer(&mut self) -> Option<&mut dyn PointerDevice> {
+        Some(self)
+    }
+
+    fn equalizer(&mut self) -> Option<&mut dyn Equalizer> {
+        Some(self)
+    }
+
+    fn onboard(&mut self) -> Option<&mut dyn OnboardMemory> {
+        Some(self)
+    }
+}
+
+impl Cooling for MockPeriphDevice {
+    fn fans(&self) -> Vec<FanInfo> {
+        Vec::new()
+    }
+    fn set_fan(&mut self, _fan: Option<&str>, _target: FanTarget) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn restore_firmware_control(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn overridden(&self) -> bool {
+        false
+    }
+}
+
+impl CurveCooling for MockPeriphDevice {
+    fn curve_channels(&self) -> Vec<FanChannelConfig> {
+        self.state.lock().unwrap().curves.clone()
+    }
+
+    fn read_firmware_curves(&mut self) -> anyhow::Result<Vec<FanChannelConfig>> {
+        Ok(self.state.lock().unwrap().curves.clone())
+    }
+
+    fn apply_channel_curve(&mut self, cfg: &FanChannelConfig) -> anyhow::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        st.applied_curves += 1;
+        if let Some(slot) = st.curves.iter_mut().find(|c| c.header == cfg.header) {
+            *slot = cfg.clone();
+        }
+        Ok(())
+    }
+
+    fn cooling_diagnostic(&self) -> (bool, String) {
+        (true, "Mock CurveCooling actif".into())
+    }
+}
+
+impl PointerDevice for MockPeriphDevice {
+    fn pointer_info(&self) -> Option<PointerDpiInfo> {
+        let st = self.state.lock().unwrap();
+        Some(PointerDpiInfo {
+            dpi_x: st.dpi_x,
+            dpi_y: st.dpi_y,
+            min_dpi: 100,
+            max_dpi: 25600,
+            step_dpi: 50,
+            independent_xy: true,
+            supports_lod: true,
+            lod: Some(st.lod.clone()),
+            stages: st.stages.clone(),
+            active_stage: Some(st.active_stage),
+            report_rate_hz: Some(1000),
+            supported_rates_hz: vec![125, 250, 500, 1000],
+        })
+    }
+
+    fn set_dpi(&mut self, x: u16, y: Option<u16>) -> anyhow::Result<()> {
+        self.set_dpi_with_lod(x, y, None)
+    }
+
+    fn set_dpi_with_lod(
+        &mut self,
+        x: u16,
+        y: Option<u16>,
+        lod: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        st.dpi_x = x;
+        st.dpi_y = y.unwrap_or(x);
+        if let Some(l) = lod {
+            st.lod = l.to_string();
+        }
+        Ok(())
+    }
+
+    fn set_dpi_stage(&mut self, stage: usize, dpi: u16) -> anyhow::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        let slot = st
+            .stages
+            .get_mut(stage)
+            .ok_or_else(|| anyhow::anyhow!("Palier invalide"))?;
+        *slot = dpi;
+        Ok(())
+    }
+
+    fn set_active_dpi_stage(&mut self, stage: usize) -> anyhow::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        if stage >= st.stages.len() {
+            anyhow::bail!("Palier invalide");
+        }
+        st.active_stage = stage;
+        Ok(())
+    }
+}
+
+impl Equalizer for MockPeriphDevice {
+    fn eq_info(&self) -> Option<EqInfo> {
+        Some(EqInfo {
+            band_count: 5,
+            min_db: -12,
+            max_db: 12,
+            frequencies_hz: vec![80, 240, 750, 2200, 6600],
+            gains_db: self.state.lock().unwrap().eq_gains.clone(),
+            presets: vec![
+                EqPresetInfo {
+                    id: "flat".into(),
+                    name: "Plat".into(),
+                    gains_db: vec![0, 0, 0, 0, 0],
+                },
+                EqPresetInfo {
+                    id: "fps".into(),
+                    name: "FPS".into(),
+                    gains_db: vec![-2, 0, 2, 4, 3],
+                },
+            ],
+        })
+    }
+
+    fn set_eq_gains(&mut self, gains_db: &[i8]) -> anyhow::Result<()> {
+        self.state.lock().unwrap().eq_gains = gains_db.to_vec();
+        Ok(())
+    }
+}
+
+impl OnboardMemory for MockPeriphDevice {
+    fn onboard_info(&self) -> Option<OnboardMemoryInfo> {
+        let st = self.state.lock().unwrap();
+        Some(OnboardMemoryInfo {
+            mode: Some("onboard".into()),
+            mode_label: Some("Mémoire souris".into()),
+            profile_count: 1,
+            button_count: 5,
+            active_profile: st.active_profile,
+            active_dpi_index: st.active_stage as u8,
+            writable: true,
+            macros_supported: true,
+        })
+    }
+
+    fn onboard_profiles(&self) -> Vec<OnboardProfileSummary> {
+        let st = self.state.lock().unwrap();
+        vec![OnboardProfileSummary {
+            slot: 1,
+            name: "Profil 1".into(),
+            active: st.active_profile == 1,
+            dpi_stages: st.stages.clone(),
+            default_dpi_idx: Some(1),
+            report_rate_hz: Some(1000),
+            editable: true,
+            sector_addr: Some("0x0100".into()),
+            from_rom: false,
+            crc_valid: Some(true),
+            buttons: vec![OnboardButtonBinding {
+                hex: "80010001".into(),
+                label: "Clic gauche".into(),
+            }],
+        }]
+    }
+
+    fn button_presets(&self) -> Vec<OnboardButtonBinding> {
+        vec![OnboardButtonBinding {
+            hex: "80010001".into(),
+            label: "Clic gauche".into(),
+        }]
+    }
+
+    fn set_active_onboard_profile(&mut self, slot: u16) -> anyhow::Result<()> {
+        self.state.lock().unwrap().active_profile = slot;
+        Ok(())
+    }
+
+    fn reload_onboard_profiles(&mut self) -> anyhow::Result<()> {
+        self.state.lock().unwrap().reloaded += 1;
+        Ok(())
+    }
+
+    fn write_onboard_profile(
+        &mut self,
+        _slot_index: usize,
+        _patch: &OnboardProfilePatch,
+    ) -> anyhow::Result<()> {
+        self.state.lock().unwrap().flashed_profiles += 1;
+        Ok(())
+    }
+
+    fn write_onboard_macro(
+        &mut self,
+        _profile_index: usize,
+        _button_index: usize,
+        _steps: &[OnboardMacroStep],
+    ) -> anyhow::Result<()> {
+        self.state.lock().unwrap().flashed_macros += 1;
+        Ok(())
+    }
+
+    fn onboard_backups(&self) -> Vec<OnboardBackupEntry> {
+        vec![OnboardBackupEntry {
+            file: "mock_backup.bin".into(),
+            tag: "profile".into(),
+            sector_hex: "0x0100".into(),
+            size: 256,
+            created_ms: 1_700_000_000_000,
+        }]
+    }
+
+    fn restore_onboard_backup(&mut self, file: &str) -> anyhow::Result<String> {
+        self.state.lock().unwrap().restored_backup = Some(file.to_string());
+        Ok(format!("Sauvegarde {file} restaurée"))
+    }
+}
+
 fn check<F>(results: &mut Vec<EndpointCheckResult>, name: &str, f: F)
 where
     F: FnOnce() -> Result<String, String>,
@@ -338,8 +638,12 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
             .unwrap_or(0)
     ));
     let (mock_dev, mock_state) = MockFullDevice::build("audit:mock_0");
-    let mut eng =
-        BackendEngine::new_headless(temp_cfg.clone(), AppConfig::default(), vec![mock_dev]);
+    let (periph_dev, periph_state) = MockPeriphDevice::build("audit:mock_periph");
+    let mut eng = BackendEngine::new_headless(
+        temp_cfg.clone(),
+        AppConfig::default(),
+        vec![mock_dev, periph_dev],
+    );
     eng.drivers.push(Box::new(MockAuditDriver {
         id: "audit:mock_0".into(),
         state: Arc::clone(&mock_state),
@@ -392,8 +696,7 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
         "get_diagnostics",
         "get_diagnostic_report",
         "input_socd_live",
-        "list_backups",
-        "corsair_list_backups",
+        "device_list_backups",
         "scan_hid",
         "superio_refresh",
     ] {
@@ -463,19 +766,84 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
 
     check(
         &mut results,
-        "device_set_dpi + device_set_eq (errors)",
+        "device_set_dpi + device_set_eq + device_onboard (trait contracts)",
         || {
             cmd_err(
                 &mut eng,
                 "device_set_dpi",
-                json!({ "device": "audit:mock_0", "x": 800 }),
+                json!({ "device_id": "audit:mock_0", "x": 800 }),
             )?;
             cmd_err(
                 &mut eng,
                 "device_set_eq",
-                json!({ "device": "audit:mock_0", "gains": [0, 0, 0, 0, 0] }),
+                json!({ "device_id": "audit:mock_0", "gains": [0, 0, 0, 0, 0] }),
             )?;
-            Ok("Rejets propres quand capacité absente".into())
+            cmd_ok(
+                &mut eng,
+                "device_set_dpi",
+                json!({ "device_id": "audit:mock_periph", "x": 1600, "y": 1200, "lod": "High" }),
+            )?;
+            cmd_ok(
+                &mut eng,
+                "device_set_dpi_stage",
+                json!({ "device_id": "audit:mock_periph", "stage": 0, "dpi": 600 }),
+            )?;
+            cmd_ok(
+                &mut eng,
+                "device_set_active_dpi_stage",
+                json!({ "device_id": "audit:mock_periph", "stage": 2 }),
+            )?;
+            cmd_ok(
+                &mut eng,
+                "device_set_eq",
+                json!({ "device_id": "audit:mock_periph", "preset": "fps" }),
+            )?;
+            cmd_ok(
+                &mut eng,
+                "device_set_eq",
+                json!({ "device_id": "audit:mock_periph", "gains": [1, 2, -1, 0, 3] }),
+            )?;
+            cmd_ok(
+                &mut eng,
+                "device_onboard_activate",
+                json!({ "device_id": "audit:mock_periph", "slot": 2 }),
+            )?;
+            cmd_ok(
+                &mut eng,
+                "device_onboard_reload",
+                json!({ "device_id": "audit:mock_periph" }),
+            )?;
+            cmd_ok(
+                &mut eng,
+                "device_onboard_flash_profile",
+                json!({ "device_id": "audit:mock_periph", "index": 0, "report_rate_hz": 1000 }),
+            )?;
+            cmd_ok(
+                &mut eng,
+                "device_onboard_flash_macro",
+                json!({ "device_id": "audit:mock_periph", "profile_index": 0, "button_index": 3, "steps": [{ "kind": "delay", "value": 10 }] }),
+            )?;
+            cmd_ok(
+                &mut eng,
+                "device_restore_backup",
+                json!({ "device_id": "audit:mock_periph", "file": "mock_backup.bin" }),
+            )?;
+            let st = periph_state.lock().unwrap();
+            if st.dpi_x != 1600
+                || st.dpi_y != 1200
+                || st.lod != "High"
+                || st.stages[0] != 600
+                || st.active_stage != 2
+                || st.eq_gains != vec![1, 2, -1, 0, 3]
+                || st.active_profile != 2
+                || st.reloaded != 1
+                || st.flashed_profiles != 1
+                || st.flashed_macros != 1
+                || st.restored_backup.as_deref() != Some("mock_backup.bin")
+            {
+                return Err("État interne MockPeriphDevice incohérent".into());
+            }
+            Ok("PointerDevice + Equalizer + OnboardMemory + Error rejections OK".into())
         },
     );
 
@@ -752,10 +1120,9 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
         )?;
         cmd_err(
             &mut eng,
-            "corsair_set_indicator_color",
-            json!({ "indicator": "winlock_on", "color": "#FFFFFF" }),
+            "device_set_dpi",
+            json!({ "device_id": "missing", "x": 800 }),
         )?;
-        cmd_err(&mut eng, "logi_set_dpi", json!({ "x": 800 }))?;
         cmd_err(&mut eng, "__nonexistent_endpoint__", json!({}))?;
         Ok("Validation courbes, GUID, périphériques absents & commande inconnue OK".into())
     });

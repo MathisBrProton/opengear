@@ -52,47 +52,39 @@ pub enum MouseButtonAction {
 }
 
 /// A single step in a Logitech HID++ 2.0 `0x8100` onboard hardware macro.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OnboardMacroStep {
-    KeyPress(u8),
-    KeyRelease(u8),
-    MousePress(u8),
-    MouseRelease(u8),
-    DelayMs(u16),
-}
+pub use opengear_core::onboard::OnboardMacroStep;
 
-impl OnboardMacroStep {
-    /// Encode into HID++ 2.0 `0x8100` macro bytecode (verified from libratbag `hidpp20.h`).
-    pub fn encode_into(&self, buf: &mut Vec<u8>) {
-        match *self {
-            Self::KeyPress(hid_usage) => {
-                buf.push(0x20);
-                buf.push(hid_usage);
-            }
-            Self::KeyRelease(hid_usage) => {
-                buf.push(0x21);
-                buf.push(hid_usage);
-            }
-            Self::MousePress(btn_1based) => {
-                let mask = 1u16 << (btn_1based.clamp(1, 16) - 1);
-                let b = mask.to_be_bytes();
-                buf.push(0x22);
-                buf.push(b[0]);
-                buf.push(b[1]);
-            }
-            Self::MouseRelease(btn_1based) => {
-                let mask = 1u16 << (btn_1based.clamp(1, 16) - 1);
-                let b = mask.to_be_bytes();
-                buf.push(0x23);
-                buf.push(b[0]);
-                buf.push(b[1]);
-            }
-            Self::DelayMs(ms) => {
-                let b = ms.clamp(1, 30000).to_be_bytes();
-                buf.push(0x40);
-                buf.push(b[0]);
-                buf.push(b[1]);
-            }
+/// Encode a single portable macro step into HID++ 2.0 `0x8100` macro bytecode
+/// (verified from libratbag `hidpp20.h`).
+pub(crate) fn encode_macro_step(step: OnboardMacroStep, buf: &mut Vec<u8>) {
+    match step {
+        OnboardMacroStep::KeyPress(hid_usage) => {
+            buf.push(0x20);
+            buf.push(hid_usage);
+        }
+        OnboardMacroStep::KeyRelease(hid_usage) => {
+            buf.push(0x21);
+            buf.push(hid_usage);
+        }
+        OnboardMacroStep::MousePress(btn_1based) => {
+            let mask = 1u16 << (btn_1based.clamp(1, 16) - 1);
+            let b = mask.to_be_bytes();
+            buf.push(0x22);
+            buf.push(b[0]);
+            buf.push(b[1]);
+        }
+        OnboardMacroStep::MouseRelease(btn_1based) => {
+            let mask = 1u16 << (btn_1based.clamp(1, 16) - 1);
+            let b = mask.to_be_bytes();
+            buf.push(0x23);
+            buf.push(b[0]);
+            buf.push(b[1]);
+        }
+        OnboardMacroStep::DelayMs(ms) => {
+            let b = ms.clamp(1, 30000).to_be_bytes();
+            buf.push(0x40);
+            buf.push(b[0]);
+            buf.push(b[1]);
         }
     }
 }
@@ -806,8 +798,8 @@ impl OnboardProfile {
             ));
         }
         let mut bytecode = Vec::new();
-        for st in steps {
-            st.encode_into(&mut bytecode);
+        for &st in steps {
+            encode_macro_step(st, &mut bytecode);
         }
         bytecode.push(0xFF); // HIDPP20_MACRO_END
 

@@ -676,14 +676,6 @@ impl Device for AuraMainboardController {
         Some(self)
     }
 
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
-    }
-
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        Some(self)
-    }
-
     fn apply_setting(&mut self, id: &str, _value: &Value) -> anyhow::Result<()> {
         anyhow::bail!("Réglage ASUS Aura inconnu : {id}")
     }

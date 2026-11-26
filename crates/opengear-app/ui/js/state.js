@@ -17,7 +17,7 @@ export const local = {
   configWarningShown: false,
   diag: { data: null, loading: false, error: null },
   diagSorted: [],
-  backups: { data: null, corsairData: null, corsairDev: 0, loading: false, error: null, mouse: 0 },
+  backups: { data: null, loading: false, error: null, deviceId: "" },
   macroSteps: [
     { key: "LCTRL", down: true, delay_ms: 10 },
     { key: "C", down: true, delay_ms: 10 },
@@ -61,7 +61,7 @@ export const isExpert = () => ui().mode === "expert";
 export function normalizeState() {
   if (!S) return;
   [
-    "corsair_devices", "logi_mice", "logi_headsets", "power_plans", "effects",
+    "power_plans", "effects",
     "blend_modes", "sensor_kinds", "button_presets", "bindable_keys", "devices",
     "device_list", "firmware_inventory",
   ].forEach((k) => {
@@ -101,31 +101,34 @@ export function syncDrafts() {
   if (local.selectedCoolingIdx >= S.cooling.channels.length) local.selectedCoolingIdx = 0;
 }
 
-export function getDraft(m, i) {
-  const profiles = arr(m.onboard_profiles);
-  if (!profiles.length) return null;
-  let idx = local.profSel[i] || 0;
+export function getDraft(dev) {
+  const id = dev && dev.info && dev.info.id;
+  const profiles = arr(dev && dev.onboard && dev.onboard.profiles);
+  if (!id || !profiles.length) return null;
+  let idx = local.profSel[id] || 0;
   if (idx >= profiles.length) idx = 0;
-  local.profSel[i] = idx;
-  const d = local.drafts[i];
-  if (!d || d.idx !== idx) local.drafts[i] = { idx, profile: clone(profiles[idx]), dirty: false };
-  const p = local.drafts[i].profile;
+  local.profSel[id] = idx;
+  const d = local.drafts[id];
+  if (!d || d.idx !== idx) local.drafts[id] = { idx, profile: clone(profiles[idx]), dirty: false };
+  const p = local.drafts[id].profile;
   p.buttons = arr(p.buttons);
   p.dpi_stages = arr(p.dpi_stages);
-  return local.drafts[i];
+  return local.drafts[id];
 }
 
-export function getDraftFor(i) {
-  const m = S && S.logi_mice[i];
-  return m ? getDraft(m, i) : null;
+export function getDraftFor(id) {
+  const d = deviceById(id);
+  return d ? getDraft(d) : null;
 }
 
-export function getEq(h, i) {
-  if (!local.eqDrafts[i]) {
-    const g = arr(h.equalizer && h.equalizer.gains_db);
-    local.eqDrafts[i] = { gains: g.length ? g.map((x) => num(x)) : [0, 0, 0, 0, 0], dirty: false };
+export function getEq(dev) {
+  const id = dev && dev.info && dev.info.id;
+  if (!id) return { gains: [0, 0, 0, 0, 0], dirty: false };
+  if (!local.eqDrafts[id]) {
+    const g = arr(dev.equalizer && dev.equalizer.gains_db);
+    local.eqDrafts[id] = { gains: g.length ? g.map((x) => num(x)) : [0, 0, 0, 0, 0], dirty: false };
   }
-  return local.eqDrafts[i];
+  return local.eqDrafts[id];
 }
 
 export function mouseImage() {
@@ -198,69 +201,99 @@ export function devicesList() {
   if (!S) return [];
   const out = [];
   const prof = S.config.profile;
-  S.corsair_devices.forEach((d, i) => {
-    const kind = d.kind;
-    const base = { key: `corsair:${i}`, deviceId: d.device_id, vendor: "Corsair", kind, name: d.product_name || "Appareil Corsair", type: d.kind_label || "Corsair", battery: d.battery_pct, status: { label: "Connecté", cls: "emerald" }, quick: [] };
-    if (kind === "Mouse") {
-      Object.assign(base, { img: mouseImage().url, imgCls: "cutout", icon: "mouse" });
-      if (d.mouse) {
-        const st = num(d.mouse.active_stage);
-        const stages = arr(d.mouse.dpi_stages);
-        base.status = { label: `${num(d.mouse.current_dpi_x, stages[st] || 0)} DPI`, cls: "cyan" };
-        if (stages.length) base.quick.push(qa("Palier DPI suivant", "cm-stage", { dev: i, stage: (st + 1) % stages.length }));
-      }
-    } else if (kind === "Headset") {
-      Object.assign(base, { img: headsetImage().url, imgCls: "cutout", icon: "headset" });
-      const side = num(d.headset && d.headset.sidetone_pct);
-      base.quick.push(qa(side > 0 ? "Couper le retour micro" : "Activer le retour micro", "dev-set", { device: d.device_id, setting: "sidetone", json: side > 0 ? 0 : 50 }));
-    } else if (kind === "CoolerHub") {
-      Object.assign(base, { img: "/assets/aio.webp", imgCls: "cutout", icon: "fan" });
-    } else if (kind === "Keyboard") {
-      const k = k70Image();
-      Object.assign(base, { img: k.url, imgCls: "cutout", icon: "keyboard" });
-      base.status = d.pollrate_hz ? { label: fmtHzShort(d.pollrate_hz), cls: "emerald" } : base.status;
-      base.quick.push(qa(prof.enable_rgb ? "Couper l'éclairage" : "Allumer l'éclairage", "rgb-enable", { on: prof.enable_rgb ? "0" : "1" }));
-      const br = num(d.hw_brightness_pct, 100);
-      const next = br >= 100 ? 50 : br >= 50 ? 0 : 100;
-      base.quick.push(qa(`Luminosité ${next} %`, "dev-set", { device: d.device_id, setting: "hw_brightness", json: next }));
-      if (d.hw_winlock != null) base.quick.push(qa(d.hw_winlock ? "Débloquer Windows" : "Bloquer Windows", "dev-set", { device: d.device_id, setting: "win_lock", json: !d.hw_winlock }, "Bloque la touche Windows pendant le jeu"));
-    } else {
-      Object.assign(base, { img: "/assets/generic_device.webp", imgCls: "cutout", icon: "chip" });
+  const KIND_IMG = {
+    memory: "/assets/ram.webp",
+    motherboard: "/assets/motherboard.webp",
+    keyboard: "/assets/keyboard.webp",
+    mouse: "/assets/mouse.webp",
+    headset: "/assets/headset.webp",
+    cooler: "/assets/aio.webp",
+    laptop: "/assets/laptop.webp",
+    led_controller: "/assets/generic_device.webp",
+    other: "/assets/generic_device.webp",
+  };
+  arr(S.device_list).forEach((d) => {
+    const id = d.info.id;
+    const kind = d.info.kind;
+    const bat = d.status.battery_pct;
+    const icon = KIND_ICON[kind] || (kind === "memory" ? "ram" : "chip");
+    let img = KIND_IMG[kind] || "/assets/generic_device.webp";
+    if (kind === "mouse" && /logitech|pro\s*x|corsair|mouse/i.test(`${d.info.vendor} ${d.info.model}`)) {
+      img = mouseImage().url;
+    } else if (kind === "headset" && /logitech|pro\s*x|corsair|headset/i.test(`${d.info.vendor} ${d.info.model}`)) {
+      img = headsetImage().url;
+    } else if (kind === "keyboard" && /k70/i.test(d.info.model)) {
+      img = k70Image().url;
     }
-    out.push(base);
-  });
-  S.logi_mice.forEach((m, i) => {
-    const mi = mouseImage();
-    const bat = m.battery || null;
-    const dpi = m.dpi;
-    const item = {
-      key: `logi-mouse:${i}`, deviceId: m.device_id, vendor: "Logitech", kind: "Mouse", name: m.name || "Souris Logitech", type: "Souris Logitech G",
-      img: mi.url, imgCls: "cutout", icon: "mouse",
-      battery: bat ? bat.percent : null, charging: !!(bat && bat.is_charging),
-      status: { label: dpi ? `${dpi.dpi_x} DPI` : "Connectée", cls: "cyan" }, quick: [],
-    };
-    if (dpi) {
-      [800, 1600, 3200].filter((v) => v >= num(dpi.min_dpi, 100) && v <= num(dpi.max_dpi, 25600)).forEach((v) => item.quick.push(qa(`${v} DPI`, "logi-dpi", { dev: i, dpi: v })));
-    }
-    out.push(item);
-  });
-  S.logi_headsets.forEach((h, i) => {
-    const hi = headsetImage();
-    const presets = arr(h.presets);
-    const flatIdx = presets.findIndex((p) => p.is_flat);
-    const fpsIdx = presets.findIndex((p) => p.id === "fps" || /fps/i.test(p.name));
-    const bat = h.battery || null;
+    const sysBat = kind === "laptop" && S.laptop_battery && S.laptop_battery.present ? S.laptop_battery : null;
+    const settings = arr(d.settings);
+    const findS = (sid) => settings.find((s) => s.id === sid);
+    const perfProf = findS("performance_profile");
+    const forced = d.cooling && d.cooling.overridden;
+    const curProf = perfProf && arr(perfProf.control && perfProf.control.options).find((o) => o.id === perfProf.value);
+    const ptr = d.pointer;
+    const eq = d.equalizer;
     const quick = [];
-    if (h.equalizer && flatIdx >= 0) quick.push(qa("Son neutre", "eq-preset", { dev: i, idx: flatIdx }));
-    if (h.equalizer && fpsIdx >= 0) quick.push(qa("Son FPS", "eq-preset", { dev: i, idx: fpsIdx }));
-    quick.push(qa(num(h.sidetone_pct) > 0 ? "Couper le retour micro" : "Retour micro 50 %", "dev-set", { device: h.device_id, setting: "sidetone", json: num(h.sidetone_pct) > 0 ? 0 : 50 }));
+
+    if (perfProf && perfProf.control && perfProf.control.type === "choice") {
+      arr(perfProf.control.options).forEach((o) => quick.push(qa(o.label, "dev-set", { device: id, setting: perfProf.id, json: JSON.stringify(o.id) })));
+    }
+    if (ptr) {
+      const stages = arr(ptr.stages);
+      if (stages.length > 1) {
+        const st = num(ptr.active_stage);
+        quick.push(qa("Palier DPI suivant", "ptr-stage", { id, stage: (st + 1) % stages.length }));
+      } else if (ptr.max_dpi > 0) {
+        [800, 1600, 3200]
+          .filter((v) => v >= num(ptr.min_dpi, 100) && v <= num(ptr.max_dpi, 25600))
+          .forEach((v) => quick.push(qa(`${v} DPI`, "ptr-dpi", { id, dpi: v })));
+      }
+    }
+    if (eq) {
+      const presets = arr(eq.presets);
+      const flat = presets.find((p) => p.id === "flat" || arr(p.gains_db).every((g) => num(g) === 0));
+      const fps = presets.find((p) => p.id === "fps" || /fps/i.test(p.name));
+      if (flat) quick.push(qa("Son neutre", "eq-preset", { id, preset: flat.id }));
+      if (fps) quick.push(qa("Son FPS", "eq-preset", { id, preset: fps.id }));
+    }
+    const side = findS("sidetone");
+    if (side) {
+      const cur = num(side.value);
+      quick.push(qa(cur > 0 ? "Couper le retour micro" : "Activer le retour micro", "dev-set", { device: id, setting: side.id, json: cur > 0 ? 0 : 50 }));
+    }
+    if (kind === "keyboard" && d.lighting) {
+      quick.push(qa(prof.enable_rgb ? "Couper l'éclairage" : "Allumer l'éclairage", "rgb-enable", { on: prof.enable_rgb ? "0" : "1" }));
+    }
+    const hwBr = findS("hw_brightness");
+    if (hwBr) {
+      const br = num(hwBr.value, 100);
+      const next = br >= 100 ? 50 : br >= 50 ? 0 : 100;
+      quick.push(qa(`Luminosité ${next} %`, "dev-set", { device: id, setting: hwBr.id, json: next }));
+    }
+    const winLock = findS("win_lock");
+    if (winLock) {
+      quick.push(qa(winLock.value ? "Débloquer Windows" : "Bloquer Windows", "dev-set", { device: id, setting: winLock.id, json: !winLock.value }, "Bloque la touche Windows pendant le jeu"));
+    }
+
+    const pollVal = findS("polling_rate") && num(findS("polling_rate").value, 0);
+    let status;
+    if (forced) status = { label: "Ventilation forcée", cls: "amber" };
+    else if (ptr) status = { label: `${num(ptr.dpi_x, arr(ptr.stages)[num(ptr.active_stage)] || 0)} DPI`, cls: "cyan" };
+    else if (curProf) status = { label: curProf.label, cls: "emerald" };
+    else if (kind === "keyboard" && pollVal) status = { label: fmtHzShort(pollVal), cls: "emerald" };
+    else if (kind === "headset") status = { label: "Connecté", cls: "purple" };
+    else status = { label: "Connecté", cls: "emerald" };
+
     out.push({
-      key: `logi-hs:${i}`, deviceId: h.device_id, vendor: "Logitech", kind: "Headset", name: h.name || "Casque Logitech", type: "Casque Logitech G",
-      img: hi.url, imgCls: "cutout", icon: "headset",
-      battery: bat ? bat.percent : null, charging: !!(bat && bat.is_charging),
-      status: { label: "Connecté", cls: "purple" }, quick,
+      key: `dev:${id}`, deviceId: id, vendor: d.info.vendor, kind, name: d.info.model,
+      type: KIND_LABEL[kind] || "Appareil", icon, img, imgCls: "cutout",
+      battery: sysBat ? sysBat.percent : bat != null ? bat : null,
+      charging: sysBat ? !!sysBat.charging : !!d.status.charging,
+      batteryHours: !sysBat && d.status.battery_hours != null ? d.status.battery_hours : null,
+      status, quick,
     });
   });
+
   if (!S.is_laptop && S.cooling.channels.length) {
     const c = S.cooling;
     out.push({
@@ -270,41 +303,6 @@ export function devicesList() {
       quick: [qa("Silence", "sl3-preset", { preset: "ultra_silent" }), qa("Équilibré", "sl3-preset", { preset: "default" }), qa("Performance", "sl3-preset", { preset: "max_perf" })],
     });
   }
-  // Devices discovered through the shared driver registry appear automatically.
-  const known = new Set(out.map((x) => x.deviceId).filter(Boolean));
-  arr(S.device_list).filter((d) => !known.has(d.info.id)).forEach((d) => {
-    const bat = d.status.battery_pct;
-    const icon = KIND_ICON[d.info.kind] || (d.info.kind === "memory" ? "ram" : "chip");
-    const KIND_IMG = {
-      memory: "/assets/ram.webp",
-      motherboard: "/assets/motherboard.webp",
-      keyboard: "/assets/keyboard.webp",
-      mouse: "/assets/mouse.webp",
-      headset: "/assets/headset.webp",
-      cooler: "/assets/aio.webp",
-      laptop: "/assets/laptop.webp",
-      led_controller: "/assets/generic_device.webp",
-      other: "/assets/generic_device.webp",
-    };
-    const img = KIND_IMG[d.info.kind] || "/assets/generic_device.webp";
-    // A laptop reports the system battery; other devices their own.
-    const sysBat = d.info.kind === "laptop" && S.laptop_battery && S.laptop_battery.present ? S.laptop_battery : null;
-    // Performance profile (shared setting id) as quick actions.
-    const prof = arr(d.settings).find((s) => s.id === "performance_profile");
-    const quick = prof && prof.control && prof.control.type === "choice"
-      ? arr(prof.control.options).map((o) => qa(o.label, "dev-set", { device: d.info.id, setting: prof.id, json: JSON.stringify(o.id) }))
-      : [];
-    const forced = d.cooling && d.cooling.overridden;
-    const curProf = prof && arr(prof.control.options).find((o) => o.id === prof.value);
-    out.push({
-      key: `dev:${d.info.id}`, deviceId: d.info.id, vendor: d.info.vendor, kind: d.info.kind, name: d.info.model,
-      type: KIND_LABEL[d.info.kind] || "Appareil", icon, img, imgCls: "cutout",
-      battery: sysBat ? sysBat.percent : bat != null ? bat : null, charging: sysBat ? !!sysBat.charging : !!d.status.charging,
-      batteryHours: !sysBat && d.status.battery_hours != null ? d.status.battery_hours : null,
-      status: forced ? { label: "Ventilation forcée", cls: "amber" } : { label: curProf ? curProf.label : "Connecté", cls: "emerald" },
-      quick,
-    });
-  });
   return out;
 }
 

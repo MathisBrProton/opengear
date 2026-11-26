@@ -3,17 +3,19 @@
 use crate::features::{FEAT_RGB_EFFECTS, LOGITECH_VID};
 use crate::hidpp::{BatteryInfo, BatteryState};
 use crate::{
-    KeyboardRgbMode, LogitechHeadset, LogitechKeyboard, LogitechMouse, MouseLedMode, OnboardMode,
+    KeyboardRgbMode, LogitechHeadset, LogitechKeyboard, LogitechMouse, MouseButtonAction,
+    MouseLedMode, OnboardMode, backup_path_for, list_sector_backups,
 };
 use anyhow::{Context, Result, bail};
 use opengear_core::Rgb;
 use opengear_core::driver::{
-    ChoiceOption, Connection, Device, DeviceInfo, DeviceKind, DeviceStatus, Driver, Section,
-    Setting, Value, polling_rate_options, setting_ids,
+    ChoiceOption, Connection, Device, DeviceInfo, DeviceKind, DeviceSpec, DeviceStatus, Driver,
+    Section, Setting, Value, polling_rate_options, setting_ids,
 };
 use opengear_core::lighting::{EffectParams, EffectRequest, HardwareEffect, Lighting, Zone};
 use opengear_core::{
-    EqInfo, EqPresetInfo, Equalizer, OnboardMemory, OnboardProfileSummary, PointerDevice,
+    EqInfo, EqPresetInfo, Equalizer, OnboardBackupEntry, OnboardButtonBinding, OnboardMacroStep,
+    OnboardMemory, OnboardMemoryInfo, OnboardProfilePatch, OnboardProfileSummary, PointerDevice,
     PointerDpiInfo,
 };
 
@@ -169,6 +171,30 @@ impl Device for LogitechMouse {
         status_of(self.info.battery.as_ref())
     }
 
+    fn specs(&self) -> Vec<DeviceSpec> {
+        let i = &self.info;
+        let mut out = vec![
+            DeviceSpec::expert(
+                "Identifiant USB",
+                format!(
+                    "{:04X}:{:04X} (emplacement 0x{:02X})",
+                    i.vid, i.pid, i.device_index
+                ),
+                true,
+            ),
+            DeviceSpec::expert("Protocole", format!("HID++ {}", i.proto_version), true),
+        ];
+        if !i.firmware.is_empty() {
+            out.push(DeviceSpec::expert("Firmware", i.firmware.join(" | "), true));
+        }
+        out.push(DeviceSpec::expert(
+            "Fonctions exposées",
+            i.features.len().to_string(),
+            false,
+        ));
+        out
+    }
+
     fn settings(&self) -> Vec<Setting> {
         let i = &self.info;
         let mut out = Vec::new();
@@ -268,19 +294,24 @@ impl Device for LogitechMouse {
     }
 
     fn onboard(&mut self) -> Option<&mut dyn OnboardMemory> {
-        (!self.info.onboard_profiles.is_empty()).then_some(self as &mut dyn OnboardMemory)
+        (!self.info.onboard_profiles.is_empty() || self.info.onboard.is_some())
+            .then_some(self as &mut dyn OnboardMemory)
+    }
+
+    fn diagnostic_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(b) = self.info.battery.as_ref() {
+            lines.push(format!(
+                "Batterie : {:?}% (en charge={:?})",
+                b.percent,
+                b.state.is_charging()
+            ));
+        }
+        lines
     }
 
     fn refresh_status(&mut self) {
         self.refresh_telemetry();
-    }
-
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
-    }
-
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        Some(self)
     }
 
     fn apply_setting(&mut self, id: &str, value: &Value) -> Result<()> {
@@ -357,6 +388,30 @@ impl Device for LogitechKeyboard {
         status_of(self.info.battery.as_ref())
     }
 
+    fn specs(&self) -> Vec<DeviceSpec> {
+        let i = &self.info;
+        let mut out = vec![
+            DeviceSpec::expert(
+                "Identifiant USB",
+                format!(
+                    "{:04X}:{:04X} (emplacement 0x{:02X})",
+                    i.vid, i.pid, i.device_index
+                ),
+                true,
+            ),
+            DeviceSpec::expert("Protocole", format!("HID++ {}", i.proto_version), true),
+        ];
+        if !i.firmware.is_empty() {
+            out.push(DeviceSpec::expert("Firmware", i.firmware.join(" | "), true));
+        }
+        out.push(DeviceSpec::expert(
+            "Fonctions exposées",
+            i.features.len().to_string(),
+            false,
+        ));
+        out
+    }
+
     fn settings(&self) -> Vec<Setting> {
         let i = &self.info;
         let mut out = Vec::new();
@@ -408,14 +463,6 @@ impl Device for LogitechKeyboard {
         self.refresh_telemetry();
     }
 
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
-    }
-
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        Some(self)
-    }
-
     fn apply_setting(&mut self, id: &str, value: &Value) -> Result<()> {
         match id {
             setting_ids::HW_BRIGHTNESS => {
@@ -451,6 +498,30 @@ impl Device for LogitechHeadset {
 
     fn status(&self) -> DeviceStatus {
         status_of(self.info.battery.as_ref())
+    }
+
+    fn specs(&self) -> Vec<DeviceSpec> {
+        let i = &self.info;
+        let mut out = vec![
+            DeviceSpec::expert(
+                "Identifiant USB",
+                format!(
+                    "{:04X}:{:04X} (emplacement 0x{:02X})",
+                    i.vid, i.pid, i.device_index
+                ),
+                true,
+            ),
+            DeviceSpec::expert("Protocole", format!("HID++ {}", i.proto_version), true),
+        ];
+        if !i.firmware.is_empty() {
+            out.push(DeviceSpec::expert("Firmware", i.firmware.join(" | "), true));
+        }
+        out.push(DeviceSpec::expert(
+            "Fonctions exposées",
+            i.features.len().to_string(),
+            false,
+        ));
+        out
     }
 
     fn settings(&self) -> Vec<Setting> {
@@ -522,14 +593,6 @@ impl Device for LogitechHeadset {
 
     fn refresh_status(&mut self) {
         self.refresh_telemetry();
-    }
-
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
-    }
-
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        Some(self)
     }
 
     fn apply_setting(&mut self, id: &str, value: &Value) -> Result<()> {
@@ -894,6 +957,14 @@ impl PointerDevice for LogitechMouse {
             max_dpi: dpi.map(|d| d.max_dpi).unwrap_or(32000),
             step_dpi: dpi.map(|d| d.step_dpi).unwrap_or(50),
             independent_xy: dpi.is_some_and(|d| d.supports_independent_xy),
+            supports_lod: dpi.is_some_and(|d| d.supports_lod),
+            lod: dpi.and_then(|d| {
+                d.lod.map(|l| match l {
+                    crate::LodLevel::Low => "Low".into(),
+                    crate::LodLevel::Medium => "Medium".into(),
+                    crate::LodLevel::High => "High".into(),
+                })
+            }),
             stages: active_stages,
             active_stage: self
                 .info
@@ -910,6 +981,16 @@ impl PointerDevice for LogitechMouse {
         LogitechMouse::set_dpi(self, x, y, lod).map_err(anyhow::Error::from)
     }
 
+    fn set_dpi_with_lod(&mut self, x: u16, y: Option<u16>, lod: Option<&str>) -> Result<()> {
+        let mapped = match lod {
+            Some("Low") => Some(crate::LodLevel::Low),
+            Some("High") => Some(crate::LodLevel::High),
+            Some("Medium") => Some(crate::LodLevel::Medium),
+            Some(_) | None => self.info.dpi.as_ref().and_then(|d| d.lod),
+        };
+        LogitechMouse::set_dpi(self, x, y, mapped).map_err(anyhow::Error::from)
+    }
+
     fn set_active_dpi_stage(&mut self, stage: usize) -> Result<()> {
         LogitechMouse::set_active_dpi_stage(self, stage as u8).map_err(anyhow::Error::from)?;
         self.refresh_telemetry();
@@ -917,7 +998,33 @@ impl PointerDevice for LogitechMouse {
     }
 }
 
+fn parse_hex4(hex: &str) -> Option<[u8; 4]> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 8 {
+        return None;
+    }
+    let hex_byte = |off: usize| u8::from_str_radix(&hex[off..off + 2], 16).ok();
+    Some([hex_byte(0)?, hex_byte(2)?, hex_byte(4)?, hex_byte(6)?])
+}
+
 impl OnboardMemory for LogitechMouse {
+    fn onboard_info(&self) -> Option<OnboardMemoryInfo> {
+        let o = self.info.onboard.as_ref()?;
+        Some(OnboardMemoryInfo {
+            mode: Some(match o.mode {
+                OnboardMode::Host => "host".into(),
+                _ => "onboard".into(),
+            }),
+            mode_label: Some(o.mode.label().into()),
+            profile_count: o.profile_count,
+            button_count: o.button_count,
+            active_profile: o.active_profile,
+            active_dpi_index: o.active_dpi_index,
+            writable: true,
+            macros_supported: true,
+        })
+    }
+
     fn onboard_profiles(&self) -> Vec<OnboardProfileSummary> {
         let active_slot = self
             .info
@@ -937,8 +1044,39 @@ impl OnboardMemory for LogitechMouse {
                 },
                 active: u16::from(p.slot_index) == active_slot,
                 dpi_stages: p.dpi_stages.to_vec(),
+                default_dpi_idx: Some(p.default_dpi_idx),
                 report_rate_hz: Some(p.report_rate_hz),
                 editable: !p.from_rom,
+                sector_addr: Some(format!("0x{:04X}", p.sector_addr)),
+                from_rom: p.from_rom,
+                crc_valid: Some(p.crc_valid),
+                buttons: p
+                    .buttons
+                    .iter()
+                    .map(|b| {
+                        let raw = b.encode();
+                        OnboardButtonBinding {
+                            hex: format!(
+                                "{:02X}{:02X}{:02X}{:02X}",
+                                raw[0], raw[1], raw[2], raw[3]
+                            ),
+                            label: b.label(),
+                        }
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn button_presets(&self) -> Vec<OnboardButtonBinding> {
+        MouseButtonAction::PRESET_ACTIONS
+            .iter()
+            .map(|(lbl, act)| {
+                let raw = act.encode();
+                OnboardButtonBinding {
+                    hex: format!("{:02X}{:02X}{:02X}{:02X}", raw[0], raw[1], raw[2], raw[3]),
+                    label: (*lbl).into(),
+                }
             })
             .collect()
     }
@@ -953,6 +1091,69 @@ impl OnboardMemory for LogitechMouse {
         LogitechMouse::reload_onboard_profiles(self).map_err(anyhow::Error::from)?;
         self.refresh_telemetry();
         Ok(())
+    }
+
+    fn write_onboard_profile(
+        &mut self,
+        slot_index: usize,
+        patch: &OnboardProfilePatch,
+    ) -> Result<()> {
+        let prof = self
+            .info
+            .onboard_profiles
+            .get_mut(slot_index)
+            .context("Index profil invalide")?;
+        if let Some(hz) = patch.report_rate_hz {
+            prof.report_rate_hz = hz;
+        }
+        if let Some(def) = patch.default_dpi_idx {
+            prof.default_dpi_idx = def.min(4);
+        }
+        if let Some(ref stages) = patch.dpi_stages {
+            for (i, &dpi) in stages.iter().take(5).enumerate() {
+                prof.dpi_stages[i] = dpi.clamp(100, 32000);
+            }
+        }
+        if let Some(ref hexes) = patch.button_hexes {
+            for (i, hex) in hexes.iter().enumerate() {
+                if i < prof.buttons.len()
+                    && let Some(raw) = parse_hex4(hex)
+                {
+                    prof.buttons[i] = MouseButtonAction::decode(raw);
+                }
+            }
+        }
+        LogitechMouse::flash_onboard_profile(self, slot_index).map_err(anyhow::Error::from)
+    }
+
+    fn write_onboard_macro(
+        &mut self,
+        profile_index: usize,
+        button_index: usize,
+        steps: &[OnboardMacroStep],
+    ) -> Result<()> {
+        LogitechMouse::flash_onboard_macro(self, profile_index, button_index, steps)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn onboard_backups(&self) -> Vec<OnboardBackupEntry> {
+        list_sector_backups()
+            .into_iter()
+            .map(|b| OnboardBackupEntry {
+                file: b.file,
+                tag: b.tag,
+                sector_hex: b.sector_hex,
+                size: b.size,
+                created_ms: b.created_ms,
+            })
+            .collect()
+    }
+
+    fn restore_onboard_backup(&mut self, file: &str) -> Result<String> {
+        let path = backup_path_for(file).context("Sauvegarde introuvable ou nom invalide")?;
+        LogitechMouse::restore_onboard_backup(self, &path).map_err(anyhow::Error::from)?;
+        self.refresh_telemetry();
+        Ok(format!("Sauvegarde {file} restaurée et vérifiée"))
     }
 }
 

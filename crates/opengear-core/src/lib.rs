@@ -15,8 +15,13 @@ pub mod serde_util;
 pub use audio::{EqInfo, EqPresetInfo, Equalizer};
 pub use color::{BlendMode, EffectKind, Rgb, RgbEffectConfig, RgbLayer, blend_rgb};
 pub use device::{DetectedDevice, DeviceVendor, KeyboardLayout, OperatingMode, PollingRate};
+pub use driver::DeviceSpec;
+pub use fans::{Cooling, CurveCooling, FanInfo, FanTarget};
 pub use keyboard::{FormFactor, PhysicalKey, physical_layout};
-pub use onboard::{OnboardMemory, OnboardProfileSummary};
+pub use onboard::{
+    OnboardBackupEntry, OnboardButtonBinding, OnboardMacroStep, OnboardMemory, OnboardMemoryInfo,
+    OnboardProfilePatch, OnboardProfileSummary,
+};
 pub use pointer::{PointerDevice, PointerDpiInfo};
 pub use profile::{
     AppConfig, KeyAction, KeyboardProfile, MacroMode, MacroStep, SocdConfig, SocdPair,

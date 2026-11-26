@@ -1,5 +1,5 @@
 import { ICONS, SWATCHES, arr, clamp, dataAttrs, esc, fmtHz, num, setBar, setTxt } from "./utils.js";
-import { S, deviceById, isExpert, k70Image, local } from "./state.js";
+import { S, deviceById, isExpert, k70Image, local, settingOf } from "./state.js";
 import { curLang, t, translateDom } from "./i18n.js";
 
 export function pageHeader(title, subHtml, actionsHtml = "", accent = "") {
@@ -259,15 +259,19 @@ export function renderKeyboard(mode, kb) {
   const hasPhoto = !!kbv.device_name;
   const photo = hasPhoto ? k70Image() : null;
   const showPhoto = hasPhoto && mode === "paint" && local.kbViewMode === "photo";
+  const name = (kb && ((kb.info && kb.info.model) || kb.product_name)) || kbv.device_name || "Clavier";
+  const pollSetting = kb && kb.info ? settingOf(kb.info.id, "polling_rate") : kb && kb.pollrate_hz;
+  const pollHz = num(pollSetting, 0);
+  const esports = kb && arr(kb.specs).some((sp) => sp.label === "Interrupteur tournoi" && sp.value === "Activé");
   if (!kbv.keys.length) return `<div class="note">Disposition du clavier indisponible.</div>`;
   return `
     <div class="kb-chassis">
       <div class="kb-topbar">
         <div class="kb-brand-strip">
-          <span>${esc(((kb && kb.product_name) || kbv.device_name || "Clavier").toUpperCase())}</span>
+          <span>${esc(String(name).toUpperCase())}</span>
           <span class="pill" title="Disposition Windows active">${esc(kbv.os_layout.top_row || "?")} · ${esc(String(kbv.standard || "").toUpperCase())}</span>
-          ${kb && kb.pollrate_hz ? `<span class="pill emerald"><span class="dot"></span>${fmtHz(kb.pollrate_hz)}</span>` : ""}
-          ${kb && kb.esports_switch_on ? `<span class="pill rog"><span class="dot"></span>Mode tournoi</span>` : ""}
+          ${pollHz ? `<span class="pill emerald"><span class="dot"></span>${fmtHz(pollHz)}</span>` : ""}
+          ${esports ? `<span class="pill rog"><span class="dot"></span>Mode tournoi</span>` : ""}
         </div>
         ${mode === "paint" && hasPhoto
           ? seg([["interactive", "Vue interactive"], ["photo", "Photo"]], local.kbViewMode, "kb-view")

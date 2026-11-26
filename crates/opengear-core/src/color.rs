@@ -265,9 +265,9 @@ impl RgbEffectConfig {
 
     /// Convert legacy numeric LED-index keys in `per_key` to W3C `key_code` keys.
     /// Returns `true` if any key was converted.
-    pub fn migrate_per_key_codes(
+    pub fn migrate_per_key_codes<'a>(
         &mut self,
-        mut mapper: impl FnMut(usize) -> Option<&'static str>,
+        mut mapper: impl FnMut(usize) -> Option<&'a str>,
     ) -> bool {
         let numeric_keys: Vec<(String, usize)> = self
             .per_key

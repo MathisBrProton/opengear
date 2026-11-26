@@ -282,6 +282,7 @@ function lightingDevicesView(devs) {
         const l = d.lighting;
         const cfg = deviceCfg(d.info.id);
         const totalLeds = arr(l.zones).reduce((s, z) => s + arr(z.leds).length, 0);
+        const extraSettings = deviceSettings(d.info.id, { sections: ["lighting"], bare: true });
         return `
           <div class="card accent-cyan">
             <div class="card-head">
@@ -294,7 +295,7 @@ function lightingDevicesView(devs) {
               </div>
             </div>
             ${renderOverrideEditor(d.info.id, null, l.hardware_effects, cfg.mode)}
-            ${deviceSettings(d.info.id, { sections: ["lighting"], bare: true })}
+            ${extraSettings ? `<div class="mt-16">${extraSettings}</div>` : ""}
             ${arr(l.zones).length > 1 || arr(l.zones).some((z) => z.resizable) ? `
               <div class="divider"></div>
               <div class="card-eyebrow mb-8">Zones de l'appareil</div>

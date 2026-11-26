@@ -37,6 +37,10 @@ pub fn device_drivers() -> Vec<Box<dyn Driver>> {
     ]
 }
 
+pub fn dump_corsair_hwp() -> anyhow::Result<String> {
+    opengear_corsair::dump_first_hwp_flash()
+}
+
 /// RAM RGB backends, in probe order: native SMBus first, then the board vendor interface, then
 /// OpenRGB (the only one usable without administrator rights).
 pub fn ram_rgb() -> RamRgb {

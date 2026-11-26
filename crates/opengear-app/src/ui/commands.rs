@@ -11,29 +11,18 @@ use crate::system_ext::idle_duration;
 use crate::tray_icon::{
     create_windows_shortcuts, is_autostart_enabled, release_single_instance, set_autostart_enabled,
 };
-use opengear_asus::{apply_asus_wmi_curve, read_asus_wmi_channel};
 use opengear_core::cooling::{
     CurvePoint, FanPolicyMode, FanTempSource, SensorKind, TempMixConfig, TempMixOp,
 };
-use opengear_core::driver::{Value as DriverValue, setting_ids};
+use opengear_core::driver::{DeviceKind, Value as DriverValue, setting_ids};
 use opengear_core::fans::FanTarget;
 use opengear_core::lighting::{EffectRequest, LightingOverride, Placement};
+use opengear_core::onboard::{OnboardMacroStep, OnboardProfilePatch};
 use opengear_core::{
     BlendMode, EffectKind, KeyAction, KeyboardProfile, MacroMode, MacroStep, Rgb, RgbEffectConfig,
     RgbLayer, SocdPair, scan_hid_devices,
 };
-use opengear_corsair::proto::{
-    PROP_BRIGHTNESS_INDICATOR_COLOR, PROP_ESPORTS_BACKLIGHT_COLOR, PROP_PROFILE_INDICATOR_COLOR,
-    PROP_WINLOCK_OFF_COLOR, PROP_WINLOCK_ON_COLOR,
-};
-use opengear_corsair::{
-    CorsairDevice, key_code_for_led_index, list_corsair_backups, restore_corsair_backup,
-};
 use opengear_input::movement_keys_effective;
-use opengear_logitech::{
-    LodLevel, LogitechHeadset, LogitechMouse, MouseButtonAction, OnboardMacroStep, backup_path_for,
-    list_sector_backups,
-};
 use opengear_mainboard::{read_superio_snapshot, restore_superio_fan_auto, set_superio_fan_pwm};
 use opengear_platform::pawnio::install_official_pawnio;
 use opengear_platform::{is_elevated, list_power_plans, relaunch_as_admin, set_active_power_plan};
@@ -236,22 +225,30 @@ impl BackendEngine {
         }
     }
 
-    fn corsair_mut(&mut self, p: &Value) -> std::result::Result<&mut CorsairDevice, String> {
-        let idx = p["device_index"].as_u64().unwrap_or(0) as usize;
-        self.typed_device_mut::<CorsairDevice>(idx)
-            .ok_or_else(|| "Périphérique Corsair non connecté".to_string())
+    fn onboard_for_cmd(
+        &mut self,
+        p: &Value,
+        missing_msg: &str,
+    ) -> std::result::Result<&mut dyn opengear_core::onboard::OnboardMemory, String> {
+        let dev_id = p["device_id"]
+            .as_str()
+            .or_else(|| p["device"].as_str())
+            .ok_or("device_id manquant")?;
+        self.find_onboard_mut(Some(dev_id))
+            .ok_or_else(|| format!("{missing_msg} : {dev_id}"))
     }
 
-    fn logi_mouse_mut(&mut self, p: &Value) -> std::result::Result<&mut LogitechMouse, String> {
-        let idx = p["device_index"].as_u64().unwrap_or(0) as usize;
-        self.typed_device_mut::<LogitechMouse>(idx)
-            .ok_or_else(|| "Souris Logitech non connectée".to_string())
-    }
-
-    fn logi_headset_mut(&mut self, p: &Value) -> std::result::Result<&mut LogitechHeadset, String> {
-        let idx = p["device_index"].as_u64().unwrap_or(0) as usize;
-        self.typed_device_mut::<LogitechHeadset>(idx)
-            .ok_or_else(|| "Casque Logitech non connecté".to_string())
+    fn pointer_for_cmd(
+        &mut self,
+        p: &Value,
+        missing_msg: &str,
+    ) -> std::result::Result<&mut dyn opengear_core::pointer::PointerDevice, String> {
+        let dev_id = p["device_id"]
+            .as_str()
+            .or_else(|| p["device"].as_str())
+            .ok_or("device_id manquant")?;
+        self.find_pointer_mut(Some(dev_id))
+            .ok_or_else(|| format!("{missing_msg} : {dev_id}"))
     }
 
     pub(crate) fn handle_cmd(
@@ -370,21 +367,34 @@ impl BackendEngine {
                     }
                 }
             } else if self.cooling_status.wmi_available && is_elevated() {
+                let pending: Vec<(usize, opengear_core::cooling::FanChannelConfig)> = self
+                    .cooling_channels
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, ch)| ch.source == FanTempSource::CpuBios)
+                    .map(|(i, ch)| {
+                        let mut cfg = ch.clone();
+                        cfg.policy = policy;
+                        (i, cfg)
+                    })
+                    .collect();
                 let mut applied = 0usize;
                 let mut failed = 0usize;
-                for ch in self.cooling_channels.iter_mut() {
-                    if ch.source != FanTempSource::CpuBios {
-                        continue;
-                    }
-                    let mut cfg = ch.clone();
-                    cfg.policy = policy;
-                    match apply_asus_wmi_curve(&cfg) {
-                        Ok(_) => {
-                            ch.policy = policy;
+                let mut ok_indices = Vec::new();
+                if let Some(fc) = self.curve_cooling_mut() {
+                    for (i, cfg) in pending {
+                        if fc.apply_channel_curve(&cfg).is_ok() {
+                            ok_indices.push(i);
                             applied += 1;
+                        } else {
+                            failed += 1;
                         }
-                        Err(_) => failed += 1,
                     }
+                } else {
+                    failed = pending.len();
+                }
+                for i in ok_indices {
+                    self.cooling_channels[i].policy = policy;
                 }
                 summary.push(format!(
                     "Ventilateurs : profil {} sur {applied} canal(aux){}",
@@ -775,30 +785,68 @@ impl BackendEngine {
                 st["last_action_msg"] = json!(format!("Annulé : {label}"));
                 Ok(st)
             }
-            "list_backups" => Ok(json!({ "backups": list_sector_backups() })),
-            "logi_restore_backup" => {
+            "device_list_backups" => {
+                let backups = self.collect_backups(p["device_id"].as_str());
+                Ok(json!({ "backups": backups }))
+            }
+            "device_restore_backup" => {
                 let file = p["file"].as_str().ok_or("Fichier de sauvegarde manquant")?;
-                let path = backup_path_for(file).ok_or("Sauvegarde introuvable ou nom invalide")?;
-                let m = self.logi_mouse_mut(p)?;
-                m.restore_onboard_backup(&path).map_err(|e| e.to_string())?;
-                m.refresh_telemetry();
+                let o = self.onboard_for_cmd(p, "Appareil à mémoire embarquée introuvable")?;
+                let msg = o.restore_onboard_backup(file).map_err(|e| e.to_string())?;
                 let mut st = self.full_state_json();
-                st["last_action_msg"] = json!(format!("Sauvegarde {file} restaurée et vérifiée"));
+                st["last_action_msg"] = json!(msg);
                 Ok(st)
             }
-            "corsair_list_backups" => Ok(json!({ "backups": list_corsair_backups() })),
-            "corsair_restore_backup" => {
-                let file = p["file"].as_str().ok_or("Fichier de sauvegarde manquant")?;
-                let dev = self.corsair_mut(p)?;
-                let file_id = dev
-                    .with_flash_session(|t| restore_corsair_backup(t, file))
+            "device_set_dpi" => {
+                let x = p["x"].as_u64().ok_or("x manquant")? as u16;
+                let y = p["y"].as_u64().map(|v| v as u16);
+                let lod = p["lod"].as_str();
+                let ptr = self.pointer_for_cmd(p, "Réglage DPI non supporté")?;
+                ptr.set_dpi_with_lod(x, y, lod).map_err(|e| e.to_string())?;
+                Ok(self.full_state_json())
+            }
+            "device_set_dpi_stage" => {
+                let stage = p["stage"].as_u64().ok_or("stage manquant")? as usize;
+                let dpi = p["dpi"].as_u64().ok_or("dpi manquant")? as u16;
+                let ptr = self.pointer_for_cmd(p, "Pointeur introuvable")?;
+                ptr.set_dpi_stage(stage, dpi).map_err(|e| e.to_string())?;
+                Ok(self.full_state_json())
+            }
+            "device_set_active_dpi_stage" => {
+                let stage = p["stage"].as_u64().ok_or("stage manquant")? as usize;
+                let ptr = self.pointer_for_cmd(p, "Pointeur introuvable")?;
+                ptr.set_active_dpi_stage(stage).map_err(|e| e.to_string())?;
+                Ok(self.full_state_json())
+            }
+            "device_onboard_activate" => {
+                let slot = p["slot"].as_u64().ok_or("slot manquant")? as u16;
+                let o = self.onboard_for_cmd(p, "Mémoire embarquée introuvable")?;
+                o.set_active_onboard_profile(slot)
                     .map_err(|e| e.to_string())?;
-                let _ = dev.reload_hwp_profiles();
-                let mut st = self.full_state_json();
-                st["last_action_msg"] = json!(format!(
-                    "Sauvegarde Corsair {file} restaurée (fichier HWP 0x{file_id:04X})"
-                ));
-                Ok(st)
+                Ok(self.full_state_json())
+            }
+            "device_onboard_reload" => {
+                let o = self.onboard_for_cmd(p, "Mémoire embarquée introuvable")?;
+                o.reload_onboard_profiles().map_err(|e| e.to_string())?;
+                Ok(self.full_state_json())
+            }
+            "device_onboard_flash_profile" => {
+                let idx = p["index"].as_u64().ok_or("index manquant")? as usize;
+                let patch = parse_onboard_patch(p);
+                let o = self.onboard_for_cmd(p, "Mémoire embarquée introuvable")?;
+                o.write_onboard_profile(idx, &patch)
+                    .map_err(|e| e.to_string())?;
+                Ok(self.full_state_json())
+            }
+            "device_onboard_flash_macro" => {
+                let prof_idx = p["profile_index"].as_u64().unwrap_or(0) as usize;
+                let btn_idx = p["button_index"].as_u64().unwrap_or(3) as usize;
+                let steps_arr = p["steps"].as_array().ok_or("steps manquants")?;
+                let steps = parse_onboard_macro_steps(steps_arr);
+                let o = self.onboard_for_cmd(p, "Mémoire embarquée introuvable")?;
+                o.write_onboard_macro(prof_idx, btn_idx, &steps)
+                    .map_err(|e| e.to_string())?;
+                Ok(self.full_state_json())
             }
             "device_set" => {
                 let device = p["device"].as_str().ok_or("device manquant")?;
@@ -811,19 +859,6 @@ impl BackendEngine {
                     st["last_action_msg"] = json!(m);
                 }
                 Ok(st)
-            }
-            "device_set_dpi" => {
-                let device_id = p["device_id"].as_str().ok_or("device_id manquant")?;
-                let x = p["x"].as_u64().ok_or("x manquant")? as u16;
-                let y = p["y"].as_u64().map(|v| v as u16);
-                let dev = self
-                    .device_mut(device_id)
-                    .ok_or_else(|| format!("Appareil introuvable : {device_id}"))?;
-                let ptr = dev
-                    .pointer()
-                    .ok_or_else(|| format!("Réglage DPI non supporté sur : {device_id}"))?;
-                ptr.set_dpi(x, y).map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
             }
             "device_set_eq" => {
                 let device_id = p["device_id"].as_str().ok_or("device_id manquant")?;
@@ -1250,9 +1285,20 @@ impl BackendEngine {
                 let key_code = if let Some(code) = p["key_code"].as_str() {
                     code.to_string()
                 } else if let Some(idx) = p["led_index"].as_u64() {
-                    key_code_for_led_index(0x1B1C, 0x1B73, idx as usize)
+                    let target = idx as usize;
+                    self.driver_devices
+                        .iter_mut()
+                        .filter(|d| d.info().kind == DeviceKind::Keyboard)
+                        .find_map(|d| {
+                            d.lighting().and_then(|l| {
+                                l.zones()
+                                    .into_iter()
+                                    .flat_map(|z| z.leds.into_iter())
+                                    .nth(target)
+                                    .and_then(|led| led.key_code)
+                            })
+                        })
                         .ok_or("Index LED inconnu sans code de touche")?
-                        .to_string()
                 } else {
                     return Err("key_code manquant".into());
                 };
@@ -1271,136 +1317,6 @@ impl BackendEngine {
                 self.persist_config();
                 Ok(self.full_state_json())
             }
-            "corsair_set_indicator_color" => {
-                let which = p["indicator"].as_str().unwrap_or("esports");
-                let hex = p["color"].as_str().ok_or("Couleur manquante")?;
-                let col = Rgb::from_hex(hex).ok_or("Couleur hex invalide")?;
-                let prop = match which {
-                    "winlock_on" => PROP_WINLOCK_ON_COLOR,
-                    "winlock_off" => PROP_WINLOCK_OFF_COLOR,
-                    "profile" => PROP_PROFILE_INDICATOR_COLOR,
-                    "brightness" => PROP_BRIGHTNESS_INDICATOR_COLOR,
-                    _ => PROP_ESPORTS_BACKLIGHT_COLOR,
-                };
-                let dev = self.corsair_mut(p)?;
-                dev.set_indicator_color(prop, col)
-                    .map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
-            "corsair_mouse_set_dpi_stage" => {
-                let stage = p["stage"].as_u64().unwrap_or(0) as u8;
-                let dpi = p["dpi"].as_u64().unwrap_or(800) as u16;
-                let dev = self.corsair_mut(p)?;
-                dev.set_mouse_dpi_stage(stage, dpi)
-                    .map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
-            "corsair_mouse_set_active_stage" => {
-                let stage = p["stage"].as_u64().unwrap_or(0) as u8;
-                let dev = self.corsair_mut(p)?;
-                dev.set_mouse_active_stage(stage)
-                    .map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
-            "logi_set_dpi" => {
-                let x = p["x"].as_u64().ok_or("DPI X manquant")? as u16;
-                let y = p["y"].as_u64().map(|v| v as u16);
-                let lod = p["lod"].as_str().map(|s| match s {
-                    "Low" => LodLevel::Low,
-                    "High" => LodLevel::High,
-                    _ => LodLevel::Medium,
-                });
-                let m = self.logi_mouse_mut(p)?;
-                m.set_dpi(x, y, lod).map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
-            "logi_set_active_profile" => {
-                let slot = p["slot"].as_u64().ok_or("slot manquant")? as u16;
-                let m = self.logi_mouse_mut(p)?;
-                m.set_active_profile(slot).map_err(|e| e.to_string())?;
-                m.refresh_telemetry();
-                Ok(self.full_state_json())
-            }
-            "logi_set_dpi_stage" => {
-                let stage = p["stage"].as_u64().ok_or("stage manquant")? as u8;
-                let m = self.logi_mouse_mut(p)?;
-                m.set_active_dpi_stage(stage).map_err(|e| e.to_string())?;
-                m.refresh_telemetry();
-                Ok(self.full_state_json())
-            }
-            "logi_reload_profiles" => {
-                let m = self.logi_mouse_mut(p)?;
-                m.reload_onboard_profiles().map_err(|e| e.to_string())?;
-                m.refresh_telemetry();
-                Ok(self.full_state_json())
-            }
-            "logi_flash_profile" => {
-                let idx = p["index"].as_u64().ok_or("index manquant")? as usize;
-                let m = self.logi_mouse_mut(p)?;
-                let prof = m
-                    .info
-                    .onboard_profiles
-                    .get_mut(idx)
-                    .ok_or("Index profil invalide")?;
-
-                if let Some(hz) = p["report_rate_hz"].as_u64() {
-                    prof.report_rate_hz = hz as u16;
-                }
-                if let Some(def) = p["default_dpi_idx"].as_u64() {
-                    prof.default_dpi_idx = (def as u8).min(4);
-                }
-                if let Some(arr) = p["dpi_stages"].as_array() {
-                    for (i, v) in arr.iter().take(5).enumerate() {
-                        if let Some(dpi) = v.as_u64() {
-                            prof.dpi_stages[i] = (dpi as u16).clamp(100, 32000);
-                        }
-                    }
-                }
-                if let Some(btns) = p["buttons"].as_array() {
-                    for (i, b) in btns.iter().enumerate() {
-                        if i < prof.buttons.len()
-                            && let Some(hex) = b.as_str()
-                            && let Some(raw) = parse_4byte_hex(hex)
-                        {
-                            prof.buttons[i] = MouseButtonAction::decode(raw);
-                        }
-                    }
-                }
-                m.flash_onboard_profile(idx).map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
-            "logi_flash_macro" => {
-                let prof_idx = p["profile_index"].as_u64().unwrap_or(0) as usize;
-                let btn_idx = p["button_index"].as_u64().unwrap_or(3) as usize;
-                let steps_arr = p["steps"].as_array().ok_or("steps manquants")?;
-                let mut steps = Vec::new();
-                for s in steps_arr {
-                    let kind = s["kind"].as_str().unwrap_or("");
-                    let val = s["value"].as_u64().unwrap_or(0) as u16;
-                    match kind {
-                        "key_down" => steps.push(OnboardMacroStep::KeyPress(val as u8)),
-                        "key_up" => steps.push(OnboardMacroStep::KeyRelease(val as u8)),
-                        "mouse_down" => steps.push(OnboardMacroStep::MousePress(val as u8)),
-                        "mouse_up" => steps.push(OnboardMacroStep::MouseRelease(val as u8)),
-                        "delay" => steps.push(OnboardMacroStep::DelayMs(val)),
-                        _ => {}
-                    }
-                }
-                let m = self.logi_mouse_mut(p)?;
-                m.flash_onboard_macro(prof_idx, btn_idx, &steps)
-                    .map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
-            "logi_set_eq" => {
-                let arr = p["gains"].as_array().ok_or("gains manquants")?;
-                let gains: Vec<i8> = arr
-                    .iter()
-                    .map(|v| v.as_i64().unwrap_or(0).clamp(-12, 12) as i8)
-                    .collect();
-                let h = self.logi_headset_mut(p)?;
-                h.set_equalizer_gains(&gains).map_err(|e| e.to_string())?;
-                Ok(self.full_state_json())
-            }
             "cooling_read_bios_curves" => {
                 if !self.cooling_status.wmi_available {
                     return Err(
@@ -1408,12 +1324,20 @@ impl BackendEngine {
                             .into(),
                     );
                 }
+                let read = self
+                    .curve_cooling_mut()
+                    .ok_or("Contrôleur de courbes carte mère absent")?
+                    .read_firmware_curves()
+                    .map_err(|e| e.to_string())?;
                 self.cooling_channels = opengear_core::cooling::FanHeaderKind::ALL
                     .iter()
                     .map(|&h| {
-                        read_asus_wmi_channel(h).unwrap_or_else(|| {
-                            opengear_core::cooling::FanChannelConfig::default_for(h)
-                        })
+                        read.iter()
+                            .find(|c| c.header == h)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                opengear_core::cooling::FanChannelConfig::default_for(h)
+                            })
                     })
                     .collect();
                 Ok(self.full_state_json())
@@ -1421,81 +1345,93 @@ impl BackendEngine {
             "cooling_update_channel" => {
                 let idx = p["index"].as_u64().ok_or("index manquant")? as usize;
                 let apply = p["apply"].as_bool().unwrap_or(false);
-                let ch = self
-                    .cooling_channels
-                    .get_mut(idx)
-                    .ok_or("Canal PWM invalide")?;
+                {
+                    let ch = self
+                        .cooling_channels
+                        .get_mut(idx)
+                        .ok_or("Canal PWM invalide")?;
 
-                if let Some(pol) = p["policy"].as_str() {
-                    ch.policy = match pol {
-                        "Silent" => FanPolicyMode::Silent,
-                        "Standard" => FanPolicyMode::Standard,
-                        "Turbo" => FanPolicyMode::Turbo,
-                        "FullSpeed" => FanPolicyMode::FullSpeed,
-                        _ => FanPolicyMode::Manual,
-                    };
-                }
-                if let Some(pts) = p["curve"].as_array() {
-                    for (i, item) in pts.iter().take(8).enumerate() {
-                        let t = item["temp_c"].as_u64().unwrap_or(50).clamp(20, 100) as u8;
-                        let d = item["duty_pct"].as_u64().unwrap_or(50).clamp(0, 100) as u8;
-                        ch.curve[i] = CurvePoint {
-                            temp_c: t,
-                            duty_pct: d,
+                    if let Some(pol) = p["policy"].as_str() {
+                        ch.policy = match pol {
+                            "Silent" => FanPolicyMode::Silent,
+                            "Standard" => FanPolicyMode::Standard,
+                            "Turbo" => FanPolicyMode::Turbo,
+                            "FullSpeed" => FanPolicyMode::FullSpeed,
+                            _ => FanPolicyMode::Manual,
                         };
                     }
-                }
-                if let Some(src) = p["source"].as_str() {
-                    ch.source = parse_temp_source(src);
-                    if idx < 5 {
-                        self.smart_fan_trackers[idx].reset();
+                    if let Some(pts) = p["curve"].as_array() {
+                        for (i, item) in pts.iter().take(8).enumerate() {
+                            let t = item["temp_c"].as_u64().unwrap_or(50).clamp(20, 100) as u8;
+                            let d = item["duty_pct"].as_u64().unwrap_or(50).clamp(0, 100) as u8;
+                            ch.curve[i] = CurvePoint {
+                                temp_c: t,
+                                duty_pct: d,
+                            };
+                        }
+                    }
+                    if let Some(src) = p["source"].as_str() {
+                        ch.source = parse_temp_source(src);
+                        if idx < 5 {
+                            self.smart_fan_trackers[idx].reset();
+                        }
+                    }
+                    if let Some(mix) = p.get("custom_mix").filter(|v| v.is_object()) {
+                        let op = match mix["op"].as_str().unwrap_or("Max") {
+                            "Avg" => TempMixOp::Avg,
+                            "Delta" => TempMixOp::Delta,
+                            _ => TempMixOp::Max,
+                        };
+                        let a = parse_sensor_kind(
+                            mix.get("a")
+                                .or_else(|| mix.get("sensor_a"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Cpu"),
+                        );
+                        let b = parse_sensor_kind(
+                            mix.get("b")
+                                .or_else(|| mix.get("sensor_b"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("GpuEdge"),
+                        );
+                        ch.custom_mix = Some(TempMixConfig { op, a, b });
+                        if idx < 5 {
+                            self.smart_fan_trackers[idx].reset();
+                        }
+                    } else if ch.source == FanTempSource::CustomMix && ch.custom_mix.is_none() {
+                        ch.custom_mix = Some(TempMixConfig::default());
+                    }
+                    if let Some(h) = p["hysteresis_c"].as_u64() {
+                        ch.hysteresis_c = (h as u8).min(12);
+                    }
+                    if let Some(sm) = p["smoothing_secs"].as_u64() {
+                        ch.smoothing_secs = (sm as u8).min(20);
                     }
                 }
-                if let Some(mix) = p.get("custom_mix").filter(|v| v.is_object()) {
-                    let op = match mix["op"].as_str().unwrap_or("Max") {
-                        "Avg" => TempMixOp::Avg,
-                        "Delta" => TempMixOp::Delta,
-                        _ => TempMixOp::Max,
-                    };
-                    let a = parse_sensor_kind(
-                        mix.get("a")
-                            .or_else(|| mix.get("sensor_a"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Cpu"),
-                    );
-                    let b = parse_sensor_kind(
-                        mix.get("b")
-                            .or_else(|| mix.get("sensor_b"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("GpuEdge"),
-                    );
-                    ch.custom_mix = Some(TempMixConfig { op, a, b });
-                    if idx < 5 {
-                        self.smart_fan_trackers[idx].reset();
-                    }
-                } else if ch.source == FanTempSource::CustomMix && ch.custom_mix.is_none() {
-                    ch.custom_mix = Some(TempMixConfig::default());
-                }
-                if let Some(h) = p["hysteresis_c"].as_u64() {
-                    ch.hysteresis_c = (h as u8).min(12);
-                }
-                if let Some(sm) = p["smoothing_secs"].as_u64() {
-                    ch.smoothing_secs = (sm as u8).min(20);
-                }
-                if apply && ch.source == FanTempSource::CpuBios {
-                    apply_asus_wmi_curve(ch).map_err(|e| e.to_string())?;
+                if apply && self.cooling_channels[idx].source == FanTempSource::CpuBios {
+                    let cfg = self.cooling_channels[idx].clone();
+                    self.curve_cooling_mut()
+                        .ok_or("Contrôleur de courbes carte mère absent")?
+                        .apply_channel_curve(&cfg)
+                        .map_err(|e| e.to_string())?;
                 }
                 Ok(self.full_state_json())
             }
             "cooling_sl3_preset" => {
                 let preset = p["preset"].as_str().unwrap_or("default");
+                let mut to_apply = None;
                 if let Some(ch) = self.cooling_channels.get_mut(0) {
                     ch.policy = FanPolicyMode::Manual;
                     ch.curve =
                         opengear_core::cooling::FanChannelConfig::silent_loop3_preset(preset);
                     if self.cooling_status.is_admin {
-                        let _ = apply_asus_wmi_curve(ch);
+                        to_apply = Some(ch.clone());
                     }
+                }
+                if let Some(cfg) = to_apply
+                    && let Some(fc) = self.curve_cooling_mut()
+                {
+                    let _ = fc.apply_channel_curve(&cfg);
                 }
                 Ok(self.full_state_json())
             }
@@ -1856,7 +1792,7 @@ impl BackendEngine {
                 self.config.active_profile = name.clone();
                 self.manual_profile_name = name;
                 self.auto_switched = false;
-                migrate_legacy_profiles(&mut self.config);
+                migrate_legacy_profiles(&mut self.config, &mut self.driver_devices);
                 seed_and_resize_device_lighting(&mut self.config, &mut self.driver_devices);
                 self.sync_input_rules();
                 self.persist_config();
@@ -2039,16 +1975,68 @@ fn parse_lighting_override(v: &Value) -> std::result::Result<LightingOverride, S
     }
 }
 
-fn parse_4byte_hex(hex: &str) -> Option<[u8; 4]> {
-    if hex.len() != 8 || !hex.is_ascii() {
-        return None;
+impl BackendEngine {
+    fn collect_backups(&mut self, device_id: Option<&str>) -> Vec<Value> {
+        let mut out = Vec::new();
+        for d in &mut self.driver_devices {
+            let info = d.info();
+            if let Some(target) = device_id
+                && info.id != target
+            {
+                continue;
+            }
+            if let Some(ob) = d.onboard() {
+                for b in ob.onboard_backups() {
+                    out.push(json!({
+                        "device_id": info.id,
+                        "device_model": info.model,
+                        "device_vendor": info.vendor,
+                        "file": b.file,
+                        "tag": b.tag,
+                        "sector_hex": b.sector_hex,
+                        "size": b.size,
+                        "created_ms": b.created_ms,
+                    }));
+                }
+            }
+        }
+        out
     }
-    Some([
-        u8::from_str_radix(&hex[0..2], 16).ok()?,
-        u8::from_str_radix(&hex[2..4], 16).ok()?,
-        u8::from_str_radix(&hex[4..6], 16).ok()?,
-        u8::from_str_radix(&hex[6..8], 16).ok()?,
-    ])
+}
+
+fn parse_onboard_patch(p: &Value) -> OnboardProfilePatch {
+    OnboardProfilePatch {
+        report_rate_hz: p["report_rate_hz"].as_u64().map(|v| v as u16),
+        default_dpi_idx: p["default_dpi_idx"].as_u64().map(|v| (v as u8).min(4)),
+        dpi_stages: p["dpi_stages"].as_array().map(|arr| {
+            arr.iter()
+                .take(5)
+                .filter_map(|v| v.as_u64().map(|dpi| (dpi as u16).clamp(100, 32000)))
+                .collect()
+        }),
+        button_hexes: p["buttons"].as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|b| b.as_str().map(str::to_string))
+                .collect()
+        }),
+    }
+}
+
+fn parse_onboard_macro_steps(arr: &[Value]) -> Vec<OnboardMacroStep> {
+    arr.iter()
+        .filter_map(|s| {
+            let kind = s["kind"].as_str().unwrap_or("");
+            let val = s["value"].as_u64().unwrap_or(0) as u16;
+            match kind {
+                "key_down" => Some(OnboardMacroStep::KeyPress(val as u8)),
+                "key_up" => Some(OnboardMacroStep::KeyRelease(val as u8)),
+                "mouse_down" => Some(OnboardMacroStep::MousePress(val as u8)),
+                "mouse_up" => Some(OnboardMacroStep::MouseRelease(val as u8)),
+                "delay" => Some(OnboardMacroStep::DelayMs(val)),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn mask_user_profile(text: &str) -> String {

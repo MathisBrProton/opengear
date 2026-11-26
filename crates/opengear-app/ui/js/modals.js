@@ -101,22 +101,21 @@ export function riskOf(cmd, p = {}) {
         details: ["Les appareils concernés sont recherchés immédiatement après l'activation.", "Tu peux le désactiver à tout moment ici."],
         confirm: "Activer",
       };
-    case "logi_flash_profile":
+    case "device_onboard_flash_profile":
       return {
-        title: "Écrire ce profil dans la souris ?",
-        body: "Le profil sera écrit dans la mémoire flash interne de la souris et remplacera le contenu actuel de cet emplacement. Une copie de sauvegarde est faite avant l'écriture, puis le résultat est vérifié (CRC-16).",
-        details: ["Ne débranche pas la souris et ne la laisse pas se mettre en veille pendant l'écriture.", "Une sauvegarde restaurable apparaîtra dans Système › Sauvegardes."],
-        confirm: "Écrire dans la souris",
+        title: "Écrire ce profil dans l'appareil ?",
+        body: "Le profil sera écrit dans la mémoire flash interne de l'appareil et remplacera le contenu actuel de cet emplacement. Une copie de sauvegarde est faite avant l'écriture, puis le résultat est vérifié.",
+        details: ["Ne débranche pas l'appareil et ne le laisse pas se mettre en veille pendant l'écriture.", "Une sauvegarde restaurable apparaîtra dans Système › Sauvegardes."],
+        confirm: "Écrire dans l'appareil",
       };
-    case "logi_flash_macro":
+    case "device_onboard_flash_macro":
       return {
-        title: "Écrire la macro dans la souris ?",
-        body: `La macro sera écrite dans la mémoire flash de la souris et assignée au bouton M${num(p.button_index) + 1} du profil embarqué sélectionné. Le bouton perdra son action actuelle.`,
-        details: ["Ne débranche pas la souris pendant l'écriture.", "Une sauvegarde du secteur est conservée (Système › Sauvegardes)."],
+        title: "Écrire la macro dans l'appareil ?",
+        body: `La macro sera écrite dans la mémoire flash de l'appareil et assignée au bouton M${num(p.button_index) + 1} du profil embarqué sélectionné. Le bouton perdra son action actuelle.`,
+        details: ["Ne débranche pas l'appareil pendant l'écriture.", "Une sauvegarde du secteur est conservée (Système › Sauvegardes)."],
         confirm: "Écrire la macro",
       };
-    case "logi_restore_backup":
-    case "corsair_restore_backup":
+    case "device_restore_backup":
       return {
         title: "Restaurer cette sauvegarde ?",
         body: "Le contenu de la sauvegarde va remplacer les données correspondantes dans la mémoire flash de l'appareil. Les réglages actuellement stockés à cet emplacement seront perdus.",

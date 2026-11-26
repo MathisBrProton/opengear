@@ -197,7 +197,8 @@ export function downloadText(filename, text) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-export const devIdx = (el) => Number(el.dataset.dev || 0);
+export const devId = (el) => el.dataset.id || "";
+export const domId = (id) => String(id || "").replace(/[^a-zA-Z0-9_-]/g, "_");
 export function inputVal(id) {
   const el = document.getElementById(id);
   return el ? el.value : null;

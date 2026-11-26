@@ -8,14 +8,15 @@ export function viewProfiles() {
   const sp = S.system_prefs;
   const linked = arr(prof.linked_apps);
   const hw = [];
-  S.corsair_devices.forEach((d) => {
-    const ctl = settingInline(d.device_id, "corsair.hw_profile", { label: d.product_name });
-    if (ctl) hw.push(`<div class="list-row"><div class="grow">${ctl}<div class="muted small">Profils enregistrés dans le clavier</div></div></div>`);
-  });
-  S.logi_mice.forEach((m, i) => {
-    const ob = m.onboard;
-    const profiles = arr(m.onboard_profiles);
-    if (ob && profiles.length) hw.push(`<div class="list-row"><div><strong>${esc(m.name)}</strong><div class="muted small">Profils enregistrés dans la souris</div></div>${seg(profiles.map((p, idx) => [num(p.slot_index, idx + 1), `Profil ${num(p.slot_index, idx + 1)}`]), ob.active_profile, "logi-activate-seg", { dev: i })}</div>`);
+  arr(S.device_list).forEach((d) => {
+    const id = d.info.id;
+    const ctl = settingInline(id, "corsair.hw_profile", { label: d.info.model });
+    if (ctl) hw.push(`<div class="list-row"><div class="grow">${ctl}<div class="muted small">Profils enregistrés dans l'appareil</div></div></div>`);
+    const ob = d.onboard && d.onboard.info;
+    const profiles = arr(d.onboard && d.onboard.profiles);
+    if (ob && profiles.length) {
+      hw.push(`<div class="list-row"><div><strong>${esc(d.info.model)}</strong><div class="muted small">Profils enregistrés dans l'appareil</div></div>${seg(profiles.map((p, idx) => [num(p.slot, idx + 1), `Profil ${num(p.slot, idx + 1)}`]), ob.active_profile, "ob-activate-seg", { id })}</div>`);
+    }
   });
   return `
     ${pageHeader("Profils", "Un profil regroupe éclairage, touches et réglages de jeu. Bascule à la main ou automatiquement selon le jeu lancé.",

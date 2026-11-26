@@ -26,7 +26,7 @@ function sysPrefs() {
   const lang = ui().language;
   const ex = isExpert();
   return `
-    <div class="grid-2">
+    <div class="grid-2 grid-balanced">
       <div class="card">
         <div class="card-head"><h2 class="card-title">Interface</h2></div>
         <div class="row-between">
@@ -179,64 +179,48 @@ function sysDiag() {
 }
 
 function sysBackups() {
-  const mice = S.logi_mice;
-  const corsairDevs = S.corsair_devices;
-  const logiList = arr(local.backups.data && local.backups.data.backups).slice().sort((a, b) => num(b.created_ms) - num(a.created_ms));
-  const corsairList = arr(local.backups.corsairData && local.backups.corsairData.backups).slice().sort((a, b) => num(b.created_ms) - num(a.created_ms));
-  if (local.backups.mouse >= mice.length) local.backups.mouse = 0;
-  if (local.backups.corsairDev >= corsairDevs.length) local.backups.corsairDev = 0;
+  const obDevs = arr(S.device_list).filter((d) => d.onboard);
+  if (local.backups.deviceId && !obDevs.some((d) => d.info.id === local.backups.deviceId)) {
+    local.backups.deviceId = obDevs[0] ? obDevs[0].info.id : "";
+  } else if (!local.backups.deviceId && obDevs.length) {
+    local.backups.deviceId = obDevs[0].info.id;
+  }
+  const all = arr(local.backups.data && local.backups.data.backups).slice().sort((a, b) => num(b.created_ms) - num(a.created_ms));
+  const list = local.backups.deviceId ? all.filter((b) => !b.device_id || b.device_id === local.backups.deviceId) : all;
 
-  let logiBody;
-  if (local.backups.loading && !local.backups.data) logiBody = `<div class="loading-inline"><div class="spinner sm"></div>Lecture des sauvegardes…</div>`;
-  else if (local.backups.error) logiBody = `<div class="alert warn"><span class="alert-icon">${ICONS.warn}</span><div><div class="alert-title">Sauvegardes indisponibles</div><div class="muted">${esc(local.backups.error)}</div></div></div>`;
-  else if (!logiList.length) logiBody = emptyState("Aucune sauvegarde Logitech", "Une sauvegarde est créée automatiquement avant chaque écriture dans la mémoire d'une souris Logitech.");
-  else logiBody = `
+  let body;
+  if (local.backups.loading && !local.backups.data) body = `<div class="loading-inline"><div class="spinner sm"></div>Lecture des sauvegardes…</div>`;
+  else if (local.backups.error) body = `<div class="alert warn"><span class="alert-icon">${ICONS.warn}</span><div><div class="alert-title">Sauvegardes indisponibles</div><div class="muted">${esc(local.backups.error)}</div></div></div>`;
+  else if (!list.length) body = emptyState("Aucune sauvegarde flash", "Une sauvegarde est créée automatiquement avant chaque écriture dans la mémoire interne d'un appareil.");
+  else body = `
     <div class="table-scroll"><table class="meta-table">
-      <thead><tr><th>Date</th><th>Type</th><th>Secteur</th><th>Taille</th><th><span class="sr-only">Action</span></th></tr></thead>
-      <tbody>${logiList.map((b) => `
-        <tr>
-          <td>${esc(fmtDate(b.created_ms))}</td>
-          <td>${esc(TAG_LABEL[b.tag] || b.tag || "—")}</td>
-          <td class="mono">${esc(b.sector_hex)}</td>
-          <td>${esc(fmtSize(b.size))}</td>
-          <td style="text-align:right"><button type="button" class="btn btn-sm btn-secondary" data-act="backup-restore" data-file="${esc(b.file)}" data-label="${esc(`${TAG_LABEL[b.tag] || b.tag || "Sauvegarde"} · secteur ${b.sector_hex} · ${fmtDate(b.created_ms)}`)}" ${mice.length ? "" : "disabled"}>Restaurer</button></td>
-        </tr>`).join("")}</tbody>
-    </table></div>`;
-
-  const corsairBody = !corsairList.length
-    ? `<div class="muted">Aucune sauvegarde Corsair HWP enregistrée pour l'instant.</div>`
-    : `<div class="table-scroll"><table class="meta-table">
-        <thead><tr><th>Date</th><th>Fichier HWP</th><th>Type</th><th>Taille</th><th><span class="sr-only">Action</span></th></tr></thead>
-        <tbody>${corsairList.map((b) => `
+      <thead><tr><th>Date</th><th>Appareil</th><th>Type</th><th>Emplacement</th><th>Taille</th><th><span class="sr-only">Action</span></th></tr></thead>
+      <tbody>${list.map((b) => {
+        const targetId = b.device_id || local.backups.deviceId;
+        const canRestore = obDevs.some((d) => d.info.id === targetId);
+        return `
           <tr>
             <td>${esc(fmtDate(b.created_ms))}</td>
-            <td class="mono">${esc(b.file_id_hex)}</td>
-            <td>${esc(TAG_LABEL[b.tag] || b.tag || "HWP")}</td>
+            <td>${esc(b.device_model || "—")}</td>
+            <td>${esc(TAG_LABEL[b.tag] || b.tag || "—")}</td>
+            <td class="mono">${esc(b.sector_hex)}</td>
             <td>${esc(fmtSize(b.size))}</td>
-            <td style="text-align:right"><button type="button" class="btn btn-sm btn-secondary" data-act="corsair-backup-restore" data-file="${esc(b.file)}" data-label="${esc(`Corsair ${b.file_id_hex} · ${fmtDate(b.created_ms)}`)}" ${corsairDevs.length ? "" : "disabled"}>Restaurer</button></td>
-          </tr>`).join("")}</tbody>
-      </table></div>`;
+            <td style="text-align:right"><button type="button" class="btn btn-sm btn-secondary" data-act="ob-backup-restore" data-id="${esc(targetId)}" data-file="${esc(b.file)}" data-label="${esc(`${b.device_model || ""} · ${TAG_LABEL[b.tag] || b.tag || "Sauvegarde"} · ${b.sector_hex} · ${fmtDate(b.created_ms)}`)}" ${canRestore ? "" : "disabled"}>Restaurer</button></td>
+          </tr>`;
+      }).join("")}</tbody>
+    </table></div>`;
 
   return `
-    <div class="stack">
-      <div class="card expert-card">
-        <div class="card-head">
-          <div><h2 class="card-title">Sauvegardes de la mémoire des souris Logitech ${expertTag()}</h2><div class="card-desc">Copies faites automatiquement avant chaque écriture de profil ou de macro.</div></div>
-          <div class="row">
-            ${mice.length > 1 ? `<label class="field-label" for="bk-mouse" style="min-width:0">Souris cible</label><select id="bk-mouse" class="og-select auto" data-change="bk-mouse">${mice.map((m, i) => `<option value="${i}" ${i === local.backups.mouse ? "selected" : ""}>${esc(m.name)}</option>`).join("")}</select>` : ""}
-            <button type="button" class="btn btn-sm btn-secondary" data-act="backups-refresh">${ICONS.refresh}Actualiser</button>
-          </div>
+    <div class="card expert-card">
+      <div class="card-head">
+        <div><h2 class="card-title">Sauvegardes de la mémoire flash ${expertTag()}</h2><div class="card-desc">Copies faites automatiquement avant chaque écriture de profil, macro ou éclairage matériel dans la flash d'un appareil.</div></div>
+        <div class="row">
+          ${obDevs.length > 1 ? `<label class="field-label" for="bk-dev" style="min-width:0">Appareil</label><select id="bk-dev" class="og-select auto" data-change="bk-dev">${obDevs.map((d) => `<option value="${esc(d.info.id)}" ${d.info.id === local.backups.deviceId ? "selected" : ""}>${esc(d.info.model)}</option>`).join("")}</select>` : ""}
+          <button type="button" class="btn btn-sm btn-secondary" data-act="backups-refresh">${ICONS.refresh}Actualiser</button>
         </div>
-        ${!mice.length ? `<div class="alert info"><span class="alert-icon">${ICONS.info}</span><div><div class="alert-title">Aucune souris Logitech détectée</div><div class="muted">Branche le récepteur LIGHTSPEED / Bolt ou le câble de la souris pour pouvoir restaurer une sauvegarde.</div></div></div>` : mice.length === 1 ? `<div class="muted mb-16">Restauration vers : <strong>${esc(mice[0].name)}</strong></div>` : ""}
-        ${logiBody}
       </div>
-      <div class="card expert-card">
-        <div class="card-head">
-          <div><h2 class="card-title">Sauvegardes flash Corsair HWP ${expertTag()}</h2><div class="card-desc">Copies créées automatiquement avant chaque flash d'éclairage matériel Corsair.</div></div>
-          ${corsairDevs.length > 1 ? `<select id="bk-corsair" class="og-select auto" data-change="bk-corsair">${corsairDevs.map((d, i) => `<option value="${i}" ${i === local.backups.corsairDev ? "selected" : ""}>${esc(d.product_name)}</option>`).join("")}</select>` : ""}
-        </div>
-        ${corsairBody}
-      </div>
+      ${!obDevs.length ? `<div class="alert info"><span class="alert-icon">${ICONS.info}</span><div><div class="alert-title">Aucun appareil à mémoire embarquée détecté</div><div class="muted">Branche un appareil compatible pour pouvoir restaurer une sauvegarde flash.</div></div></div>` : ""}
+      ${body}
     </div>`;
 }
 
@@ -244,7 +228,7 @@ function sysAbout() {
   const si = S.static_info;
   const la = S.local_assets;
   return `
-    <div class="grid-2">
+    <div class="grid-2 grid-balanced">
       <div class="card">
         <div class="card-head"><h2 class="card-title">OpenGear</h2></div>
         <p class="muted">Contrôleur matériel unifié, léger et local : remplace iCUE, G HUB et Armoury Crate pour l'éclairage, les souris, claviers, casques et la ventilation.</p>

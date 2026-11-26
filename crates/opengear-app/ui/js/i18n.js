@@ -283,6 +283,7 @@ const EN = {
   "Appui court / Maintien": "Tap / Hold",
   "Taper un texte": "Type text",
   "Assigner": "Assign",
+  "Apparence du casque": "Headset style",
   "Macro en plusieurs étapes": "Multi-step macro",
   "Enregistrer en direct": "Record live",
   "Arrêter l'enregistrement": "Stop recording",

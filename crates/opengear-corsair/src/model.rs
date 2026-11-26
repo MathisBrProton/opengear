@@ -3,19 +3,103 @@
 use crate::device::{CorsairDevice, CorsairDeviceKind};
 use crate::hwp::HwpLightingKind;
 use crate::keymap::{K70_TKL_KEYS, keys_for_layout, layout_for_device};
-use crate::proto::CORSAIR_VID;
+use crate::proto::{
+    CORSAIR_VID, PROP_BRIGHTNESS_INDICATOR_COLOR, PROP_ESPORTS_BACKLIGHT_COLOR,
+    PROP_PROFILE_INDICATOR_COLOR, PROP_WINLOCK_OFF_COLOR, PROP_WINLOCK_ON_COLOR,
+};
 use anyhow::{Context, Result, bail};
 use opengear_core::driver::{
     ChoiceOption, Connection, Device, DeviceInfo, DeviceKeyGeom, DeviceKeyboardLayout, DeviceKind,
-    DeviceStatus, Driver, Section, Setting, Value, polling_rate_options, setting_ids,
+    DeviceSpec, DeviceStatus, Driver, Section, Setting, Value, polling_rate_options, setting_ids,
 };
 use opengear_core::lighting::{
     EffectParams, EffectRequest, HardwareEffect, Led, Lighting, Zone, ZoneKind,
 };
 use opengear_core::{
-    OnboardMemory, OnboardProfileSummary, OperatingMode, PointerDevice, PointerDpiInfo,
-    PollingRate, Rgb,
+    OnboardBackupEntry, OnboardMemory, OnboardMemoryInfo, OnboardProfileSummary, OperatingMode,
+    PointerDevice, PointerDpiInfo, PollingRate, Rgb,
 };
+
+/// Read-only Bragi flash file dump for CLI diagnostics (`opengear corsair hwp-dump`).
+pub fn dump_first_hwp_flash() -> Result<String> {
+    use std::fmt::Write as _;
+    let mut devices = CorsairDevice::connect_all();
+    let dev = devices
+        .first_mut()
+        .context("Aucun périphérique Corsair Bragi détecté")?;
+    let mut out = format!(
+        "=== Dump Flash Bragi v2 (READ-ONLY) : {} ===\n",
+        dev.info.product_name
+    );
+    dev.with_flash_session(|t| {
+        let mut to_inspect: Vec<u16> = Vec::new();
+        for &(fid, label) in &[
+            (crate::proto::FILE_LISTING, "FileListing (0x0011)"),
+            (crate::proto::FILE_PROFILES_LIST, "ProfilesList (0x000F)"),
+        ] {
+            match t.read_file(fid) {
+                Ok(bytes) => {
+                    let _ = write!(out, "\n[{label}] {} octets : ", bytes.len());
+                    for b in &bytes {
+                        let _ = write!(out, "{b:02X} ");
+                    }
+                    out.push('\n');
+                    for chunk in bytes.as_chunks::<2>().0 {
+                        let id = u16::from_le_bytes([chunk[0], chunk[1]]);
+                        if id >= crate::proto::FILE_FREE_MIN && !to_inspect.contains(&id) {
+                            to_inspect.push(id);
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = writeln!(out, "[{label}] -> {e}");
+                }
+            }
+        }
+        let _ = writeln!(
+            out,
+            "\n=== Fichiers utilisateurs détectés ({}) ===",
+            to_inspect.len()
+        );
+        for fid in to_inspect {
+            match t.read_file(fid) {
+                Ok(bytes) => {
+                    let hdr = if bytes.len() >= 2 {
+                        u16::from_le_bytes([bytes[0], bytes[1]])
+                    } else {
+                        0
+                    };
+                    let _ = writeln!(
+                        out,
+                        "\n  File 0x{fid:04X} ({} B, magic=0x{hdr:04X}):",
+                        bytes.len()
+                    );
+                    for (row, chunk) in bytes.chunks(16).enumerate() {
+                        let _ = write!(out, "    {:04X}: ", row * 16);
+                        for b in chunk {
+                            let _ = write!(out, "{b:02X} ");
+                        }
+                        out.push_str("  ");
+                        for &b in chunk {
+                            let ch = if (0x20..=0x7E).contains(&b) {
+                                b as char
+                            } else {
+                                '.'
+                            };
+                            out.push(ch);
+                        }
+                        out.push('\n');
+                    }
+                }
+                Err(e) => {
+                    let _ = writeln!(out, "  File 0x{fid:04X} -> {e}");
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
 
 /// Driver discovering all connected Corsair Bragi v2 devices.
 pub struct CorsairDriver;
@@ -47,6 +131,34 @@ const WINLOCK_SHORTCUTS: [(&str, &str, u8); 4] = [
     ("corsair.winlock.alt_tab", "Verrou : Alt + Tab", 2),
     ("corsair.winlock.alt_f4", "Verrou : Alt + F4", 4),
     ("corsair.winlock.shift_tab", "Verrou : Maj + Tab", 8),
+];
+/// Programmable keyboard indicator LEDs: `(setting id, label, Bragi property id)`.
+const INDICATOR_COLORS: [(&str, &str, u8); 5] = [
+    (
+        "corsair.indicator.esports",
+        "Voyant mode tournoi",
+        PROP_ESPORTS_BACKLIGHT_COLOR,
+    ),
+    (
+        "corsair.indicator.winlock_on",
+        "Voyant verrou Windows actif",
+        PROP_WINLOCK_ON_COLOR,
+    ),
+    (
+        "corsair.indicator.winlock_off",
+        "Voyant verrou Windows inactif",
+        PROP_WINLOCK_OFF_COLOR,
+    ),
+    (
+        "corsair.indicator.profile",
+        "Voyant bouton profil",
+        PROP_PROFILE_INDICATOR_COLOR,
+    ),
+    (
+        "corsair.indicator.brightness",
+        "Voyant luminosité",
+        PROP_BRIGHTNESS_INDICATOR_COLOR,
+    ),
 ];
 const DEBOUNCE_STEPS_MS: [u8; 10] = [0, 1, 2, 3, 5, 10, 15, 20, 30, 60];
 /// Mask used by the firmware when it does not report one.
@@ -102,6 +214,66 @@ impl Device for CorsairDevice {
             battery_pct: self.info.battery_pct,
             ..Default::default()
         }
+    }
+
+    fn specs(&self) -> Vec<DeviceSpec> {
+        let i = &self.info;
+        let mut out = Vec::new();
+        if i.kind == CorsairDeviceKind::Keyboard {
+            out.push(DeviceSpec::simple("Disposition", i.layout.label()));
+        }
+        if let Some(total) = i.storage_total_kb
+            && total > 0
+        {
+            let free = i
+                .storage_free_kb
+                .map_or_else(|| "?".to_string(), |f| f.to_string());
+            out.push(DeviceSpec::simple(
+                "Mémoire interne",
+                format!("{free} Ko libres sur {total} Ko"),
+            ));
+        }
+        if let Some(ref c) = i.cooler {
+            if let Some(v) = c.product_line_id {
+                out.push(DeviceSpec::simple("Gamme", format!("0x{v:02X}")));
+            }
+            if let Some(v) = c.pump_version_id {
+                out.push(DeviceSpec::simple("Version de pompe", format!("0x{v:02X}")));
+            }
+            if let Some(v) = c.radiator_size {
+                out.push(DeviceSpec::simple("Taille du radiateur", format!("{v} mm")));
+            }
+        }
+        if i.esports_switch_on == Some(true) {
+            out.push(DeviceSpec::simple("Interrupteur tournoi", "Activé"));
+        }
+        let usb = if i.subdevice_id > 0 {
+            format!(
+                "{:04X}:{:04X} (sous-appareil {})",
+                i.vid, i.pid, i.subdevice_id
+            )
+        } else {
+            format!("{:04X}:{:04X}", i.vid, i.pid)
+        };
+        out.push(DeviceSpec::expert("Identifiant USB", usb, true));
+        if !i.bootloader_version.is_empty() {
+            out.push(DeviceSpec::expert(
+                "Bootloader",
+                &i.bootloader_version,
+                true,
+            ));
+        }
+        if !i.serial.is_empty() {
+            out.push(DeviceSpec::expert("Numéro de série", &i.serial, true));
+        }
+        if i.out_report_len > 0 {
+            out.push(DeviceSpec::expert(
+                "Taille de rapport",
+                format!("{} octets", i.out_report_len),
+                true,
+            ));
+        }
+        out
     }
 
     fn settings(&self) -> Vec<Setting> {
@@ -231,6 +403,15 @@ impl Device for CorsairDevice {
                 .help("T'entendre dans le casque quand tu parles."),
             );
         }
+        if i.kind == CorsairDeviceKind::Keyboard {
+            for (sid, label, _) in INDICATOR_COLORS {
+                out.push(
+                    Setting::color(sid, label, Section::Lighting, "#FF1848")
+                        .expert()
+                        .stored_in_device(),
+                );
+            }
+        }
         out
     }
 
@@ -246,7 +427,8 @@ impl Device for CorsairDevice {
     }
 
     fn onboard(&mut self) -> Option<&mut dyn OnboardMemory> {
-        (!self.info.hwp_profiles.is_empty()).then_some(self as &mut dyn OnboardMemory)
+        (!self.info.hwp_profiles.is_empty() || self.info.kind == CorsairDeviceKind::Keyboard)
+            .then_some(self as &mut dyn OnboardMemory)
     }
 
     fn diagnostic_lines(&self) -> Vec<String> {
@@ -280,14 +462,6 @@ impl Device for CorsairDevice {
         })
     }
 
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
-    }
-
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        Some(self)
-    }
-
     fn apply_setting(&mut self, id: &str, value: &Value) -> Result<()> {
         match id {
             setting_ids::POLLING_RATE => {
@@ -312,6 +486,14 @@ impl Device for CorsairDevice {
                 self.set_headset_sidetone(pct, pct == 0)?;
             }
             other => {
+                if let Some(&(_, _, prop_id)) =
+                    INDICATOR_COLORS.iter().find(|(sid, _, _)| *sid == other)
+                {
+                    let hex = value.as_str().context("couleur hex attendue")?;
+                    let col = Rgb::from_hex(hex).context("couleur hex invalide")?;
+                    self.set_indicator_color(prop_id, col)?;
+                    return Ok(());
+                }
                 let Some(&(_, _, bit)) = WINLOCK_SHORTCUTS.iter().find(|(sid, _, _)| *sid == other)
                 else {
                     bail!("Réglage inconnu : {other}");
@@ -459,6 +641,8 @@ impl PointerDevice for CorsairDevice {
             max_dpi: 30000,
             step_dpi: 50,
             independent_xy: false,
+            supports_lod: false,
+            lod: None,
             stages: m.dpi_stages.to_vec(),
             active_stage: Some(active),
             report_rate_hz: self.info.pollrate.map(|p| p.hz()),
@@ -489,6 +673,27 @@ impl PointerDevice for CorsairDevice {
 }
 
 impl OnboardMemory for CorsairDevice {
+    fn onboard_info(&self) -> Option<OnboardMemoryInfo> {
+        let active = self.info.active_hw_profile.unwrap_or(0) as u16;
+        Some(OnboardMemoryInfo {
+            mode: Some(if self.info.mode == OperatingMode::Software {
+                "host".into()
+            } else {
+                "onboard".into()
+            }),
+            mode_label: Some(match self.info.mode {
+                OperatingMode::Software => "Piloté par OpenGear".into(),
+                OperatingMode::Hardware => "Profils flash Corsair".into(),
+            }),
+            profile_count: self.info.hwp_profiles.len() as u8,
+            button_count: 0,
+            active_profile: active,
+            active_dpi_index: 0,
+            writable: false,
+            macros_supported: false,
+        })
+    }
+
     fn onboard_profiles(&self) -> Vec<OnboardProfileSummary> {
         let active = self.info.active_hw_profile.unwrap_or(0) as u16;
         self.info
@@ -499,8 +704,13 @@ impl OnboardMemory for CorsairDevice {
                 name: hp.name.clone(),
                 active: hp.slot_index as u16 == active,
                 dpi_stages: Vec::new(),
+                default_dpi_idx: None,
                 report_rate_hz: None,
                 editable: false,
+                sector_addr: Some(format!("0x{:04X}", hp.profile_file_id)),
+                from_rom: false,
+                crc_valid: None,
+                buttons: Vec::new(),
             })
             .collect()
     }
@@ -512,6 +722,29 @@ impl OnboardMemory for CorsairDevice {
 
     fn reload_onboard_profiles(&mut self) -> Result<()> {
         self.reload_hwp_profiles().map_err(anyhow::Error::from)
+    }
+
+    fn onboard_backups(&self) -> Vec<OnboardBackupEntry> {
+        crate::list_corsair_backups()
+            .into_iter()
+            .map(|b| OnboardBackupEntry {
+                file: b.file,
+                tag: b.tag,
+                sector_hex: b.file_id_hex,
+                size: b.size,
+                created_ms: b.created_ms,
+            })
+            .collect()
+    }
+
+    fn restore_onboard_backup(&mut self, file: &str) -> Result<String> {
+        let file_id = self
+            .with_flash_session(|t| crate::restore_corsair_backup(t, file))
+            .map_err(anyhow::Error::from)?;
+        let _ = self.reload_hwp_profiles();
+        Ok(format!(
+            "Sauvegarde Corsair {file} restaurée (fichier HWP 0x{file_id:04X})"
+        ))
     }
 }
 

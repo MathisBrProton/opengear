@@ -3,7 +3,7 @@
 use anyhow::Result;
 use opengear_core::cooling::{CurvePoint, FanChannelConfig, FanHeaderKind, FanPolicyMode};
 use opengear_core::driver::{Connection, Device, DeviceInfo, DeviceKind, Driver};
-use opengear_core::fans::{Cooling, FanInfo, FanTarget, clamp_target};
+use opengear_core::fans::{Cooling, CurveCooling, FanInfo, FanTarget, clamp_target};
 use opengear_platform::is_elevated;
 
 /// ASUS `ASUSManagement` WMI FanType IDs (verified on ASUS ROG desktop boards).
@@ -298,7 +298,8 @@ impl Driver for AsusWmiCoolingDriver {
     }
 
     fn discover(&self) -> Vec<Box<dyn Device>> {
-        if !probe_asus_wmi_cooling().wmi_available {
+        let status = probe_asus_wmi_cooling();
+        if !status.wmi_available {
             return Vec::new();
         }
         let initial: Vec<FanChannelConfig> = FanHeaderKind::ALL
@@ -312,14 +313,16 @@ impl Driver for AsusWmiCoolingDriver {
             })
             .collect();
         vec![Box::new(AsusWmiCoolingDevice {
+            status,
             initial,
             manual_pct: [None; 5],
         })]
     }
 }
 
-/// ASUS motherboard fan/pump channels exposed through the shared `Cooling` capability.
+/// ASUS motherboard fan/pump channels exposed through the shared `Cooling` & `CurveCooling` capabilities.
 pub struct AsusWmiCoolingDevice {
+    status: AsusWmiCoolingStatus,
     initial: Vec<FanChannelConfig>,
     manual_pct: [Option<u8>; 5],
 }
@@ -381,6 +384,34 @@ impl Device for AsusWmiCoolingDevice {
 
     fn cooling(&mut self) -> Option<&mut dyn Cooling> {
         Some(self)
+    }
+
+    fn fan_curves(&mut self) -> Option<&mut dyn CurveCooling> {
+        Some(self)
+    }
+}
+
+impl CurveCooling for AsusWmiCoolingDevice {
+    fn curve_channels(&self) -> Vec<FanChannelConfig> {
+        self.initial.clone()
+    }
+
+    fn read_firmware_curves(&mut self) -> Result<Vec<FanChannelConfig>> {
+        let updated: Vec<FanChannelConfig> = FanHeaderKind::ALL
+            .iter()
+            .map(|&h| read_asus_wmi_channel(h).unwrap_or_else(|| FanChannelConfig::default_for(h)))
+            .collect();
+        self.initial = updated.clone();
+        Ok(updated)
+    }
+
+    fn apply_channel_curve(&mut self, cfg: &FanChannelConfig) -> Result<()> {
+        let _ = apply_asus_wmi_curve(cfg)?;
+        Ok(())
+    }
+
+    fn cooling_diagnostic(&self) -> (bool, String) {
+        (self.status.wmi_available, self.status.message.clone())
     }
 }
 
@@ -448,6 +479,11 @@ mod tests {
     #[test]
     fn cooling_trait_exposes_all_headers_with_safety_floors() {
         let dev = AsusWmiCoolingDevice {
+            status: AsusWmiCoolingStatus {
+                is_admin: true,
+                wmi_available: true,
+                message: "OK".into(),
+            },
             initial: FanHeaderKind::ALL
                 .iter()
                 .map(|&h| FanChannelConfig::default_for(h))

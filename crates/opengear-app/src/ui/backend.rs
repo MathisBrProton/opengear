@@ -12,9 +12,6 @@ use crate::system_ext::{
     sample_ambilight_screen,
 };
 use crate::tray_icon::{TrayMenuState, tray_notify, update_tray_state};
-use opengear_asus::{
-    AsusWmiCoolingStatus, apply_asus_wmi_curve, probe_asus_wmi_cooling, read_asus_wmi_channel,
-};
 use opengear_core::cooling::{
     FanChannelConfig, FanCurveTracker, FanHeaderKind, FanPolicyMode, FanTempSource, SensorReadings,
     resolve_temp_reading,
@@ -35,7 +32,6 @@ use super::keyboard_view::KeyboardView;
 use opengear_core::{
     AppConfig, DetectedDevice, EffectKind, Rgb, RgbEffectConfig, blend_rgb, scan_hid_devices,
 };
-use opengear_corsair::key_code_for_led_index;
 use opengear_input::{InputEngine, reset_held_state};
 use opengear_openrgb::server::{OpenRgbSdkServer, OpenRgbServerEvent, SdkController};
 use serde_json::json;
@@ -46,6 +42,13 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use tao::event_loop::EventLoopProxy;
 use tracing::{error, info};
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct MainboardCoolingStatus {
+    pub is_admin: bool,
+    pub wmi_available: bool,
+    pub message: String,
+}
 
 pub(crate) struct BackendEngine {
     pub config_path: PathBuf,
@@ -61,7 +64,7 @@ pub(crate) struct BackendEngine {
     pub telemetry: TelemetryCollector,
     pub last_tel: SystemTelemetry,
     pub power_plans: Vec<PowerPlan>,
-    pub cooling_status: AsusWmiCoolingStatus,
+    pub cooling_status: MainboardCoolingStatus,
     pub cooling_channels: Vec<FanChannelConfig>,
     pub initial_cooling_channels: Vec<Option<FanChannelConfig>>,
     pub input_engine: InputEngine,
@@ -200,7 +203,6 @@ impl BackendEngine {
     ) -> Self {
         let config_path = AppConfig::default_config_path();
         let (mut config, config_warning) = AppConfig::load_or_recover(&config_path);
-        migrate_legacy_profiles(&mut config);
         let drivers = crate::drivers::device_drivers();
         let mut telemetry = TelemetryCollector::new();
         let (scanned_devices, power_plans, mut driver_devices, chassis_laptop, last_tel) =
@@ -221,6 +223,7 @@ impl BackendEngine {
                 )
             });
         let last_hid_sig = signature_from_detected(&scanned_devices);
+        migrate_legacy_profiles(&mut config, &mut driver_devices);
         seed_and_resize_device_lighting(&mut config, &mut driver_devices);
 
         if let Some(kb) = driver_devices
@@ -272,33 +275,8 @@ impl BackendEngine {
         } else {
             None
         };
-        let device_fans = device_cooling_owner(&mut driver_devices);
-        let cooling_status = mainboard_cooling_status(device_fans.as_deref());
-        let initial_cooling_channels: Vec<Option<FanChannelConfig>> = FanHeaderKind::ALL
-            .iter()
-            .map(|&h| {
-                if cooling_status.wmi_available {
-                    read_asus_wmi_channel(h)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        // Laptop fans belong to the embedded controller (driven through a device's `Cooling`),
-        // never to motherboard fan headers.
-        let cooling_channels: Vec<FanChannelConfig> =
-            if device_fans.is_some() || (is_laptop && !cooling_status.wmi_available) {
-                Vec::new()
-            } else {
-                FanHeaderKind::ALL
-                    .iter()
-                    .zip(&initial_cooling_channels)
-                    .map(|(&h, read)| {
-                        read.clone()
-                            .unwrap_or_else(|| FanChannelConfig::default_for(h))
-                    })
-                    .collect()
-            };
+        let (cooling_status, initial_cooling_channels, cooling_channels) =
+            collect_curve_cooling_state(&mut driver_devices, is_laptop);
         let superio = if is_laptop {
             SuperIoSnapshot::default()
         } else {
@@ -380,7 +358,7 @@ impl BackendEngine {
         mut config: AppConfig,
         mut driver_devices: Vec<Box<dyn Device>>,
     ) -> Self {
-        migrate_legacy_profiles(&mut config);
+        migrate_legacy_profiles(&mut config, &mut driver_devices);
         seed_and_resize_device_lighting(&mut config, &mut driver_devices);
         let cooling_channels: Vec<FanChannelConfig> = FanHeaderKind::ALL
             .iter()
@@ -399,7 +377,7 @@ impl BackendEngine {
             telemetry: TelemetryCollector::new(),
             last_tel: SystemTelemetry::default(),
             power_plans: Vec::new(),
-            cooling_status: AsusWmiCoolingStatus {
+            cooling_status: MainboardCoolingStatus {
                 is_admin: false,
                 wmi_available: false,
                 message: "Audit headless".into(),
@@ -628,19 +606,33 @@ impl BackendEngine {
             }
         }
 
+        let to_restore: Vec<FanChannelConfig> = (0..self.smart_fan_trackers.len())
+            .filter_map(|i| {
+                self.smart_fan_trackers[i]
+                    .last_duty()
+                    .is_some()
+                    .then(|| self.wmi_restore_config(i))
+                    .flatten()
+            })
+            .collect();
         let mut remaining_wmi = Vec::new();
-        for i in 0..self.smart_fan_trackers.len() {
-            if self.smart_fan_trackers[i].last_duty().is_some()
-                && let Some(cfg) = self.wmi_restore_config(i)
-                && let Err(e) = apply_asus_wmi_curve(&cfg)
-            {
-                error!(
-                    "Restauration ventilateur {:?} impossible à la fermeture : {e}",
-                    cfg.header
-                );
-                remaining_wmi.push(cfg);
+        if !to_restore.is_empty() {
+            if let Some(fc) = self.curve_cooling_mut() {
+                for cfg in to_restore {
+                    if let Err(e) = fc.apply_channel_curve(&cfg) {
+                        error!(
+                            "Restauration ventilateur {:?} impossible à la fermeture : {e}",
+                            cfg.header
+                        );
+                        remaining_wmi.push(cfg);
+                    }
+                }
+            } else {
+                remaining_wmi = to_restore;
             }
-            self.smart_fan_trackers[i].reset();
+        }
+        for tracker in &mut self.smart_fan_trackers {
+            tracker.reset();
         }
         let superio_logs = restore_all_superio_fans_auto();
         let superio_failed = superio_logs.iter().any(|l| {
@@ -862,6 +854,7 @@ impl BackendEngine {
                     nvme: sensors.nvme_temp_c,
                     motherboard: sensors.motherboard_temp_c,
                 };
+                let mut pending_applies: Vec<(usize, u8, FanChannelConfig)> = Vec::new();
                 for (idx, ch) in self.cooling_channels.iter().enumerate() {
                     if ch.source == FanTempSource::CpuBios || idx >= 5 {
                         continue;
@@ -876,13 +869,23 @@ impl BackendEngine {
                         for pt in &mut flat.curve {
                             pt.duty_pct = target_duty;
                         }
-                        if apply_asus_wmi_curve(&flat).is_ok() {
-                            let newly_overridden =
-                                self.smart_fan_trackers[idx].last_duty().is_none();
-                            self.smart_fan_trackers[idx].mark_applied(target_duty);
-                            if newly_overridden {
-                                marker_dirty = true;
-                            }
+                        pending_applies.push((idx, target_duty, flat));
+                    }
+                }
+                if !pending_applies.is_empty()
+                    && let Some(fc) = self.curve_cooling_mut()
+                {
+                    let mut applied = Vec::new();
+                    for (idx, target_duty, flat) in pending_applies {
+                        if fc.apply_channel_curve(&flat).is_ok() {
+                            applied.push((idx, target_duty));
+                        }
+                    }
+                    for (idx, target_duty) in applied {
+                        let newly_overridden = self.smart_fan_trackers[idx].last_duty().is_none();
+                        self.smart_fan_trackers[idx].mark_applied(target_duty);
+                        if newly_overridden {
+                            marker_dirty = true;
                         }
                     }
                 }
@@ -1469,8 +1472,12 @@ impl BackendEngine {
 
         self.cooling_keepalive.clear();
         if !self.headless {
-            let device_fans = device_cooling_owner(&mut self.driver_devices);
-            self.cooling_status = mainboard_cooling_status(device_fans.as_deref());
+            let (status, initial, _) =
+                collect_curve_cooling_state(&mut self.driver_devices, self.is_laptop);
+            self.cooling_status = status;
+            if self.cooling_status.wmi_available {
+                self.initial_cooling_channels = initial;
+            }
             self.sync_cooling_marker();
             self.power_plans = list_power_plans();
             self.scanned_devices = scan_hid_devices(false).unwrap_or_default();
@@ -1602,7 +1609,7 @@ impl BackendEngine {
     }
 
     pub(crate) fn apply_restored_config(&mut self) {
-        migrate_legacy_profiles(&mut self.config);
+        migrate_legacy_profiles(&mut self.config, &mut self.driver_devices);
         self.sync_input_rules();
         let need_engine = self.profile_needs_input_engine();
         if need_engine && !self.input_engine.is_running() {
@@ -1799,26 +1806,101 @@ pub(crate) fn device_cooling_owner(devices: &mut [Box<dyn Device>]) -> Option<St
     })
 }
 
-/// Motherboard fan interface status. When a device already drives the fans (laptop embedded
-/// controller), the ASUS WMI fan interface is not probed.
-pub(crate) fn mainboard_cooling_status(device_fans: Option<&str>) -> AsusWmiCoolingStatus {
-    match device_fans {
-        Some(model) => AsusWmiCoolingStatus {
-            is_admin: is_elevated(),
-            wmi_available: false,
-            message: format!("Ventilateurs pilotés par l'appareil « {model} »."),
-        },
-        None => probe_asus_wmi_cooling(),
+/// Read motherboard firmware fan-curve capability through `CurveCooling` when no laptop driver
+/// owns the chassis fans.
+pub(crate) fn collect_curve_cooling_state(
+    devices: &mut [Box<dyn Device>],
+    is_laptop: bool,
+) -> (
+    MainboardCoolingStatus,
+    Vec<Option<FanChannelConfig>>,
+    Vec<FanChannelConfig>,
+) {
+    if let Some(model) = device_cooling_owner(devices) {
+        return (
+            MainboardCoolingStatus {
+                is_admin: is_elevated(),
+                wmi_available: false,
+                message: format!("Ventilateurs pilotés par l'appareil « {model} »."),
+            },
+            vec![None; FanHeaderKind::ALL.len()],
+            Vec::new(),
+        );
     }
+
+    if let Some(fc) = devices.iter_mut().find_map(|d| d.fan_curves()) {
+        let (wmi_available, message) = fc.cooling_diagnostic();
+        let read_list = if wmi_available {
+            fc.curve_channels()
+        } else {
+            Vec::new()
+        };
+        let initial: Vec<Option<FanChannelConfig>> = FanHeaderKind::ALL
+            .iter()
+            .map(|&h| read_list.iter().find(|c| c.header == h).cloned())
+            .collect();
+        let channels = if is_laptop && !wmi_available {
+            Vec::new()
+        } else {
+            FanHeaderKind::ALL
+                .iter()
+                .zip(&initial)
+                .map(|(&h, read)| {
+                    read.clone()
+                        .unwrap_or_else(|| FanChannelConfig::default_for(h))
+                })
+                .collect()
+        };
+        return (
+            MainboardCoolingStatus {
+                is_admin: is_elevated(),
+                wmi_available,
+                message,
+            },
+            initial,
+            channels,
+        );
+    }
+
+    let status = MainboardCoolingStatus {
+        is_admin: is_elevated(),
+        wmi_available: false,
+        message: if !is_elevated() {
+            "Droits administrateur requis pour le contrôle WMI carte mère.".into()
+        } else {
+            "Aucun contrôleur de courbes carte mère détecté.".into()
+        },
+    };
+    let channels = if is_laptop {
+        Vec::new()
+    } else {
+        FanHeaderKind::ALL
+            .iter()
+            .map(|&h| FanChannelConfig::default_for(h))
+            .collect()
+    };
+    (status, vec![None; FanHeaderKind::ALL.len()], channels)
 }
 
-pub(crate) fn migrate_legacy_profiles(config: &mut AppConfig) {
+pub(crate) fn migrate_legacy_profiles(config: &mut AppConfig, devices: &mut [Box<dyn Device>]) {
+    let key_codes: Vec<Option<String>> = devices
+        .iter_mut()
+        .filter(|d| d.info().kind == DeviceKind::Keyboard)
+        .find_map(|d| {
+            d.lighting().map(|l| {
+                l.zones()
+                    .into_iter()
+                    .flat_map(|z| z.leds.into_iter().map(|led| led.key_code))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
     for prof in &mut config.profiles {
         if prof.lighting_migrated {
             continue;
         }
         prof.rgb
-            .migrate_per_key_codes(|idx| key_code_for_led_index(0x1B1C, 0x1B73, idx));
+            .migrate_per_key_codes(|idx| key_codes.get(idx).and_then(|o| o.as_deref()));
         prof.lighting_migrated = true;
     }
 }

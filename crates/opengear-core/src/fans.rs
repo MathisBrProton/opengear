@@ -99,6 +99,21 @@ pub trait Cooling {
     fn restore_firmware_control(&mut self) -> Result<()>;
 }
 
+/// Firmware/BIOS fan-curve capability shared by motherboard controllers (ASUS Q-Fan WMI, etc.).
+pub trait CurveCooling: Cooling {
+    /// Current firmware/Smart-Cooling configuration of every header.
+    fn curve_channels(&self) -> Vec<crate::cooling::FanChannelConfig>;
+
+    /// Re-read the live curves & policies directly from BIOS/firmware.
+    fn read_firmware_curves(&mut self) -> Result<Vec<crate::cooling::FanChannelConfig>>;
+
+    /// Apply one channel configuration (`Manual` curve, preset policy, pump limits…).
+    fn apply_channel_curve(&mut self, cfg: &crate::cooling::FanChannelConfig) -> Result<()>;
+
+    /// Diagnostic pair `(firmware_curves_available, human_status_message)`.
+    fn cooling_diagnostic(&self) -> (bool, String);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

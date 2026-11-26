@@ -63,6 +63,35 @@ pub struct DeviceStatus {
     pub battery_hours: Option<u16>,
 }
 
+/// Technical spec row exposed by a [`Device`] for the inspector UI and CLI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceSpec {
+    pub label: String,
+    pub value: String,
+    pub mono: bool,
+    pub expert: bool,
+}
+
+impl DeviceSpec {
+    pub fn simple(label: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            value: value.into(),
+            mono: false,
+            expert: false,
+        }
+    }
+
+    pub fn expert(label: impl Into<String>, value: impl Into<String>, mono: bool) -> Self {
+        Self {
+            label: label.into(),
+            value: value.into(),
+            mono,
+            expert: true,
+        }
+    }
+}
+
 /// Where a setting is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -363,6 +392,11 @@ pub trait Device: Send {
         None
     }
 
+    /// Programmable BIOS/firmware fan curves, if exposed by this device (see [`crate::fans::CurveCooling`]).
+    fn fan_curves(&mut self) -> Option<&mut dyn crate::fans::CurveCooling> {
+        None
+    }
+
     /// Pointer (mouse) DPI & stage controls, if applicable.
     fn pointer(&mut self) -> Option<&mut dyn crate::pointer::PointerDevice> {
         None
@@ -383,6 +417,11 @@ pub trait Device: Send {
         None
     }
 
+    /// Additional hardware/technical specifications shown in the device info card and CLI.
+    fn specs(&self) -> Vec<DeviceSpec> {
+        Vec::new()
+    }
+
     /// Extra lines for the diagnostic report (probe details, firmware state…).
     fn diagnostic_lines(&self) -> Vec<String> {
         Vec::new()
@@ -390,16 +429,6 @@ pub trait Device: Send {
 
     /// Refresh live telemetry/status (battery, etc.) if needed.
     fn refresh_status(&mut self) {}
-
-    /// Optional downcast hook for capabilities not yet migrated to traits.
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        None
-    }
-
-    /// Optional mutable downcast hook for capabilities not yet migrated to traits.
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        None
-    }
 
     /// Apply a value already validated against the setting returned by [`Device::settings`].
     fn apply_setting(&mut self, id: &str, value: &Value) -> Result<()> {

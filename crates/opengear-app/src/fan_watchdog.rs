@@ -9,7 +9,6 @@
 //!   applies the marker immediately;
 //! - and, as a last resort, the next GUI launch applies any marker left behind.
 
-use opengear_asus::apply_asus_wmi_curve;
 use opengear_core::AppConfig;
 use opengear_core::cooling::FanChannelConfig;
 use opengear_core::driver::{Device, Driver};
@@ -195,6 +194,30 @@ where
     (log, remaining)
 }
 
+fn restore_marker_via_drivers(
+    marker: &FanOverrideMarker,
+) -> (Vec<String>, Option<FanOverrideMarker>) {
+    let mut curve_devices: Vec<Box<dyn Device>> = if marker.wmi_restore.is_empty() {
+        Vec::new()
+    } else {
+        let config = AppConfig::load(&AppConfig::default_config_path()).unwrap_or_default();
+        crate::drivers::device_drivers()
+            .into_iter()
+            .filter(|d| !d.experimental() || config.experimental_drivers.contains(d.name()))
+            .flat_map(|d| d.discover())
+            .filter_map(|mut dev| dev.fan_curves().is_some().then_some(dev))
+            .collect()
+    };
+    restore_from_marker_with(
+        marker,
+        |cfg| match curve_devices.iter_mut().find_map(|d| d.fan_curves()) {
+            Some(fc) => fc.apply_channel_curve(cfg).map_err(|e| e.to_string()),
+            None => Err("Contrôleur de courbes carte mère introuvable".into()),
+        },
+        rediscover_and_restore,
+    )
+}
+
 /// Startup recovery: a marker left by a previous (dead) session is applied, then updated or removed.
 /// Call only once the single-instance lock is held, so the owner cannot still be running.
 pub fn recover_stale_marker() {
@@ -212,15 +235,7 @@ pub fn recover_stale_marker() {
         return;
     }
     warn!("Ventilateurs laissés en mode manuel par une session précédente — restauration BIOS.");
-    let (logs, remaining) = restore_from_marker_with(
-        &marker,
-        |cfg| {
-            apply_asus_wmi_curve(cfg)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        },
-        rediscover_and_restore,
-    );
+    let (logs, remaining) = restore_marker_via_drivers(&marker);
     for line in logs {
         info!("{line}");
     }
@@ -253,15 +268,7 @@ pub fn run_watchdog(parent_pid: u32) -> anyhow::Result<()> {
     if let Some(marker) = read_marker()
         && marker.pid == parent_pid
     {
-        let (logs, remaining) = restore_from_marker_with(
-            &marker,
-            |cfg| {
-                apply_asus_wmi_curve(cfg)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            },
-            rediscover_and_restore,
-        );
+        let (logs, remaining) = restore_marker_via_drivers(&marker);
         for line in logs {
             info!("{line}");
         }

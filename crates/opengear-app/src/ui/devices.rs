@@ -6,7 +6,9 @@
 use super::backend::BackendEngine;
 use opengear_core::PollingRate;
 use opengear_core::driver::{Device, DeviceKind, Driver, Value, setting_ids, validate_setting};
-use opengear_core::fans::{Cooling, FanTarget, clamp_target};
+use opengear_core::fans::{Cooling, CurveCooling, FanTarget, clamp_target};
+use opengear_core::onboard::OnboardMemory;
+use opengear_core::pointer::PointerDevice;
 use serde_json::{Value as Json, json};
 
 /// `{ fans, overridden }` of a device's `Cooling`, as sent to the UI.
@@ -126,18 +128,22 @@ impl BackendEngine {
             .map(|d| d.as_mut())
     }
 
-    pub(crate) fn typed_devices<T: 'static>(&self) -> Vec<&T> {
-        self.driver_devices
-            .iter()
-            .filter_map(|d| d.as_any().and_then(|a| a.downcast_ref::<T>()))
-            .collect()
+    pub(crate) fn curve_cooling_mut(&mut self) -> Option<&mut dyn CurveCooling> {
+        self.driver_devices.iter_mut().find_map(|d| d.fan_curves())
     }
 
-    pub(crate) fn typed_device_mut<T: 'static>(&mut self, idx: usize) -> Option<&mut T> {
-        self.driver_devices
-            .iter_mut()
-            .filter_map(|d| d.as_any_mut().and_then(|a| a.downcast_mut::<T>()))
-            .nth(idx)
+    pub(crate) fn find_pointer_mut(
+        &mut self,
+        device_id: Option<&str>,
+    ) -> Option<&mut dyn PointerDevice> {
+        self.device_mut(device_id?).and_then(|d| d.pointer())
+    }
+
+    pub(crate) fn find_onboard_mut(
+        &mut self,
+        device_id: Option<&str>,
+    ) -> Option<&mut dyn OnboardMemory> {
+        self.device_mut(device_id?).and_then(|d| d.onboard())
     }
 
     /// Re-discover only the USB driver(s) whose vendor matches a hotplug change.
@@ -194,6 +200,8 @@ impl BackendEngine {
             let placement = placements.get(&info.id).cloned().unwrap_or_default();
             let status = d.status();
             let settings = d.settings();
+            let specs = d.specs();
+            let has_curves = d.fan_curves().is_some();
             let cooling = d.cooling().map(|c| cooling_json(c));
             let lighting = d.lighting().map(|l| {
                 json!({
@@ -204,15 +212,42 @@ impl BackendEngine {
                 })
             });
             let pointer = d.pointer().and_then(|p| p.pointer_info());
+            let battery_model = (info.kind == DeviceKind::Mouse)
+                .then(|| {
+                    status.battery_pct.map(|pct| {
+                        let hz = pointer
+                            .as_ref()
+                            .and_then(|p| p.report_rate_hz)
+                            .unwrap_or(1000);
+                        super::state::mouse_power_model_json(
+                            &self.local_assets,
+                            &info.id,
+                            &info.model,
+                            pct,
+                            hz,
+                        )
+                    })
+                })
+                .flatten();
             let equalizer = d.equalizer().and_then(|e| e.eq_info());
-            let onboard = d.onboard().map(|o| o.onboard_profiles());
+            let onboard = d.onboard().map(|o| {
+                json!({
+                    "info": o.onboard_info(),
+                    "profiles": o.onboard_profiles(),
+                    "button_presets": o.button_presets(),
+                    "backups": o.onboard_backups(),
+                })
+            });
             out.push(json!({
                 "info": info,
                 "status": status,
                 "settings": settings,
+                "specs": specs,
+                "has_curves": has_curves,
                 "lighting": lighting,
                 "cooling": cooling,
                 "pointer": pointer,
+                "battery_model": battery_model,
                 "equalizer": equalizer,
                 "onboard": onboard,
             }));

@@ -218,3 +218,58 @@ fn code_only_strips_comments_and_strings() {
     assert_eq!(code_only(r#"let a = "hpqBIntM"; // hpq"#), "let a = ; ");
     assert_eq!(code_only(r#"f("a\"b", x)"#), "f(, x)");
 }
+
+#[test]
+fn no_downcasting_in_workspace_sources() {
+    let deps = internal_deps();
+    let mut violations = Vec::new();
+    for crate_name in deps.keys() {
+        violations.extend(find_markers(
+            crate_name,
+            &["as_any", "downcast_ref", "downcast_mut"],
+        ));
+    }
+    assert!(
+        violations.is_empty(),
+        "Downcast ou `as_any` interdit — utiliser les traits de opengear-core :\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn app_does_not_import_hardware_vendor_crates_outside_drivers() {
+    let mut files = Vec::new();
+    rust_files(
+        &workspace_root().join("crates").join(APP).join("src"),
+        &mut files,
+    );
+    let forbidden = [
+        "opengear_asus",
+        "opengear_corsair",
+        "opengear_hp",
+        "opengear_hyperx",
+        "opengear_logitech",
+        "opengear_razer",
+        "opengear_steelseries",
+    ];
+    let mut hits = Vec::new();
+    for f in files {
+        if f.file_name().is_some_and(|n| n == "drivers.rs") {
+            continue;
+        }
+        let text = fs::read_to_string(&f).unwrap();
+        for (i, line) in text.lines().enumerate() {
+            let code = code_only(line).to_ascii_lowercase();
+            for crate_ident in forbidden {
+                if code.contains(crate_ident) {
+                    hits.push(format!("{}:{} -> `{crate_ident}`", f.display(), i + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "Seul src/drivers.rs dans opengear-app peut importer les crates marques :\n{}",
+        hits.join("\n")
+    );
+}

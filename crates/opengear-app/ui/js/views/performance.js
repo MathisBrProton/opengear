@@ -1,4 +1,4 @@
-import { ICONS, POLICIES, arr, clamp, esc, fmtHz, num } from "../utils.js";
+import { ICONS, POLICIES, arr, clamp, domId, esc, fmtHz, num } from "../utils.js";
 import { S, deviceById, isExpert, local } from "../state.js";
 import { advancedHint, coolingDeviceIds, deviceFans, deviceSettings, emptyState, expertTag, pageHeader, seg, sensorChips, sliderRow, subtabs, sw } from "../components.js";
 
@@ -21,30 +21,22 @@ export function viewPerformance() {
 
 function perfInputs() {
   const cards = [];
-  const covered = new Set();
-  S.logi_mice.forEach((m, i) => {
-    covered.add(m.device_id);
-    cards.push(cardLogiDpi(m, i));
-  });
-  S.corsair_devices.forEach((d, i) => {
-    if (d.kind === "Mouse" && d.mouse) {
-      covered.add(d.device_id);
-      cards.push(cardCorsairMouse(d, i));
-    } else if (d.kind === "Keyboard" && d.pollrate_hz) {
-      covered.add(d.device_id);
-      cards.push(cardCorsairPoll(d, i));
-    }
-  });
   arr(S.device_list).forEach((d) => {
-    if (covered.has(d.info.id)) return;
-    if (d.info.kind !== "mouse" && d.info.kind !== "keyboard") return;
-    const html = deviceSettings(d.info.id, { sections: ["performance", "input"], bare: true });
+    const id = d.info.id;
+    const kind = d.info.kind;
+    if (d.pointer) {
+      cards.push(cardPointer(d));
+      return;
+    }
+    if (kind !== "mouse" && kind !== "keyboard") return;
+    const html = deviceSettings(id, { sections: ["performance", "input"], bare: true });
     if (!html) return;
+    const poll = d.settings && d.settings.find((s) => s.id === "polling_rate");
     cards.push(`
       <div class="card accent-cyan">
         <div class="card-head">
           <div><h2 class="card-title">${esc(d.info.model)}</h2><div class="card-desc">${esc(d.info.vendor)} · Réglages matériels</div></div>
-          <span class="pill cyan">Connecté</span>
+          <span class="pill ${poll ? "emerald" : "cyan"}">${poll && poll.value ? fmtHz(num(poll.value)) : "Connecté"}</span>
         </div>
         ${html}
       </div>`);
@@ -56,68 +48,55 @@ function perfInputs() {
   return `<div class="grid-2">${cards.join("")}</div>${advancedHint("Angle snapping et sensibilité X/Y séparée sont disponibles en mode Expert.")}`;
 }
 
-export function cardLogiDpi(m, i) {
-  const dpi = m.dpi;
-  const rr = m.report_rate;
+export function cardPointer(dev) {
+  const id = dev.info.id;
+  const did = domId(id);
+  const dpi = dev.pointer;
   const ex = isExpert();
-  if (!dpi && !rr) return `<div class="card"><h2 class="card-title">${esc(m.name)}</h2><div class="muted mt-8">Cette souris n'expose pas de réglage de sensibilité.</div></div>`;
-  const presets = dpi ? [400, 800, 1200, 1600, 3200, 6400].filter((v) => v >= num(dpi.min_dpi, 100) && v <= num(dpi.max_dpi, 25600)) : [];
+  const stages = arr(dpi && dpi.stages);
+  const activeStage = dpi && dpi.active_stage != null ? num(dpi.active_stage) : 0;
+  const rrHz = dpi && dpi.report_rate_hz;
+  if (!dpi) {
+    const html = deviceSettings(id, { sections: ["performance"], bare: true });
+    return html
+      ? `<div class="card accent-cyan"><div class="card-head"><h2 class="card-title">${esc(dev.info.model)}</h2></div>${html}</div>`
+      : `<div class="card"><h2 class="card-title">${esc(dev.info.model)}</h2><div class="muted mt-8">Cette souris n'expose pas de réglage de sensibilité.</div></div>`;
+  }
+  const presets = dpi.max_dpi > 0
+    ? [400, 800, 1200, 1600, 3200, 6400].filter((v) => v >= num(dpi.min_dpi, 100) && v <= num(dpi.max_dpi, 25600))
+    : [];
+  const pillText = `${num(dpi.dpi_x, stages[activeStage] || 0)} DPI${rrHz ? ` · ${fmtHz(num(rrHz))}` : ""}`;
   return `
     <div class="card accent-cyan">
       <div class="card-head">
-        <div><h2 class="card-title">${esc(m.name)}</h2><div class="card-desc">Sensibilité et fréquence d'envoi</div></div>
-        <span class="pill cyan">${dpi ? `${num(dpi.dpi_x)} DPI` : ""}${dpi && rr ? " · " : ""}${rr ? fmtHz(num(rr.current_hz, 1000)) : ""}</span>
+        <div><h2 class="card-title">${esc(dev.info.model)}</h2><div class="card-desc">${stages.length && !presets.length ? "Paliers de sensibilité (bouton DPI de la souris)" : "Sensibilité et fréquence d'envoi"}</div></div>
+        <span class="pill cyan">${pillText}</span>
       </div>
-      ${dpi ? `
+      ${presets.length ? `
         <div class="row" role="group" aria-label="DPI rapides">
-          ${presets.map((v) => `<button type="button" class="btn btn-sm ${num(dpi.dpi_x) === v ? "btn-primary" : "btn-secondary"}" data-act="logi-dpi" data-dev="${i}" data-dpi="${v}" aria-pressed="${num(dpi.dpi_x) === v}">${v}</button>`).join("")}
+          ${presets.map((v) => `<button type="button" class="btn btn-sm ${num(dpi.dpi_x) === v ? "btn-primary" : "btn-secondary"}" data-act="ptr-dpi" data-id="${esc(id)}" data-dpi="${v}" aria-pressed="${num(dpi.dpi_x) === v}">${v}</button>`).join("")}
         </div>
         <div class="stack mt-12" style="gap:10px">
-          ${sliderRow(ex && dpi.supports_independent_xy ? "DPI horizontal (X)" : "DPI précis", { id: `ldpi-${i}`, min: num(dpi.min_dpi, 100), max: num(dpi.max_dpi, 25600), step: num(dpi.step_dpi, 50) || 50, value: num(dpi.dpi_x, 800), input: "label", data: { fmt: "dpi" }, display: `${num(dpi.dpi_x, 800)} DPI` })}
-          ${ex && dpi.supports_independent_xy ? sliderRow("DPI vertical (Y)", { id: `ldpiy-${i}`, min: num(dpi.min_dpi, 100), max: num(dpi.max_dpi, 25600), step: num(dpi.step_dpi, 50) || 50, value: num(dpi.dpi_y, dpi.dpi_x), input: "label", data: { fmt: "dpi" }, display: `${num(dpi.dpi_y, dpi.dpi_x)} DPI` }) : ""}
+          ${sliderRow(ex && dpi.independent_xy ? "DPI horizontal (X)" : "DPI précis", { id: `pdpi-${did}`, min: num(dpi.min_dpi, 100), max: num(dpi.max_dpi, 25600), step: num(dpi.step_dpi, 50) || 50, value: num(dpi.dpi_x, 800), input: "label", data: { fmt: "dpi" }, display: `${num(dpi.dpi_x, 800)} DPI` })}
+          ${ex && dpi.independent_xy ? sliderRow("DPI vertical (Y)", { id: `pdpiy-${did}`, min: num(dpi.min_dpi, 100), max: num(dpi.max_dpi, 25600), step: num(dpi.step_dpi, 50) || 50, value: num(dpi.dpi_y, dpi.dpi_x), input: "label", data: { fmt: "dpi" }, display: `${num(dpi.dpi_y, dpi.dpi_x)} DPI` }) : ""}
         </div>
-        <div class="row mt-12"><button type="button" class="btn btn-sm btn-primary" data-act="logi-dpi-apply" data-dev="${i}">Appliquer le DPI précis</button></div>
-        ${dpi.supports_lod ? `
-          <div class="row-between mt-12">
-            <span class="field-label">Distance de décrochage</span>
-            ${seg([["Low", "Basse"], ["Medium", "Moyenne"], ["High", "Haute"]], dpi.lod, "logi-lod", { dev: i })}
-          </div>` : ""}` : ""}
-      <div class="mt-12">${deviceSettings(m.device_id, { sections: ["performance"], bare: true })}</div>
-    </div>`;
-}
-
-export function cardCorsairMouse(dev, i) {
-  const m = dev.mouse;
-  const stages = arr(m.dpi_stages);
-  const active = num(m.active_stage);
-  return `
-    <div class="card accent-cyan">
-      <div class="card-head">
-        <div><h2 class="card-title">${esc(dev.product_name)}</h2><div class="card-desc">Paliers de sensibilité (bouton DPI de la souris)</div></div>
-        <span class="pill cyan">${num(m.current_dpi_x, stages[active] || 0)} DPI</span>
-      </div>
-      <div class="stack" style="gap:8px">
-        ${stages.map((v, s) => `
-          <div class="row-nowrap">
-            <button type="button" class="btn btn-sm ${active === s ? "btn-primary" : "btn-secondary"}" data-act="cm-stage" data-dev="${i}" data-stage="${s}" aria-pressed="${active === s}" style="min-width:96px">Palier ${s + 1}${active === s ? " (actif)" : ""}</button>
-            <input type="number" class="og-input narrow" min="100" max="30000" step="50" value="${num(v)}" id="cm-dpi-${i}-${s}" aria-label="DPI du palier ${s + 1}" />
-            <button type="button" class="btn btn-sm btn-secondary" data-act="cm-dpi-save" data-dev="${i}" data-stage="${s}">Enregistrer</button>
-          </div>`).join("")}
-      </div>
-      <div class="mt-12">${deviceSettings(dev.device_id, { sections: ["performance"], bare: true })}</div>
-    </div>`;
-}
-
-function cardCorsairPoll(dev, i) {
-  const maxHz = num(dev.max_pollrate_hz, 8000) || 8000;
-  const rates = [125, 250, 500, 1000, 2000, 4000, 8000].filter((hz) => hz <= maxHz);
-  return `
-    <div class="card accent-cyan">
-      <div class="card-head">
-        <div><h2 class="card-title">${esc(dev.product_name)}</h2><div class="card-desc">Fréquence d'envoi du clavier : plus elle est haute, plus la latence est faible (consommation CPU légèrement supérieure).</div></div>
-        <span class="pill emerald">${fmtHz(dev.pollrate_hz)}</span>
-      </div>
-      ${deviceSettings(dev.device_id, { sections: ["performance"], bare: true })}
+        <div class="row mt-12"><button type="button" class="btn btn-sm btn-primary" data-act="ptr-dpi-apply" data-id="${esc(id)}">Appliquer le DPI précis</button></div>
+      ` : ""}
+      ${stages.length ? `
+        <div class="stack mt-12" style="gap:8px">
+          ${stages.map((v, s) => `
+            <div class="row-nowrap">
+              <button type="button" class="btn btn-sm ${activeStage === s ? "btn-primary" : "btn-secondary"}" data-act="ptr-stage" data-id="${esc(id)}" data-stage="${s}" aria-pressed="${activeStage === s}" style="min-width:96px">Palier ${s + 1}${activeStage === s ? " (actif)" : ""}</button>
+              <input type="number" class="og-input narrow" min="100" max="30000" step="50" value="${num(v)}" id="pstage-${did}-${s}" aria-label="DPI du palier ${s + 1}" />
+              <button type="button" class="btn btn-sm btn-secondary" data-act="ptr-stage-save" data-id="${esc(id)}" data-stage="${s}">Enregistrer</button>
+            </div>`).join("")}
+        </div>` : ""}
+      ${dpi.supports_lod ? `
+        <div class="row-between mt-12">
+          <span class="field-label">Distance de décrochage</span>
+          ${seg([["Low", "Basse"], ["Medium", "Moyenne"], ["High", "Haute"]], dpi.lod, "ptr-lod", { id })}
+        </div>` : ""}
+      <div class="mt-12">${deviceSettings(id, { sections: ["performance"], bare: true })}</div>
     </div>`;
 }
 
@@ -192,7 +171,8 @@ function viewCooling() {
   const ex = isExpert();
   const sio = c.superio || { detected: false, fans: [], diagnostic: "" };
   const deviceIds = coolingDeviceIds().filter((id) => {
-    if (id === "asus_wmi_cooling:mainboard" && c.wmi_available) return false;
+    const dev = deviceById(id);
+    if (dev && dev.has_curves && c.wmi_available) return false;
     if (id === "superio:mainboard" && ex && sio.detected) return false;
     return true;
   });
@@ -309,7 +289,7 @@ function viewCooling() {
               </div>`).join("")}
           </div>` : ""}
       </div>` : advancedHint("Courbes 8 points, source de température et contrôle direct des ventilateurs sont en mode Expert.")}
-    ${deviceIds.length && !c.wmi_available ? `<div class="mt-16">${deviceIds.map((id) => {
+    ${deviceIds.length && !c.wmi_available ? `<div class="stack mt-16">${deviceIds.map((id) => {
       const d = deviceById(id);
       const name = d ? d.info.model : id;
       return deviceFans(id, { title: `Ventilateurs · ${name}` });

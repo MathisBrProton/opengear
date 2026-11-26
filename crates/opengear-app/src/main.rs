@@ -13,18 +13,12 @@ mod ui;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use opengear_asus::{AuraHwMode, AuraMainboardController, probe_asus_wmi_cooling};
-use opengear_core::{
-    EffectKind, OperatingMode, PollingRate, Rgb, RgbEffectConfig, scan_hid_devices,
-};
-use opengear_corsair::CorsairDevice;
-use opengear_hp::probe_hp_omen;
-use opengear_logitech::{
-    BatteryPowerModel, LodLevel, LogitechHeadset, LogitechKeyboard, LogitechMouse, OnboardMode,
-};
+use opengear_core::driver::{Device, DeviceKind, Value as DriverValue, setting_ids};
+use opengear_core::lighting::{EffectRequest, Placement, render_frame};
+use opengear_core::{EffectKind, PollingRate, Rgb, RgbEffectConfig, scan_hid_devices};
 use opengear_mainboard::{EneRamMode, read_hardware_sensors};
 use opengear_platform::{
-    TelemetryCollector, list_power_plans, read_display_info, read_laptop_battery,
+    TelemetryCollector, is_elevated, list_power_plans, read_display_info, read_laptop_battery,
 };
 use std::time::{Duration, Instant};
 
@@ -338,6 +332,80 @@ fn cmd_telemetry() -> Result<()> {
     Ok(())
 }
 
+fn discover_for_driver(driver_name: &str) -> Vec<Box<dyn Device>> {
+    drivers::device_drivers()
+        .into_iter()
+        .filter(|d| d.name() == driver_name)
+        .flat_map(|d| d.discover())
+        .collect()
+}
+
+fn print_device_summary(dev: &mut dyn Device) {
+    let i = dev.info();
+    let st = dev.status();
+    println!(
+        "\n[{:?}] {} ({}) — {} | FW={}",
+        i.kind,
+        i.model,
+        i.vendor,
+        i.id,
+        i.firmware.as_deref().unwrap_or("—")
+    );
+    if let Some(pct) = st.battery_pct {
+        println!(
+            "  Batterie       : {pct}% (en charge={:?}, autonomie est.={:?} h)",
+            st.charging, st.battery_hours
+        );
+    }
+    for sp in dev.specs() {
+        println!("  {:<15}: {}", sp.label, sp.value);
+    }
+    for s in dev.settings() {
+        println!("  [{}] {} = {:?}", s.id, s.label, s.value);
+    }
+    if let Some(ptr) = dev.pointer().and_then(|p| p.pointer_info()) {
+        println!(
+            "  Pointeur       : {}x{} DPI (paliers={:?}, actif={:?}, LOD={:?}, polling={:?} Hz)",
+            ptr.dpi_x, ptr.dpi_y, ptr.stages, ptr.active_stage, ptr.lod, ptr.report_rate_hz
+        );
+    }
+    if let Some(eq) = dev.equalizer().and_then(|e| e.eq_info()) {
+        println!(
+            "  Égaliseur      : {} bandes {:?} Hz => {:?} dB",
+            eq.band_count, eq.frequencies_hz, eq.gains_db
+        );
+    }
+    if let Some(ob) = dev.onboard() {
+        for p in ob.onboard_profiles() {
+            println!(
+                "  Profil Flash #{} '{}' (actif={}, rom={}, crc={:?}, Hz={:?}, DPIs={:?})",
+                p.slot, p.name, p.active, p.from_rom, p.crc_valid, p.report_rate_hz, p.dpi_stages
+            );
+        }
+    }
+    if let Some(l) = dev.lighting() {
+        for z in l.zones() {
+            println!(
+                "  Zone RGB       : {} ({}) — {} LEDs",
+                z.id,
+                z.name,
+                z.leds.len()
+            );
+        }
+    }
+    if let Some(c) = dev.cooling() {
+        for f in c.fans() {
+            println!(
+                "  Ventilateur    : {} ({}) = {:?} tr/min (min {}%, manuel={:?})",
+                f.id, f.name, f.rpm, f.min_pct, f.manual_pct
+            );
+        }
+    }
+    for line in dev.diagnostic_lines() {
+        println!("  [diag] {line}");
+    }
+}
+
 fn cmd_hp_probe() -> Result<()> {
     let mut tel = TelemetryCollector::new();
     std::thread::sleep(Duration::from_millis(200));
@@ -345,7 +413,7 @@ fn cmd_hp_probe() -> Result<()> {
     let s = &tel.static_info;
     let bat = read_laptop_battery();
     let disp = read_display_info();
-    let omen = probe_hp_omen();
+    let mut hp_devs = discover_for_driver("hp_omen");
 
     println!("=== OpenGear Laptop / HP OMEN Probe ===");
     println!("Machine     : {} | {}", s.manufacturer, s.model);
@@ -384,27 +452,19 @@ fn cmd_hp_probe() -> Result<()> {
         "Écran       : {}x{} @ {:?} Hz (supportés: {:?}) | Luminosité={:?}%",
         disp.width, disp.height, disp.current_hz, disp.supported_hz, disp.brightness_pct
     );
-    println!(
-        "HP OMEN WMI : detected={} admin={} wmi={} thermal_v={} fans={} rpms={:?} kbd={} backlight={}",
-        omen.detected,
-        omen.is_admin,
-        omen.wmi_accessible,
-        omen.thermal_version,
-        omen.fan_count,
-        omen.fan_rpms,
-        omen.keyboard_label,
-        omen.backlight_on
-    );
-    println!("Diagnostic  : {}", omen.diagnostic);
-    for line in &omen.probe_log {
-        println!("  [WMI] {line}");
+    if hp_devs.is_empty() {
+        println!("HP OMEN WMI : aucun contrôleur détecté (ou droits admin requis).");
+    } else {
+        for dev in &mut hp_devs {
+            print_device_summary(dev.as_mut());
+        }
     }
     Ok(())
 }
 
 fn cmd_corsair(action: CorsairCmd) -> Result<()> {
     if let CorsairCmd::Info = action {
-        let devices = CorsairDevice::connect_all();
+        let mut devices = discover_for_driver("corsair");
         if devices.is_empty() {
             println!("Aucun périphérique Corsair Bragi v2 détecté.");
             return Ok(());
@@ -413,223 +473,73 @@ fn cmd_corsair(action: CorsairCmd) -> Result<()> {
             "=== Corsair Bragi v2 Multi-Device ({} détecté(s)) ===",
             devices.len()
         );
-        for dev in &devices {
-            let i = &dev.info;
-            println!(
-                "\n[{}] {} ({:04X}:{:04X}, sub={})",
-                i.kind.label(),
-                i.product_name,
-                i.vid,
-                i.pid,
-                i.subdevice_id
-            );
-            println!(
-                "  Firmware       : {} (Bootloader {})",
-                i.firmware_version, i.bootloader_version
-            );
-            println!(
-                "  Mode / Polling : {} | {:?} (max {:?})",
-                i.mode, i.pollrate, i.max_pollrate
-            );
-            println!(
-                "  Luminosité HW  : {}% | Report OUT={}B",
-                dev.hw_brightness_pct(),
-                i.out_report_len
-            );
-            if let Some(b) = i.battery_pct {
-                println!("  Batterie       : {b}% (status={:?})", i.battery_status);
-            }
-            if i.hw_winlock.is_some() || i.debounce_enabled.is_some() {
-                println!(
-                    "  Clavier MCU    : Layout={} | WinLock={:?} (mask={:?}) | Debounce={:?} ({:?}ms) | Esports={:?} | ProfilHW={:?} | Flash={:?}/{:?} Ko",
-                    i.layout.label(),
-                    i.hw_winlock,
-                    i.winlock_shortcuts_mask,
-                    i.debounce_enabled,
-                    i.debounce_timeout_ms,
-                    i.esports_switch_on,
-                    i.active_hw_profile,
-                    i.storage_free_kb,
-                    i.storage_total_kb
-                );
-                if !i.hwp_profiles.is_empty() {
-                    println!("  Profils Flash HWP ({}) :", i.hwp_profiles.len());
-                    for hp in &i.hwp_profiles {
-                        let light_desc = hp
-                            .lighting
-                            .as_ref()
-                            .map(|l| {
-                                let cols: Vec<String> =
-                                    l.colors.iter().map(|c| c.to_hex()).collect();
-                                format!(
-                                    "{} [file=0x{:04X}, {} LEDs, cols={:?}]",
-                                    l.kind.label(),
-                                    l.file_id,
-                                    l.led_indices.len(),
-                                    cols
-                                )
-                            })
-                            .unwrap_or_else(|| "Aucun".into());
-                        println!(
-                            "    #{} '{}' (file=0x{:04X}, {} actions, {} props) -> {}",
-                            hp.slot_index + 1,
-                            hp.name,
-                            hp.profile_file_id,
-                            hp.assignment_count,
-                            hp.property_count,
-                            light_desc
-                        );
-                    }
-                }
-            }
-            if let Some(m) = &i.mouse {
-                println!(
-                    "  Souris Bragi   : DPIs={:?} (actif=#{}, live={:?}x{:?}) | LOD={:?} | MotionSync={:?}",
-                    m.dpi_stages,
-                    m.active_stage,
-                    m.current_dpi_x,
-                    m.current_dpi_y,
-                    m.lift_height,
-                    m.motion_sync
-                );
-            }
-            if let Some(h) = &i.headset {
-                println!(
-                    "  Casque Bragi   : Sidetone={:?}% (muted={:?}) | MicMuted={:?} | EQ={:?} | ANC={:?}",
-                    h.sidetone_pct, h.sidetone_muted, h.mic_muted, h.active_eq_preset, h.anc_mode
-                );
-            }
-            if let Some(c) = &i.cooler {
-                println!(
-                    "  Cooler Bragi   : Line={:?} | Pump={:?} | Radiator={:?}",
-                    c.product_line_id, c.pump_version_id, c.radiator_size
-                );
-            }
+        for dev in &mut devices {
+            print_device_summary(dev.as_mut());
         }
         return Ok(());
     }
 
     if let CorsairCmd::HwpDump = action {
-        let mut devices = CorsairDevice::connect_all();
-        let Some(dev) = devices.first_mut() else {
-            bail!("Aucun périphérique Corsair Bragi détecté");
-        };
-        println!(
-            "=== Dump Flash Bragi v2 (READ-ONLY) : {} ===",
-            dev.info.product_name
-        );
-        dev.with_flash_session(|t| {
-            let mut to_inspect: Vec<u16> = Vec::new();
-            for &(fid, label) in &[
-                (
-                    opengear_corsair::proto::FILE_LISTING,
-                    "FileListing (0x0011)",
-                ),
-                (
-                    opengear_corsair::proto::FILE_PROFILES_LIST,
-                    "ProfilesList (0x000F)",
-                ),
-            ] {
-                match t.read_file(fid) {
-                    Ok(bytes) => {
-                        print!("\n[{label}] {} octets : ", bytes.len());
-                        for b in &bytes {
-                            print!("{b:02X} ");
-                        }
-                        println!();
-                        for chunk in bytes.as_chunks::<2>().0 {
-                            let id = u16::from_le_bytes([chunk[0], chunk[1]]);
-                            if id >= opengear_corsair::proto::FILE_FREE_MIN
-                                && !to_inspect.contains(&id)
-                            {
-                                to_inspect.push(id);
-                            }
-                        }
-                    }
-                    Err(e) => println!("[{label}] -> {e}"),
-                }
-            }
-            println!(
-                "\n=== Fichiers utilisateurs détectés ({}) ===",
-                to_inspect.len()
-            );
-            for fid in to_inspect {
-                match t.read_file(fid) {
-                    Ok(bytes) => {
-                        let hdr = if bytes.len() >= 2 {
-                            u16::from_le_bytes([bytes[0], bytes[1]])
-                        } else {
-                            0
-                        };
-                        println!(
-                            "\n  File 0x{fid:04X} ({} B, magic=0x{hdr:04X}):",
-                            bytes.len()
-                        );
-                        for (row, chunk) in bytes.chunks(16).enumerate() {
-                            print!("    {:04X}: ", row * 16);
-                            for b in chunk {
-                                print!("{b:02X} ");
-                            }
-                            print!("  ");
-                            for &b in chunk {
-                                let ch = if (0x20..=0x7E).contains(&b) {
-                                    b as char
-                                } else {
-                                    '.'
-                                };
-                                print!("{ch}");
-                            }
-                            println!();
-                        }
-                    }
-                    Err(e) => println!("  File 0x{fid:04X} -> {e}"),
-                }
-            }
-            Ok(())
-        })?;
+        let dump = drivers::dump_corsair_hwp()?;
+        println!("{dump}");
         return Ok(());
     }
 
-    let devices = CorsairDevice::connect_all();
-    let mut kb = devices
-        .into_iter()
-        .find(|d| d.info.kind == opengear_corsair::CorsairDeviceKind::Keyboard)
+    let mut devices = discover_for_driver("corsair");
+    let kb = devices
+        .iter_mut()
+        .find(|d| d.info().kind == DeviceKind::Keyboard)
         .context("Aucun clavier Corsair Bragi détecté")?;
 
     match action {
         CorsairCmd::Info | CorsairCmd::HwpDump => unreachable!(),
-        CorsairCmd::Pollrate { hz } => {
-            kb.set_restore_hw_on_drop(false);
-            match hz {
-                None => {
-                    let current = kb.info.pollrate.context("Polling rate indisponible")?;
-                    println!("Fréquence actuelle : {current}");
-                    if let Some(max) = kb.info.max_pollrate {
-                        println!("Fréquence maximale : {max}");
-                    }
-                }
-                Some(target_hz) => {
-                    let rate = PollingRate::from_hz(target_hz)
-                        .context("Fréquence invalide (125, 250, 500, 1000, 2000, 4000, 8000)")?;
-                    kb.set_pollrate(rate)?;
-                    println!("Fréquence appliquée : {rate}");
-                }
+        CorsairCmd::Pollrate { hz } => match hz {
+            None => {
+                let s = kb
+                    .settings()
+                    .into_iter()
+                    .find(|s| s.id == setting_ids::POLLING_RATE)
+                    .context("Polling rate indisponible")?;
+                println!("Fréquence actuelle : {:?}", s.value);
             }
-        }
+            Some(target_hz) => {
+                let rate = PollingRate::from_hz(target_hz)
+                    .context("Fréquence invalide (125, 250, 500, 1000, 2000, 4000, 8000)")?;
+                kb.apply_setting(
+                    setting_ids::POLLING_RATE,
+                    &DriverValue::Text(rate.hz().to_string()),
+                )?;
+                println!("Fréquence appliquée : {rate}");
+            }
+        },
         CorsairCmd::Brightness { percent } => {
-            kb.set_restore_hw_on_drop(false);
-            kb.set_hw_brightness_pct(percent)?;
+            kb.apply_setting(
+                setting_ids::HW_BRIGHTNESS,
+                &DriverValue::Number(f64::from(percent.min(100))),
+            )?;
             println!("Luminosité matérielle réglée sur {}%", percent.min(100));
         }
         CorsairCmd::Mode { mode } => {
-            kb.set_restore_hw_on_drop(false);
-            let m = match mode.to_ascii_lowercase().as_str() {
-                "hw" | "hardware" => OperatingMode::Hardware,
-                "sw" | "software" => OperatingMode::Software,
+            let target = match mode.to_ascii_lowercase().as_str() {
+                "hw" | "hardware" => "hw",
+                "sw" | "software" => "sw",
                 _ => bail!("Mode invalide (attendu: hw ou sw)"),
             };
-            kb.set_mode(m)?;
-            println!("Mode basculé sur : {m}");
+            if let Some(lighting) = kb.lighting() {
+                if target == "hw" {
+                    lighting.release()?;
+                } else {
+                    let zones = lighting.zones();
+                    let colors = render_frame(
+                        &zones,
+                        &Placement::default(),
+                        &RgbEffectConfig::default(),
+                        0.0,
+                    );
+                    lighting.set_frame(&colors)?;
+                }
+            }
+            println!("Mode basculé sur : {target}");
         }
         CorsairCmd::Rgb {
             color,
@@ -643,17 +553,24 @@ fn cmd_corsair(action: CorsairCmd) -> Result<()> {
                 primary,
                 ..RgbEffectConfig::default()
             };
-
+            let lighting = kb.lighting().context("Éclairage indisponible")?;
+            let zones = lighting.zones();
             if seconds == 0 {
-                kb.set_restore_hw_on_drop(false);
-                kb.render_effect(&cfg, 0.0)?;
+                let colors = render_frame(&zones, &Placement::default(), &cfg, 0.0);
+                lighting.set_frame(&colors)?;
             } else {
-                kb.set_restore_hw_on_drop(true);
                 let start = Instant::now();
                 while start.elapsed() < Duration::from_secs(seconds) {
-                    kb.render_effect(&cfg, start.elapsed().as_secs_f32())?;
+                    let colors = render_frame(
+                        &zones,
+                        &Placement::default(),
+                        &cfg,
+                        start.elapsed().as_secs_f32(),
+                    );
+                    lighting.set_frame(&colors)?;
                     std::thread::sleep(Duration::from_millis(33));
                 }
+                let _ = lighting.release();
             }
         }
     }
@@ -735,28 +652,15 @@ fn cmd_asus(action: AsusCmd) -> Result<()> {
         _ => {}
     }
 
-    let mut aura = AuraMainboardController::connect()?;
+    let mut aura_devs = discover_for_driver("asus_aura");
+    let dev = aura_devs
+        .first_mut()
+        .context("Contrôleur ASUS Aura USB introuvable")?;
     match action {
         AsusCmd::RamScan | AsusCmd::RamRgb { .. } => unreachable!(),
         AsusCmd::Info => {
-            let i = &aura.info;
             println!("=== ASUS AURA Mainboard Info ===");
-            println!(
-                "Contrôleur     : {} ({:04X}:{:04X})",
-                i.product_name, i.vid, i.pid
-            );
-            println!("Firmware Aura  : {}", i.firmware_version);
-            println!("LEDs CM fixes  : {}", i.mainboard_fixed_leds);
-            println!("Headers 12V RGB: {}", i.rgb_12v_headers);
-            println!("Headers 5V ARGB: {}", i.argb_5v_headers);
-            println!("Config table   : {}", i.config_table_hex);
-            println!("Canaux détectés:");
-            for ch in &i.channels {
-                println!(
-                    "  [{}] {} — kind={:?}, eff_ch={}, direct_ch={}, leds={}",
-                    ch.index, ch.name, ch.kind, ch.effect_channel, ch.direct_channel, ch.led_count
-                );
-            }
+            print_device_summary(dev.as_mut());
         }
         AsusCmd::Mode {
             mode,
@@ -765,30 +669,26 @@ fn cmd_asus(action: AsusCmd) -> Result<()> {
             commit,
         } => {
             let rgb = Rgb::from_hex(&color).context("Couleur hex invalide")?;
-            let hw_mode = match mode.to_ascii_lowercase().as_str() {
-                "off" => AuraHwMode::Off,
-                "static" => AuraHwMode::Static,
-                "breathing" => AuraHwMode::Breathing,
-                "flashing" => AuraHwMode::Flashing,
-                "spectrum" => AuraHwMode::SpectrumCycle,
-                "rainbow" => AuraHwMode::Rainbow,
-                "wave" => AuraHwMode::Wave,
-                "chase" => AuraHwMode::Chase,
-                "comet" => AuraHwMode::ChaseFade,
-                "redpulse" => AuraHwMode::RedPulse,
-                _ => bail!(
-                    "Mode Aura inconnu (off, static, breathing, flashing, spectrum, rainbow, wave, chase, comet, redpulse)"
-                ),
+            let lighting = dev.lighting().context("Éclairage Aura indisponible")?;
+            let matched = lighting
+                .hardware_effects()
+                .into_iter()
+                .find(|e| e.id.eq_ignore_ascii_case(&mode))
+                .with_context(|| format!("Mode Aura inconnu : {mode}"))?;
+            let req = EffectRequest {
+                effect: matched.id.clone(),
+                zone: None,
+                colors: vec![rgb],
+                speed: None,
+                brightness: None,
+                reverse: shutdown,
+                save: commit,
             };
-            aura.set_all_hw_mode(hw_mode, rgb, shutdown)?;
-            if commit {
-                aura.commit()?;
-            }
+            lighting.apply_hardware_effect(&req)?;
             println!(
-                "ASUS AURA appliqué : {} ({}, shutdown={}, commit={})",
-                hw_mode.label(),
+                "ASUS AURA appliqué : {} ({}, commit={})",
+                matched.label,
                 rgb.to_hex(),
-                shutdown,
                 commit
             );
         }
@@ -804,28 +704,21 @@ fn cmd_asus(action: AsusCmd) -> Result<()> {
                 primary,
                 ..RgbEffectConfig::default()
             };
-            aura.enter_direct_mode()?;
+            let lighting = dev.lighting().context("Éclairage Aura indisponible")?;
+            let zones = lighting.zones();
             let start = Instant::now();
             println!("Streaming Direct ASUS AURA '{effect}' pendant {seconds}s...");
             while start.elapsed() < Duration::from_secs(seconds) {
-                let t = start.elapsed().as_secs_f32();
-                let ch_counts: Vec<usize> =
-                    aura.info.channels.iter().map(|c| c.led_count).collect();
-                for (ch_idx, count) in ch_counts.into_iter().enumerate() {
-                    let leds: Vec<Rgb> = (0..count)
-                        .map(|i| {
-                            let nx = if count <= 1 {
-                                0.5
-                            } else {
-                                i as f32 / (count - 1) as f32
-                            };
-                            cfg.sample(i, nx, 0.5, t)
-                        })
-                        .collect();
-                    aura.send_channel_direct(ch_idx, &leds)?;
-                }
+                let colors = render_frame(
+                    &zones,
+                    &Placement::default(),
+                    &cfg,
+                    start.elapsed().as_secs_f32(),
+                );
+                lighting.set_frame(&colors)?;
                 std::thread::sleep(Duration::from_millis(33));
             }
+            let _ = lighting.release();
             println!("Terminé.");
         }
     }
@@ -833,144 +726,13 @@ fn cmd_asus(action: AsusCmd) -> Result<()> {
 }
 
 fn cmd_logitech(action: LogitechCmd) -> Result<()> {
+    let mut devices = discover_for_driver("logitech");
     match action {
         LogitechCmd::Info => {
             let assets = local_assets::LocalAssetCatalog::discover();
-            let mice = LogitechMouse::connect_all();
-            println!(
-                "=== Logitech Souris / LIGHTSPEED ({} détectée(s)) ===",
-                mice.len()
-            );
-            for m in &mice {
-                let i = &m.info;
-                println!(
-                    "Modèle       : {} ({:04X}:{:04X}, slot 0x{:02X})",
-                    i.name, i.vid, i.pid, i.device_index
-                );
-                println!("HID++        : v{}", i.proto_version);
-                if !i.firmware.is_empty() {
-                    println!("Firmware     : {}", i.firmware.join(" | "));
-                }
-                if let Some(b) = &i.battery {
-                    let hz = i.report_rate.as_ref().map(|r| r.current_hz).unwrap_or(1000);
-                    let est = b
-                        .percent
-                        .map(|p| {
-                            let pm = assets
-                                .find_battery_model(i.pid, &i.name)
-                                .map(|bm| {
-                                    BatteryPowerModel::from_params(
-                                        p,
-                                        bm.capacity_mwh,
-                                        bm.sensor_mw,
-                                        bm.mcu_mw,
-                                        bm.radio_mw_for_hz(hz),
-                                    )
-                                })
-                                .unwrap_or_else(|| BatteryPowerModel::for_pro_x_wireless(p, hz));
-                            format!(
-                                " | ~{:.1}h restantes ({:.1} mW @ {hz}Hz)",
-                                pm.estimated_hours, pm.total_mw
-                            )
-                        })
-                        .unwrap_or_default();
-                    println!(
-                        "Batterie     : {:?}% ({}, {:?} mV){est}",
-                        b.percent,
-                        b.state.label(),
-                        b.voltage_mv
-                    );
-                }
-                if let Some(d) = &i.dpi {
-                    println!(
-                        "Capteur DPI  : X={} Y={} (min={}, max={}, step={}, ext={}, XY_indep={}, LOD={:?})",
-                        d.dpi_x,
-                        d.dpi_y,
-                        d.min_dpi,
-                        d.max_dpi,
-                        d.step_dpi,
-                        d.extended,
-                        d.supports_independent_xy,
-                        d.lod
-                    );
-                }
-                if let Some(r) = &i.report_rate {
-                    println!(
-                        "Polling Rate : {} Hz (supportés: {:?} Hz, ext={})",
-                        r.current_hz, r.supported_hz, r.extended
-                    );
-                }
-                if let Some(o) = &i.onboard {
-                    println!(
-                        "Mémoire Emb. : {} (profils={}, boutons={}, actif=#{}, stage_dpi=#{})",
-                        o.mode.label(),
-                        o.profile_count,
-                        o.button_count,
-                        o.active_profile,
-                        o.active_dpi_index
-                    );
-                }
-                if !i.onboard_profiles.is_empty() {
-                    println!("Profils embarqués ({}) :", i.onboard_profiles.len());
-                    for p in &i.onboard_profiles {
-                        let btns: Vec<String> = p.buttons.iter().map(|b| b.label()).collect();
-                        println!(
-                            "  #{} '{}' [sec=0x{:04X}, {}, enabled={}, crc_ok={}] {} Hz | DPIs={:?} (def=#{}) | Boutons=[{}]",
-                            p.slot_index,
-                            p.name,
-                            p.sector_addr,
-                            if p.from_rom { "ROM" } else { "FLASH" },
-                            p.enabled,
-                            p.crc_valid,
-                            p.report_rate_hz,
-                            p.dpi_stages,
-                            p.default_dpi_idx,
-                            btns.join(", ")
-                        );
-                    }
-                }
-                println!("Features HID++: {} détectées", i.features.len());
-            }
-
-            let kbs = LogitechKeyboard::connect_all();
-            if !kbs.is_empty() {
-                println!("\n=== Logitech Claviers ({} détecté(s)) ===", kbs.len());
-                for k in &kbs {
-                    println!(
-                        "  {} ({:04X}:{:04X}, slot 0x{:02X}) | RGB={} | Luminosité={:?}%",
-                        k.info.name,
-                        k.info.vid,
-                        k.info.pid,
-                        k.info.device_index,
-                        k.info.supports_rgb_effects,
-                        k.info.brightness_pct
-                    );
-                }
-            }
-
-            let headsets = LogitechHeadset::connect_all();
-            println!(
-                "\n=== Logitech Casques Audio ({} détecté(s)) ===",
-                headsets.len()
-            );
-            for h in &headsets {
-                let i = &h.info;
-                println!("Modèle       : {} ({:04X}:{:04X})", i.name, i.vid, i.pid);
-                println!(
-                    "HID++        : v{} | FW: {}",
-                    i.proto_version,
-                    i.firmware.join(" | ")
-                );
-                println!(
-                    "Sidetone     : supporté={} (actuel={}%)",
-                    i.supports_sidetone, i.sidetone_pct
-                );
-                if let Some(eq) = &i.equalizer {
-                    println!(
-                        "Égaliseur    : {} bandes ({}..{} dB) freqs={:?} gains={:?}",
-                        eq.band_count, eq.min_db, eq.max_db, eq.frequencies_hz, eq.gains_db
-                    );
-                }
+            println!("=== Logitech HID++ ({} détecté(s)) ===", devices.len());
+            for dev in &mut devices {
+                print_device_summary(dev.as_mut());
             }
             println!(
                 "\nAssets locaux: G HUB Depot={} ({} modèles battery.xml, {} variantes souris, {} variantes casque) | iCUE 5 RCC={} ({} images K70)",
@@ -983,44 +745,68 @@ fn cmd_logitech(action: LogitechCmd) -> Result<()> {
             );
         }
         LogitechCmd::Dpi { x, y, lod } => {
-            let mut m = LogitechMouse::connect()?;
-            let lod_val = lod
+            let m = devices
+                .iter_mut()
+                .find(|d| d.info().kind == DeviceKind::Mouse)
+                .context("Aucune souris Logitech détectée")?;
+            let ptr = m.pointer().context("Réglage DPI indisponible")?;
+            let lod_norm = lod
                 .as_deref()
                 .map(|s| match s.to_ascii_lowercase().as_str() {
-                    "low" => LodLevel::Low,
-                    "high" => LodLevel::High,
-                    _ => LodLevel::Medium,
+                    "low" => "Low",
+                    "high" => "High",
+                    _ => "Medium",
                 });
-            m.set_dpi(x, y, lod_val)?;
+            ptr.set_dpi_with_lod(x, y, lod_norm)?;
             println!(
                 "DPI souris appliqué : X={x}, Y={}, LOD={:?}",
                 y.unwrap_or(x),
-                lod_val
+                lod_norm
             );
         }
         LogitechCmd::Pollrate { hz } => {
-            let mut m = LogitechMouse::connect()?;
-            m.set_report_rate_hz(hz)?;
+            let m = devices
+                .iter_mut()
+                .find(|d| d.info().kind == DeviceKind::Mouse)
+                .context("Aucune souris Logitech détectée")?;
+            m.apply_setting(
+                setting_ids::POLLING_RATE,
+                &DriverValue::Text(hz.to_string()),
+            )?;
             println!("Polling rate souris appliqué : {hz} Hz");
         }
         LogitechCmd::Mode { mode } => {
-            let mut m = LogitechMouse::connect()?;
-            let om = match mode.to_ascii_lowercase().as_str() {
-                "onboard" | "hw" => OnboardMode::Onboard,
-                "host" | "sw" => OnboardMode::Host,
+            let m = devices
+                .iter_mut()
+                .find(|d| d.info().kind == DeviceKind::Mouse)
+                .context("Aucune souris Logitech détectée")?;
+            let val = match mode.to_ascii_lowercase().as_str() {
+                "onboard" | "hw" => "onboard",
+                "host" | "sw" => "host",
                 _ => bail!("Mode invalide (onboard ou host)"),
             };
-            m.set_onboard_mode(om)?;
-            println!("Mode souris basculé sur : {}", om.label());
+            m.apply_setting("logitech.onboard_mode", &DriverValue::Text(val.into()))?;
+            println!("Mode souris basculé sur : {val}");
         }
         LogitechCmd::Sidetone { percent } => {
-            let mut h = LogitechHeadset::connect()?;
-            h.set_sidetone(percent)?;
+            let h = devices
+                .iter_mut()
+                .find(|d| d.info().kind == DeviceKind::Headset)
+                .context("Aucun casque Logitech détecté")?;
+            h.apply_setting(
+                setting_ids::SIDETONE,
+                &DriverValue::Number(f64::from(percent.min(100))),
+            )?;
             println!("Sidetone casque réglé sur {}%", percent.min(100));
         }
         LogitechCmd::Eq { bands } => {
-            let mut h = LogitechHeadset::connect()?;
-            h.set_equalizer_gains(&bands)?;
+            let h = devices
+                .iter_mut()
+                .find(|d| d.info().kind == DeviceKind::Headset)
+                .context("Aucun casque Logitech détecté")?;
+            h.equalizer()
+                .context("Égaliseur indisponible")?
+                .set_eq_gains(&bands)?;
             println!("Égaliseur matériel casque appliqué : {:?} dB", bands);
         }
     }
@@ -1030,12 +816,25 @@ fn cmd_logitech(action: LogitechCmd) -> Result<()> {
 fn cmd_cooling(action: CoolingCmd) -> Result<()> {
     match action {
         CoolingCmd::Status => {
-            let st = probe_asus_wmi_cooling();
+            let mut devs = discover_for_driver("asus_wmi_cooling");
+            let (wmi_available, message) = devs
+                .iter_mut()
+                .find_map(|d| d.fan_curves().map(|fc| fc.cooling_diagnostic()))
+                .unwrap_or_else(|| {
+                    (
+                        false,
+                        if is_elevated() {
+                            "Aucun contrôleur de courbes carte mère détecté.".into()
+                        } else {
+                            "Droits administrateur requis pour l'interface WMI carte mère.".into()
+                        },
+                    )
+                });
             let sensors = read_hardware_sensors();
-            println!("=== OpenGear Cooling — be quiet! Silent Loop 3 + ASUS WMI ===");
-            println!("Droits Admin   : {}", st.is_admin);
-            println!("WMI Disponible : {}", st.wmi_available);
-            println!("Statut         : {}", st.message);
+            println!("=== OpenGear Cooling — Courbes Carte Mère ===");
+            println!("Droits Admin   : {}", is_elevated());
+            println!("WMI Disponible : {wmi_available}");
+            println!("Statut         : {message}");
             println!(
                 "Capteurs Live  : {} (disponible={})",
                 sensors.source, sensors.available

@@ -1,4 +1,4 @@
-import { BTN_NAMES, ICONS, MACRO_PRESETS, arr, esc, fmtHz, num, plural } from "../utils.js";
+import { BTN_NAMES, ICONS, MACRO_PRESETS, arr, domId, esc, fmtHz, num, plural } from "../utils.js";
 import { rpc } from "../ipc.js";
 import { S, codeLabel, getDraft, isExpert, keyLabel, local, mouseImage } from "../state.js";
 import { advancedHint, emptyState, expertTag, keyboardSetup, pageHeader, renderKeyboard, seg, settingInline, sliderRow, subtabs, sw } from "../components.js";
@@ -71,10 +71,10 @@ function inputKeys() {
   const layer = local.activeLayer || "base";
   const layerMap = layer === "base" ? (prof.bindings || {}) : ((prof.layers && prof.layers[layer]) || {});
   const bindings = Object.entries(layerMap);
-  const kb = S.corsair_devices.find((d) => d.kind === "Keyboard") || null;
+  const kb = arr(S.device_list).find((d) => d.info.kind === "keyboard") || null;
   const keyOpts = (sel) => S.bindable_keys.map((k) => `<option value="${esc(k)}" ${k === sel ? "selected" : ""}>${esc(keyLabel(k))}</option>`).join("");
   return `
-    <div class="card mb-12">
+    <div class="card mb-16">
       <div class="row-between">
         <div><strong>Couche active (Layers QMK/Fn)</strong><div class="muted small">Édite la couche principale ou la couche secondaire Fn, activable par maintien/bascule d'une touche ou d'un bouton souris.</div></div>
         ${seg([["base", "Couche Base"], ["fn", "Couche Fn"]], layer, "input-layer", {}, "purple")}
@@ -88,7 +88,7 @@ function inputKeys() {
         <div class="row">
           <label class="field-label" for="mac-remap">Remplacer par</label>
           <select id="mac-remap" class="og-select grow">${keyOpts("F13")}</select>
-          <button type="button" class="btn btn-primary btn-sm" data-act="bind-remap">Appliquer</button>
+          <button type="button" class="btn btn-primary btn-sm btn-action" data-act="bind-remap">Appliquer</button>
         </div>
         <div class="row mt-12">
           <button type="button" class="btn btn-secondary btn-sm" data-act="bind-disable">Désactiver la touche</button>
@@ -111,7 +111,7 @@ function inputKeys() {
         <div class="row">
           <label class="field-label" for="mac-text">Taper un texte</label>
           <input id="mac-text" class="og-input grow" placeholder="Ex. : gg wp" />
-          <button type="button" class="btn btn-secondary btn-sm" data-act="bind-text">Assigner</button>
+          <button type="button" class="btn btn-secondary btn-sm btn-action" data-act="bind-text">Assigner</button>
         </div>
         <div class="divider"></div>
         <div class="row-between">
@@ -132,7 +132,7 @@ function inputKeys() {
           <button type="button" class="btn btn-secondary btn-sm" data-act="macro-add">Ajouter</button>
           <button type="button" class="btn btn-ghost btn-sm" data-act="macro-clear">Vider</button>
         </div>
-        <div class="mono muted mt-12 scroll-y selectable" style="max-height:110px;overflow:auto;background:#0b0e16;padding:8px 10px;border-radius:8px" aria-live="polite">
+        <div class="mono muted mt-12 scroll-y selectable macro-log" aria-live="polite">
           ${sp.macro_recording
             ? `<span style="color:#ff8aa2;font-weight:700">Enregistrement en cours… tape ta combinaison puis clique sur « Arrêter l'enregistrement ».</span>`
             : local.macroSteps.map((st, i) => `${i + 1}. ${st.down ? "Appui  " : "Relâche"} ${esc(st.key)} (${num(st.delay_ms)} ms)`).join("<br/>") || "Aucune étape pour l'instant."}
@@ -142,12 +142,12 @@ function inputKeys() {
       <div class="card">
         <div class="card-head"><h2 class="card-title">Touches modifiées</h2><span class="pill">${plural(bindings.length, "règle", "règles")}</span></div>
         ${bindings.length === 0 ? `<div class="muted">Aucune touche modifiée sur ce profil. Clique sur une touche du clavier ci-dessus pour commencer.</div>` : `
-          <table class="meta-table">
+          <div class="table-scroll"><table class="meta-table">
             <thead><tr><th>Touche</th><th>Action</th><th><span class="sr-only">Supprimer</span></th></tr></thead>
             <tbody>
               ${bindings.map(([k, act]) => `<tr><td class="mono" style="color:var(--cyan);font-weight:700" title="${esc(k)}">${esc(keyLabel(k))}</td><td>${esc(describeAction(act))}</td><td style="text-align:right"><button type="button" class="btn btn-sm btn-secondary" data-act="bind-remove" data-key="${esc(k)}" aria-label="Supprimer la règle ${esc(keyLabel(k))}">Supprimer</button></td></tr>`).join("")}
             </tbody>
-          </table>`}
+          </table></div>`}
       </div>
     </div>`;
 }
@@ -176,11 +176,11 @@ function describeAction(act) {
 }
 
 function flashtapCard() {
-  const kbs = arr(S.corsair_devices).filter((d) => d.flashtap_supported);
+  const kbs = arr(S.device_list).filter((d) => arr(d.settings).some((s) => s.id === "hw_socd"));
   if (!kbs.length) {
-    const corsairKb = arr(S.corsair_devices).find((d) => d.kind === "Keyboard");
-    return corsairKb
-      ? `<div class="card mb-16"><div class="muted">FlashTap matériel non détecté sur ${esc(corsairKb.product_name)} : ce firmware n'expose pas de réglage FlashTap reconnu. Le Snap Tap logiciel ci-dessous reste disponible.</div></div>`
+    const kb = arr(S.device_list).find((d) => d.info.kind === "keyboard");
+    return kb && arr(kb.settings).length
+      ? `<div class="card mb-16"><div class="muted">FlashTap matériel non détecté sur ${esc(kb.info.model)} : ce firmware n'expose pas de réglage FlashTap reconnu. Le Snap Tap logiciel ci-dessous reste disponible.</div></div>`
       : "";
   }
   return `
@@ -192,10 +192,13 @@ function flashtapCard() {
         </div>
       </div>
       <div class="stack" style="gap:10px">
-        ${kbs.map((d) => `
-          <div class="row-between">
-            ${settingInline(d.device_id, "hw_socd", { label: `${d.product_name} — FlashTap ${d.flashtap_enabled ? "actif" : "inactif"}` })}
-          </div>`).join("")}
+        ${kbs.map((d) => {
+          const s = d.settings.find((x) => x.id === "hw_socd");
+          return `
+            <div class="row-between">
+              ${settingInline(d.info.id, "hw_socd", { label: `${d.info.model} — FlashTap ${s && s.value ? "actif" : "inactif"}` })}
+            </div>`;
+        }).join("")}
         <div class="muted">Activer le FlashTap coupe automatiquement le Snap Tap logiciel. Vérifie le résultat avec le testeur juste en dessous.</div>
       </div>
     </div>`;
@@ -265,7 +268,7 @@ function inputEsports() {
         </div>
         <div class="divider"></div>
         <div class="row-nowrap">
-          <button type="button" class="btn btn-secondary grow" data-act="click-test" style="padding:12px">Clique ici rapidement pour mesurer l'intervalle entre deux clics</button>
+          <button type="button" class="btn btn-secondary btn-wrap grow" data-act="click-test" style="padding:10px 14px">Clique ici rapidement pour mesurer l'intervalle entre deux clics</button>
           <span class="pill mono" id="es-click-res" style="min-width:110px;justify-content:center" aria-live="polite">Prêt</span>
         </div>
       </div>
@@ -285,7 +288,7 @@ function softwareMouseCard() {
   ].join("");
   const btnLabel = (id) => (btns.find((b) => b.id === id) || {}).label || id;
   return `
-    <div class="card mb-12">
+    <div class="card mb-16">
       <div class="row-between">
         <div><strong>Couche souris active</strong><div class="muted small">Assignations de base ou activées quand la couche Fn est active (G-Shift).</div></div>
         ${seg([["base", "Couche Base"], ["fn", "Couche Fn"]], layer, "input-layer", {}, "purple")}
@@ -306,7 +309,7 @@ function softwareMouseCard() {
         <div class="row mt-12">
           <label class="field-label" for="m-remap-target">Remplacer par</label>
           <select id="m-remap-target" class="og-select grow">${targets}</select>
-          <button type="button" class="btn btn-primary btn-sm" data-act="m-bind-remap">Appliquer</button>
+          <button type="button" class="btn btn-primary btn-sm btn-action" data-act="m-bind-remap">Appliquer</button>
         </div>
         <div class="row mt-12">
           <button type="button" class="btn btn-secondary btn-sm" data-act="m-bind-disable">Désactiver ce bouton</button>
@@ -316,43 +319,46 @@ function softwareMouseCard() {
         <div class="row">
           <label class="field-label" for="m-bind-text">Texte</label>
           <input id="m-bind-text" class="og-input grow" placeholder="Ex. : /dance" />
-          <button type="button" class="btn btn-secondary btn-sm" data-act="m-bind-text">Assigner</button>
+          <button type="button" class="btn btn-secondary btn-sm btn-action" data-act="m-bind-text">Assigner</button>
         </div>
         <div class="divider"></div>
         <div class="row">
-          <select id="m-macro-mode" class="og-select auto" aria-label="Mode macro souris">
+          <label class="field-label" for="m-macro-mode">Macro</label>
+          <select id="m-macro-mode" class="og-select grow" aria-label="Mode macro souris">
             <option value="once">Une fois</option>
             <option value="while_held">Tant que maintenu</option>
             <option value="toggle">Bascule On/Off</option>
           </select>
-          <button type="button" class="btn btn-primary btn-sm grow" data-act="m-bind-macro">Assigner la macro (${arr(local.macroSteps).length} étapes)</button>
+          <button type="button" class="btn btn-primary btn-sm" data-act="m-bind-macro">Assigner la macro (${arr(local.macroSteps).length} étapes)</button>
         </div>
       </div>
       <div class="card">
         <div class="card-head"><h2 class="card-title">Règles souris actives</h2><span class="pill">${plural(mb.length, "règle", "règles")}</span></div>
         ${mb.length === 0 ? `<div class="muted">Aucun bouton de souris remappé sur ce profil.</div>` : `
-          <table class="meta-table">
+          <div class="table-scroll"><table class="meta-table">
             <thead><tr><th>Bouton</th><th>Action</th><th><span class="sr-only">Supprimer</span></th></tr></thead>
             <tbody>
               ${mb.map(([btn, act]) => `<tr><td><strong>${esc(btnLabel(btn))}</strong></td><td>${esc(describeAction(act))}</td><td style="text-align:right"><button type="button" class="btn btn-sm btn-secondary" data-act="m-bind-remove" data-button="${esc(btn)}">Supprimer</button></td></tr>`).join("")}
             </tbody>
-          </table>`}
+          </table></div>`}
       </div>
     </div>`;
 }
 
 function inputMouse() {
   const swCard = softwareMouseCard();
-  if (!S.logi_mice.length) {
-    return `${swCard}${emptyState("Aucune souris à mémoire embarquée détectée", "Les boutons latéraux et molette ci-dessus fonctionnent déjà avec toute souris. Pour éditer la mémoire flash d'une Logitech G, branche son câble ou récepteur.")}`;
+  const mice = arr(S.device_list).filter((d) => d.onboard && d.info.kind === "mouse");
+  if (!mice.length) {
+    return `${swCard}${emptyState("Aucune souris à mémoire embarquée détectée", "Les boutons latéraux et molette ci-dessus fonctionnent déjà avec toute souris. Pour éditer la mémoire flash d'une souris compatible, branche son câble ou récepteur.")}`;
   }
-  return `${swCard}<div class="stack">${S.logi_mice.map((m, i) => cardLogiOnboard(m, i)).join("")}</div>`;
+  return `${swCard}<div class="stack">${mice.map((dev) => cardOnboard(dev)).join("")}</div>`;
 }
 
-function mouseStage(m, i, buttons, btnCount) {
+function mouseStage(dev, buttons, btnCount) {
+  const id = dev.info.id;
   const imgInfo = mouseImage();
   const markers = arr(S.local_assets.mouse_markers);
-  const sel = local.btnSel[i] || 0;
+  const sel = local.btnSel[id] || 0;
   const proj = (idx, fx, fy) => {
     if (!imgInfo.official || !markers[idx]) return { px: fx, py: fy };
     const mk = markers[idx];
@@ -368,7 +374,7 @@ function mouseStage(m, i, buttons, btnCount) {
   return `
     <div class="hero-stage" style="padding:0">
       <div class="mouse-stage-inner">
-        <img src="${esc(imgInfo.url)}" class="cutout" alt="${esc(m.name)}" />
+        <img src="${esc(imgInfo.url)}" class="cutout" alt="${esc(dev.info.model)}" />
         <svg class="mouse-svg-overlay" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
           ${callouts.map((c) => {
             const on = sel === c.idx;
@@ -377,7 +383,7 @@ function mouseStage(m, i, buttons, btnCount) {
           }).join("")}
         </svg>
         ${callouts.map((c) => `
-          <button type="button" class="callout-pin ${sel === c.idx ? "active" : ""}" data-act="mbtn-sel" data-dev="${i}" data-btn="${c.idx}" style="left:${c.lx}%;top:${c.ly}%" aria-pressed="${sel === c.idx}">
+          <button type="button" class="callout-pin ${sel === c.idx ? "active" : ""}" data-act="mbtn-sel" data-id="${esc(id)}" data-btn="${c.idx}" style="left:${c.lx}%;top:${c.ly}%" aria-pressed="${sel === c.idx}">
             <div class="pin-id">${esc(c.id)}</div>
             <div class="pin-act">${esc((buttons[c.idx] && buttons[c.idx].label) || "Standard")}</div>
           </button>`).join("")}
@@ -386,35 +392,38 @@ function mouseStage(m, i, buttons, btnCount) {
     </div>`;
 }
 
-export function cardLogiOnboard(m, i) {
-  const ob = m.onboard;
-  const profiles = arr(m.onboard_profiles);
+export function cardOnboard(dev) {
+  const id = dev.info.id;
+  const did = domId(id);
+  const ob = dev.onboard && dev.onboard.info;
+  const profiles = arr(dev.onboard && dev.onboard.profiles);
+  const presets = arr(dev.onboard && dev.onboard.button_presets).length ? dev.onboard.button_presets : arr(S.button_presets);
   if (!ob || !profiles.length) {
-    return `<div class="card"><h2 class="card-title">${esc(m.name)}</h2><div class="muted mt-8">Cette souris n'expose pas de profils embarqués modifiables : ses boutons gardent leur fonction d'usine.</div></div>`;
+    return `<div class="card"><h2 class="card-title">${esc(dev.info.model)}</h2><div class="muted mt-8">Cet appareil n'expose pas de profils embarqués modifiables : ses boutons gardent leur fonction d'usine.</div></div>`;
   }
-  const d = getDraft(m, i);
+  const d = getDraft(dev);
   const p = d.profile;
   const btns = p.buttons;
   const btnCount = Math.max(btns.length, num(ob.button_count, 5));
   const ex = isExpert();
   const selIdx = d.idx;
-  const sel = local.btnSel[i] || 0;
-  const profSeg = profiles.map((pr, idx) => [idx, `Profil ${num(pr.slot_index, idx + 1)}${pr.slot_index === ob.active_profile ? " (actif)" : ""}`]);
-  if (!ex) {
+  const sel = local.btnSel[id] || 0;
+  const profSeg = profiles.map((pr, idx) => [idx, `Profil ${num(pr.slot, idx + 1)}${pr.slot === ob.active_profile ? " (actif)" : ""}`]);
+  if (!ex || !ob.writable) {
     return `
       <div class="card">
-        <div class="card-head"><div><h2 class="card-title">${esc(m.name)}</h2><div class="card-desc">Profils enregistrés dans la souris</div></div></div>
-        <div class="grid-stage">
-          ${mouseStage(m, i, btns, btnCount)}
+        <div class="card-head"><div><h2 class="card-title">${esc(dev.info.model)}</h2><div class="card-desc">Profils enregistrés dans l'appareil</div></div></div>
+        <div class="${dev.info.kind === "mouse" ? "grid-stage" : ""}">
+          ${dev.info.kind === "mouse" ? mouseStage(dev, btns, btnCount) : ""}
           <div class="stack">
             <div class="list">
               ${profiles.map((pr, idx) => `
-                <div class="list-row ${pr.slot_index === ob.active_profile ? "active" : ""}">
-                  <div><strong>Profil ${num(pr.slot_index, idx + 1)}</strong><div class="muted small">${arr(pr.dpi_stages).map((v) => num(v)).join(" / ")} DPI · ${fmtHz(num(pr.report_rate_hz, 1000))}</div></div>
-                  ${pr.slot_index === ob.active_profile ? `<span class="pill cyan"><span class="dot"></span>Actif</span>` : `<button type="button" class="btn btn-sm btn-secondary" data-act="logi-activate" data-dev="${i}" data-slot="${num(pr.slot_index)}">Activer</button>`}
+                <div class="list-row ${pr.slot === ob.active_profile ? "active" : ""}">
+                  <div><strong>${esc(pr.name || `Profil ${num(pr.slot, idx + 1)}`)}</strong><div class="muted small">${arr(pr.dpi_stages).map((v) => num(v)).join(" / ")}${arr(pr.dpi_stages).length ? " DPI · " : ""}${pr.report_rate_hz ? fmtHz(num(pr.report_rate_hz)) : ""}</div></div>
+                  ${pr.slot === ob.active_profile ? `<span class="pill cyan"><span class="dot"></span>Actif</span>` : `<button type="button" class="btn btn-sm btn-secondary" data-act="ob-activate" data-id="${esc(id)}" data-slot="${num(pr.slot)}">Activer</button>`}
                 </div>`).join("")}
             </div>
-            ${advancedHint("La modification des boutons et l'écriture des profils et macros dans la souris se font en mode Expert.")}
+            ${ob.writable ? advancedHint("La modification des boutons et l'écriture des profils et macros se font en mode Expert.") : ""}
           </div>
         </div>
       </div>`;
@@ -422,26 +431,26 @@ export function cardLogiOnboard(m, i) {
   return `
     <div class="card expert-card">
       <div class="card-head">
-        <div><h2 class="card-title">${esc(m.name)} — mémoire embarquée ${expertTag()}</h2><div class="card-desc">Les modifications restent en brouillon tant que tu ne les écris pas dans la souris.${d.dirty ? " <strong style='color:var(--amber)'>Brouillon modifié.</strong>" : ""}</div></div>
-        ${settingInline(m.device_id, "logitech.onboard_mode", { label: "Mode" })}
+        <div><h2 class="card-title">${esc(dev.info.model)} — mémoire embarquée ${expertTag()}</h2><div class="card-desc">Les modifications restent en brouillon tant que tu ne les écris pas dans l'appareil.${d.dirty ? " <strong style='color:var(--amber)'>Brouillon modifié.</strong>" : ""}</div></div>
+        ${settingInline(id, "logitech.onboard_mode", { label: "Mode" })}
       </div>
       <div class="grid-stage">
-        ${mouseStage(m, i, btns, btnCount)}
+        ${mouseStage(dev, btns, btnCount)}
         <div class="stack">
           <div class="row-between">
-            ${seg(profSeg, selIdx, "logi-prof-sel", { dev: i })}
-            <button type="button" class="btn btn-sm btn-secondary" data-act="logi-activate" data-dev="${i}" data-slot="${num(p.slot_index)}">Activer ce profil</button>
+            ${seg(profSeg, selIdx, "ob-prof-sel", { id })}
+            <button type="button" class="btn btn-sm btn-secondary" data-act="ob-activate" data-id="${esc(id)}" data-slot="${num(p.slot)}">Activer ce profil</button>
           </div>
-          <div class="muted small">Emplacement ${esc(p.sector_addr)} · ${p.from_rom ? "ROM d'usine" : "Flash"} · ${p.crc_valid ? "intégrité vérifiée" : "intégrité à vérifier"}</div>
+          <div class="muted small">Emplacement ${esc(p.sector_addr || "—")} · ${p.from_rom ? "ROM d'usine" : "Flash"}${p.crc_valid != null ? (p.crc_valid ? " · intégrité vérifiée" : " · intégrité à vérifier") : ""}</div>
           <div>
             <div class="field-label" style="margin-bottom:6px">Paliers DPI (le point indique le palier par défaut)</div>
             <div class="stack" style="gap:6px">
               ${p.dpi_stages.map((v, st) => `
                 <div class="row-nowrap">
-                  <input type="radio" name="def-dpi-${i}" value="${st}" ${num(p.default_dpi_idx) === st ? "checked" : ""} data-change="draft-def-dpi" data-dev="${i}" aria-label="Palier ${st + 1} par défaut" style="accent-color:var(--cyan)" />
+                  <input type="radio" name="def-dpi-${did}" value="${st}" ${num(p.default_dpi_idx) === st ? "checked" : ""} data-change="draft-def-dpi" data-id="${esc(id)}" aria-label="Palier ${st + 1} par défaut" style="accent-color:var(--cyan)" />
                   <span class="muted" style="width:60px">Palier ${st + 1}</span>
-                  <input type="number" class="og-input narrow" min="100" max="32000" step="50" value="${num(v)}" data-change="draft-stage-dpi" data-dev="${i}" data-stage="${st}" aria-label="DPI du palier ${st + 1}" />
-                  <button type="button" class="btn btn-sm btn-secondary" data-act="logi-test-stage" data-dev="${i}" data-stage="${st}">Tester</button>
+                  <input type="number" class="og-input narrow" min="100" max="32000" step="50" value="${num(v)}" data-change="draft-stage-dpi" data-id="${esc(id)}" data-stage="${st}" aria-label="DPI du palier ${st + 1}" />
+                  <button type="button" class="btn btn-sm btn-secondary" data-act="ob-test-stage" data-id="${esc(id)}" data-stage="${st}">Tester</button>
                 </div>`).join("")}
             </div>
           </div>
@@ -450,13 +459,13 @@ export function cardLogiOnboard(m, i) {
             <div class="stack" style="gap:6px">
               ${Array.from({ length: btnCount }, (_, b) => {
                 const cur = btns[b] || { hex: "", label: "Standard" };
-                const known = S.button_presets.some((bp) => bp.hex === cur.hex);
+                const known = presets.some((bp) => bp.hex === cur.hex);
                 return `
                   <div class="row-nowrap" style="${sel === b ? "background:rgba(0,212,255,0.08);border-radius:6px;padding:2px 4px" : ""}">
-                    <label class="muted" style="width:110px;font-size:12px" for="btn-${i}-${b}">${esc(BTN_NAMES[b] || `Bouton M${b + 1}`)}</label>
-                    <select id="btn-${i}-${b}" class="og-select grow" data-change="draft-btn" data-dev="${i}" data-btn="${b}">
+                    <label class="muted" style="width:110px;font-size:12px" for="btn-${did}-${b}">${esc(BTN_NAMES[b] || `Bouton M${b + 1}`)}</label>
+                    <select id="btn-${did}-${b}" class="og-select grow" data-change="draft-btn" data-id="${esc(id)}" data-btn="${b}">
                       ${!known ? `<option value="${esc(cur.hex)}" selected>${esc(cur.label)}</option>` : ""}
-                      ${S.button_presets.map((bp) => `<option value="${esc(bp.hex)}" ${bp.hex === cur.hex ? "selected" : ""}>${esc(bp.label)}</option>`).join("")}
+                      ${presets.map((bp) => `<option value="${esc(bp.hex)}" ${bp.hex === cur.hex ? "selected" : ""}>${esc(bp.label)}</option>`).join("")}
                     </select>
                   </div>`;
               }).join("")}
@@ -464,18 +473,19 @@ export function cardLogiOnboard(m, i) {
           </div>
           <div class="row-between">
             <span class="field-label">Fréquence du profil</span>
-            ${seg([125, 250, 500, 1000].map((hz) => [hz, fmtHz(hz)]), p.report_rate_hz, "draft-hz", { dev: i })}
+            ${seg([125, 250, 500, 1000].map((hz) => [hz, fmtHz(hz)]), p.report_rate_hz, "draft-hz", { id })}
           </div>
           <div class="row">
-            <button type="button" class="btn btn-primary" data-act="logi-flash" data-dev="${i}">Écrire le profil dans la souris</button>
-            <button type="button" class="btn btn-secondary btn-sm" data-act="logi-reload" data-dev="${i}">Relire la souris</button>
+            <button type="button" class="btn btn-primary" data-act="ob-flash" data-id="${esc(id)}">Écrire le profil dans la souris</button>
+            <button type="button" class="btn btn-secondary btn-sm" data-act="ob-reload" data-id="${esc(id)}">Relire la souris</button>
           </div>
-          <div class="divider" style="margin:4px 0"></div>
-          <div class="row">
-            <label class="field-label" for="macro-preset-${i}">Macro matérielle sur M${sel + 1}</label>
-            <select id="macro-preset-${i}" class="og-select auto">${Object.entries(MACRO_PRESETS).map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`).join("")}</select>
-            <button type="button" class="btn btn-secondary btn-sm" data-act="logi-flash-macro" data-dev="${i}">Écrire la macro</button>
-          </div>
+          ${ob.macros_supported ? `
+            <div class="divider" style="margin:4px 0"></div>
+            <div class="row">
+              <label class="field-label" for="macro-preset-${did}">Macro matérielle sur M${sel + 1}</label>
+              <select id="macro-preset-${did}" class="og-select auto">${Object.entries(MACRO_PRESETS).map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`).join("")}</select>
+              <button type="button" class="btn btn-secondary btn-sm" data-act="ob-flash-macro" data-id="${esc(id)}">Écrire la macro</button>
+            </div>` : ""}
         </div>
       </div>
     </div>`;

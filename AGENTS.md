@@ -130,19 +130,14 @@ La CI exécute exactement ces commandes. Si `cargo fmt` ou `cargo clippy` est in
   générique `device_fan_set`, ventilateurs rendus au firmware à la fermeture et par le processus
   de surveillance (`cooling_devices` du marqueur `fan_override.json`). Les préréglages et
   l'économie sur batterie n'utilisent que les ids partagés.
-- Réglages/capacités encore propres à une marque, à remplacer par des traits dédiés : couleurs de
-  voyants Corsair (écriture seule), paliers DPI, égaliseur, mémoire embarquée Logitech
-  (profils/boutons/macros), ventilateurs carte mère (ASUS WMI, SuperIO : courbes et Smart
-  Cooling encore servis par `cooling_channels` / `superio_*`, pas encore par `Cooling`).
+- Tous les réglages et capacités transverses passent par les traits de `opengear-core` (`Device`, `Lighting`, `Cooling`, `CurveCooling`, `PointerDevice`, `Equalizer`, `OnboardMemory`) avec zéro `as_any`/downcast dans le workspace et zéro import marque dans `opengear-app` hors `src/drivers.rs` (sauf pont serveur TCP `opengear_openrgb::server` dans `ui/backend.rs`).
+- Réglages/capacités restant à unifier davantage : ventilateurs carte mère (courbes WMI et contrôle direct SuperIO : lecture et Smart Cooling encore servis par `cooling_channels` / `superio_*` en parallèle de `Device::cooling()`).
 - `opengear-core::profile` conserve quelques champs hérités (`sync_asus_aura`, `asus_argb_led_counts`,
   `silent_loop3_*`, `omen_sync_rgb`) uniquement pour la rétro-compatibilité au chargement des anciens
   fichiers ; la configuration active vit dans `device_lighting` et `device_placements`.
 - Souris/casques Corsair sans carte de LEDs connue (`Device::lighting()` renvoie `None`) et mode
   direct par LED RAM ENE (seul le registre uniforme `REG_DIRECT = 0` est utilisé sans fiche ENE
   détaillée) restent à compléter.
-- L'app accède encore aux types d'un pilote par `Device::as_any()` + `downcast_ref` (Corsair pour
-  la carte clavier, les paliers DPI et les profils HWP) : chaque
-  accès disparaît quand la capacité correspondante devient un trait. N'en ajouter aucun nouveau.
 - Pilote Razer (`opengear-razer`, **expérimental**, jamais testé sur matériel) : protocole générique
   90 octets uniquement (177 appareils). Non pris en charge : casques Kraken, contrôleur ARGB, AIO
   Hanbo, modèles « custom », appareils relayés par un récepteur sans fil, maintien d'éclairage des

@@ -475,14 +475,6 @@ impl Device for RamRgbDevice {
         (!self.status.ene_modules.is_empty()).then_some(self as &mut dyn Lighting)
     }
 
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
-    }
-
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        Some(self)
-    }
-
     fn apply_setting(&mut self, id: &str, _value: &Value) -> Result<()> {
         anyhow::bail!("Réglage RAM RGB inconnu : {id}")
     }
