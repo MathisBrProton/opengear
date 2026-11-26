@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Faille de sécurité (signalement privé)
+    url: https://github.com/MathisBrProton/opengear/security/advisories/new
+    about: Ne publie jamais une faille en issue publique.

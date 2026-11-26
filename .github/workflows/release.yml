@@ -1,0 +1,112 @@
+name: Release
+
+# Pushing a tag vX.Y.Z builds the artifacts and creates a DRAFT GitHub release.
+# Nothing is published until a maintainer reviews the draft and clicks "Publish".
+# Manual runs (workflow_dispatch) build the artifacts only, for testing; they never publish.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build release artifacts (Windows)
+    runs-on: windows-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.1-x86_64-pc-windows-gnu"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches the workspace version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          ver=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "v$ver" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Le tag $GITHUB_REF_NAME ne correspond pas à la version de Cargo.toml (v$ver)."
+            exit 1
+          fi
+
+      - name: Install toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.99.1-x86_64-pc-windows-gnu --profile minimal \
+            --target x86_64-pc-windows-gnullvm
+          rustup component add rust-mingw --target x86_64-pc-windows-gnullvm \
+            --toolchain 1.99.1-x86_64-pc-windows-gnu
+          rustc --version --verbose
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Stage and build the installer
+        shell: bash
+        run: |
+          mkdir -p dist/stage/pawnio_modules
+          cp target/x86_64-pc-windows-gnullvm/release/opengear.exe dist/stage/OpenGear.exe
+          cp target/x86_64-pc-windows-gnullvm/release/WebView2Loader.dll dist/stage/WebView2Loader.dll
+          cp target/x86_64-pc-windows-gnullvm/release/pawnio_modules/* dist/stage/pawnio_modules/
+          cargo build --release --manifest-path tools/opengear-setup/Cargo.toml --locked
+
+      - name: Assemble release assets
+        shell: pwsh
+        run: |
+          $out = "release-assets"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          # Installer (what most users should download)
+          Copy-Item "tools/opengear-setup/target/x86_64-pc-windows-gnullvm/release/opengear-setup.exe" "$out/OpenGear-Setup.exe"
+
+          # Portable build: the exe needs WebView2Loader.dll and the PawnIO modules next to it
+          $portable = "portable-build"
+          New-Item -ItemType Directory -Force -Path "$portable/pawnio_modules" | Out-Null
+          Copy-Item "dist/stage/OpenGear.exe", "dist/stage/WebView2Loader.dll" -Destination $portable
+          Copy-Item "dist/stage/pawnio_modules/*" -Destination "$portable/pawnio_modules"
+          Compress-Archive -Path "$portable/*" -DestinationPath "$out/OpenGear-portable.zip"
+
+          # SHA-256 checksums, so users can verify what they downloaded
+          Get-ChildItem $out -File | Where-Object Name -ne "SHA256SUMS.txt" | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower()
+            "$hash  $($_.Name)"
+          } | Set-Content -Encoding ascii "$out/SHA256SUMS.txt"
+
+          Get-Content "$out/SHA256SUMS.txt"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish-draft:
+    name: Create draft release
+    needs: package
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --draft \
+            --verify-tag \
+            --title "OpenGear $GITHUB_REF_NAME" \
+            --generate-notes

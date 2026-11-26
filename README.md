@@ -8,7 +8,21 @@ télémétrie et sans compte.
 > [Matériel supporté](#matériel-supporté)). OpenGear écrit dans la mémoire flash de certains
 > appareils : lis la section [Sécurité](#sécurité) avant d'utiliser le mode Expert.
 
+> **English summary.** OpenGear is a free, open-source Windows app (Rust) that controls RGB
+> lighting, mouse and keyboard settings, fans and pumps, macros and key remapping, from one
+> lightweight program. No account, no telemetry. It is tested on a few specific devices;
+> drivers marked *experimental* have not been tested on real hardware yet. Contributions are
+> welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+
 ## Démarrage rapide
+
+### Télécharger
+
+Le plus simple : [télécharge la dernière release](https://github.com/MathisBrProton/opengear/releases/latest)
+et lance `OpenGear-Setup.exe`. Une version portable (`OpenGear-portable.zip`) est aussi disponible.
+Vérifie l'intégrité avec `SHA256SUMS.txt`.
+
+### Lancer l'application
 
 ### Lancer l'application
 
@@ -58,6 +72,22 @@ avancés ; le mode Expert donne accès à tout. Chaque changement de configurati
 | Nuvoton | SuperIO NCT679x (PWM direct) | PawnIO LpcIO |
 | HP | PC portables OMEN / Victus : modes thermiques, ventilateurs, puissance GPU, clavier 4 zones | BIOS WMI `hpqBIntM` |
 | Tout clavier | Remappage, macros, Snap Tap, avec la vraie disposition Windows (AZERTY, QWERTZ, UK…) et le format choisi (100 %, TKL, 75 %, 65 %, 60 %, ANSI/ISO) | Hook Windows |
+
+### Pilotes expérimentaux
+
+Ces pilotes sont écrits à partir de documentation de protocole, mais **n'ont pas encore été testés
+sur du matériel réel**. Ils sont désactivés par défaut : Système → Préférences → Pilotes expérimentaux.
+
+| Marque | Appareils | Protocole |
+|---|---|---|
+| Razer | Périphériques à protocole 90 octets (177 modèles) | Razer HID (`opengear-razer`) |
+| SteelSeries | Périphériques HID (voir `docs/protocols/steelseries.md`) | HID (`opengear-steelseries`) |
+| HyperX | Périphériques HID (voir `docs/protocols/hyperx.md`) | HID (`opengear-hyperx`) |
+| OpenRGB | Pont vers un serveur OpenRGB lancé séparément | SDK réseau local (`opengear-openrgb`) |
+
+**Testeur ?** Un appareil de ces marques t'intéresse ? Ouvre une issue
+« [Support d'appareil](https://github.com/MathisBrProton/opengear/issues/new/choose) » : les essais
+se font en lecture seule et ton retour fait avancer la matrice de compatibilité.
 
 Le scanner (`opengear scan`) liste aussi les appareils détectés mais pas encore pilotés.
 
@@ -124,6 +154,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-and-run.ps1
 | `opengear-asus` | Aura USB, ventilateurs ASUS WMI, transport SMBus ASUS WMI pour la RAM |
 | `opengear-openrgb` | Client du SDK réseau d'OpenRGB (implémentation propre du protocole) |
 | `opengear-hp` | HP OMEN / Victus via le BIOS WMI `hpqBIntM` |
+| `opengear-razer` | Pilote Razer (expérimental) : protocole 90 octets, tables générées depuis `docs/protocols/` |
+| `opengear-steelseries` | Pilote SteelSeries (expérimental, d'après `docs/protocols/steelseries.md`) |
+| `opengear-hyperx` | Pilote HyperX (expérimental, d'après `docs/protocols/hyperx.md`) |
 | `opengear-input` | Hook clavier bas niveau : remap, macros, SOCD, anti-rebond |
 | `opengear-app` | Exécutable : CLI + interface WebView2 (`ui/` embarqué), tray, installeur |
 | `tools/opengear-setup` | Installeur autonome (`OpenGear-Setup.exe`) |
@@ -143,8 +176,17 @@ embarquée dans l'exécutable et reliée au backend Rust par IPC.
 | Marqueur ventilateurs (temporaire) | `%APPDATA%\OpenGear\fan_override.json` |
 | Journaux | `%LOCALAPPDATA%\OpenGear\logs\opengear.log` (rotation, 3 fichiers max) |
 
+## Contribuer
+
+Toute aide est bienvenue, surtout les **tests sur matériel** et les **fiches de protocole**.
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) : mise en place, règles, workflow de PR.
+- [SECURITY.md](SECURITY.md) : signaler une faille en privé.
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) : participation respectueuse.
+- Issues `good first issue` et `help wanted` : par où commencer.
+
 ## Licence
 
-Code sous **MIT OR Apache-2.0** (`LICENSE-MIT`, `LICENSE-APACHE`). Les modules PawnIO
-embarqués sont sous LGPL-2.1 et les photos produit appartiennent à leurs fabricants : voir
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Code sous **MIT OR Apache-2.0** : tu choisis l'une ou l'autre (`LICENSE-MIT`, `LICENSE-APACHE`).
+Les modules PawnIO embarqués sont sous LGPL-2.1 et les photos produit appartiennent à leurs
+fabricants : voir [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
