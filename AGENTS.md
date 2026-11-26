@@ -15,7 +15,7 @@ opengear-platform    services Windows sans marque : client WMI COM, pilote PawnI
                      batterie portable, écran intégré (appareil `laptop_display`), disposition
                      clavier OS
 opengear-mainboard   puces de carte mère sans marque : SMBus (trait `SmbusBus`), contrôleurs RGB
-                     de RAM ENE, SuperIO Nuvoton, température CPU, capteurs
+                     de RAM ENE, SuperIO Nuvoton/ITE, température CPU, capteurs
 opengear-input       hook clavier/souris : remap, macros, SOCD, anti-rebond
 opengear-<marque>    UN crate par fabricant ou protocole : corsair, logitech, asus, hp, openrgb…
 opengear-app         orchestration : CLI, backend de l'UI, tray, installeur. Aucun protocole.
@@ -131,7 +131,10 @@ La CI exécute exactement ces commandes. Si `cargo fmt` ou `cargo clippy` est in
   de surveillance (`cooling_devices` du marqueur `fan_override.json`). Les préréglages et
   l'économie sur batterie n'utilisent que les ids partagés.
 - Tous les réglages et capacités transverses passent par les traits de `opengear-core` (`Device`, `Lighting`, `Cooling`, `CurveCooling`, `PointerDevice`, `Equalizer`, `OnboardMemory`) avec zéro `as_any`/downcast dans le workspace et zéro import marque dans `opengear-app` hors `src/drivers.rs` (sauf pont serveur TCP `opengear_openrgb::server` dans `ui/backend.rs`).
-- Réglages/capacités restant à unifier davantage : ventilateurs carte mère (courbes WMI et contrôle direct SuperIO : lecture et Smart Cooling encore servis par `cooling_channels` / `superio_*` en parallèle de `Device::cooling()`).
+- Ventilateurs carte mère : côté pilotes, les courbes WMI (`CurveCooling`) et le contrôle direct
+  SuperIO (`Cooling`) passent déjà par les traits de `opengear-core` et `src/drivers.rs` ; seul
+  l'état/IPC de `opengear-app` conserve encore `cooling_channels` / `cooling_*` / `superio_*`
+  en parallèle de `Device::cooling()` et `device_fan_set`.
 - `opengear-core::profile` conserve quelques champs hérités (`sync_asus_aura`, `asus_argb_led_counts`,
   `silent_loop3_*`, `omen_sync_rgb`) uniquement pour la rétro-compatibilité au chargement des anciens
   fichiers ; la configuration active vit dans `device_lighting` et `device_placements`.

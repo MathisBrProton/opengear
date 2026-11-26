@@ -82,6 +82,7 @@ sur du matériel réel**. Ils sont désactivés par défaut : Système → Préf
 | SteelSeries | Périphériques HID (voir `docs/protocols/steelseries.md`) | HID (`opengear-steelseries`) |
 | HyperX | Périphériques HID (voir `docs/protocols/hyperx.md`) | HID (`opengear-hyperx`) |
 | OpenRGB | Pont vers un serveur OpenRGB lancé séparément | SDK réseau local (`opengear-openrgb`) |
+| ITE | SuperIO IT86xx / IT87xx (PWM direct) | PawnIO LpcIO (`opengear-mainboard`) |
 
 **Testeur ?** Un appareil de ces marques t'intéresse ? Ouvre une issue
 « [Support d'appareil](https://github.com/MathisBrProton/opengear/issues/new/choose) » : les essais
@@ -146,11 +147,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-and-run.ps1
 |---|---|
 | `opengear-core` | Types partagés sans marque : modèle d'appareil (`Driver` / `Device` / réglages), couleurs et moteur d'effets, profils TOML, modèle de ventilation, géométrie clavier |
 | `opengear-platform` | Services Windows sans marque : client WMI COM, pilote PawnIO, élévation, plans d'alimentation, télémétrie, batterie, écran intégré (appareil partagé), disposition clavier |
-| `opengear-mainboard` | Puces de carte mère sans marque : SMBus, RGB de RAM ENE (multi-transport), SuperIO Nuvoton, température CPU, capteurs |
+| `opengear-mainboard` | Puces de carte mère sans marque : SMBus, RGB de RAM ENE (multi-transport), SuperIO Nuvoton et ITE (expérimental), température CPU, capteurs |
 | `opengear-corsair` | Driver Corsair Bragi v2 (RGB par touche, polling, profils flash HWP) |
 | `opengear-logitech` | HID++ 2.0 (DPI, batterie, profils et macros embarqués, égaliseur) |
 | `opengear-asus` | Aura USB, ventilateurs ASUS WMI, transport SMBus ASUS WMI pour la RAM |
-| `opengear-openrgb` | Client du SDK réseau d'OpenRGB (implémentation propre du protocole) |
+| `opengear-openrgb` | Pont serveur TCP SDK OpenRGB local et client réseau (expérimental, implémentation propre) |
 | `opengear-hp` | HP OMEN / Victus via le BIOS WMI `hpqBIntM` |
 | `opengear-razer` | Pilote Razer (expérimental) : protocole 90 octets, tables générées depuis `docs/protocols/` |
 | `opengear-steelseries` | Pilote SteelSeries (expérimental, d'après `docs/protocols/steelseries.md`) |
@@ -170,7 +171,7 @@ embarquée dans l'exécutable et reliée au backend Rust par IPC.
 | Quoi | Où |
 |---|---|
 | Profils | `%APPDATA%\OpenGear\opengear_profiles.toml` |
-| Sauvegardes flash | `%APPDATA%\OpenGear\backups\logitech\` |
+| Sauvegardes flash | `%APPDATA%\OpenGear\backups\` (`logitech\`, `corsair\`) |
 | Marqueur ventilateurs (temporaire) | `%APPDATA%\OpenGear\fan_override.json` |
 | Journaux | `%LOCALAPPDATA%\OpenGear\logs\opengear.log` (rotation, 3 fichiers max) |
 
