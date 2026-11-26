@@ -150,15 +150,18 @@ pub(crate) fn highest_refresh_rate(settings: &[Setting]) -> Option<Value> {
         })
 }
 
-pub(crate) fn compute_hid_signature() -> Vec<(u16, u16, u16)> {
-    let mut sig: Vec<(u16, u16, u16)> = scan_hid_devices(false)
-        .unwrap_or_default()
-        .into_iter()
+pub(crate) fn signature_from_detected(devices: &[DetectedDevice]) -> Vec<(u16, u16, u16)> {
+    let mut sig: Vec<(u16, u16, u16)> = devices
+        .iter()
         .map(|d| (d.vid, d.pid, d.usage_page))
         .collect();
     sig.sort_unstable();
     sig.dedup();
     sig
+}
+
+pub(crate) fn compute_hid_signature() -> Vec<(u16, u16, u16)> {
+    signature_from_detected(&scan_hid_devices(false).unwrap_or_default())
 }
 
 pub(crate) fn changed_vendors(old: &[(u16, u16, u16)], new: &[(u16, u16, u16)]) -> Vec<u16> {
@@ -198,13 +201,26 @@ impl BackendEngine {
         let config_path = AppConfig::default_config_path();
         let (mut config, config_warning) = AppConfig::load_or_recover(&config_path);
         migrate_legacy_profiles(&mut config);
-        let scanned_devices = scan_hid_devices(false).unwrap_or_default();
-        let last_hid_sig = compute_hid_signature();
-        let power_plans = list_power_plans();
-
         let drivers = crate::drivers::device_drivers();
-        let mut driver_devices =
-            super::devices::discover_all(&drivers, &config.experimental_drivers);
+        let mut telemetry = TelemetryCollector::new();
+        let (scanned_devices, power_plans, mut driver_devices, chassis_laptop, last_tel) =
+            std::thread::scope(|s| {
+                let h_scan = s.spawn(|| scan_hid_devices(false).unwrap_or_default());
+                let h_plans = s.spawn(list_power_plans);
+                let exp = &config.experimental_drivers;
+                let h_devs = s.spawn(|| super::devices::discover_all(&drivers, exp));
+                let h_laptop = s.spawn(is_laptop_chassis);
+                // Keep TelemetryCollector on the backend thread that owns it afterwards.
+                let tel = telemetry.sample();
+                (
+                    h_scan.join().unwrap_or_default(),
+                    h_plans.join().unwrap_or_default(),
+                    h_devs.join().unwrap_or_default(),
+                    h_laptop.join().unwrap_or(false),
+                    tel,
+                )
+            });
+        let last_hid_sig = signature_from_detected(&scanned_devices);
         seed_and_resize_device_lighting(&mut config, &mut driver_devices);
 
         if let Some(kb) = driver_devices
@@ -242,9 +258,7 @@ impl BackendEngine {
             }
         }
 
-        let mut telemetry = TelemetryCollector::new();
-        let last_tel = telemetry.sample();
-        let is_laptop = is_laptop_chassis()
+        let is_laptop = chassis_laptop
             || driver_devices
                 .iter()
                 .any(|d| d.info().kind == DeviceKind::Laptop);

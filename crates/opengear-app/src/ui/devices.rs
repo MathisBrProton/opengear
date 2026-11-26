@@ -65,27 +65,57 @@ pub(crate) fn rediscover_for_vendors(
             !touched_prefixes.iter().any(|p| id.starts_with(p))
         })
         .collect();
-    for drv in drivers {
-        let allowed = !drv.experimental() || enabled_experimental.contains(drv.name());
-        if allowed && drv.usb_vendor_ids().iter().any(|v| vendors.contains(v)) {
+    let enabled: Vec<&Box<dyn Driver>> = drivers
+        .iter()
+        .filter(|drv| {
+            (!drv.experimental() || enabled_experimental.contains(drv.name()))
+                && drv.usb_vendor_ids().iter().any(|v| vendors.contains(v))
+        })
+        .collect();
+    if enabled.len() <= 1 {
+        for drv in enabled {
             rebuilt.extend(drv.discover());
         }
+    } else {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = enabled
+                .into_iter()
+                .map(|drv| s.spawn(move || drv.discover()))
+                .collect();
+            for h in handles {
+                if let Ok(devs) = h.join() {
+                    rebuilt.extend(devs);
+                }
+            }
+        });
     }
     *driver_devices = rebuilt;
     touched_prefixes
 }
 
-/// Discover the devices of every registered driver; experimental drivers only when the user
-/// enabled them (`enabled_experimental` = `AppConfig::experimental_drivers`).
+/// Discover the devices of every registered driver in parallel (preserving driver order);
+/// experimental drivers only when enabled (`enabled_experimental` = `AppConfig::experimental_drivers`).
 pub(crate) fn discover_all(
     drivers: &[Box<dyn Driver>],
     enabled_experimental: &std::collections::BTreeSet<String>,
 ) -> Vec<Box<dyn Device>> {
-    drivers
+    let active: Vec<&Box<dyn Driver>> = drivers
         .iter()
         .filter(|d| !d.experimental() || enabled_experimental.contains(d.name()))
-        .flat_map(|d| d.discover())
-        .collect()
+        .collect();
+    if active.len() <= 1 {
+        return active.into_iter().flat_map(|d| d.discover()).collect();
+    }
+    std::thread::scope(|s| {
+        let handles: Vec<_> = active
+            .into_iter()
+            .map(|drv| s.spawn(move || drv.discover()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    })
 }
 
 impl BackendEngine {

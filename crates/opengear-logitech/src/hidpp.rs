@@ -264,22 +264,50 @@ impl HidppTransport {
         Self::open_all_matching_filtered(None, usage_page, preferred_usage)
     }
 
+    /// Open and feature-enumerate all matching Logitech HID++ transports across multiple
+    /// `(usage_page, preferred_usage)` pairs in a single pass, probing interfaces in parallel.
+    pub(crate) fn open_all_usage_pages(specs: &[(u16, Option<u16>)]) -> Vec<(u16, Self)> {
+        Self::open_all_multi(None, specs)
+    }
+
     fn open_all_matching_filtered(
         pid_filter: Option<u16>,
         usage_page: u16,
         preferred_usage: Option<u16>,
     ) -> Vec<Self> {
+        Self::open_all_multi(pid_filter, &[(usage_page, preferred_usage)])
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect()
+    }
+
+    fn open_all_multi(pid_filter: Option<u16>, specs: &[(u16, Option<u16>)]) -> Vec<(u16, Self)> {
         let Ok(api) = HidApi::new() else {
             return Vec::new();
         };
 
-        // Group candidates by (vid, pid, interface_number, serial_or_path) so devices with empty
-        // serials never collide and only the best usage per physical interface is opened.
-        let mut by_iface: Vec<(u16, u16, i32, String, u16, CString, String)> = Vec::new();
+        struct HidppCandidate {
+            usage_page: u16,
+            vid: u16,
+            pid: u16,
+            iface: i32,
+            group_key: String,
+            usage: u16,
+            path_cstr: CString,
+            product: String,
+        }
+
+        // Group candidates by (usage_page, vid, pid, interface_number, serial_or_path) so devices
+        // with empty serials never collide and only the best usage per physical interface opens.
+        let mut by_iface: Vec<HidppCandidate> = Vec::new();
         for d in api.device_list() {
-            if d.vendor_id() != LOGITECH_VID || d.usage_page() != usage_page {
+            if d.vendor_id() != LOGITECH_VID {
                 continue;
             }
+            let usage_page = d.usage_page();
+            let Some(&(_, preferred_usage)) = specs.iter().find(|&&(p, _)| p == usage_page) else {
+                continue;
+            };
             if pid_filter.is_some_and(|p| d.product_id() != p) {
                 continue;
             }
@@ -309,28 +337,49 @@ impl HidppTransport {
                 }
             };
 
-            if let Some(existing) = by_iface
-                .iter_mut()
-                .find(|e| e.0 == vid && e.1 == pid && e.2 == iface && e.3 == group_key)
-            {
-                if is_better(usage) < is_better(existing.4) {
-                    existing.4 = usage;
-                    existing.5 = path_cstr;
-                    existing.6 = product;
+            if let Some(existing) = by_iface.iter_mut().find(|e| {
+                e.usage_page == usage_page
+                    && e.vid == vid
+                    && e.pid == pid
+                    && e.iface == iface
+                    && e.group_key == group_key
+            }) {
+                if is_better(usage) < is_better(existing.usage) {
+                    existing.usage = usage;
+                    existing.path_cstr = path_cstr;
+                    existing.product = product;
                 }
             } else {
-                by_iface.push((vid, pid, iface, group_key, usage, path_cstr, product));
+                by_iface.push(HidppCandidate {
+                    usage_page,
+                    vid,
+                    pid,
+                    iface,
+                    group_key,
+                    usage,
+                    path_cstr,
+                    product,
+                });
             }
         }
 
-        let mut results = Vec::new();
-        for (vid, pid, _iface, _key, usage, path_cstr, product) in by_iface {
+        // Probe every candidate interface concurrently so wireless receiver timeouts overlap.
+        let probe_one = |cand: &HidppCandidate| -> Vec<(u16, Self)> {
+            let Ok(thread_api) = HidApi::new() else {
+                return Vec::new();
+            };
+            let usage_page = cand.usage_page;
+            let vid = cand.vid;
+            let pid = cand.pid;
+            let usage = cand.usage;
+            let path_cstr = &cand.path_cstr;
+            let product = &cand.product;
             let path_str = path_cstr.to_string_lossy().into_owned();
             let use_long_only = usage == 0x0002 || usage_page == 0xFF43;
             let short_only = usage == 0x0001 && usage_page == 0xFF00;
 
             let mut matched_slots = Vec::new();
-            if let Ok(probe_dev) = api.open_path(&path_cstr) {
+            if let Ok(probe_dev) = thread_api.open_path(path_cstr) {
                 let mut probe = Self {
                     dev: Box::new(HidApiIo(probe_dev)),
                     vid,
@@ -346,14 +395,14 @@ impl HidppTransport {
                 };
                 probe.drain();
 
-                // Probe wired/direct 0xFF FIRST (fast 150 ms) so wired mice don't stall ~2s on receiver slots.
+                // Probe wired/direct 0xFF FIRST (fast 90 ms) so wired mice never stall on receiver slots.
                 probe.device_index = 0xFF;
-                if let Ok((maj, min)) = probe.ping_protocol_version_timeout(150) {
+                if let Ok((maj, min)) = probe.ping_protocol_version_timeout(90) {
                     matched_slots.push((0xFF, maj, min));
                 } else if usage_page != 0xFF43 {
                     for idx in 0x01..=0x06u8 {
                         probe.device_index = idx;
-                        let timeout = if idx == 0x01 { 1200 } else { 160 };
+                        let timeout = if idx == 0x01 { 450 } else { 90 };
                         if let Ok((maj, min)) = probe.ping_protocol_version_timeout(timeout) {
                             matched_slots.push((idx, maj, min));
                         }
@@ -361,8 +410,9 @@ impl HidppTransport {
                 }
             }
 
+            let mut out = Vec::new();
             if matched_slots.is_empty() && usage_page == 0xFF43 {
-                if let Ok(dev) = api.open_path(&path_cstr) {
+                if let Ok(dev) = thread_api.open_path(path_cstr) {
                     let t = Self {
                         dev: Box::new(HidApiIo(dev)),
                         vid,
@@ -377,13 +427,13 @@ impl HidppTransport {
                         features: Vec::new(),
                     };
                     t.drain();
-                    results.push(t);
+                    out.push((usage_page, t));
                 }
-                continue;
+                return out;
             }
 
             for (idx, maj, min) in matched_slots {
-                if let Ok(dev) = api.open_path(&path_cstr) {
+                if let Ok(dev) = thread_api.open_path(path_cstr) {
                     let mut t = Self {
                         dev: Box::new(HidApiIo(dev)),
                         vid,
@@ -399,11 +449,25 @@ impl HidppTransport {
                     };
                     t.drain();
                     let _ = t.enumerate_features();
-                    results.push(t);
+                    out.push((usage_page, t));
                 }
             }
+            out
+        };
+
+        if by_iface.len() <= 1 {
+            return by_iface.iter().flat_map(probe_one).collect();
         }
-        results
+        std::thread::scope(|s| {
+            let handles: Vec<_> = by_iface
+                .iter()
+                .map(|cand| s.spawn(move || probe_one(cand)))
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        })
     }
 
     pub fn read_device_type(&self) -> Option<u8> {

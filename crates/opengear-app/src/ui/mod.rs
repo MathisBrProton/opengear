@@ -264,6 +264,11 @@ pub fn run_gui(cli_minimized: bool) -> Result<()> {
     let start_hidden = cli_minimized || initial_cfg.start_minimized;
     UI_VISIBLE.store(!start_hidden, Ordering::SeqCst);
 
+    let assets_handle = std::thread::Builder::new()
+        .name("opengear-assets".into())
+        .spawn(LocalAssetCatalog::discover)
+        .ok();
+
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
@@ -282,7 +287,11 @@ pub fn run_gui(cli_minimized: bool) -> Result<()> {
     apply_dark_titlebar(&window);
     start_system_tray(proxy.clone(), UserEvent::Tray);
 
-    let local_assets = Arc::new(LocalAssetCatalog::discover());
+    let local_assets = Arc::new(
+        assets_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_else(LocalAssetCatalog::discover),
+    );
 
     let shared_sensors = Arc::new(Mutex::new(HardwareSensorsSnapshot::default()));
     let sensors_bg = Arc::clone(&shared_sensors);

@@ -30,23 +30,49 @@ impl Driver for LogitechDriver {
     }
 
     fn discover(&self) -> Vec<Box<dyn Device>> {
-        let mut out: Vec<Box<dyn Device>> = Vec::new();
-        out.extend(
-            LogitechMouse::connect_all()
+        // Single unified HID++ pass across mice (0xFF00), keyboards (0xFF00/0xFF43), and
+        // headsets (0xFF43) instead of three sequential scans, initializing each device in parallel.
+        let transports = crate::hidpp::HidppTransport::open_all_usage_pages(&[
+            (0xFF00, Some(0x0002)),
+            (0xFF43, Some(0x0202)),
+        ]);
+        let mut seen = std::collections::BTreeSet::new();
+        let unique: Vec<(u16, crate::hidpp::HidppTransport)> = transports
+            .into_iter()
+            .filter(|(_, t)| seen.insert((t.vid, t.pid, t.device_index)))
+            .collect();
+
+        let init_one = |(up, t): (u16, crate::hidpp::HidppTransport)| -> Option<Box<dyn Device>> {
+            if up == 0xFF43 {
+                if LogitechHeadset::is_headset(&t) {
+                    Some(Box::new(LogitechHeadset::from_transport(t)))
+                } else if t.proto_major > 0 && LogitechKeyboard::is_keyboard(&t) {
+                    Some(Box::new(LogitechKeyboard::from_transport(t)))
+                } else {
+                    None
+                }
+            } else if t.proto_major == 0 {
+                None
+            } else if LogitechKeyboard::is_keyboard(&t) {
+                Some(Box::new(LogitechKeyboard::from_transport(t)))
+            } else {
+                Some(Box::new(LogitechMouse::from_transport(t)))
+            }
+        };
+
+        if unique.len() <= 1 {
+            return unique.into_iter().filter_map(init_one).collect();
+        }
+        std::thread::scope(|s| {
+            let handles: Vec<_> = unique
                 .into_iter()
-                .map(|d| Box::new(d) as Box<dyn Device>),
-        );
-        out.extend(
-            LogitechKeyboard::connect_all()
+                .map(|pair| s.spawn(move || init_one(pair)))
+                .collect();
+            handles
                 .into_iter()
-                .map(|d| Box::new(d) as Box<dyn Device>),
-        );
-        out.extend(
-            LogitechHeadset::connect_all()
-                .into_iter()
-                .map(|d| Box::new(d) as Box<dyn Device>),
-        );
-        out
+                .filter_map(|h| h.join().ok().flatten())
+                .collect()
+        })
     }
 }
 

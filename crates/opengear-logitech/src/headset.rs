@@ -134,7 +134,7 @@ impl LogitechHeadset {
         Ok(Self::from_transport(transport))
     }
 
-    fn from_transport(transport: HidppTransport) -> Self {
+    pub(crate) fn from_transport(transport: HidppTransport) -> Self {
         let name = transport
             .read_device_name()
             .unwrap_or_else(|| transport.product_string.clone());

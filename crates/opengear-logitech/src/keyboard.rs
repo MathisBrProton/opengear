@@ -86,7 +86,7 @@ impl LogitechKeyboard {
         !has_dpi && !has_hs && has_kb_feat
     }
 
-    fn from_transport(transport: HidppTransport) -> Self {
+    pub(crate) fn from_transport(transport: HidppTransport) -> Self {
         let name = transport
             .read_device_name()
             .unwrap_or_else(|| transport.product_string.clone());
