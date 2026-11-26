@@ -790,8 +790,10 @@ fn build_task_xml(
 fn decode_task_xml_stdout(raw: &[u8]) -> String {
     if raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE {
         let units: Vec<u16> = raw[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         return String::from_utf16_lossy(&units);
     }
