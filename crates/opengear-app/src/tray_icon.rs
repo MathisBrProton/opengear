@@ -12,7 +12,41 @@ pub enum TrayAction {
     ShowWindow,
     ToggleSocd,
     ToggleSyncRgb,
+    SwitchProfile(String),
+    ApplyPreset(String),
     Quit,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrayMenuState {
+    pub active_profile: String,
+    pub profiles: Vec<String>,
+    pub socd_enabled: bool,
+    pub sync_rgb_enabled: bool,
+    pub status_line: String,
+}
+
+static TRAY_MENU_STATE: OnceLock<std::sync::Mutex<TrayMenuState>> = OnceLock::new();
+
+fn tray_state_store() -> &'static std::sync::Mutex<TrayMenuState> {
+    TRAY_MENU_STATE.get_or_init(|| std::sync::Mutex::new(TrayMenuState::default()))
+}
+
+pub(crate) fn format_tray_tooltip(state: &TrayMenuState) -> String {
+    let mut tip = String::from("OpenGear");
+    if !state.active_profile.is_empty() {
+        tip.push_str(" — ");
+        tip.push_str(&state.active_profile);
+    }
+    if !state.status_line.is_empty() {
+        tip.push_str(" · ");
+        tip.push_str(&state.status_line);
+    }
+    if tip.chars().count() > 120 {
+        tip = tip.chars().take(119).collect();
+        tip.push('…');
+    }
+    tip
 }
 
 /// Generate a crisp anti-aliased RGBA OpenGear logo (obsidian squircle + glowing cyan/blue rim + lightning bolt).
@@ -234,23 +268,34 @@ mod win_tray {
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Shell::{
-        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+        Shell_NotifyIconW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
         DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-        HICON, HWND_BROADCAST, ICONINFO, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
-        PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
-        TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND,
-        WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+        HICON, HWND_BROADCAST, ICONINFO, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+        MF_UNCHECKED, MSG, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+        SetForegroundWindow, SetMenuDefaultItem, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu,
+        TranslateMessage, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL,
+        WM_RBUTTONUP, WNDCLASSW,
     };
 
     const WM_TRAY_CALLBACK: u32 = WM_APP + 42;
+    const WM_UPDATE_TRAY_TIP: u32 = WM_APP + 43;
     const TRAY_UID: u32 = 1001;
     const CMD_SHOW: usize = 101;
     const CMD_TOGGLE_SOCD: usize = 102;
     const CMD_TOGGLE_SYNC: usize = 103;
     const CMD_QUIT: usize = 109;
+    const CMD_PRESET_BASE: usize = 200;
+    const CMD_PROFILE_BASE: usize = 300;
+    const PRESET_ENTRIES: &[(&str, &str)] = &[
+        ("silent", "Silencieux"),
+        ("gaming", "Jeu"),
+        ("office", "Bureau"),
+        ("lights_off", "Tout éteint"),
+    ];
 
     type TraySender = Box<dyn Fn(TrayAction) + Send + Sync>;
     static TRAY_SENDER: OnceLock<std::sync::Mutex<Option<TraySender>>> = OnceLock::new();
@@ -394,17 +439,96 @@ mod win_tray {
                 if ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK {
                     emit(TrayAction::ShowWindow);
                 } else if ev == WM_RBUTTONUP {
+                    let st = tray_state_store()
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
                     let hmenu = unsafe { CreatePopupMenu() };
                     if !hmenu.is_null() {
                         let s_open = to_wide("Ouvrir OpenGear");
-                        let s_socd = to_wide("Basculer SOCD / Snap Tap");
-                        let s_sync = to_wide("Basculer OpenGear Sync RGB");
+                        let s_socd = to_wide("Snap Tap (SOCD)");
+                        let s_sync = to_wide("Synchronisation RGB");
                         let s_quit = to_wide("Quitter OpenGear");
                         unsafe {
+                            if !st.status_line.is_empty() {
+                                let s_status = to_wide(&st.status_line);
+                                AppendMenuW(hmenu, MF_STRING | MF_GRAYED, 0, s_status.as_ptr());
+                                AppendMenuW(hmenu, MF_SEPARATOR, 0, std::ptr::null());
+                            }
                             AppendMenuW(hmenu, MF_STRING, CMD_SHOW, s_open.as_ptr());
+                            let _ = SetMenuDefaultItem(hmenu, CMD_SHOW as u32, 0);
                             AppendMenuW(hmenu, MF_SEPARATOR, 0, std::ptr::null());
-                            AppendMenuW(hmenu, MF_STRING, CMD_TOGGLE_SOCD, s_socd.as_ptr());
-                            AppendMenuW(hmenu, MF_STRING, CMD_TOGGLE_SYNC, s_sync.as_ptr());
+
+                            if !st.profiles.is_empty() {
+                                let prof_menu = CreatePopupMenu();
+                                if !prof_menu.is_null() {
+                                    for (idx, name) in st.profiles.iter().take(64).enumerate() {
+                                        let label = to_wide(name);
+                                        let chk = if *name == st.active_profile {
+                                            MF_CHECKED
+                                        } else {
+                                            MF_UNCHECKED
+                                        };
+                                        AppendMenuW(
+                                            prof_menu,
+                                            MF_STRING | chk,
+                                            CMD_PROFILE_BASE + idx,
+                                            label.as_ptr(),
+                                        );
+                                    }
+                                    let s_prof = to_wide("Profil actif");
+                                    AppendMenuW(
+                                        hmenu,
+                                        MF_POPUP,
+                                        prof_menu as usize,
+                                        s_prof.as_ptr(),
+                                    );
+                                }
+                            }
+
+                            let preset_menu = CreatePopupMenu();
+                            if !preset_menu.is_null() {
+                                for (idx, (_, label)) in PRESET_ENTRIES.iter().enumerate() {
+                                    let w = to_wide(label);
+                                    AppendMenuW(
+                                        preset_menu,
+                                        MF_STRING,
+                                        CMD_PRESET_BASE + idx,
+                                        w.as_ptr(),
+                                    );
+                                }
+                                let s_presets = to_wide("Préréglages rapides");
+                                AppendMenuW(
+                                    hmenu,
+                                    MF_POPUP,
+                                    preset_menu as usize,
+                                    s_presets.as_ptr(),
+                                );
+                            }
+
+                            AppendMenuW(hmenu, MF_SEPARATOR, 0, std::ptr::null());
+                            let socd_chk = if st.socd_enabled {
+                                MF_CHECKED
+                            } else {
+                                MF_UNCHECKED
+                            };
+                            let sync_chk = if st.sync_rgb_enabled {
+                                MF_CHECKED
+                            } else {
+                                MF_UNCHECKED
+                            };
+                            AppendMenuW(
+                                hmenu,
+                                MF_STRING | socd_chk,
+                                CMD_TOGGLE_SOCD,
+                                s_socd.as_ptr(),
+                            );
+                            AppendMenuW(
+                                hmenu,
+                                MF_STRING | sync_chk,
+                                CMD_TOGGLE_SYNC,
+                                s_sync.as_ptr(),
+                            );
                             AppendMenuW(hmenu, MF_SEPARATOR, 0, std::ptr::null());
                             AppendMenuW(hmenu, MF_STRING, CMD_QUIT, s_quit.as_ptr());
                             let mut pt = POINT { x: 0, y: 0 };
@@ -426,12 +550,44 @@ mod win_tray {
                 }
                 0
             }
+            WM_UPDATE_TRAY_TIP => {
+                let st = tray_state_store()
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let tip_str = format_tray_tooltip(&st);
+                let tip = to_wide(&tip_str);
+                unsafe {
+                    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+                    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+                    nid.hWnd = hwnd;
+                    nid.uID = TRAY_UID;
+                    nid.uFlags = NIF_TIP;
+                    let n = tip.len().min(nid.szTip.len() - 1);
+                    nid.szTip[..n].copy_from_slice(&tip[..n]);
+                    Shell_NotifyIconW(NIM_MODIFY, &nid);
+                }
+                0
+            }
             WM_COMMAND => {
-                match wparam & 0xFFFF {
+                let cmd = wparam & 0xFFFF;
+                match cmd {
                     CMD_SHOW => emit(TrayAction::ShowWindow),
                     CMD_TOGGLE_SOCD => emit(TrayAction::ToggleSocd),
                     CMD_TOGGLE_SYNC => emit(TrayAction::ToggleSyncRgb),
                     CMD_QUIT => emit(TrayAction::Quit),
+                    c if (CMD_PRESET_BASE..CMD_PRESET_BASE + PRESET_ENTRIES.len()).contains(&c) => {
+                        let id = PRESET_ENTRIES[c - CMD_PRESET_BASE].0.to_string();
+                        emit(TrayAction::ApplyPreset(id));
+                    }
+                    c if (CMD_PROFILE_BASE..CMD_PROFILE_BASE + 64).contains(&c) => {
+                        let idx = c - CMD_PROFILE_BASE;
+                        if let Ok(st) = tray_state_store().lock()
+                            && let Some(name) = st.profiles.get(idx)
+                        {
+                            emit(TrayAction::SwitchProfile(name.clone()));
+                        }
+                    }
                     _ => {}
                 }
                 0
@@ -584,6 +740,15 @@ mod win_tray {
             }
         }
     }
+
+    pub fn post_tip_refresh() {
+        let raw = TRAY_HWND.load(Ordering::SeqCst);
+        if raw != 0 {
+            unsafe {
+                PostMessageW(raw as HWND, WM_UPDATE_TRAY_TIP, 0, 0);
+            }
+        }
+    }
 }
 
 pub fn start_system_tray<E, F>(proxy: EventLoopProxy<E>, mapper: F)
@@ -602,6 +767,26 @@ where
 pub fn stop_system_tray() {
     #[cfg(windows)]
     win_tray::stop();
+}
+
+/// Update the tray tooltip and context-menu state without touching WebView2.
+pub fn update_tray_state(next: TrayMenuState) {
+    let changed = if let Ok(mut guard) = tray_state_store().lock() {
+        if *guard == next {
+            false
+        } else {
+            *guard = next;
+            true
+        }
+    } else {
+        false
+    };
+    #[cfg(windows)]
+    if changed {
+        win_tray::post_tip_refresh();
+    }
+    #[cfg(not(windows))]
+    let _ = changed;
 }
 
 pub fn wake_message_id() -> u32 {
@@ -1466,5 +1651,28 @@ mod tests {
             raw.extend_from_slice(&u.to_le_bytes());
         }
         assert_eq!(decode_task_xml_stdout(&raw), src);
+    }
+
+    #[test]
+    fn tray_tooltip_formats_and_truncates_cleanly() {
+        let st = TrayMenuState {
+            active_profile: "Jeu".into(),
+            profiles: vec!["Default".into(), "Jeu".into()],
+            socd_enabled: true,
+            sync_rgb_enabled: false,
+            status_line: "CPU 55°C · GPU 62°C · Batterie 88%".into(),
+        };
+        let tip = format_tray_tooltip(&st);
+        assert!(tip.contains("Jeu"));
+        assert!(tip.contains("CPU 55°C"));
+
+        let long = TrayMenuState {
+            active_profile: "A".repeat(80),
+            status_line: "B".repeat(80),
+            ..Default::default()
+        };
+        let trunc = format_tray_tooltip(&long);
+        assert!(trunc.chars().count() <= 120);
+        assert!(trunc.ends_with('…'));
     }
 }

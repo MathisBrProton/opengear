@@ -15,6 +15,7 @@ use opengear_core::lighting::{EffectParams, EffectRequest, HardwareEffect, Light
 use opengear_platform::{PawnIoAvailability, is_elevated, pawnio::pawnio_availability};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhysicalDimmInfo {
@@ -145,7 +146,14 @@ impl RamRgb {
         Self { backends }
     }
 
+    /// Probe available backends and physical SMBIOS DIMMs; when multiple physical DIMMs are
+    /// present and the first responding backend sees fewer modules, later backends are also
+    /// checked so an incomplete backend cannot hide the remaining DIMMs.
     pub fn probe(&self) -> RamRgbStatus {
+        self.probe_with_dimms(read_physical_dimms())
+    }
+
+    fn probe_with_dimms(&self, physical_dimms: Vec<PhysicalDimmInfo>) -> RamRgbStatus {
         let admin = is_elevated();
         let pio = pawnio_availability();
         let mut status = RamRgbStatus {
@@ -157,7 +165,7 @@ impl RamRgb {
                 PawnIoAvailability::NotInstalled => "not_installed",
             }
             .to_string(),
-            physical_dimms: read_physical_dimms(),
+            physical_dimms,
             ene_modules: Vec::new(),
             message: String::new(),
             last_mode: "Static".into(),
@@ -165,6 +173,8 @@ impl RamRgb {
             last_speed: 2,
         };
         let mut unavailable = Vec::new();
+        let mut best: Option<(&'static str, RamProbe)> = None;
+        let expected_dimms = status.physical_dimms.len();
         for backend in self
             .backends
             .iter()
@@ -172,19 +182,63 @@ impl RamRgb {
         {
             let probe = backend.probe();
             status.bus_available |= probe.available;
+            info!(
+                backend = backend.label(),
+                available = probe.available,
+                modules = probe.modules.len(),
+                physical_dimms = expected_dimms,
+                "Sonde RAM RGB"
+            );
             if !probe.available {
                 unavailable.push(backend.label());
             }
             if !probe.modules.is_empty() {
-                status.message = format!(
-                    "{} barrette(s) DDR RGB détectée(s) via {} ({}).",
-                    probe.modules.len(),
-                    backend.label(),
-                    describe(&probe.modules)
-                );
-                status.ene_modules = probe.modules;
-                return status;
+                let replace = best
+                    .as_ref()
+                    .is_none_or(|(_, cur)| probe.modules.len() > cur.modules.len());
+                if replace {
+                    best = Some((backend.label(), probe));
+                }
+                let enough = if expected_dimms > 0 {
+                    best.as_ref()
+                        .is_some_and(|(_, b)| b.modules.len() >= expected_dimms)
+                } else {
+                    true
+                };
+                if enough {
+                    break;
+                }
             }
+        }
+        if let Some((label, best_probe)) = best {
+            for m in &best_probe.modules {
+                info!(
+                    backend = %m.backend,
+                    addr = format_args!("0x{:02X}", m.address_7bit),
+                    bus_arg = m.bus_arg,
+                    fw = %m.firmware,
+                    is_v2 = m.is_v2,
+                    leds = m.led_count,
+                    mode = m.current_mode,
+                    "Barrette ENE détectée"
+                );
+            }
+            if expected_dimms > best_probe.modules.len() {
+                warn!(
+                    detected_ene = best_probe.modules.len(),
+                    physical_dimms = expected_dimms,
+                    backend = label,
+                    "Moins de contrôleurs ENE détectés que de barrettes RAM physiques"
+                );
+            }
+            status.message = format!(
+                "{} barrette(s) DDR RGB détectée(s) via {} ({}).",
+                best_probe.modules.len(),
+                label,
+                describe(&best_probe.modules)
+            );
+            status.ene_modules = best_probe.modules;
+            return status;
         }
         status.message = if !admin && pio == PawnIoAvailability::NeedsAdmin {
             "Pilote PawnIO détecté : relance OpenGear en administrateur pour piloter le RGB de ta RAM et lire la température CPU en natif.".into()
@@ -198,6 +252,7 @@ impl RamRgb {
                 unavailable.join(", ")
             )
         };
+        warn!(status = %status.message, "Aucun contrôleur RAM RGB trouvé");
         status
     }
 
@@ -237,7 +292,27 @@ impl RamRgb {
         let mut results = Vec::new();
         for (backend, group) in self.group(&targets)? {
             self.check_rights(backend)?;
-            results.push(backend.apply(&group, effect)?);
+            debug!(
+                backend = backend.label(),
+                count = group.len(),
+                addrs = ?group
+                    .iter()
+                    .map(|m| format!("0x{:02X}", m.address_7bit))
+                    .collect::<Vec<_>>(),
+                mode = ?effect.mode,
+                color = %effect.color.to_hex(),
+                save_eeprom = effect.save_eeprom,
+                "Envoi effet RAM RGB"
+            );
+            let res = backend.apply(&group, effect).inspect_err(|err| {
+                warn!(
+                    backend = backend.label(),
+                    save_eeprom = effect.save_eeprom,
+                    ?err,
+                    "Échec application effet RAM RGB"
+                );
+            })?;
+            results.push(res);
         }
         Ok(results.join(" + "))
     }
@@ -484,7 +559,14 @@ impl Lighting for RamRgbDevice {
                 reverse: false,
                 save_eeprom: false,
             };
-            self.ram.apply(&self.status.ene_modules, Some(addr), &eff)?;
+            if let Err(err) = self.ram.apply(&self.status.ene_modules, Some(addr), &eff) {
+                warn!(
+                    addr = format_args!("0x{addr:02X}"),
+                    ?err,
+                    "Échec trame Direct RAM RGB"
+                );
+                return Err(err);
+            }
             if let Some(slot) = self.last_colors.get_mut(idx) {
                 *slot = Some(color);
             }
@@ -498,6 +580,16 @@ impl Lighting for RamRgbDevice {
         let wire_speed = 4u8.saturating_sub(req.speed.unwrap_or(2).min(4));
         let color = req.colors.first().copied().unwrap_or(Rgb::CYAN);
         let target_addr = req.zone.as_deref().and_then(parse_dimm_zone_addr);
+        info!(
+            mode = ?mode,
+            color = %color.to_hex(),
+            speed = wire_speed,
+            reverse = req.reverse,
+            save_eeprom = req.save,
+            target_addr = ?target_addr.map(|a| format!("0x{a:02X}")),
+            modules = self.status.ene_modules.len(),
+            "Application effet matériel RAM RGB"
+        );
         let effect = RamEffect {
             mode,
             color,
@@ -505,8 +597,10 @@ impl Lighting for RamRgbDevice {
             reverse: req.reverse,
             save_eeprom: req.save,
         };
-        self.ram
+        let summary = self
+            .ram
             .apply(&self.status.ene_modules, target_addr, &effect)?;
+        info!(summary = %summary, "Effet matériel RAM RGB appliqué");
         self.status.last_mode = mode.id().to_string();
         self.status.last_color = color.to_hex();
         self.status.last_speed = wire_speed;
@@ -527,10 +621,27 @@ impl Lighting for RamRgbDevice {
             .map(|m| (m, m.current_mode))
             .collect();
         if !pairs.is_empty() {
-            let _ = self.ram.set_modes(&pairs);
+            match self.ram.set_modes(&pairs) {
+                Ok(n) => info!(restored = n, total = pairs.len(), "Contrôle RAM RGB libéré"),
+                Err(err) => warn!(?err, "Échec restauration modes RAM RGB à la libération"),
+            }
         }
         self.last_colors.fill(None);
         Ok(())
+    }
+}
+
+/// Merge ENE modules discovered across multiple SMBus ports without duplicating mirrored
+/// addresses (keeping the first port that saw each `address_7bit`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn merge_port_modules(out: &mut Vec<EneRamModule>, port_modules: Vec<EneRamModule>) {
+    for m in port_modules {
+        if !out
+            .iter()
+            .any(|existing| existing.address_7bit == m.address_7bit)
+        {
+            out.push(m);
+        }
     }
 }
 
@@ -546,26 +657,55 @@ mod pawnio_backend {
 
     pub(super) fn probe() -> RamProbe {
         if pawnio_availability() != PawnIoAvailability::Ready {
+            debug!("PawnIO indisponible pour la sonde RAM SMBus");
             return RamProbe::default();
         }
         let Some(_lock) = lock_smbus() else {
+            warn!("Mutex SMBus occupé : impossible de sonder la RAM via PawnIO");
             return RamProbe::default();
         };
         let mut available = false;
         for controller in [SmbusController::Piix4, SmbusController::I801] {
-            let Ok(bus) = PawnIoSmbus::open(controller) else {
-                continue;
+            let bus = match PawnIoSmbus::open(controller) {
+                Ok(b) => b,
+                Err(err) => {
+                    debug!(
+                        controller = controller.label(),
+                        ?err,
+                        "Contrôleur SMBus PawnIO absent"
+                    );
+                    continue;
+                }
             };
             available = true;
+            let mut found = Vec::new();
             for &port in bus.ports() {
-                if bus.select_port(port).is_err() {
+                if let Err(err) = bus.select_port(port) {
+                    debug!(
+                        controller = controller.label(),
+                        port,
+                        ?err,
+                        "Sélection port SMBus échouée"
+                    );
                     continue;
                 }
                 ene::remap_from_0x77(&bus);
                 let modules = ene::scan(&bus, ene::ENE_RAM_ADDRESSES, port, controller.tag());
                 if !modules.is_empty() {
-                    return RamProbe { available, modules };
+                    info!(
+                        controller = controller.label(),
+                        port,
+                        count = modules.len(),
+                        "Modules ENE trouvés sur le port SMBus"
+                    );
+                    merge_port_modules(&mut found, modules);
                 }
+            }
+            if !found.is_empty() {
+                return RamProbe {
+                    available,
+                    modules: found,
+                };
             }
         }
         RamProbe {
@@ -614,14 +754,43 @@ mod pawnio_backend {
     }
 
     pub(super) fn apply(modules: &[&EneRamModule], effect: &RamEffect) -> Result<String> {
-        let (applied, skipped, used) =
-            for_each_module(modules, |m| *m, |bus, m| ene::apply(bus, m, effect))?;
-        if applied == 0 {
-            anyhow::bail!(
-                "Aucune barrette ENE vérifiée — aucune écriture effectuée ({})",
-                skipped.join(", ")
-            );
+        let _lock = lock_smbus().context("Bus SMBus occupé par un autre logiciel")?;
+        let mut applied = 0usize;
+        let mut used = Vec::new();
+        for controller in [SmbusController::Piix4, SmbusController::I801] {
+            let mine: Vec<&EneRamModule> = modules
+                .iter()
+                .copied()
+                .filter(|m| SmbusController::from_tag(&m.backend) == Some(controller))
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let bus = PawnIoSmbus::open(controller)?;
+            used.push(controller);
+            let mut ports: Vec<u16> = mine.iter().map(|m| m.bus_arg).collect();
+            ports.sort_unstable();
+            ports.dedup();
+            for port in ports {
+                let on_port: Vec<&EneRamModule> =
+                    mine.iter().copied().filter(|m| m.bus_arg == port).collect();
+                if let Err(err) = bus.select_port(port) {
+                    warn!(
+                        controller = controller.label(),
+                        port,
+                        ?err,
+                        "Sélection port SMBus impossible lors de l'écriture RAM"
+                    );
+                    continue;
+                }
+                applied += ene::apply_all(&bus, &on_port, effect)?;
+            }
         }
+        anyhow::ensure!(
+            applied > 0 && applied == modules.len(),
+            "Écriture RAM RGB incomplète : {applied}/{} barrette(s) vérifiée(s)",
+            modules.len()
+        );
         Ok(format!(
             "OK PawnIO {} ({applied} DIMM{})",
             used.iter()
@@ -888,5 +1057,43 @@ mod tests {
         let w_old = bus_old.writes.borrow().clone();
         let w_new = shared.0.lock().unwrap().writes.borrow().clone();
         assert_eq!(w_old, w_new);
+    }
+
+    #[test]
+    fn merge_port_modules_collects_split_dimms_and_deduplicates_mirrors() {
+        let mut m0 = module(0x70, "pawnio_piix4");
+        m0.bus_arg = 0;
+        let mut mirror = module(0x70, "pawnio_piix4");
+        mirror.bus_arg = 1;
+        let mut m1 = module(0x71, "pawnio_piix4");
+        m1.bus_arg = 2;
+
+        let mut merged = Vec::new();
+        merge_port_modules(&mut merged, vec![m0]);
+        merge_port_modules(&mut merged, vec![mirror, m1]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].address_7bit, 0x70);
+        assert_eq!(merged[0].bus_arg, 0);
+        assert_eq!(merged[1].address_7bit, 0x71);
+        assert_eq!(merged[1].bus_arg, 2);
+    }
+
+    #[test]
+    fn probe_prefers_complete_backend_when_physical_dimms_exceed_first_match() {
+        let dimm = |slot: &str| PhysicalDimmInfo {
+            slot: slot.into(),
+            manufacturer: "G.Skill".into(),
+            part_number: "F5".into(),
+            capacity_gb: 16,
+            speed_mts: 6000,
+            memory_type: "DDR5".into(),
+        };
+        let ram = RamRgb::new(vec![
+            fake("a", false, vec![module(0x70, "a")]),
+            fake("b", false, vec![module(0x70, "b"), module(0x71, "b")]),
+        ]);
+        let st = ram.probe_with_dimms(vec![dimm("A2"), dimm("B2")]);
+        assert_eq!(st.ene_modules.len(), 2);
+        assert_eq!(st.ene_modules[0].backend, "b");
     }
 }

@@ -189,13 +189,19 @@ function normTempSource(src) {
 
 function viewCooling() {
   const c = S.cooling;
-  const deviceIds = coolingDeviceIds();
-  if (deviceIds.length && !c.channels.length) return viewDeviceCooling(deviceIds);
   const ex = isExpert();
-  if (!c.channels.length) return emptyState("Ventilation non pilotable", c.message || "Aucun canal de ventilation n'a été trouvé sur cette carte mère.");
+  const sio = c.superio || { detected: false, fans: [], diagnostic: "" };
+  const deviceIds = coolingDeviceIds().filter((id) => {
+    if (id === "asus_wmi_cooling:mainboard" && c.wmi_available) return false;
+    if (id === "superio:mainboard" && ex && sio.detected) return false;
+    return true;
+  });
+  if (!c.channels.length) {
+    if (deviceIds.length) return viewDeviceCooling(deviceIds);
+    return emptyState("Ventilation non pilotable", c.message || "Aucun canal de ventilation n'a été trouvé sur cette carte mère.");
+  }
   const ch = c.channels[local.selectedCoolingIdx] || c.channels[0];
   const pols = ex ? POLICIES : POLICIES.filter(([id]) => id !== "Manual");
-  const sio = c.superio || { detected: false, fans: [], diagnostic: "" };
   const curSrc = normTempSource(ch.source);
   return `
     ${!c.is_admin ? `
@@ -237,10 +243,38 @@ function viewCooling() {
               <option value="CpuBios" ${curSrc === "CpuBios" ? "selected" : ""}>Processeur (régulation BIOS)</option>
               <option value="GpuEdge" ${curSrc === "GpuEdge" ? "selected" : ""}>Carte graphique (cœur)</option>
               <option value="GpuHotspot" ${curSrc === "GpuHotspot" ? "selected" : ""}>Carte graphique (point chaud)</option>
-              <option value="MaxCpuGpu" ${curSrc === "MaxCpuGpu" ? "selected" : ""}>Le plus chaud des deux</option>
+              <option value="Nvme" ${curSrc === "Nvme" ? "selected" : ""}>SSD NVMe</option>
+              <option value="MaxCpuGpu" ${curSrc === "MaxCpuGpu" ? "selected" : ""}>Max CPU / GPU</option>
+              <option value="AvgCpuGpu" ${curSrc === "AvgCpuGpu" ? "selected" : ""}>Moyenne CPU + GPU</option>
+              <option value="MaxAll" ${curSrc === "MaxAll" ? "selected" : ""}>Max global (CPU / GPU / NVMe)</option>
+              <option value="CustomMix" ${curSrc === "CustomMix" ? "selected" : ""}>Source composée personnalisée…</option>
             </select>
           </div>
-          <div class="stack mt-12">${sliderRow("Hystérésis anti-yoyo", { id: "cool-hyst", min: 0, max: 10, value: num(ch.hysteresis_c, 3), input: "label", change: "cool-hyst", data: { fmt: "deg" }, display: `${num(ch.hysteresis_c, 3)} °C` })}</div>
+          ${curSrc === "CustomMix" ? (() => {
+            const mix = ch.custom_mix || { op: "Max", a: "Cpu", b: "GpuEdge" };
+            const mixA = mix.a || mix.sensor_a || "Cpu";
+            const mixB = mix.b || mix.sensor_b || "GpuEdge";
+            const sensors = arr(S.sensor_kinds).length ? arr(S.sensor_kinds) : [
+              { id: "Cpu", label: "Processeur" },
+              { id: "GpuEdge", label: "GPU cœur" },
+              { id: "GpuHotspot", label: "GPU point chaud" },
+              { id: "Nvme", label: "SSD NVMe" },
+            ];
+            return `
+              <div class="row mt-8" style="gap:8px">
+                <select id="cool-mix-op" class="og-select auto" data-change="cool-mix" aria-label="Opération thermique">
+                  <option value="Max" ${mix.op === "Max" ? "selected" : ""}>Max(A, B)</option>
+                  <option value="Avg" ${mix.op === "Avg" ? "selected" : ""}>Moyenne(A, B)</option>
+                  <option value="Delta" ${mix.op === "Delta" ? "selected" : ""}>Écart |A − B|</option>
+                </select>
+                <select id="cool-mix-a" class="og-select auto" data-change="cool-mix" aria-label="Capteur A">${sensors.map((s) => `<option value="${esc(s.id)}" ${mixA === s.id ? "selected" : ""}>${esc(s.label)}</option>`).join("")}</select>
+                <select id="cool-mix-b" class="og-select auto" data-change="cool-mix" aria-label="Capteur B">${sensors.map((s) => `<option value="${esc(s.id)}" ${mixB === s.id ? "selected" : ""}>${esc(s.label)}</option>`).join("")}</select>
+              </div>`;
+          })() : ""}
+          <div class="stack mt-12" style="gap:10px">
+            ${sliderRow("Hystérésis anti-yoyo", { id: "cool-hyst", min: 0, max: 10, value: num(ch.hysteresis_c, 3), input: "label", change: "cool-hyst", data: { fmt: "deg" }, display: `${num(ch.hysteresis_c, 3)} °C` })}
+            ${sliderRow("Lissage anti-pics", { id: "cool-smooth", min: 0, max: 20, value: num(ch.smoothing_secs, 0), input: "label", change: "cool-smooth", data: { fmt: "sec" }, display: num(ch.smoothing_secs, 0) ? `${num(ch.smoothing_secs, 0)} s` : "Instantané" })}
+          </div>
           <div class="curve-wrap mt-12"><svg id="fan-curve-svg" class="curve-svg" viewBox="0 0 680 250" role="img" aria-label="Courbe de ventilation"></svg></div>
           <div class="curve-pts" id="curve-pts">${curvePointsHtml(ch)}</div>
           <div class="row mt-16">
@@ -274,7 +308,12 @@ function viewCooling() {
                 <button type="button" class="btn btn-sm btn-secondary" data-act="sio-auto" data-ch="${num(f.index)}">Auto BIOS</button>
               </div>`).join("")}
           </div>` : ""}
-      </div>` : advancedHint("Courbes 8 points, source de température et contrôle direct des ventilateurs sont en mode Expert.")}`;
+      </div>` : advancedHint("Courbes 8 points, source de température et contrôle direct des ventilateurs sont en mode Expert.")}
+    ${deviceIds.length && !c.wmi_available ? `<div class="mt-16">${deviceIds.map((id) => {
+      const d = deviceById(id);
+      const name = d ? d.info.model : id;
+      return deviceFans(id, { title: `Ventilateurs · ${name}` });
+    }).join("")}</div>` : ""}`;
 }
 
 function curvePointsHtml(ch) {

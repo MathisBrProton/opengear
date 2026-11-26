@@ -9,6 +9,7 @@ use crate::smbus::SmbusBus;
 use anyhow::Result;
 use opengear_core::Rgb;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 /// One ENE RAM controller found on a bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,8 +172,18 @@ const V1_FIRMWARES: &[&str] = &[
 ];
 
 fn read_reg(bus: &(impl SmbusBus + ?Sized), addr: u8, reg: u16) -> Option<u8> {
-    bus.write_word_data(addr, 0x00, reg.swap_bytes()).ok()?;
-    bus.read_byte_data(addr, 0x81)
+    for attempt in 0..2 {
+        if bus.write_word_data(addr, 0x00, reg.swap_bytes()).is_ok()
+            && let Some(val) = bus.read_byte_data(addr, 0x81)
+        {
+            return Some(val);
+        }
+        if attempt == 0 {
+            #[cfg(not(test))]
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    None
 }
 
 fn write_reg(bus: &(impl SmbusBus + ?Sized), addr: u8, reg: u16, val: u8) -> Result<()> {
@@ -180,9 +191,13 @@ fn write_reg(bus: &(impl SmbusBus + ?Sized), addr: u8, reg: u16, val: u8) -> Res
     bus.write_byte_data(addr, 0x01, val)
 }
 
-/// Read-only ENE fingerprint check.
+/// Read-only ENE fingerprint check (retries a single transient read miss per byte).
 pub fn fingerprint_ok(bus: &(impl SmbusBus + ?Sized), addr: u8) -> bool {
-    (0u8..16).all(|i| bus.read_byte_data(addr, 0xA0 + i) == Some(i))
+    (0u8..16).all(|i| {
+        bus.read_byte_data(addr, 0xA0 + i)
+            .or_else(|| bus.read_byte_data(addr, 0xA0 + i))
+            == Some(i)
+    })
 }
 
 fn is_micron(bus: &(impl SmbusBus + ?Sized), addr: u8) -> bool {
@@ -194,8 +209,34 @@ fn is_micron(bus: &(impl SmbusBus + ?Sized), addr: u8) -> bool {
 }
 
 /// A controller that is safe to write to.
+/// Retries briefly outside tests in case the shared SMBus is momentarily busy after a prior transfer.
 fn is_writable_ene(bus: &(impl SmbusBus + ?Sized), addr: u8) -> bool {
-    fingerprint_ok(bus, addr) && !is_micron(bus, addr)
+    let fp = fingerprint_ok(bus, addr);
+    if fp {
+        if !is_micron(bus, addr) {
+            return true;
+        }
+        debug!(
+            addr = format_args!("0x{addr:02X}"),
+            "Contrôleur ENE ignoré : constructeur Micron"
+        );
+        return false;
+    }
+    #[cfg(not(test))]
+    for attempt in 1..=3 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        if fingerprint_ok(bus, addr) {
+            if !is_micron(bus, addr) {
+                debug!(
+                    addr = format_args!("0x{addr:02X}"),
+                    attempt, "Empreinte ENE récupérée après réessai SMBus"
+                );
+                return true;
+            }
+            return false;
+        }
+    }
+    false
 }
 
 /// Fingerprint check limited to the addresses ENE controllers use (diagnostics).
@@ -211,6 +252,12 @@ pub fn read_module(
     backend: &str,
 ) -> Option<EneRamModule> {
     if !is_writable_ene(bus, addr) {
+        if !address_free(bus, addr) {
+            debug!(
+                addr = format_args!("0x{addr:02X}"),
+                bus_arg, backend, "Adresse SMBus non libre mais empreinte ENE absente ou Micron"
+            );
+        }
         return None;
     }
     let mut name = Vec::with_capacity(16);
@@ -222,6 +269,14 @@ pub fn read_module(
     }
     let firmware = String::from_utf8_lossy(&name).trim().to_string();
     if firmware.len() < 4 {
+        warn!(
+            addr = format_args!("0x{addr:02X}"),
+            bus_arg,
+            backend,
+            raw_len = name.len(),
+            firmware = %firmware,
+            "Empreinte ENE valide mais nom de firmware trop court"
+        );
         return None;
     }
     let led_count = read_reg(bus, addr, REG_LED_COUNT)
@@ -246,10 +301,21 @@ pub fn scan(
     bus_arg: u16,
     backend: &str,
 ) -> Vec<EneRamModule> {
-    addresses
+    let found: Vec<EneRamModule> = addresses
         .iter()
         .filter_map(|&a| read_module(bus, a, bus_arg, backend))
-        .collect()
+        .collect();
+    debug!(
+        backend,
+        bus_arg,
+        count = found.len(),
+        addrs = ?found
+            .iter()
+            .map(|m| format!("0x{:02X}({})", m.address_7bit, m.firmware))
+            .collect::<Vec<_>>(),
+        "Scan ENE terminé"
+    );
+    found
 }
 
 fn address_free(bus: &(impl SmbusBus + ?Sized), addr: u8) -> bool {
@@ -272,24 +338,43 @@ pub fn remap_from_0x77(bus: &(impl SmbusBus + ?Sized)) {
             next += 1;
         }
         let Some(&target) = ENE_RAM_ADDRESSES.get(next) else {
+            warn!(slot, "Aucune adresse ENE libre pour remapper 0x77");
             break;
         };
         next += 1;
-        let _ = write_reg(bus, 0x77, REG_SLOT_INDEX, slot);
-        let _ = write_reg(bus, 0x77, REG_I2C_ADDRESS, target << 1);
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        info!(
+            slot,
+            target = format_args!("0x{target:02X}"),
+            "Remappage d'un contrôleur ENE depuis 0x77"
+        );
+        if let Err(err) = write_reg(bus, 0x77, REG_SLOT_INDEX, slot) {
+            warn!(slot, ?err, "Échec écriture REG_SLOT_INDEX sur 0x77");
+        }
+        if let Err(err) = write_reg(bus, 0x77, REG_I2C_ADDRESS, target << 1) {
+            warn!(
+                slot,
+                target = format_args!("0x{target:02X}"),
+                ?err,
+                "Échec écriture REG_I2C_ADDRESS sur 0x77"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
-/// Apply `effect` to one module. Returns `Ok(false)` (nothing written) when the controller no
-/// longer passes the safety checks.
-pub fn apply(
+fn write_effect_registers(
     bus: &(impl SmbusBus + ?Sized),
     module: &EneRamModule,
     effect: &RamEffect,
 ) -> Result<bool> {
     let addr = module.address_7bit;
     if !is_writable_ene(bus, addr) {
+        warn!(
+            addr = format_args!("0x{addr:02X}"),
+            bus_arg = module.bus_arg,
+            backend = %module.backend,
+            "Écriture ENE annulée : le contrôleur ne répond plus à l'empreinte de sécurité"
+        );
         return Ok(false);
     }
     let colors = if module.is_v2 { COLORS_V2 } else { COLORS_V1 };
@@ -305,11 +390,72 @@ pub fn apply(
     write_reg(bus, addr, REG_SPEED, effect.speed.min(4))?;
     write_reg(bus, addr, REG_DIRECTION, u8::from(effect.reverse))?;
     write_reg(bus, addr, REG_APPLY, APPLY_NOW)?;
+    Ok(true)
+}
+
+/// Apply `effect` to one module. Returns `Ok(false)` (nothing written) when the controller no
+/// longer passes the safety checks.
+pub fn apply(
+    bus: &(impl SmbusBus + ?Sized),
+    module: &EneRamModule,
+    effect: &RamEffect,
+) -> Result<bool> {
+    if !write_effect_registers(bus, module, effect)? {
+        return Ok(false);
+    }
     if effect.save_eeprom {
-        write_reg(bus, addr, REG_APPLY, APPLY_SAVE)?;
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        write_reg(bus, module.address_7bit, REG_APPLY, APPLY_SAVE)?;
+        #[cfg(not(test))]
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     Ok(true)
+}
+
+/// Apply `effect` to every module on a shared bus segment cleanly:
+/// Pass 1 programs and activates (`APPLY_NOW`) all DIMMs first so an EEPROM burn on DIMM #1
+/// cannot interfere with programming DIMM #2; Pass 2 commits EEPROM (`0xAA`) per DIMM with a
+/// full 100 ms burn window.
+pub fn apply_all(
+    bus: &(impl SmbusBus + ?Sized),
+    modules: &[&EneRamModule],
+    effect: &RamEffect,
+) -> Result<usize> {
+    let mut updated_addrs = Vec::with_capacity(modules.len());
+    for module in modules {
+        if write_effect_registers(bus, module, effect)? {
+            debug!(
+                addr = format_args!("0x{:02X}", module.address_7bit),
+                mode = ?effect.mode,
+                color = %effect.color.to_hex(),
+                speed = effect.speed,
+                reverse = effect.reverse,
+                "Registres ENE appliqués (APPLY_NOW)"
+            );
+            updated_addrs.push(module.address_7bit);
+        }
+    }
+    if effect.save_eeprom && !updated_addrs.is_empty() {
+        #[cfg(not(test))]
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        for &addr in &updated_addrs {
+            write_reg(bus, addr, REG_APPLY, APPLY_SAVE)?;
+            #[cfg(not(test))]
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let alive_mode = read_reg(bus, addr, REG_MODE);
+            info!(
+                addr = format_args!("0x{addr:02X}"),
+                alive_mode = ?alive_mode,
+                "Commit EEPROM ENE (0xAA) terminé"
+            );
+            if alive_mode.is_none() {
+                warn!(
+                    addr = format_args!("0x{addr:02X}"),
+                    "Le contrôleur ENE ne répond plus immédiatement après le commit EEPROM 0xAA"
+                );
+            }
+        }
+    }
+    Ok(updated_addrs.len())
 }
 
 /// Switch one module to a raw ENE mode (used to turn the lights off and restore them).
@@ -317,6 +463,10 @@ pub fn apply(
 pub fn set_mode(bus: &(impl SmbusBus + ?Sized), module: &EneRamModule, mode: u8) -> Result<bool> {
     let addr = module.address_7bit;
     if !is_writable_ene(bus, addr) {
+        warn!(
+            addr = format_args!("0x{addr:02X}"),
+            mode, "Changement mode ENE ignoré : empreinte absente"
+        );
         return Ok(false);
     }
     write_reg(bus, addr, REG_DIRECT, 0)?;
@@ -468,5 +618,59 @@ pub(crate) mod tests {
         let empty = FakeEneBus::default();
         assert!(!apply(&empty, &m, &effect(false)).unwrap());
         assert!(scan(&empty, ENE_RAM_ADDRESSES, 0, "t").is_empty());
+    }
+
+    #[test]
+    fn apply_all_programs_every_dimm_before_committing_eeprom() {
+        let mut bus = FakeEneBus::with_module(0x70, "AUDA0-E6K5-0101", 1);
+        bus.present.push(0x71);
+        bus.load(0x71, "AUDA0-E6K5-0101", 1);
+        let m0 = read_module(&bus, 0x70, 0, "t").unwrap();
+        let m1 = read_module(&bus, 0x71, 0, "t").unwrap();
+
+        let count = apply_all(&bus, &[&m0, &m1], &effect(true)).unwrap();
+        assert_eq!(count, 2);
+
+        let writes = bus.writes.borrow();
+        let save0 = writes
+            .iter()
+            .position(|&w| w == (0x70, 0x80A0, APPLY_SAVE))
+            .expect("DIMM 0 EEPROM commit");
+        let save1 = writes
+            .iter()
+            .position(|&w| w == (0x71, 0x80A0, APPLY_SAVE))
+            .expect("DIMM 1 EEPROM commit");
+        let now1 = writes
+            .iter()
+            .position(|&w| w == (0x71, 0x80A0, APPLY_NOW))
+            .expect("DIMM 1 live apply");
+        assert!(now1 < save0 && save0 < save1);
+    }
+
+    #[test]
+    fn fingerprint_ok_recovers_from_single_transient_read_drop() {
+        struct FlakyBus {
+            dropped_once: RefCell<bool>,
+        }
+        impl SmbusBus for FlakyBus {
+            fn read_byte_data(&self, _addr7: u8, cmd: u8) -> Option<u8> {
+                if cmd == 0xA7 && !*self.dropped_once.borrow() {
+                    *self.dropped_once.borrow_mut() = true;
+                    return None;
+                }
+                (0xA0..=0xAF).contains(&cmd).then_some(cmd - 0xA0)
+            }
+            fn write_byte_data(&self, _: u8, _: u8, _: u8) -> Result<()> {
+                Ok(())
+            }
+            fn write_word_data(&self, _: u8, _: u8, _: u16) -> Result<()> {
+                Ok(())
+            }
+        }
+        let bus = FlakyBus {
+            dropped_once: RefCell::new(false),
+        };
+        assert!(fingerprint_ok(&bus, 0x70));
+        assert!(*bus.dropped_once.borrow());
     }
 }

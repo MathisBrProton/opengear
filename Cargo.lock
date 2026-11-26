@@ -1598,6 +1598,7 @@ dependencies = [
  "opengear-core",
  "opengear-platform",
  "serde",
+ "tracing",
 ]
 
 [[package]]

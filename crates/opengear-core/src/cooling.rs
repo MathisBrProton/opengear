@@ -113,6 +113,14 @@ pub enum FanTempSource {
     GpuHotspot,
     /// Driven dynamically by `max(CPU, GPU Edge)` — ideal for radiator / case airflow!
     MaxCpuGpu,
+    /// Driven dynamically by `avg(CPU, GPU Edge)` — smooth balanced airflow.
+    AvgCpuGpu,
+    /// Driven dynamically by the hottest NVMe SSD sensor.
+    Nvme,
+    /// Driven dynamically by `max(CPU, GPU Edge, NVMe)`.
+    MaxAll,
+    /// Driven dynamically by a user-defined composed formula (`TempMixConfig`).
+    CustomMix,
 }
 
 impl FanTempSource {
@@ -122,6 +130,10 @@ impl FanTempSource {
             Self::GpuEdge => "gpu_edge",
             Self::GpuHotspot => "gpu_hotspot",
             Self::MaxCpuGpu => "max_cpu_gpu",
+            Self::AvgCpuGpu => "avg_cpu_gpu",
+            Self::Nvme => "nvme",
+            Self::MaxAll => "max_all",
+            Self::CustomMix => "custom_mix",
         }
     }
 
@@ -130,7 +142,118 @@ impl FanTempSource {
             "gpu_edge" => Self::GpuEdge,
             "gpu_hotspot" => Self::GpuHotspot,
             "max_cpu_gpu" => Self::MaxCpuGpu,
+            "avg_cpu_gpu" => Self::AvgCpuGpu,
+            "nvme" => Self::Nvme,
+            "max_all" => Self::MaxAll,
+            "custom_mix" => Self::CustomMix,
             _ => Self::CpuBios,
+        }
+    }
+}
+
+/// Individual live sensor inputs available for composed virtual temperature sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SensorKind {
+    #[default]
+    Cpu,
+    GpuEdge,
+    GpuHotspot,
+    Nvme,
+    Motherboard,
+}
+
+/// Operation combining two sensor readings into a composed virtual temperature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TempMixOp {
+    #[default]
+    Max,
+    Avg,
+    Delta,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TempMixConfig {
+    pub op: TempMixOp,
+    pub a: SensorKind,
+    pub b: SensorKind,
+}
+
+impl Default for TempMixConfig {
+    fn default() -> Self {
+        Self {
+            op: TempMixOp::Max,
+            a: SensorKind::Cpu,
+            b: SensorKind::GpuEdge,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SensorReadings {
+    pub cpu: Option<f32>,
+    pub gpu_edge: Option<f32>,
+    pub gpu_hotspot: Option<f32>,
+    pub nvme: Option<f32>,
+    pub motherboard: Option<f32>,
+}
+
+impl SensorReadings {
+    pub fn get(&self, kind: SensorKind) -> Option<f32> {
+        let v = match kind {
+            SensorKind::Cpu => self.cpu,
+            SensorKind::GpuEdge => self.gpu_edge,
+            SensorKind::GpuHotspot => self.gpu_hotspot,
+            SensorKind::Nvme => self.nvme,
+            SensorKind::Motherboard => self.motherboard,
+        };
+        v.filter(|t| t.is_finite())
+    }
+}
+
+/// Resolve the effective temperature (°C) for `source` and optional `custom_mix`.
+pub fn resolve_temp_reading(
+    source: FanTempSource,
+    custom_mix: Option<&TempMixConfig>,
+    r: &SensorReadings,
+) -> Option<f32> {
+    match source {
+        FanTempSource::CpuBios => None,
+        FanTempSource::GpuEdge => r.gpu_edge.or(r.gpu_hotspot),
+        FanTempSource::GpuHotspot => r.gpu_hotspot.or(r.gpu_edge),
+        FanTempSource::Nvme => r.nvme,
+        FanTempSource::MaxCpuGpu => match (r.cpu, r.gpu_edge) {
+            (Some(c), Some(g)) => Some(c.max(g)),
+            (c, g) => c.or(g),
+        },
+        FanTempSource::AvgCpuGpu => match (r.cpu, r.gpu_edge) {
+            (Some(c), Some(g)) => Some((c + g) * 0.5),
+            (c, g) => c.or(g),
+        },
+        FanTempSource::MaxAll => [r.cpu, r.gpu_edge, r.nvme]
+            .into_iter()
+            .flatten()
+            .filter(|t| t.is_finite())
+            .reduce(f32::max),
+        FanTempSource::CustomMix => {
+            let mix = custom_mix.copied().unwrap_or_default();
+            let va = r.get(mix.a);
+            let vb = r.get(mix.b);
+            match mix.op {
+                TempMixOp::Max => match (va, vb) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                },
+                TempMixOp::Avg => match (va, vb) {
+                    (Some(a), Some(b)) => Some((a + b) * 0.5),
+                    (a, b) => a.or(b),
+                },
+                TempMixOp::Delta => match (va, vb) {
+                    (Some(a), Some(b)) => Some((a - b).abs().clamp(0.0, 120.0)),
+                    _ => None,
+                },
+            }
         }
     }
 }
@@ -144,6 +267,11 @@ pub struct FanChannelConfig {
     pub source: FanTempSource,
     #[serde(default = "default_hysteresis")]
     pub hysteresis_c: u8,
+    /// Exponential temperature smoothing time constant in seconds (0 = instant, no smoothing).
+    #[serde(default)]
+    pub smoothing_secs: u8,
+    #[serde(default)]
+    pub custom_mix: Option<TempMixConfig>,
 }
 
 fn default_hysteresis() -> u8 {
@@ -321,6 +449,8 @@ impl FanChannelConfig {
             curve,
             source: FanTempSource::CpuBios,
             hysteresis_c: 3,
+            smoothing_secs: 0,
+            custom_mix: None,
         }
     }
 
@@ -397,6 +527,99 @@ impl FanChannelConfig {
             ],
             _ => Self::default_for(FanHeaderKind::AioPump).curve,
         }
+    }
+}
+
+/// Stateful per-channel temperature smoothing + asymmetric hysteresis tracker for software curves.
+#[derive(Debug, Clone, Copy)]
+pub struct FanCurveTracker {
+    smoothed_temp: Option<f32>,
+    ref_temp: f32,
+    last_duty: Option<u8>,
+}
+
+impl Default for FanCurveTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FanCurveTracker {
+    pub fn new() -> Self {
+        Self {
+            smoothed_temp: None,
+            ref_temp: 40.0,
+            last_duty: None,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.smoothed_temp = None;
+        self.ref_temp = 40.0;
+        self.last_duty = None;
+    }
+
+    pub fn last_duty(&self) -> Option<u8> {
+        self.last_duty
+    }
+
+    pub fn mark_applied(&mut self, duty: u8) {
+        self.last_duty = Some(duty);
+    }
+
+    /// Evaluate the next target duty (%) for `cfg` given a sensor reading (`None` -> failsafe 100 %),
+    /// elapsed step `dt_secs`, and minimum duty deadband `deadband_pct`.
+    /// Returns `Some(target_duty)` only when the target differs enough to warrant a hardware write.
+    pub fn evaluate(
+        &mut self,
+        cfg: &FanChannelConfig,
+        measured: Option<f32>,
+        dt_secs: f32,
+        deadband_pct: u8,
+    ) -> Option<u8> {
+        let floor = cfg.header.min_safe_duty_pct();
+        let raw_t = match measured {
+            Some(t) if t.is_finite() => t,
+            _ => {
+                // Sensor absent / NaN: bypass smoothing and fail safe immediately.
+                self.smoothed_temp = None;
+                self.ref_temp = 100.0;
+                let target = cfg.interpolate_duty(100.0).max(floor);
+                let changed = self
+                    .last_duty
+                    .is_none_or(|prev| prev.abs_diff(target) >= deadband_pct);
+                return changed.then_some(target);
+            }
+        };
+
+        let smooth_t = if cfg.smoothing_secs == 0 || !dt_secs.is_finite() || dt_secs <= 0.0 {
+            raw_t
+        } else {
+            match self.smoothed_temp {
+                Some(prev) => {
+                    let tau = cfg.smoothing_secs as f32;
+                    let alpha = (dt_secs / (tau + dt_secs)).clamp(0.05, 1.0);
+                    prev + alpha * (raw_t - prev)
+                }
+                None => raw_t,
+            }
+        };
+        self.smoothed_temp = Some(smooth_t);
+
+        let hyst = cfg.hysteresis_c as f32;
+        // Rising: follow immediately. Falling: wait until below the hysteresis band.
+        let eff_t = if smooth_t >= self.ref_temp || smooth_t <= self.ref_temp - hyst {
+            self.ref_temp = smooth_t;
+            smooth_t
+        } else {
+            self.ref_temp
+        };
+
+        let target = cfg.interpolate_duty(eff_t).max(floor);
+        let changed = self
+            .last_duty
+            .is_none_or(|prev| prev.abs_diff(target) >= deadband_pct);
+        changed.then_some(target)
     }
 }
 
@@ -501,6 +724,76 @@ mod safety_tests {
         assert!(
             s.iter()
                 .all(|p| (20..=100).contains(&p.temp_c) && p.duty_pct <= 100)
+        );
+    }
+
+    #[test]
+    fn tracker_smooths_spikes_and_respects_hysteresis_and_failsafe() {
+        let mut cfg = FanChannelConfig::default_for(FanHeaderKind::CpuFan);
+        cfg.hysteresis_c = 4;
+        cfg.smoothing_secs = 9;
+        let mut tr = FanCurveTracker::new();
+
+        // First sample seeds the filter at 40 C.
+        let d0 = tr.evaluate(&cfg, Some(40.0), 3.0, 3).unwrap();
+        tr.mark_applied(d0);
+        // Short 80 C spike is dampened by EMA (tau=9s, dt=3s -> alpha=0.25 -> 50 C, not 80 C).
+        let d_spike = tr.evaluate(&cfg, Some(80.0), 3.0, 3).unwrap();
+        assert!(
+            d_spike < cfg.interpolate_duty(80.0),
+            "spike should be smoothed: got {d_spike}"
+        );
+        tr.mark_applied(d_spike);
+
+        // Small drop inside hysteresis band keeps reference temp held.
+        let d_drop = tr.evaluate(&cfg, Some(48.0), 3.0, 1);
+        assert_eq!(
+            d_drop, None,
+            "drop inside hysteresis band must not change duty"
+        );
+
+        // Missing sensor fails safe to 100 % immediately, bypassing smoothing.
+        let d_fail = tr.evaluate(&cfg, None, 3.0, 1).unwrap();
+        assert_eq!(d_fail, 100);
+    }
+
+    #[test]
+    fn composed_temp_sources_compute_max_avg_delta_and_nvme() {
+        let r = SensorReadings {
+            cpu: Some(62.0),
+            gpu_edge: Some(50.0),
+            gpu_hotspot: Some(68.0),
+            nvme: Some(44.0),
+            motherboard: Some(36.0),
+        };
+        assert_eq!(
+            resolve_temp_reading(FanTempSource::Nvme, None, &r),
+            Some(44.0)
+        );
+        assert_eq!(
+            resolve_temp_reading(FanTempSource::AvgCpuGpu, None, &r),
+            Some(56.0)
+        );
+        assert_eq!(
+            resolve_temp_reading(FanTempSource::MaxAll, None, &r),
+            Some(62.0)
+        );
+        let delta = TempMixConfig {
+            op: TempMixOp::Delta,
+            a: SensorKind::Cpu,
+            b: SensorKind::Motherboard,
+        };
+        assert_eq!(
+            resolve_temp_reading(FanTempSource::CustomMix, Some(&delta), &r),
+            Some(26.0)
+        );
+        let missing_delta = SensorReadings {
+            cpu: Some(60.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_temp_reading(FanTempSource::CustomMix, Some(&delta), &missing_delta),
+            None
         );
     }
 }

@@ -294,9 +294,83 @@ impl RgbEffectConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Add,
+    Screen,
+    Max,
+}
+
+/// Overlay RGB layer composited on top of the base software effect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RgbLayer {
+    #[serde(default = "default_layer_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_layer_opacity")]
+    pub opacity: f32,
+    #[serde(default)]
+    pub blend: BlendMode,
+    pub effect: RgbEffectConfig,
+    /// Empty = all LEDs; non-empty = only LEDs whose `key_code` or zone id matches.
+    #[serde(default)]
+    pub key_filter: Vec<String>,
+}
+
+fn default_layer_enabled() -> bool {
+    true
+}
+
+fn default_layer_opacity() -> f32 {
+    1.0
+}
+
+impl Default for RgbLayer {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            opacity: 1.0,
+            blend: BlendMode::Add,
+            effect: RgbEffectConfig {
+                kind: EffectKind::ReactiveTyping,
+                ..RgbEffectConfig::default()
+            },
+            key_filter: Vec::new(),
+        }
+    }
+}
+
+/// Composite `top` over `base` using `mode` and `opacity` in `0.0..=1.0`.
+pub fn blend_rgb(base: Rgb, top: Rgb, mode: BlendMode, opacity: f32) -> Rgb {
+    let a = opacity.clamp(0.0, 1.0);
+    if a <= 0.001 {
+        return base;
+    }
+    let mixed = match mode {
+        BlendMode::Normal => top,
+        BlendMode::Add => Rgb::new(
+            base.r.saturating_add(top.r),
+            base.g.saturating_add(top.g),
+            base.b.saturating_add(top.b),
+        ),
+        BlendMode::Screen => {
+            let scr = |x: u8, y: u8| -> u8 {
+                let xf = x as f32 / 255.0;
+                let yf = y as f32 / 255.0;
+                ((1.0 - (1.0 - xf) * (1.0 - yf)) * 255.0).round() as u8
+            };
+            Rgb::new(scr(base.r, top.r), scr(base.g, top.g), scr(base.b, top.b))
+        }
+        BlendMode::Max => Rgb::new(base.r.max(top.r), base.g.max(top.g), base.b.max(top.b)),
+    };
+    base.lerp(mixed, a)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Rgb;
+    use super::*;
 
     #[test]
     fn from_hex_parses_valid_colors() {
@@ -317,5 +391,23 @@ mod tests {
     fn hex_round_trip() {
         let c = Rgb::new(12, 200, 7);
         assert_eq!(Rgb::from_hex(&c.to_hex()), Some(c));
+    }
+
+    #[test]
+    fn blend_modes_composite_correctly() {
+        let base = Rgb::new(100, 50, 20);
+        let top = Rgb::new(200, 220, 10);
+        assert_eq!(
+            blend_rgb(base, top, BlendMode::Add, 1.0),
+            Rgb::new(255, 255, 30)
+        );
+        assert_eq!(
+            blend_rgb(base, top, BlendMode::Max, 1.0),
+            Rgb::new(200, 220, 20)
+        );
+        assert_eq!(blend_rgb(base, top, BlendMode::Normal, 0.0), base);
+        assert_eq!(blend_rgb(base, top, BlendMode::Normal, 1.0), top);
+        let scr = blend_rgb(Rgb::BLACK, top, BlendMode::Screen, 1.0);
+        assert_eq!(scr, top);
     }
 }

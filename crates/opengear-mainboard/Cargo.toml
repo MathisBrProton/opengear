@@ -8,5 +8,6 @@ description = "Vendor-neutral motherboard chips: SMBus, ENE DRAM RGB, Nuvoton Su
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
+tracing.workspace = true
 opengear-core.workspace = true
 opengear-platform.workspace = true

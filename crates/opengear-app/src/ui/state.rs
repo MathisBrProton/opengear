@@ -4,7 +4,7 @@ use opengear_core::cooling::FanHeaderKind;
 use opengear_core::driver::DeviceKind;
 use opengear_core::{EffectKind, OperatingMode};
 use opengear_corsair::CorsairDevice;
-use opengear_input::ALL_BINDABLE_KEYS;
+use opengear_input::{ALL_BINDABLE_KEYS, ALL_MOUSE_BUTTONS, ALL_MOUSE_TARGETS};
 use opengear_logitech::{
     BatteryPowerModel, BatteryState, EQ_PRESETS, LogitechHeadset, LogitechMouse, MouseButtonAction,
     OnboardMode,
@@ -339,6 +339,20 @@ impl BackendEngine {
             .map(|&e| json!({ "id": format!("{:?}", e), "label": e.label() }))
             .collect();
 
+        let blend_modes = vec![
+            json!({ "id": "Normal", "label": "Normal" }),
+            json!({ "id": "Add", "label": "Addition" }),
+            json!({ "id": "Screen", "label": "Écran" }),
+            json!({ "id": "Max", "label": "Maximum" }),
+        ];
+
+        let sensor_kinds = vec![
+            json!({ "id": "Cpu", "label": "Processeur" }),
+            json!({ "id": "GpuEdge", "label": "GPU cœur" }),
+            json!({ "id": "GpuHotspot", "label": "GPU point chaud" }),
+            json!({ "id": "Nvme", "label": "SSD NVMe" }),
+        ];
+
         json!({
             "presets": PRESETS.iter().map(|(id, label, description)| json!({
                 "id": id,
@@ -346,7 +360,17 @@ impl BackendEngine {
                 "description": description,
             })).collect::<Vec<_>>(),
             "bindable_keys": ALL_BINDABLE_KEYS,
+            "bindable_mouse_buttons": ALL_MOUSE_BUTTONS.iter().map(|(id, label)| json!({
+                "id": id,
+                "label": label,
+            })).collect::<Vec<_>>(),
+            "bindable_mouse_targets": ALL_MOUSE_TARGETS.iter().map(|(id, label)| json!({
+                "id": id,
+                "label": label,
+            })).collect::<Vec<_>>(),
             "effects": effects,
+            "blend_modes": blend_modes,
+            "sensor_kinds": sensor_kinds,
             "button_presets": button_presets,
         })
     }
@@ -394,7 +418,9 @@ impl BackendEngine {
                     "is_pump": c.header == FanHeaderKind::AioPump,
                     "policy": format!("{:?}", c.policy),
                     "source": format!("{:?}", c.source),
+                    "custom_mix": c.custom_mix,
                     "hysteresis_c": c.hysteresis_c,
+                    "smoothing_secs": c.smoothing_secs,
                     "curve": c.curve,
                 })
             })
@@ -460,6 +486,26 @@ impl BackendEngine {
 
         let catalog = Self::catalog_json();
         let device_list = self.device_list_json();
+        let rgb_layers_json: Vec<Value> = active_profile
+            .rgb_layers
+            .iter()
+            .map(|l| {
+                json!({
+                    "enabled": l.enabled,
+                    "blend": format!("{:?}", l.blend),
+                    "opacity": l.opacity,
+                    "key_filter": l.key_filter,
+                    "effect": {
+                        "kind": format!("{:?}", l.effect.kind),
+                        "primary": l.effect.primary.to_hex(),
+                        "secondary": l.effect.secondary.to_hex(),
+                        "speed": l.effect.speed,
+                        "brightness": l.effect.brightness,
+                        "reverse": l.effect.reverse,
+                    }
+                })
+            })
+            .collect();
 
         let mut root = json!({
             "static_info": {
@@ -511,11 +557,15 @@ impl BackendEngine {
                     "enable_rgb": active_profile.enable_rgb,
                     "win_lock": active_profile.win_lock,
                     "bindings": active_profile.bindings,
+                    "mouse_bindings": active_profile.mouse_bindings,
+                    "layers": active_profile.layers,
+                    "mouse_layers": active_profile.mouse_layers,
                     "socd": active_profile.socd,
                     "key_chatter_ms": active_profile.key_chatter_ms,
                     "mouse_debounce_ms": active_profile.mouse_debounce_ms,
                     "linked_apps": active_profile.linked_apps,
                     "device_lighting": active_profile.device_lighting,
+                    "rgb_layers": rgb_layers_json,
                     "rgb": {
                         "kind": format!("{:?}", active_profile.rgb.kind),
                         "primary": active_profile.rgb.primary.to_hex(),
@@ -529,8 +579,12 @@ impl BackendEngine {
             },
             "input_running": self.input_engine.is_running(),
             "bindable_keys": catalog["bindable_keys"],
+            "bindable_mouse_buttons": catalog["bindable_mouse_buttons"],
+            "bindable_mouse_targets": catalog["bindable_mouse_targets"],
             "keyboard": self.keyboard_view().to_json(),
             "effects": catalog["effects"],
+            "blend_modes": catalog["blend_modes"],
+            "sensor_kinds": catalog["sensor_kinds"],
             "button_presets": catalog["button_presets"],
             "power_plans": self.power_plans.iter().map(|p| json!({
                 "guid": p.guid,

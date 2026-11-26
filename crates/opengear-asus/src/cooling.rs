@@ -2,6 +2,8 @@
 
 use anyhow::Result;
 use opengear_core::cooling::{CurvePoint, FanChannelConfig, FanHeaderKind, FanPolicyMode};
+use opengear_core::driver::{Connection, Device, DeviceInfo, DeviceKind, Driver};
+use opengear_core::fans::{Cooling, FanInfo, FanTarget, clamp_target};
 use opengear_platform::is_elevated;
 
 /// ASUS `ASUSManagement` WMI FanType IDs (verified on ASUS ROG desktop boards).
@@ -283,6 +285,152 @@ pub fn read_asus_wmi_channel(header: FanHeaderKind) -> Option<FanChannelConfig> 
     }
 }
 
+/// Shared `Driver` for ASUS `ASUSManagement` WMI Q-Fan motherboard cooling.
+pub struct AsusWmiCoolingDriver;
+
+impl Driver for AsusWmiCoolingDriver {
+    fn name(&self) -> &'static str {
+        "asus_wmi_cooling"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Carte mère ASUS (WMI Q-Fan)"
+    }
+
+    fn discover(&self) -> Vec<Box<dyn Device>> {
+        if !probe_asus_wmi_cooling().wmi_available {
+            return Vec::new();
+        }
+        let initial: Vec<FanChannelConfig> = FanHeaderKind::ALL
+            .iter()
+            .map(|&h| {
+                read_asus_wmi_channel(h).unwrap_or_else(|| {
+                    let mut c = FanChannelConfig::default_for(h);
+                    c.policy = FanPolicyMode::Standard;
+                    c
+                })
+            })
+            .collect();
+        vec![Box::new(AsusWmiCoolingDevice {
+            initial,
+            manual_pct: [None; 5],
+        })]
+    }
+}
+
+/// ASUS motherboard fan/pump channels exposed through the shared `Cooling` capability.
+pub struct AsusWmiCoolingDevice {
+    initial: Vec<FanChannelConfig>,
+    manual_pct: [Option<u8>; 5],
+}
+
+impl AsusWmiCoolingDevice {
+    fn header_index(id: &str) -> Option<usize> {
+        let kind = FanHeaderKind::from_id(id)?;
+        FanHeaderKind::ALL.iter().position(|&h| h == kind)
+    }
+
+    fn set_header(&mut self, idx: usize, target: FanTarget) -> Result<()> {
+        let header = FanHeaderKind::ALL[idx];
+        let info = FanInfo {
+            id: header.id().into(),
+            name: header.label().into(),
+            rpm: None,
+            max_rpm: None,
+            min_pct: header.min_safe_duty_pct(),
+            manual_pct: self.manual_pct[idx],
+        };
+        match clamp_target(&info, target) {
+            FanTarget::Auto => {
+                let mut restore = self
+                    .initial
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| FanChannelConfig::default_for(header));
+                if restore.policy == FanPolicyMode::Manual {
+                    restore.policy = FanPolicyMode::Standard;
+                }
+                apply_asus_wmi_curve(&restore)?;
+                self.manual_pct[idx] = None;
+            }
+            FanTarget::Fixed(pct) => {
+                let mut flat = FanChannelConfig::default_for(header);
+                flat.policy = FanPolicyMode::Manual;
+                for pt in &mut flat.curve {
+                    pt.duty_pct = pct;
+                }
+                apply_asus_wmi_curve(&flat)?;
+                self.manual_pct[idx] = Some(pct);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Device for AsusWmiCoolingDevice {
+    fn info(&self) -> DeviceInfo {
+        DeviceInfo {
+            id: "asus_wmi_cooling:mainboard".into(),
+            vendor: "ASUS".into(),
+            model: "Carte mère ASUS (Q-Fan WMI)".into(),
+            kind: DeviceKind::Motherboard,
+            connection: Connection::Internal,
+            firmware: None,
+        }
+    }
+
+    fn cooling(&mut self) -> Option<&mut dyn Cooling> {
+        Some(self)
+    }
+}
+
+impl Cooling for AsusWmiCoolingDevice {
+    fn fans(&self) -> Vec<FanInfo> {
+        FanHeaderKind::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| FanInfo {
+                id: h.id().into(),
+                name: h.label().into(),
+                rpm: None,
+                max_rpm: None,
+                min_pct: h.min_safe_duty_pct(),
+                manual_pct: self.manual_pct[i],
+            })
+            .collect()
+    }
+
+    fn set_fan(&mut self, fan: Option<&str>, target: FanTarget) -> Result<()> {
+        match fan {
+            Some(id) => {
+                let idx = Self::header_index(id)
+                    .ok_or_else(|| anyhow::anyhow!("Canal ASUS WMI introuvable : {id}"))?;
+                self.set_header(idx, target)
+            }
+            None => {
+                for idx in 0..FanHeaderKind::ALL.len() {
+                    self.set_header(idx, target)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn overridden(&self) -> bool {
+        self.manual_pct.iter().any(|p| p.is_some())
+    }
+
+    fn restore_firmware_control(&mut self) -> Result<()> {
+        let had_local = self.overridden();
+        for idx in 0..FanHeaderKind::ALL.len() {
+            if !had_local || self.manual_pct[idx].is_some() {
+                self.set_header(idx, FanTarget::Auto)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +443,23 @@ mod tests {
         assert!(check_wmi_error_codes("PolicyErr= CurveErr=", true).is_err());
         assert!(check_wmi_error_codes("PolicyErr=0", true).is_err());
         assert!(check_wmi_error_codes("", false).is_err());
+    }
+
+    #[test]
+    fn cooling_trait_exposes_all_headers_with_safety_floors() {
+        let dev = AsusWmiCoolingDevice {
+            initial: FanHeaderKind::ALL
+                .iter()
+                .map(|&h| FanChannelConfig::default_for(h))
+                .collect(),
+            manual_pct: [None; 5],
+        };
+        let fans = dev.fans();
+        assert_eq!(fans.len(), 5);
+        assert_eq!(fans[0].id, "aio_pump");
+        assert_eq!(fans[0].min_pct, 45);
+        assert_eq!(fans[1].id, "cpu_fan");
+        assert_eq!(fans[1].min_pct, 20);
+        assert!(!dev.overridden());
     }
 }

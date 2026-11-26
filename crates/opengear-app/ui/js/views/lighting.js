@@ -150,6 +150,52 @@ function lightingGlobal(devs) {
       </div>
     </div>
 
+    <div class="card mt-16">
+      <div class="card-head">
+        <div>
+          <h2 class="card-title">Calques RGB (composition)</h2>
+          <div class="card-desc">Superpose des effets par-dessus l'effet global (ex. ondulation réactive ou barre audio filtrée sur certaines touches).</div>
+        </div>
+        <button type="button" class="btn btn-sm btn-primary" data-act="rgb-layer-add">+ Ajouter un calque</button>
+      </div>
+      ${arr(prof.rgb_layers).length === 0 ? `<div class="muted">Aucun calque superposé. Ajoute un calque pour combiner plusieurs effets en temps réel.</div>` : `
+        <div class="stack" style="gap:10px">
+          ${arr(prof.rgb_layers).map((layer, li) => {
+            const ef = layer.effect || {};
+            const opPct = Math.round(num(layer.opacity, 1) * 100);
+            const blends = arr(S.blend_modes).length ? arr(S.blend_modes) : [
+              { id: "Normal", label: "Normal" },
+              { id: "Add", label: "Addition" },
+              { id: "Screen", label: "Écran" },
+              { id: "Max", label: "Maximum" },
+            ];
+            return `
+              <div class="zone-item">
+                <div class="row-between mb-8">
+                  <div class="row">
+                    ${sw(!!layer.enabled, layer.name || `Calque ${li + 1}`, "rgb-layer-en", { idx: li })}
+                  </div>
+                  <div class="row">
+                    <select class="og-select auto" data-change="rgb-layer-blend" data-idx="${li}" aria-label="Mode de fusion">
+                      ${blends.map((b) => `<option value="${esc(b.id)}" ${layer.blend === b.id ? "selected" : ""}>${esc(b.label)}</option>`).join("")}
+                    </select>
+                    <button type="button" class="btn btn-sm btn-ghost" data-act="rgb-layer-del" data-idx="${li}">Supprimer</button>
+                  </div>
+                </div>
+                <div class="row" style="gap:8px;flex-wrap:wrap">
+                  <select class="og-select auto" data-change="rgb-layer-kind" data-idx="${li}" aria-label="Effet du calque">
+                    ${S.effects.map((e) => `<option value="${esc(e.id)}" ${ef.kind === e.id ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
+                  </select>
+                  <input type="color" class="og-color" value="${safeHex(ef.primary, "#00D4FF")}" data-change="rgb-layer-color" data-idx="${li}" data-field="primary" aria-label="Couleur principale calque" />
+                  <input type="color" class="og-color" value="${safeHex(ef.secondary, "#9B3CFF")}" data-change="rgb-layer-color" data-idx="${li}" data-field="secondary" aria-label="Couleur secondaire calque" />
+                  <input class="og-input mono grow" value="${esc(arr(layer.key_filter || layer.keys).join(", "))}" placeholder="Toutes les touches (ou KeyQ,KeyW…)" data-change="rgb-layer-keys" data-idx="${li}" aria-label="Filtre de touches" />
+                </div>
+                <div class="mt-8">${sliderRow("Opacité", { min: 0, max: 1, step: 0.05, value: num(layer.opacity, 1), input: "label", change: "rgb-layer-opacity", data: { idx: li, fmt: "pct" }, display: `${opPct} %` })}</div>
+              </div>`;
+          }).join("")}
+        </div>`}
+    </div>
+
     ${perKeyBoards.map((d) => `
       <div class="card mt-16">
         <div class="card-head">
@@ -219,7 +265,7 @@ function renderOverrideEditor(devId, zoneId, hwEffects, existingOverride) {
         ${spdRange ? sliderRow("Vitesse", { min: spdRange[0], max: spdRange[1], step: 1, value: clamp(num(d.hwSpeed, spdRange[0]), spdRange[0], spdRange[1]), input: "lgt-draft", data: { devId, ...(isZone ? { zoneId } : {}), field: "hwSpeed" }, display: String(clamp(num(d.hwSpeed, spdRange[0]), spdRange[0], spdRange[1])) }) : ""}
         <div class="row">
           <button type="button" class="btn btn-primary btn-sm" data-act="lgt-apply" ${dataAttr} data-save="0">Appliquer</button>
-          ${curDef.params.savable && isExpert() ? `<button type="button" class="btn btn-secondary btn-sm" data-act="lgt-apply" ${dataAttr} data-save="1">Enregistrer en mémoire (${expertTag()})</button>` : ""}
+          ${curDef.params.savable ? `<button type="button" class="btn btn-secondary btn-sm" data-act="lgt-apply" ${dataAttr} data-save="1">Enregistrer en mémoire (flash)</button>` : ""}
         </div>` : ""}
       ${d.mode === "global" || d.mode === "off" || d.mode === "inherit" ? `
         <div class="row"><button type="button" class="btn btn-secondary btn-sm" data-act="lgt-apply" ${dataAttr} data-save="0">${d.mode === "inherit" ? "Suivre l'appareil" : "Appliquer ce choix"}</button></div>` : ""}
@@ -281,7 +327,7 @@ function lightingCanvas(devs) {
   const selectedId = devs.some((d) => d.info.id === local.canvasSelectedId) ? local.canvasSelectedId : devs[0].info.id;
   local.canvasSelectedId = selectedId;
   const selDev = devs.find((d) => d.info.id === selectedId);
-  const selPl = placements[selectedId] || selDev.lighting.placement || { x: 0, y: 0, width: 1, height: 1 };
+  const selPl = placements[selectedId] || selDev.lighting.placement || { x: 0, y: 0, width: 1, height: 1, rotation_deg: 0 };
 
   return `
     <div class="grid-stage">
@@ -295,7 +341,8 @@ function lightingCanvas(devs) {
         </div>
         <div class="desk-canvas" id="desk-canvas">
           ${devs.map((d) => {
-            const pl = placements[d.info.id] || d.lighting.placement || { x: 0, y: 0, width: 1, height: 1 };
+            const pl = placements[d.info.id] || d.lighting.placement || { x: 0, y: 0, width: 1, height: 1, rotation_deg: 0 };
+            const rot = num(pl.rotation_deg, 0);
             const isSel = d.info.id === selectedId;
             const dots = [];
             arr(d.lighting.zones).forEach((z) => {
@@ -308,7 +355,7 @@ function lightingCanvas(devs) {
               }
             });
             return `
-              <div class="canvas-dev ${isSel ? "selected" : ""}" data-canvas-dev="${esc(d.info.id)}" style="left:${(pl.x * 100).toFixed(1)}%;top:${(pl.y * 100).toFixed(1)}%;width:${(pl.width * 100).toFixed(1)}%;height:${(pl.height * 100).toFixed(1)}%">
+              <div class="canvas-dev ${isSel ? "selected" : ""}" data-canvas-dev="${esc(d.info.id)}" style="left:${(pl.x * 100).toFixed(1)}%;top:${(pl.y * 100).toFixed(1)}%;width:${(pl.width * 100).toFixed(1)}%;height:${(pl.height * 100).toFixed(1)}%;transform:rotate(${rot}deg)">
                 <div class="canvas-dev-title">${esc(d.info.model)}</div>
                 <div class="canvas-dev-sub">${esc(d.info.vendor)}</div>
                 ${dots.join("")}
@@ -329,6 +376,7 @@ function lightingCanvas(devs) {
           ${sliderRow("Position Y", { min: 0, max: 95, step: 1, value: Math.round(selPl.y * 100), input: "label", change: "canvas-coord", data: { devId: selectedId, field: "y", fmt: "pct100" }, display: `${Math.round(selPl.y * 100)} %` })}
           ${sliderRow("Largeur", { min: 5, max: 100, step: 1, value: Math.round(selPl.width * 100), input: "label", change: "canvas-coord", data: { devId: selectedId, field: "width", fmt: "pct100" }, display: `${Math.round(selPl.width * 100)} %` })}
           ${sliderRow("Hauteur", { min: 5, max: 100, step: 1, value: Math.round(selPl.height * 100), input: "label", change: "canvas-coord", data: { devId: selectedId, field: "height", fmt: "pct100" }, display: `${Math.round(selPl.height * 100)} %` })}
+          ${sliderRow("Rotation", { min: -180, max: 180, step: 5, value: Math.round(num(selPl.rotation_deg, 0)), input: "label", change: "canvas-coord", data: { devId: selectedId, field: "rotation_deg", fmt: "rot" }, display: `${Math.round(num(selPl.rotation_deg, 0))} °` })}
         </div>
       </div>
     </div>`;

@@ -121,9 +121,34 @@ mod win {
     const DBT_DEVNODES_CHANGED: usize = 0x0007;
     const DBT_DEVICEARRIVAL: usize = 0x8000;
     const DBT_DEVICEREMOVECOMPLETE: usize = 0x8004;
+    const DBT_DEVTYP_DEVICEINTERFACE: u32 = 5;
+    /// `GUID_DEVINTERFACE_HID` (`{4D1E55B2-F16F-11CF-88CB-001111000030}`).
+    const GUID_DEVINTERFACE_HID: [u8; 16] = [
+        0xB2, 0x55, 0x1E, 0x4D, 0x6F, 0xF1, 0xCF, 0x11, 0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00,
+        0x30,
+    ];
     /// Device events arrive in bursts (one per interface): wait for quiet before reporting.
     const DEVICE_DEBOUNCE_TIMER: usize = 1;
     const DEVICE_DEBOUNCE_MS: u32 = 700;
+
+    #[repr(C)]
+    struct DevBroadcastDeviceInterfaceW {
+        dbcc_size: u32,
+        dbcc_devicetype: u32,
+        dbcc_reserved: u32,
+        dbcc_classguid: [u8; 16],
+        dbcc_name: [u16; 1],
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn RegisterDeviceNotificationW(
+            hrecipient: HWND,
+            notificationfilter: *const core::ffi::c_void,
+            flags: u32,
+        ) -> *mut core::ffi::c_void;
+        fn UnregisterDeviceNotification(handle: *mut core::ffi::c_void) -> i32;
+    }
 
     static RESUMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
@@ -222,11 +247,26 @@ mod win {
                 }
                 WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
                 RegisterSuspendResumeNotification(hwnd as _, DEVICE_NOTIFY_WINDOW_HANDLE);
+                let filter = DevBroadcastDeviceInterfaceW {
+                    dbcc_size: std::mem::size_of::<DevBroadcastDeviceInterfaceW>() as u32,
+                    dbcc_devicetype: DBT_DEVTYP_DEVICEINTERFACE,
+                    dbcc_reserved: 0,
+                    dbcc_classguid: GUID_DEVINTERFACE_HID,
+                    dbcc_name: [0],
+                };
+                let dev_notify = RegisterDeviceNotificationW(
+                    hwnd,
+                    (&filter as *const DevBroadcastDeviceInterfaceW).cast(),
+                    DEVICE_NOTIFY_WINDOW_HANDLE,
+                );
 
                 let mut msg: MSG = std::mem::zeroed();
                 while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
+                }
+                if !dev_notify.is_null() {
+                    let _ = UnregisterDeviceNotification(dev_notify);
                 }
                 let _ = WTSUnRegisterSessionNotification(hwnd);
                 DestroyWindow(hwnd);

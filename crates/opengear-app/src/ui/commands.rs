@@ -1,5 +1,5 @@
 use super::backend::{
-    BackendEngine, apply_validated_hw_effect, migrate_legacy_profiles,
+    BackendEngine, apply_validated_hw_effect, migrate_legacy_profiles, release_device_lighting,
     seed_and_resize_device_lighting,
 };
 #[cfg(test)]
@@ -12,13 +12,15 @@ use crate::tray_icon::{
     create_windows_shortcuts, is_autostart_enabled, release_single_instance, set_autostart_enabled,
 };
 use opengear_asus::{apply_asus_wmi_curve, read_asus_wmi_channel};
-use opengear_core::cooling::{CurvePoint, FanPolicyMode, FanTempSource};
+use opengear_core::cooling::{
+    CurvePoint, FanPolicyMode, FanTempSource, SensorKind, TempMixConfig, TempMixOp,
+};
 use opengear_core::driver::{Value as DriverValue, setting_ids};
 use opengear_core::fans::FanTarget;
 use opengear_core::lighting::{EffectRequest, LightingOverride, Placement};
 use opengear_core::{
-    EffectKind, KeyAction, KeyboardProfile, MacroStep, Rgb, RgbEffectConfig, SocdPair,
-    scan_hid_devices,
+    BlendMode, EffectKind, KeyAction, KeyboardProfile, MacroMode, MacroStep, Rgb, RgbEffectConfig,
+    RgbLayer, SocdPair, scan_hid_devices,
 };
 use opengear_corsair::proto::{
     PROP_BRIGHTNESS_INDICATOR_COLOR, PROP_ESPORTS_BACKLIGHT_COLOR, PROP_PROFILE_INDICATOR_COLOR,
@@ -56,12 +58,19 @@ fn undo_label_for(cmd: &str) -> Option<&'static str> {
         "lighting_set_device" => "Éclairage par appareil",
         "lighting_resize_zone" => "Nombre de LED",
         "lighting_set_placement" => "Placement sur le bureau",
+        "set_rgb_layers" => "Calques RGB",
         "switch_profile" => "Changement de profil",
         "create_profile" => "Création de profil",
         "set_keyboard_layout" => "Format du clavier",
         "input_set_winlock" => "Verrou de la touche Windows",
         "input_set_binding" => "Assignation de touche",
         "input_remove_binding" => "Suppression d'assignation",
+        "input_set_layer_binding" => "Assignation sur couche",
+        "input_remove_layer_binding" => "Suppression sur couche",
+        "input_set_mouse_binding" => "Assignation de bouton souris",
+        "input_remove_mouse_binding" => "Suppression d'assignation souris",
+        "input_set_mouse_layer_binding" => "Assignation souris sur couche",
+        "input_remove_mouse_layer_binding" => "Suppression souris sur couche",
         "input_set_esports" => "Réglages e-sport",
         "profile_set_linked_apps" => "Applications liées au profil",
         "profile_import_json" => "Import de profil",
@@ -74,8 +83,30 @@ pub(crate) fn parse_temp_source(s: &str) -> FanTempSource {
     match s {
         "GpuLive" | "GpuEdge" | "gpu_edge" => FanTempSource::GpuEdge,
         "GpuHotspot" | "gpu_hotspot" => FanTempSource::GpuHotspot,
+        "Nvme" | "nvme" => FanTempSource::Nvme,
         "MixCpuGpu" | "MaxCpuGpu" | "max_cpu_gpu" => FanTempSource::MaxCpuGpu,
+        "AvgCpuGpu" | "avg_cpu_gpu" => FanTempSource::AvgCpuGpu,
+        "MaxAll" | "max_all" => FanTempSource::MaxAll,
+        "CustomMix" | "custom_mix" => FanTempSource::CustomMix,
         _ => FanTempSource::CpuBios,
+    }
+}
+
+fn parse_sensor_kind(s: &str) -> SensorKind {
+    match s {
+        "GpuEdge" | "gpu_edge" => SensorKind::GpuEdge,
+        "GpuHotspot" | "gpu_hotspot" => SensorKind::GpuHotspot,
+        "Nvme" | "nvme" => SensorKind::Nvme,
+        _ => SensorKind::Cpu,
+    }
+}
+
+fn parse_blend_mode(s: &str) -> BlendMode {
+    match s {
+        "Add" | "add" => BlendMode::Add,
+        "Screen" | "screen" => BlendMode::Screen,
+        "Max" | "max" => BlendMode::Max,
+        _ => BlendMode::Normal,
     }
 }
 
@@ -170,20 +201,39 @@ impl BackendEngine {
                 cfg.enabled = next;
                 if next {
                     cfg.mode = None;
+                    cfg.zones.clear();
                 }
             }
             next
         };
+        tracing::info!(enabled = on, "Bascule synchronisation RGB via tray");
         if !on {
+            let lighting_cfgs = self.config.active_profile_mut().device_lighting.clone();
             for dev in &mut self.driver_devices {
+                let id = dev.info().id;
                 if let Some(lighting) = dev.lighting() {
-                    let _ = lighting.release();
+                    release_device_lighting(lighting, lighting_cfgs.get(&id));
                 }
             }
             self.live_active_devices.clear();
         }
-        self.last_device_frame_at.clear();
+        self.invalidate_rgb_frames();
         self.persist_config();
+    }
+
+    pub(crate) fn tray_switch_profile(&mut self, name: &str) {
+        if self.config.profiles.iter().any(|pr| pr.name == name) {
+            self.config.active_profile = name.to_string();
+            self.manual_profile_name = name.to_string();
+            self.auto_switched = false;
+            self.apply_restored_config();
+        }
+    }
+
+    pub(crate) fn tray_apply_preset(&mut self, preset: &str) {
+        if self.apply_preset(preset).is_ok() {
+            self.persist_config();
+        }
     }
 
     fn corsair_mut(&mut self, p: &Value) -> std::result::Result<&mut CorsairDevice, String> {
@@ -208,7 +258,7 @@ impl BackendEngine {
         &mut self,
         cmd: &str,
         p: &Value,
-        proxy: &EventLoopProxy<UserEvent>,
+        proxy: Option<&EventLoopProxy<UserEvent>>,
     ) -> std::result::Result<Value, String> {
         let record_undo = match cmd {
             "set_rgb_config" => p["commit"].as_bool().unwrap_or(true),
@@ -287,7 +337,7 @@ impl BackendEngine {
                 cfg.zones.clear();
             }
         }
-        self.last_device_frame_at.clear();
+        self.invalidate_rgb_frames();
         summary.push(format!("Éclairage : {}", kind.label()));
 
         // Devices with a performance profile (laptop BIOS modes…) follow the preset.
@@ -477,9 +527,10 @@ impl BackendEngine {
         );
 
         if !self.is_laptop
-            && self
-                .typed_devices::<opengear_asus::AuraMainboardController>()
-                .is_empty()
+            && !self
+                .driver_devices
+                .iter()
+                .any(|d| d.info().id.starts_with("asus_aura:"))
         {
             push(
                 "aura",
@@ -497,6 +548,9 @@ impl BackendEngine {
                 || p.mouse_debounce_ms > 0
                 || p.win_lock
                 || !p.bindings.is_empty()
+                || !p.mouse_bindings.is_empty()
+                || p.layers.values().any(|m| !m.is_empty())
+                || p.mouse_layers.values().any(|m| !m.is_empty())
         };
         let engine_ok = self.input_engine.is_running();
         push(
@@ -583,13 +637,6 @@ impl BackendEngine {
             if let Some(pct) = st.battery_pct {
                 let _ = writeln!(r, "  Batterie : {pct}% (en charge={:?})", st.charging);
             }
-            if let Some(c) = dev.as_any().and_then(|a| a.downcast_ref::<CorsairDevice>()) {
-                let _ = writeln!(
-                    r,
-                    "  Corsair Bragi : report {} o | FlashTap 0xF5 = {}",
-                    c.info.out_report_len, c.info.flashtap_probe
-                );
-            }
             for line in dev.diagnostic_lines() {
                 let _ = writeln!(r, "  {line}");
             }
@@ -636,7 +683,7 @@ impl BackendEngine {
         &mut self,
         cmd: &str,
         p: &Value,
-        proxy: &EventLoopProxy<UserEvent>,
+        proxy: Option<&EventLoopProxy<UserEvent>>,
     ) -> std::result::Result<Value, String> {
         match cmd {
             "get_state" => Ok(self.full_state_json()),
@@ -742,6 +789,43 @@ impl BackendEngine {
                 }
                 Ok(st)
             }
+            "device_set_dpi" => {
+                let device_id = p["device_id"].as_str().ok_or("device_id manquant")?;
+                let x = p["x"].as_u64().ok_or("x manquant")? as u16;
+                let y = p["y"].as_u64().map(|v| v as u16);
+                let dev = self
+                    .device_mut(device_id)
+                    .ok_or_else(|| format!("Appareil introuvable : {device_id}"))?;
+                let ptr = dev
+                    .pointer()
+                    .ok_or_else(|| format!("Réglage DPI non supporté sur : {device_id}"))?;
+                ptr.set_dpi(x, y).map_err(|e| e.to_string())?;
+                Ok(self.full_state_json())
+            }
+            "device_set_eq" => {
+                let device_id = p["device_id"].as_str().ok_or("device_id manquant")?;
+                let dev = self
+                    .device_mut(device_id)
+                    .ok_or_else(|| format!("Appareil introuvable : {device_id}"))?;
+                let eq = dev
+                    .equalizer()
+                    .ok_or_else(|| format!("Égaliseur non supporté sur : {device_id}"))?;
+                let gains: Vec<i8> = if let Some(preset_id) = p["preset"].as_str() {
+                    eq.eq_info()
+                        .and_then(|info| info.presets.into_iter().find(|pr| pr.id == preset_id))
+                        .ok_or_else(|| format!("Préréglage égaliseur inconnu : {preset_id}"))?
+                        .gains_db
+                } else {
+                    p["gains"]
+                        .as_array()
+                        .ok_or("gains ou preset manquant")?
+                        .iter()
+                        .map(|v| v.as_i64().unwrap_or(0).clamp(-12, 12) as i8)
+                        .collect()
+                };
+                eq.set_eq_gains(&gains).map_err(|e| e.to_string())?;
+                Ok(self.full_state_json())
+            }
             "set_experimental_driver" => {
                 let name = p["name"].as_str().ok_or("name manquant")?;
                 let enabled = p["enabled"].as_bool().ok_or("enabled manquant")?;
@@ -771,8 +855,8 @@ impl BackendEngine {
                     self.config.active_profile = name.to_string();
                     self.manual_profile_name = name.to_string();
                     self.auto_switched = false;
-                    self.sync_input_rules();
-                    self.persist_config();
+                    self.apply_restored_config();
+                    self.sync_tray_state();
                 }
                 Ok(self.full_state_json())
             }
@@ -786,6 +870,7 @@ impl BackendEngine {
                 self.config.profiles.push(cloned);
                 self.config.active_profile = name.to_string();
                 self.persist_config();
+                self.sync_tray_state();
                 Ok(self.full_state_json())
             }
             "set_keyboard_layout" => {
@@ -810,6 +895,7 @@ impl BackendEngine {
             }
             "lighting_sync_all" => {
                 let on = p["enabled"].as_bool().unwrap_or(false);
+                tracing::info!(enabled = on, "Bascule synchronisation RGB globale");
                 {
                     let prof = self.config.active_profile_mut();
                     prof.enable_rgb = on;
@@ -818,20 +904,27 @@ impl BackendEngine {
                         let entry = prof.device_lighting.entry(id).or_default();
                         entry.enabled = on;
                         if on {
+                            // Clear per-device and per-zone overrides (including Hardware) so Sync
+                            // applies uniformly across all zones, while preserving last_*_hardware
+                            // for restoration when Sync is disabled.
                             entry.mode = None;
+                            entry.zones.clear();
                         }
                     }
                 }
                 if !on {
+                    let lighting_cfgs = self.config.active_profile_mut().device_lighting.clone();
                     for d in &mut self.driver_devices {
+                        let id = d.info().id;
                         if let Some(lighting) = d.lighting() {
-                            let _ = lighting.release();
+                            release_device_lighting(lighting, lighting_cfgs.get(&id));
                         }
                     }
                     self.live_active_devices.clear();
                 }
-                self.last_device_frame_at.clear();
+                self.invalidate_rgb_frames();
                 self.persist_config();
+                self.sync_tray_state();
                 Ok(self.full_state_json())
             }
             "lighting_set_device" => {
@@ -849,13 +942,23 @@ impl BackendEngine {
                     if req.zone.is_none() {
                         req.zone = zone_id.clone();
                     }
+                    tracing::info!(
+                        device = dev_id,
+                        zone = ?req.zone,
+                        effect = %req.effect,
+                        save = req.save,
+                        "Application effet matériel RGB"
+                    );
                     let dev = self
                         .device_mut(dev_id)
                         .ok_or_else(|| format!("Appareil introuvable : {dev_id}"))?;
                     let lighting = dev
                         .lighting()
                         .ok_or_else(|| format!("Éclairage non supporté sur : {dev_id}"))?;
-                    apply_validated_hw_effect(lighting, &req).map_err(|e| e.to_string())?;
+                    apply_validated_hw_effect(lighting, &req).map_err(|e| {
+                        tracing::warn!(device = dev_id, zone = ?req.zone, effect = %req.effect, ?e, "Échec effet matériel RGB");
+                        e.to_string()
+                    })?;
                 } else if matches!(parsed_override, Some(LightingOverride::Off)) {
                     let dev = self
                         .device_mut(dev_id)
@@ -864,13 +967,26 @@ impl BackendEngine {
                         && let Some(lighting) = dev.lighting()
                     {
                         let len = opengear_core::lighting::frame_len(&lighting.zones());
-                        let _ = lighting.set_frame(&vec![Rgb::BLACK; len]);
+                        if let Err(err) = lighting.set_frame(&vec![Rgb::BLACK; len]) {
+                            tracing::warn!(device = dev_id, ?err, "Échec extinction éclairage RGB");
+                        }
                     }
-                } else if enabled_arg == Some(false)
-                    && let Some(dev) = self.device_mut(dev_id)
-                    && let Some(lighting) = dev.lighting()
-                {
-                    let _ = lighting.release();
+                } else if enabled_arg == Some(false) {
+                    tracing::info!(
+                        device = dev_id,
+                        "Désactivation synchronisation RGB appareil"
+                    );
+                    let dev_cfg = self
+                        .config
+                        .active_profile_mut()
+                        .device_lighting
+                        .get(dev_id)
+                        .cloned();
+                    if let Some(dev) = self.device_mut(dev_id)
+                        && let Some(lighting) = dev.lighting()
+                    {
+                        release_device_lighting(lighting, dev_cfg.as_ref());
+                    }
                 }
 
                 {
@@ -886,6 +1002,13 @@ impl BackendEngine {
                     }
                     match (zone_id.as_deref(), parsed_override) {
                         (Some(zid), Some(ov)) => {
+                            if let LightingOverride::Hardware { ref request } = ov
+                                && !request.effect.starts_with("shutdown:")
+                            {
+                                let mut saved = request.clone();
+                                saved.save = false;
+                                entry.last_zone_hardware.insert(zid.to_string(), saved);
+                            }
                             if matches!(ov, LightingOverride::Global) {
                                 entry.zones.remove(zid);
                             } else {
@@ -899,6 +1022,16 @@ impl BackendEngine {
                             entry.zones.remove(zid);
                         }
                         (None, Some(ov)) => {
+                            if let LightingOverride::Hardware { ref request } = ov
+                                && !request.effect.starts_with("shutdown:")
+                            {
+                                let mut saved = request.clone();
+                                saved.save = false;
+                                entry.last_hardware = Some(saved);
+                                // Whole-device hardware overrides supersede prior per-zone hardware presets.
+                                entry.last_zone_hardware.clear();
+                                entry.zones.clear();
+                            }
                             if matches!(ov, LightingOverride::Hardware { .. })
                                 && enabled_arg.is_none()
                             {
@@ -916,8 +1049,9 @@ impl BackendEngine {
                         _ => {}
                     }
                 }
-                self.last_device_frame_at.remove(dev_id);
+                self.invalidate_rgb_frame_for(dev_id);
                 self.persist_config();
+                self.sync_tray_state();
                 Ok(self.full_state_json())
             }
             "lighting_resize_zone" => {
@@ -951,7 +1085,7 @@ impl BackendEngine {
                     .or_default()
                     .zone_led_counts
                     .insert(zone_id.to_string(), clamped);
-                self.last_device_frame_at.remove(dev_id);
+                self.invalidate_rgb_frame_for(dev_id);
                 self.persist_config();
                 Ok(self.full_state_json())
             }
@@ -961,10 +1095,12 @@ impl BackendEngine {
                 let y = p["y"].as_f64().unwrap_or(0.0) as f32;
                 let w = p["width"].as_f64().unwrap_or(1.0) as f32;
                 let h = p["height"].as_f64().unwrap_or(1.0) as f32;
+                let rotation_deg = p["rotation_deg"].as_f64().unwrap_or(0.0) as f32;
                 let xc = x.clamp(0.0, 0.95);
                 let yc = y.clamp(0.0, 0.95);
                 let wc = w.clamp(0.05, 1.0 - xc);
                 let hc = h.clamp(0.05, 1.0 - yc);
+                let rot = rotation_deg.clamp(-180.0, 180.0);
                 self.config.set_placement(
                     dev_id,
                     Placement {
@@ -972,9 +1108,69 @@ impl BackendEngine {
                         y: yc,
                         width: wc,
                         height: hc,
+                        rotation_deg: rot,
                     },
                 );
-                self.last_device_frame_at.remove(dev_id);
+                self.invalidate_rgb_frame_for(dev_id);
+                self.persist_config();
+                Ok(self.full_state_json())
+            }
+            "set_rgb_layers" => {
+                let arr = p["layers"].as_array().ok_or("layers manquant")?;
+                let mut parsed = Vec::with_capacity(arr.len().min(8));
+                for item in arr.iter().take(8) {
+                    let enabled = item["enabled"].as_bool().unwrap_or(true);
+                    let blend = parse_blend_mode(item["blend"].as_str().unwrap_or("Normal"));
+                    let opacity = (item["opacity"].as_f64().unwrap_or(1.0) as f32).clamp(0.0, 1.0);
+                    let key_filter: Vec<String> = item
+                        .get("key_filter")
+                        .or_else(|| item.get("keys"))
+                        .and_then(|v| v.as_array())
+                        .map(|ks| {
+                            ks.iter()
+                                .filter_map(|k| k.as_str().map(str::trim))
+                                .filter(|k| !k.is_empty())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let ef = &item["effect"];
+                    let kind = parse_effect_kind(ef["kind"].as_str().unwrap_or("Static"))
+                        .unwrap_or(EffectKind::Static);
+                    let primary = ef["primary"]
+                        .as_str()
+                        .and_then(Rgb::from_hex)
+                        .unwrap_or(Rgb::CYAN);
+                    let secondary = ef["secondary"]
+                        .as_str()
+                        .and_then(Rgb::from_hex)
+                        .unwrap_or_else(|| Rgb::new(155, 60, 255));
+                    let speed = (ef["speed"].as_f64().unwrap_or(1.0) as f32).clamp(0.1, 5.0);
+                    let brightness =
+                        (ef["brightness"].as_f64().unwrap_or(1.0) as f32).clamp(0.0, 1.0);
+                    let reverse = ef["reverse"].as_bool().unwrap_or(false);
+                    parsed.push(RgbLayer {
+                        enabled,
+                        opacity,
+                        blend,
+                        key_filter,
+                        effect: RgbEffectConfig {
+                            kind,
+                            primary,
+                            secondary,
+                            speed,
+                            brightness,
+                            reverse,
+                            ..Default::default()
+                        },
+                    });
+                }
+                self.config.active_profile_mut().rgb_layers = parsed;
+                let need_engine = self.profile_needs_input_engine();
+                if !self.headless && need_engine && !self.input_engine.is_running() {
+                    let _ = self.input_engine.start();
+                }
+                self.invalidate_rgb_frames();
                 self.persist_config();
                 Ok(self.full_state_json())
             }
@@ -1012,14 +1208,16 @@ impl BackendEngine {
                     prof.enable_rgb
                 };
                 if !en_now {
+                    let lighting_cfgs = self.config.active_profile_mut().device_lighting.clone();
                     for dev in &mut self.driver_devices {
+                        let id = dev.info().id;
                         if let Some(lighting) = dev.lighting() {
-                            let _ = lighting.release();
+                            release_device_lighting(lighting, lighting_cfgs.get(&id));
                         }
                     }
                     self.live_active_devices.clear();
                 }
-                self.last_device_frame_at.clear();
+                self.invalidate_rgb_frames();
                 if commit {
                     self.persist_config();
                 }
@@ -1040,13 +1238,13 @@ impl BackendEngine {
                 let prof = self.config.active_profile_mut();
                 prof.rgb.kind = EffectKind::PerKey;
                 prof.rgb.per_key.insert(key_code, col);
-                self.last_device_frame_at.clear();
+                self.invalidate_rgb_frames();
                 self.persist_config();
                 Ok(self.full_state_json())
             }
             "clear_per_key" => {
                 self.config.active_profile_mut().rgb.per_key.clear();
-                self.last_device_frame_at.clear();
+                self.invalidate_rgb_frames();
                 self.persist_config();
                 Ok(self.full_state_json())
             }
@@ -1227,11 +1425,39 @@ impl BackendEngine {
                 if let Some(src) = p["source"].as_str() {
                     ch.source = parse_temp_source(src);
                     if idx < 5 {
-                        self.smart_fan_last_duty[idx] = None;
+                        self.smart_fan_trackers[idx].reset();
                     }
+                }
+                if let Some(mix) = p.get("custom_mix").filter(|v| v.is_object()) {
+                    let op = match mix["op"].as_str().unwrap_or("Max") {
+                        "Avg" => TempMixOp::Avg,
+                        "Delta" => TempMixOp::Delta,
+                        _ => TempMixOp::Max,
+                    };
+                    let a = parse_sensor_kind(
+                        mix.get("a")
+                            .or_else(|| mix.get("sensor_a"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Cpu"),
+                    );
+                    let b = parse_sensor_kind(
+                        mix.get("b")
+                            .or_else(|| mix.get("sensor_b"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("GpuEdge"),
+                    );
+                    ch.custom_mix = Some(TempMixConfig { op, a, b });
+                    if idx < 5 {
+                        self.smart_fan_trackers[idx].reset();
+                    }
+                } else if ch.source == FanTempSource::CustomMix && ch.custom_mix.is_none() {
+                    ch.custom_mix = Some(TempMixConfig::default());
                 }
                 if let Some(h) = p["hysteresis_c"].as_u64() {
                     ch.hysteresis_c = (h as u8).min(12);
+                }
+                if let Some(sm) = p["smoothing_secs"].as_u64() {
+                    ch.smoothing_secs = (sm as u8).min(20);
                 }
                 if apply && ch.source == FanTempSource::CpuBios {
                     apply_asus_wmi_curve(ch).map_err(|e| e.to_string())?;
@@ -1253,12 +1479,14 @@ impl BackendEngine {
             "cooling_relaunch_admin" => {
                 release_single_instance();
                 relaunch_as_admin().map_err(|e| e.to_string())?;
-                let _ = proxy.send_event(UserEvent::Quit);
+                if let Some(px) = proxy {
+                    let _ = px.send_event(UserEvent::Quit);
+                }
                 Ok(json!({ "relaunching": true }))
             }
             "input_set_enabled" => {
                 let on = p["enabled"].as_bool().unwrap_or(false);
-                if on {
+                if on && !self.headless {
                     self.input_engine.start().map_err(|e| e.to_string())?;
                     self.sync_input_rules();
                 } else {
@@ -1271,39 +1499,123 @@ impl BackendEngine {
                 self.config.active_profile_mut().win_lock = on;
                 self.sync_input_rules();
                 self.persist_config();
+                self.sync_tray_state();
                 Ok(self.full_state_json())
             }
             "input_set_binding" => {
                 let key = p["key"].as_str().ok_or("key manquante")?.to_string();
-                let kind = p["kind"].as_str().ok_or("kind manquant")?;
-                let action = match kind {
-                    "remap" => KeyAction::Remap {
-                        target: p["target"].as_str().unwrap_or("F13").to_string(),
-                    },
-                    "disable" => KeyAction::Disable,
-                    "text" => KeyAction::Text {
-                        text: p["text"].as_str().unwrap_or("").to_string(),
-                        delay_ms: p["delay_ms"].as_u64().unwrap_or(15) as u32,
-                    },
-                    "macro" => {
-                        let name = p["name"].as_str().unwrap_or("Macro").to_string();
-                        let steps: Vec<MacroStep> = serde_json::from_value(p["steps"].clone())
-                            .map_err(|e| e.to_string())?;
-                        KeyAction::Macro { name, steps }
-                    }
-                    _ => return Err("Type d'action inconnu".into()),
-                };
+                let action = parse_key_action(p)?;
                 self.config
                     .active_profile_mut()
                     .bindings
                     .insert(key, action);
                 self.sync_input_rules();
                 self.persist_config();
+                self.sync_tray_state();
                 Ok(self.full_state_json())
             }
             "input_remove_binding" => {
                 let key = p["key"].as_str().ok_or("key manquante")?;
                 self.config.active_profile_mut().bindings.remove(key);
+                self.sync_input_rules();
+                self.persist_config();
+                self.sync_tray_state();
+                Ok(self.full_state_json())
+            }
+            "input_set_mouse_binding" => {
+                let button = p["button"].as_str().ok_or("button manquant")?.to_string();
+                let action = parse_key_action(p)?;
+                self.config
+                    .active_profile_mut()
+                    .mouse_bindings
+                    .insert(button, action);
+                if !self.headless && !self.input_engine.is_running() {
+                    let _ = self.input_engine.start();
+                }
+                self.sync_input_rules();
+                self.persist_config();
+                self.sync_tray_state();
+                Ok(self.full_state_json())
+            }
+            "input_remove_mouse_binding" => {
+                let button = p["button"].as_str().ok_or("button manquant")?;
+                self.config
+                    .active_profile_mut()
+                    .mouse_bindings
+                    .remove(button);
+                self.sync_input_rules();
+                self.persist_config();
+                self.sync_tray_state();
+                Ok(self.full_state_json())
+            }
+            "input_set_layer_binding" => {
+                let layer = p["layer"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or("layer manquant")?
+                    .to_string();
+                let key = p["key"].as_str().ok_or("key manquante")?.to_string();
+                let action = parse_key_action(p)?;
+                self.config
+                    .active_profile_mut()
+                    .layers
+                    .entry(layer)
+                    .or_default()
+                    .insert(key, action);
+                if !self.headless && !self.input_engine.is_running() {
+                    let _ = self.input_engine.start();
+                }
+                self.sync_input_rules();
+                self.persist_config();
+                Ok(self.full_state_json())
+            }
+            "input_remove_layer_binding" => {
+                let layer = p["layer"].as_str().ok_or("layer manquant")?;
+                let key = p["key"].as_str().ok_or("key manquante")?;
+                let prof = self.config.active_profile_mut();
+                if let Some(map) = prof.layers.get_mut(layer) {
+                    map.remove(key);
+                    if map.is_empty() {
+                        prof.layers.remove(layer);
+                    }
+                }
+                self.sync_input_rules();
+                self.persist_config();
+                Ok(self.full_state_json())
+            }
+            "input_set_mouse_layer_binding" => {
+                let layer = p["layer"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or("layer manquant")?
+                    .to_string();
+                let button = p["button"].as_str().ok_or("button manquant")?.to_string();
+                let action = parse_key_action(p)?;
+                self.config
+                    .active_profile_mut()
+                    .mouse_layers
+                    .entry(layer)
+                    .or_default()
+                    .insert(button, action);
+                if !self.headless && !self.input_engine.is_running() {
+                    let _ = self.input_engine.start();
+                }
+                self.sync_input_rules();
+                self.persist_config();
+                Ok(self.full_state_json())
+            }
+            "input_remove_mouse_layer_binding" => {
+                let layer = p["layer"].as_str().ok_or("layer manquant")?;
+                let button = p["button"].as_str().ok_or("button manquant")?;
+                let prof = self.config.active_profile_mut();
+                if let Some(map) = prof.mouse_layers.get_mut(layer) {
+                    map.remove(button);
+                    if map.is_empty() {
+                        prof.mouse_layers.remove(layer);
+                    }
+                }
                 self.sync_input_rules();
                 self.persist_config();
                 Ok(self.full_state_json())
@@ -1364,17 +1676,20 @@ impl BackendEngine {
                     let pr = self.config.active_profile_mut();
                     pr.socd.enabled || pr.key_chatter_ms > 0 || pr.mouse_debounce_ms > 0
                 };
-                if need_engine && !self.input_engine.is_running() {
+                if !self.headless && need_engine && !self.input_engine.is_running() {
                     let _ = self.input_engine.start();
                 }
                 self.sync_input_rules();
                 self.persist_config();
+                self.sync_tray_state();
                 Ok(self.full_state_json())
             }
             "input_macro_record_start" => {
-                self.input_engine
-                    .start_macro_recording()
-                    .map_err(|e| e.to_string())?;
+                if !self.headless {
+                    self.input_engine
+                        .start_macro_recording()
+                        .map_err(|e| e.to_string())?;
+                }
                 Ok(self.full_state_json())
             }
             "input_macro_record_stop" => {
@@ -1437,6 +1752,11 @@ impl BackendEngine {
             }
             "superio_refresh" => {
                 self.superio = read_superio_snapshot();
+                if let Some(d) = self.device_mut("superio:mainboard")
+                    && let Some(c) = d.cooling()
+                {
+                    c.refresh();
+                }
                 Ok(self.full_state_json())
             }
             "superio_set_pwm" => {
@@ -1445,6 +1765,11 @@ impl BackendEngine {
                 let msg = set_superio_fan_pwm(ch, duty).map_err(|e| e.to_string())?;
                 self.sync_fan_marker();
                 self.superio = read_superio_snapshot();
+                if let Some(d) = self.device_mut("superio:mainboard")
+                    && let Some(c) = d.cooling()
+                {
+                    c.refresh();
+                }
                 let mut st = self.full_state_json();
                 st["last_action_msg"] = json!(msg);
                 Ok(st)
@@ -1454,6 +1779,11 @@ impl BackendEngine {
                 let msg = restore_superio_fan_auto(ch).map_err(|e| e.to_string())?;
                 self.sync_fan_marker();
                 self.superio = read_superio_snapshot();
+                if let Some(d) = self.device_mut("superio:mainboard")
+                    && let Some(c) = d.cooling()
+                {
+                    c.refresh();
+                }
                 let mut st = self.full_state_json();
                 st["last_action_msg"] = json!(msg);
                 Ok(st)
@@ -1480,7 +1810,10 @@ impl BackendEngine {
                 check_import_size(raw)?;
                 let prof: KeyboardProfile =
                     serde_json::from_str(raw).map_err(|e| format!("JSON invalide : {e}"))?;
-                let name = prof.name.clone();
+                let name = prof.name.trim().to_string();
+                if name.is_empty() {
+                    return Err("Nom de profil manquant dans le JSON".into());
+                }
                 if let Some(existing) = self.config.profiles.iter_mut().find(|pr| pr.name == name) {
                     *existing = prof;
                 } else {
@@ -1493,6 +1826,7 @@ impl BackendEngine {
                 seed_and_resize_device_lighting(&mut self.config, &mut self.driver_devices);
                 self.sync_input_rules();
                 self.persist_config();
+                self.sync_tray_state();
                 Ok(self.full_state_json())
             }
             "device_fan_set" => {
@@ -1501,6 +1835,9 @@ impl BackendEngine {
                 let target: FanTarget =
                     serde_json::from_value(p["target"].clone()).map_err(|e| e.to_string())?;
                 self.set_device_fan(device, fan, target)?;
+                if device == "superio:mainboard" {
+                    self.superio = read_superio_snapshot();
+                }
                 Ok(self.full_state_json())
             }
             "laptop_set_auto_battery" => {
@@ -1512,6 +1849,64 @@ impl BackendEngine {
             _ => Err(format!("Commande IPC inconnue : {cmd}")),
         }
     }
+}
+
+fn parse_macro_mode(s: Option<&str>) -> MacroMode {
+    match s {
+        Some("while_held") => MacroMode::WhileHeld,
+        Some("toggle") => MacroMode::Toggle,
+        _ => MacroMode::Once,
+    }
+}
+
+fn parse_key_action(p: &Value) -> std::result::Result<KeyAction, String> {
+    let kind = p["kind"].as_str().ok_or("kind manquant")?;
+    Ok(match kind {
+        "remap" => KeyAction::Remap {
+            target: p["target"].as_str().unwrap_or("F13").to_string(),
+        },
+        "disable" => KeyAction::Disable,
+        "text" => KeyAction::Text {
+            text: p["text"].as_str().unwrap_or("").to_string(),
+            delay_ms: p["delay_ms"].as_u64().unwrap_or(15) as u32,
+        },
+        "macro" => {
+            let name = p["name"].as_str().unwrap_or("Macro").to_string();
+            let steps: Vec<MacroStep> =
+                serde_json::from_value(p["steps"].clone()).map_err(|e| e.to_string())?;
+            let mode = parse_macro_mode(p["mode"].as_str());
+            KeyAction::Macro { name, steps, mode }
+        }
+        "layer_hold" => {
+            let layer = p["layer"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("fn")
+                .to_string();
+            KeyAction::LayerHold { layer }
+        }
+        "layer_toggle" => {
+            let layer = p["layer"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("fn")
+                .to_string();
+            KeyAction::LayerToggle { layer }
+        }
+        "tap_hold" => {
+            let tap_key = p["tap"].as_str().ok_or("tap manquant")?.to_string();
+            let hold_key = p["hold"].as_str().ok_or("hold manquant")?.to_string();
+            let threshold_ms = (p["tap_ms"].as_u64().unwrap_or(200) as u16).clamp(50, 1000);
+            KeyAction::TapHold {
+                tap_key,
+                hold_key,
+                threshold_ms,
+            }
+        }
+        _ => return Err("Type d'action inconnu".into()),
+    })
 }
 
 fn parse_effect_kind(s: &str) -> Option<EffectKind> {
@@ -1717,5 +2112,42 @@ mod tests {
         assert!(!is_valid_power_guid("not-a-guid"));
         assert!(check_import_size("ok").is_ok());
         assert!(check_import_size(&"x".repeat(2 * 1024 * 1024 + 1)).is_err());
+    }
+
+    #[test]
+    fn enabling_global_sync_clears_zone_overrides_while_preserving_hw_restore() {
+        use opengear_core::Rgb;
+        use opengear_core::lighting::{DeviceLightingConfig, EffectRequest, LightingOverride};
+        let hw_req = EffectRequest {
+            effect: "Static".into(),
+            zone: Some("ch_0".into()),
+            colors: vec![Rgb::CYAN],
+            speed: None,
+            brightness: None,
+            reverse: false,
+            save: false,
+        };
+        let mut cfg = DeviceLightingConfig {
+            enabled: false,
+            mode: Some(LightingOverride::Hardware {
+                request: hw_req.clone(),
+            }),
+            ..Default::default()
+        };
+        cfg.zones.insert(
+            "ch_0".into(),
+            LightingOverride::Hardware {
+                request: hw_req.clone(),
+            },
+        );
+        cfg.last_zone_hardware.insert("ch_0".into(), hw_req);
+
+        // Mirrors what `lighting_sync_all` / `tray_toggle_sync` does on enable:
+        cfg.enabled = true;
+        cfg.mode = None;
+        cfg.zones.clear();
+
+        assert!(cfg.zones.is_empty());
+        assert!(cfg.last_zone_hardware.contains_key("ch_0"));
     }
 }

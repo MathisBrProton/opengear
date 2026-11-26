@@ -13,6 +13,7 @@ export const local = {
   selectedMouseVariant: 0,
   selectedHeadsetVariant: 0,
   uiModeOverride: null,
+  activeLayer: "base",
   configWarningShown: false,
   diag: { data: null, loading: false, error: null },
   diagSorted: [],
@@ -60,7 +61,8 @@ export function normalizeState() {
   if (!S) return;
   [
     "corsair_devices", "logi_mice", "logi_headsets", "power_plans", "effects",
-    "button_presets", "bindable_keys", "devices", "device_list", "firmware_inventory",
+    "blend_modes", "sensor_kinds", "button_presets", "bindable_keys", "devices",
+    "device_list", "firmware_inventory",
   ].forEach((k) => {
     if (!Array.isArray(S[k])) S[k] = [];
   });

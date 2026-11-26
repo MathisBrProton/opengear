@@ -1,6 +1,7 @@
 pub(crate) mod backend;
 pub(crate) mod commands;
 pub(crate) mod devices;
+pub(crate) mod endpoint_tests;
 pub(crate) mod keyboard_view;
 pub(crate) mod state;
 
@@ -75,6 +76,8 @@ pub(crate) enum BackendMsg {
     SysEvent(SysEvent),
     TrayToggleSocd,
     TrayToggleSync,
+    TraySwitchProfile(String),
+    TrayApplyPreset(String),
     AsyncWorkerDone {
         id: u64,
         action_msg: Option<String>,
@@ -417,6 +420,12 @@ pub fn run_gui(cli_minimized: bool) -> Result<()> {
                 }
                 TrayAction::ToggleSyncRgb => {
                     let _ = ipc_tx.send(BackendMsg::TrayToggleSync);
+                }
+                TrayAction::SwitchProfile(name) => {
+                    let _ = ipc_tx.send(BackendMsg::TraySwitchProfile(name));
+                }
+                TrayAction::ApplyPreset(id) => {
+                    let _ = ipc_tx.send(BackendMsg::TrayApplyPreset(id));
                 }
                 TrayAction::Quit => {
                     if !exit_started {

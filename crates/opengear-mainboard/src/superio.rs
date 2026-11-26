@@ -2,6 +2,8 @@
 //! controller via Microsoft WHQL-signed **PawnIO** (`LpcIO.bin`).
 
 use anyhow::{Context, Result};
+use opengear_core::driver::{Connection, Device, DeviceInfo, DeviceKind, Driver};
+use opengear_core::fans::{Cooling, FanInfo, FanTarget, clamp_target};
 #[cfg(windows)]
 use opengear_platform::PawnIoAvailability;
 use opengear_platform::is_elevated;
@@ -860,6 +862,120 @@ pub fn restore_superio_fan_auto(channel_idx: usize) -> Result<String> {
     }
 }
 
+/// Shared `Driver` exposing SuperIO (Nuvoton / ITE) fan headers via the common `Cooling` trait.
+pub struct SuperIoCoolingDriver;
+
+impl Driver for SuperIoCoolingDriver {
+    fn name(&self) -> &'static str {
+        "superio"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Contrôleur SuperIO carte mère (PawnIO)"
+    }
+
+    fn discover(&self) -> Vec<Box<dyn Device>> {
+        let snap = read_superio_snapshot();
+        if !snap.detected {
+            return Vec::new();
+        }
+        vec![Box::new(SuperIoCoolingDevice { snap })]
+    }
+}
+
+/// Detected SuperIO fan controller exposed behind the shared `Cooling` capability.
+pub struct SuperIoCoolingDevice {
+    snap: SuperIoSnapshot,
+}
+
+impl SuperIoCoolingDevice {
+    fn parse_fan_index(id: &str) -> Option<usize> {
+        id.strip_prefix("fan_")?.parse::<usize>().ok()
+    }
+
+    fn fan_info(f: &SuperIoFanChannel) -> FanInfo {
+        FanInfo {
+            id: format!("fan_{}", f.index),
+            name: f.label.clone(),
+            rpm: Some(f.rpm),
+            max_rpm: None,
+            min_pct: SUPERIO_MIN_PWM_PCT,
+            manual_pct: f.is_manual.then_some(f.pwm_pct),
+        }
+    }
+}
+
+impl Device for SuperIoCoolingDevice {
+    fn info(&self) -> DeviceInfo {
+        DeviceInfo {
+            id: "superio:mainboard".into(),
+            vendor: "Carte mère".into(),
+            model: format!("SuperIO {}", self.snap.chip_name),
+            kind: DeviceKind::Motherboard,
+            connection: Connection::Internal,
+            firmware: Some(self.snap.chip_id_hex.clone()),
+        }
+    }
+
+    fn cooling(&mut self) -> Option<&mut dyn Cooling> {
+        Some(self)
+    }
+}
+
+impl Cooling for SuperIoCoolingDevice {
+    fn fans(&self) -> Vec<FanInfo> {
+        self.snap.fans.iter().map(Self::fan_info).collect()
+    }
+
+    fn refresh(&mut self) {
+        self.snap = read_superio_snapshot();
+    }
+
+    fn set_fan(&mut self, fan: Option<&str>, target: FanTarget) -> Result<()> {
+        let channels: Vec<(usize, FanInfo)> = match fan {
+            Some(id) => {
+                let idx = Self::parse_fan_index(id)
+                    .ok_or_else(|| anyhow::anyhow!("Canal SuperIO invalide : {id}"))?;
+                let f = self
+                    .snap
+                    .fans
+                    .iter()
+                    .find(|c| c.index == idx)
+                    .ok_or_else(|| anyhow::anyhow!("Canal SuperIO introuvable : {id}"))?;
+                vec![(idx, Self::fan_info(f))]
+            }
+            None => self
+                .snap
+                .fans
+                .iter()
+                .map(|f| (f.index, Self::fan_info(f)))
+                .collect(),
+        };
+        for (idx, info) in channels {
+            match clamp_target(&info, target) {
+                FanTarget::Auto => {
+                    restore_superio_fan_auto(idx)?;
+                }
+                FanTarget::Fixed(pct) => {
+                    set_superio_fan_pwm_with_floor(idx, pct, SUPERIO_MIN_PWM_PCT)?;
+                }
+            }
+        }
+        self.refresh();
+        Ok(())
+    }
+
+    fn overridden(&self) -> bool {
+        !saved_superio_states().is_empty() || self.snap.fans.iter().any(|f| f.is_manual)
+    }
+
+    fn restore_firmware_control(&mut self) -> Result<()> {
+        let _ = restore_all_superio_fans_auto();
+        self.refresh();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,5 +1011,23 @@ mod tests {
         assert_eq!(ite_rpm_from_count(675), 1000);
         assert_eq!(ite_manual_target(0x90, 50, true), (0x10, 128));
         assert_eq!(ite_manual_target(0x80, 100, false), (127, 127));
+    }
+
+    #[test]
+    fn superio_cooling_device_parses_ids_and_enforces_floor() {
+        assert_eq!(SuperIoCoolingDevice::parse_fan_index("fan_2"), Some(2));
+        assert_eq!(SuperIoCoolingDevice::parse_fan_index("cpu_fan"), None);
+        let ch = SuperIoFanChannel {
+            index: 1,
+            label: "FAN2".into(),
+            rpm: 1200,
+            pwm_pct: 40,
+            mode_raw: 0x01,
+            is_manual: true,
+        };
+        let info = SuperIoCoolingDevice::fan_info(&ch);
+        assert_eq!(info.id, "fan_1");
+        assert_eq!(info.min_pct, SUPERIO_MIN_PWM_PCT);
+        assert_eq!(info.manual_pct, Some(40));
     }
 }

@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use opengear_mainboard::ram::{EneRamModule, RamEffect, RamProbe, RamRgbBackend};
+use tracing::{debug, info, warn};
 
 const TAG: &str = "asus_wmi";
 
@@ -89,23 +90,30 @@ mod imp {
 
     pub(super) fn probe() -> RamProbe {
         let Some(_lock) = lock_smbus() else {
+            warn!("Mutex SMBus occupé : sonde ASUS WMI RAM ignorée");
             return RamProbe::default();
         };
         let mut probe = RamProbe::default();
         for shift in [0u32, 1] {
-            let Ok(bus) = AsusWmiSmbus::open(shift) else {
-                return probe;
+            let bus = match AsusWmiSmbus::open(shift) {
+                Ok(b) => b,
+                Err(err) => {
+                    debug!(shift, ?err, "Interface ASUSManagement WMI SMBus absente");
+                    return probe;
+                }
             };
             probe.available = true;
-            probe.modules = ene::scan(&bus, &ADDRESSES, shift as u16, TAG);
-            if !probe.modules.is_empty() {
+            let modules = ene::scan(&bus, &ADDRESSES, shift as u16, TAG);
+            info!(shift, found = modules.len(), "Scan RAM via ASUS WMI SMBus");
+            if !modules.is_empty() {
+                probe.modules = modules;
                 break;
             }
         }
         probe
     }
 
-    /// Run `f` for every module on the bus variant (shift) it was found with.
+    /// Run `f` on every module grouped by bus variant (shift).
     pub(super) fn for_each<T>(
         items: &[T],
         module_of: impl Fn(&T) -> &EneRamModule,
@@ -127,6 +135,24 @@ mod imp {
                     applied += 1;
                 }
             }
+        }
+        Ok(applied)
+    }
+
+    pub(super) fn apply_all(modules: &[&EneRamModule], effect: &RamEffect) -> Result<usize> {
+        let _lock = lock_smbus().context("Bus SMBus occupé par un autre logiciel")?;
+        let mut applied = 0;
+        for shift in [0u32, 1] {
+            let mine: Vec<&EneRamModule> = modules
+                .iter()
+                .copied()
+                .filter(|m| m.bus_arg as u32 == shift)
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let bus = AsusWmiSmbus::open(shift)?;
+            applied += ene::apply_all(&bus, &mine, effect)?;
         }
         Ok(applied)
     }
@@ -157,14 +183,12 @@ impl RamRgbBackend for AsusWmiRamBackend {
     fn apply(&self, modules: &[&EneRamModule], effect: &RamEffect) -> Result<String> {
         #[cfg(windows)]
         {
-            let applied = imp::for_each(
-                modules,
-                |m| *m,
-                |bus, m| opengear_mainboard::ene::apply(bus, m, effect),
-            )?;
-            if applied == 0 {
-                anyhow::bail!("Aucune barrette ENE vérifiée — aucune écriture effectuée");
-            }
+            let applied = imp::apply_all(modules, effect)?;
+            anyhow::ensure!(
+                applied > 0 && applied == modules.len(),
+                "Écriture ASUS WMI RAM RGB incomplète : {applied}/{} barrette(s) vérifiée(s)",
+                modules.len()
+            );
             Ok(format!("OK ({applied}/{} DIMM)", modules.len()))
         }
         #[cfg(not(windows))]

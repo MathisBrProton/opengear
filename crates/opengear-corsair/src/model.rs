@@ -2,17 +2,20 @@
 
 use crate::device::{CorsairDevice, CorsairDeviceKind};
 use crate::hwp::HwpLightingKind;
-use crate::keymap::{K70_TKL_KEYS, layout_for_device};
+use crate::keymap::{K70_TKL_KEYS, keys_for_layout, layout_for_device};
 use crate::proto::CORSAIR_VID;
 use anyhow::{Context, Result, bail};
 use opengear_core::driver::{
-    ChoiceOption, Connection, Device, DeviceInfo, DeviceKind, DeviceStatus, Driver, Section,
-    Setting, Value, polling_rate_options, setting_ids,
+    ChoiceOption, Connection, Device, DeviceInfo, DeviceKeyGeom, DeviceKeyboardLayout, DeviceKind,
+    DeviceStatus, Driver, Section, Setting, Value, polling_rate_options, setting_ids,
 };
 use opengear_core::lighting::{
     EffectParams, EffectRequest, HardwareEffect, Led, Lighting, Zone, ZoneKind,
 };
-use opengear_core::{OperatingMode, PollingRate, Rgb};
+use opengear_core::{
+    OnboardMemory, OnboardProfileSummary, OperatingMode, PointerDevice, PointerDpiInfo,
+    PollingRate, Rgb,
+};
 
 /// Driver discovering all connected Corsair Bragi v2 devices.
 pub struct CorsairDriver;
@@ -235,6 +238,48 @@ impl Device for CorsairDevice {
         (self.info.kind == CorsairDeviceKind::Keyboard).then_some(self as &mut dyn Lighting)
     }
 
+    fn pointer(&mut self) -> Option<&mut dyn PointerDevice> {
+        self.info
+            .mouse
+            .is_some()
+            .then_some(self as &mut dyn PointerDevice)
+    }
+
+    fn onboard(&mut self) -> Option<&mut dyn OnboardMemory> {
+        (!self.info.hwp_profiles.is_empty()).then_some(self as &mut dyn OnboardMemory)
+    }
+
+    fn diagnostic_lines(&self) -> Vec<String> {
+        vec![format!(
+            "Corsair Bragi : report {} o | FlashTap 0xF5 = {}",
+            self.info.out_report_len, self.info.flashtap_probe
+        )]
+    }
+
+    fn keyboard_layout(&self) -> Option<DeviceKeyboardLayout> {
+        if self.info.kind != CorsairDeviceKind::Keyboard {
+            return None;
+        }
+        let desc = layout_for_device(self.info.vid, self.info.pid)?;
+        let keys = keys_for_layout(&desc, self.info.layout)
+            .into_iter()
+            .map(|k| DeviceKeyGeom {
+                code: k.code(),
+                fallback_label: k.label_qwerty,
+                x: k.x,
+                y: k.y,
+                width: k.width,
+                height: k.height,
+                led_index: k.led_index,
+            })
+            .collect();
+        Some(DeviceKeyboardLayout {
+            product_name: self.info.product_name.clone(),
+            standard: self.info.layout,
+            keys,
+        })
+    }
+
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
@@ -393,6 +438,80 @@ impl Lighting for CorsairDevice {
     fn release(&mut self) -> Result<()> {
         self.set_mode(OperatingMode::Hardware)?;
         Ok(())
+    }
+}
+
+impl PointerDevice for CorsairDevice {
+    fn pointer_info(&self) -> Option<PointerDpiInfo> {
+        let m = self.info.mouse.as_ref()?;
+        let active = (m.active_stage as usize).min(m.dpi_stages.len().saturating_sub(1));
+        let dpi_x = m.current_dpi_x.unwrap_or(m.dpi_stages[active]);
+        let dpi_y = m.current_dpi_y.unwrap_or(dpi_x);
+        let max_hz = self.info.max_pollrate.map_or(8000, |p| p.hz());
+        let supported_rates_hz = [125, 250, 500, 1000, 2000, 4000, 8000]
+            .into_iter()
+            .filter(|&hz| hz <= max_hz)
+            .collect();
+        Some(PointerDpiInfo {
+            dpi_x,
+            dpi_y,
+            min_dpi: 100,
+            max_dpi: 30000,
+            step_dpi: 50,
+            independent_xy: false,
+            stages: m.dpi_stages.to_vec(),
+            active_stage: Some(active),
+            report_rate_hz: self.info.pollrate.map(|p| p.hz()),
+            supported_rates_hz,
+        })
+    }
+
+    fn set_dpi(&mut self, x: u16, _y: Option<u16>) -> Result<()> {
+        let stage = self
+            .info
+            .mouse
+            .as_ref()
+            .map(|m| m.active_stage)
+            .unwrap_or(0);
+        self.set_mouse_dpi_stage(stage, x)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn set_dpi_stage(&mut self, stage: usize, dpi: u16) -> Result<()> {
+        self.set_mouse_dpi_stage(stage as u8, dpi)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn set_active_dpi_stage(&mut self, stage: usize) -> Result<()> {
+        self.set_mouse_active_stage(stage as u8)
+            .map_err(anyhow::Error::from)
+    }
+}
+
+impl OnboardMemory for CorsairDevice {
+    fn onboard_profiles(&self) -> Vec<OnboardProfileSummary> {
+        let active = self.info.active_hw_profile.unwrap_or(0) as u16;
+        self.info
+            .hwp_profiles
+            .iter()
+            .map(|hp| OnboardProfileSummary {
+                slot: hp.slot_index as u16,
+                name: hp.name.clone(),
+                active: hp.slot_index as u16 == active,
+                dpi_stages: Vec::new(),
+                report_rate_hz: None,
+                editable: false,
+            })
+            .collect()
+    }
+
+    fn set_active_onboard_profile(&mut self, slot: u16) -> Result<()> {
+        self.set_active_hw_profile(slot as u8)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn reload_onboard_profiles(&mut self) -> Result<()> {
+        self.reload_hwp_profiles().map_err(anyhow::Error::from)
     }
 }
 

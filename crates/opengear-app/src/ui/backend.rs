@@ -2,7 +2,7 @@ use super::{
     BackendMsg, SHUTDOWN_REQUESTED, SMART_FAN_ACTIVE, THERMAL_RGB_ACTIVE, UI_VISIBLE, UserEvent,
     send_reply,
 };
-use crate::audio_ext::read_output_peak;
+use crate::audio_ext::{AudioSpectrum, read_audio_spectrum};
 use crate::fan_watchdog;
 use crate::local_assets::LocalAssetCatalog;
 use crate::selftest::SelfTestReport;
@@ -11,31 +11,31 @@ use crate::system_ext::{
     AmbilightFrame, get_foreground_exe_name, idle_duration, list_visible_apps,
     sample_ambilight_screen,
 };
-use crate::tray_icon::tray_notify;
+use crate::tray_icon::{TrayMenuState, tray_notify, update_tray_state};
 use opengear_asus::{
-    AsusWmiCoolingStatus, AuraMainboardController, apply_asus_wmi_curve, probe_asus_wmi_cooling,
-    read_asus_wmi_channel,
+    AsusWmiCoolingStatus, apply_asus_wmi_curve, probe_asus_wmi_cooling, read_asus_wmi_channel,
 };
-use opengear_core::cooling::{FanChannelConfig, FanHeaderKind, FanPolicyMode, FanTempSource};
+use opengear_core::cooling::{
+    FanChannelConfig, FanCurveTracker, FanHeaderKind, FanPolicyMode, FanTempSource, SensorReadings,
+    resolve_temp_reading,
+};
 use opengear_core::driver::{Control, Device, DeviceKind, Setting, Value, setting_ids};
 use opengear_core::lighting::{
     DeviceLightingConfig, EffectRequest, LightingOverride, Zone, frame_len, render_frame,
 };
 use opengear_mainboard::{
-    HardwareSensorsSnapshot, RamRgbDevice, SuperIoSnapshot, read_superio_snapshot,
-    restore_all_superio_fans_auto,
+    HardwareSensorsSnapshot, SuperIoSnapshot, read_superio_snapshot, restore_all_superio_fans_auto,
 };
 use opengear_platform::{
     LaptopBatteryInfo, PowerPlan, SystemTelemetry, TelemetryCollector, is_elevated,
     is_laptop_chassis, list_power_plans, read_laptop_battery,
 };
 
-const SMART_FAN_FAILSAFE_TEMP_C: f32 = 100.0;
 use super::keyboard_view::KeyboardView;
 use opengear_core::{
-    AppConfig, DetectedDevice, EffectKind, Rgb, RgbEffectConfig, scan_hid_devices,
+    AppConfig, DetectedDevice, EffectKind, Rgb, RgbEffectConfig, blend_rgb, scan_hid_devices,
 };
-use opengear_corsair::{CorsairDevice, CorsairDeviceKind, key_code_for_led_index};
+use opengear_corsair::key_code_for_led_index;
 use opengear_input::{InputEngine, reset_held_state};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -70,11 +70,11 @@ pub(crate) struct BackendEngine {
     pub manual_profile_name: String,
     pub auto_switched: bool,
     pub last_ambilight: Option<AmbilightFrame>,
-    pub audio_smooth_peak: f32,
+    pub audio_spectrum: AudioSpectrum,
     pub last_device_frame_at: HashMap<String, Instant>,
+    pub last_device_frames: HashMap<String, Vec<Rgb>>,
     pub live_active_devices: HashSet<String>,
-    pub smart_fan_last_duty: [Option<u8>; 5],
-    pub smart_fan_ref_temp: [f32; 5],
+    pub smart_fan_trackers: [FanCurveTracker; 5],
     pub superio: SuperIoSnapshot,
     pub last_selftest: Option<SelfTestReport>,
     pub undo_stack: Vec<(String, AppConfig)>,
@@ -97,6 +97,8 @@ pub(crate) struct BackendEngine {
     pub last_ac_online: Option<bool>,
     /// `(device, setting, previous value)` changed by the battery saver, restored on AC.
     pub ac_saved_settings: Vec<(String, String, Value)>,
+    /// True in headless/selftest audits: suppresses OS tray/fan-watchdog side effects and live hooks.
+    pub headless: bool,
 }
 
 /// One change made by the battery saver: `(setting, new value, previous value)`.
@@ -201,17 +203,39 @@ impl BackendEngine {
             super::devices::discover_all(&drivers, &config.experimental_drivers);
         seed_and_resize_device_lighting(&mut config, &mut driver_devices);
 
-        if let Some(kb) = driver_devices.iter().find_map(|d| {
-            let c = d.as_any()?.downcast_ref::<CorsairDevice>()?;
-            (c.info.kind == CorsairDeviceKind::Keyboard).then_some(c)
-        }) {
-            let pr = kb.info.pollrate;
-            let br = kb.hw_brightness_pct();
+        if let Some(kb) = driver_devices
+            .iter()
+            .find(|d| d.info().kind == DeviceKind::Keyboard)
+        {
+            let settings = kb.settings();
+            let pr = settings.iter().find_map(|s| {
+                if s.id == setting_ids::POLLING_RATE
+                    && let Value::Text(hz_str) = &s.value
+                {
+                    hz_str
+                        .parse::<u16>()
+                        .ok()
+                        .and_then(opengear_core::PollingRate::from_hz)
+                } else {
+                    None
+                }
+            });
+            let br = settings.iter().find_map(|s| {
+                if s.id == setting_ids::HW_BRIGHTNESS
+                    && let Value::Number(pct) = &s.value
+                {
+                    Some((*pct).clamp(0.0, 100.0) as u8)
+                } else {
+                    None
+                }
+            });
             let prof = config.active_profile_mut();
             if let Some(rate) = pr {
                 prof.polling_rate = rate;
             }
-            prof.hw_brightness_pct = br;
+            if let Some(pct) = br {
+                prof.hw_brightness_pct = pct;
+            }
         }
 
         let mut telemetry = TelemetryCollector::new();
@@ -285,11 +309,11 @@ impl BackendEngine {
             manual_profile_name: String::new(),
             auto_switched: false,
             last_ambilight: None,
-            audio_smooth_peak: 0.0,
+            audio_spectrum: AudioSpectrum::default(),
             last_device_frame_at: HashMap::new(),
+            last_device_frames: HashMap::new(),
             live_active_devices: HashSet::new(),
-            smart_fan_last_duty: [None; 5],
-            smart_fan_ref_temp: [40.0; 5],
+            smart_fan_trackers: [FanCurveTracker::new(); 5],
             superio,
             last_selftest: None,
             undo_stack: Vec::new(),
@@ -308,6 +332,7 @@ impl BackendEngine {
             cooling_marker_ids: Vec::new(),
             last_ac_online,
             ac_saved_settings: Vec::new(),
+            headless: false,
         };
         // A device may already be overridden (e.g. Max Fan left on): arm the crash safety net.
         eng.sync_cooling_marker();
@@ -319,10 +344,131 @@ impl BackendEngine {
             || p0.mouse_debounce_ms > 0
             || p0.win_lock
             || !p0.bindings.is_empty()
+            || !p0.mouse_bindings.is_empty()
         {
             let _ = eng.input_engine.start();
         }
+        eng.sync_tray_state();
         eng
+    }
+
+    /// Construct a sandboxed headless engine backed by a disposable config path and injected devices,
+    /// without starting OS hooks, tray syncs, WMI polling, or fan watchdog markers.
+    pub(crate) fn new_headless(
+        config_path: PathBuf,
+        mut config: AppConfig,
+        mut driver_devices: Vec<Box<dyn Device>>,
+    ) -> Self {
+        migrate_legacy_profiles(&mut config);
+        seed_and_resize_device_lighting(&mut config, &mut driver_devices);
+        let cooling_channels: Vec<FanChannelConfig> = FanHeaderKind::ALL
+            .iter()
+            .map(|&h| FanChannelConfig::default_for(h))
+            .collect();
+        let manual_profile_name = config.active_profile.clone();
+        Self {
+            config_path,
+            config,
+            config_warning: None,
+            local_assets: Arc::new(LocalAssetCatalog::default()),
+            shared_sensors: Arc::new(Mutex::new(HardwareSensorsSnapshot::default())),
+            drivers: Vec::new(),
+            driver_devices,
+            last_hid_sig: Vec::new(),
+            telemetry: TelemetryCollector::new(),
+            last_tel: SystemTelemetry::default(),
+            power_plans: Vec::new(),
+            cooling_status: AsusWmiCoolingStatus {
+                is_admin: false,
+                wmi_available: false,
+                message: "Audit headless".into(),
+            },
+            cooling_channels,
+            initial_cooling_channels: vec![None; FanHeaderKind::ALL.len()],
+            input_engine: InputEngine::new(),
+            scanned_devices: Vec::new(),
+            start_time: Instant::now(),
+            foreground_app: None,
+            manual_profile_name,
+            auto_switched: false,
+            last_ambilight: None,
+            audio_spectrum: AudioSpectrum::default(),
+            last_device_frame_at: HashMap::new(),
+            last_device_frames: HashMap::new(),
+            live_active_devices: HashSet::new(),
+            smart_fan_trackers: [FanCurveTracker::new(); 5],
+            superio: SuperIoSnapshot::default(),
+            last_selftest: None,
+            undo_stack: Vec::new(),
+            visible_apps_cache: None,
+            watchdog_spawned: false,
+            suspended: false,
+            resume_reconnect_at: None,
+            blackout_lock: false,
+            blackout_idle: false,
+            blackout_applied: false,
+            battery_alerted: HashMap::new(),
+            is_laptop: false,
+            keyboard_view_cache: None,
+            laptop_battery: LaptopBatteryInfo::default(),
+            cooling_keepalive: HashMap::new(),
+            cooling_marker_ids: Vec::new(),
+            last_ac_online: None,
+            ac_saved_settings: Vec::new(),
+            headless: true,
+        }
+    }
+
+    pub(crate) fn invalidate_rgb_frames(&mut self) {
+        self.last_device_frame_at.clear();
+        self.last_device_frames.clear();
+    }
+
+    pub(crate) fn invalidate_rgb_frame_for(&mut self, dev_id: &str) {
+        self.last_device_frame_at.remove(dev_id);
+        self.last_device_frames.remove(dev_id);
+    }
+
+    pub(crate) fn sync_tray_state(&mut self) {
+        if self.headless {
+            return;
+        }
+        let sensors = self.latest_sensors();
+        let gpu_t = self
+            .last_tel
+            .gpu
+            .edge_temp_c
+            .or(self.last_tel.gpu.hotspot_temp_c);
+        let bat = self
+            .driver_devices
+            .iter_mut()
+            .filter_map(|d| d.status().battery_pct)
+            .next();
+        let mut parts = Vec::new();
+        if let Some(c) = sensors.cpu_temp_c {
+            parts.push(format!("CPU {}°C", c.round() as i32));
+        }
+        if let Some(g) = gpu_t {
+            parts.push(format!("GPU {}°C", g.round() as i32));
+        }
+        if let Some(b) = bat {
+            parts.push(format!("Batterie {b}%"));
+        }
+        let prof = self.config.active_profile_mut().clone();
+        let sync_rgb = prof.enable_rgb || prof.device_lighting.values().any(|c| c.enabled);
+        let state = TrayMenuState {
+            active_profile: self.config.active_profile.clone(),
+            profiles: self
+                .config
+                .profiles
+                .iter()
+                .map(|p| p.name.clone())
+                .collect(),
+            socd_enabled: prof.socd.enabled,
+            sync_rgb_enabled: sync_rgb,
+            status_line: parts.join(" · "),
+        };
+        update_tray_state(state);
     }
 
     pub(crate) fn persist_config(&mut self) {
@@ -336,6 +482,9 @@ impl BackendEngine {
         self.input_engine.update_rules(
             prof.win_lock,
             &prof.bindings,
+            &prof.mouse_bindings,
+            &prof.layers,
+            &prof.mouse_layers,
             &prof.socd,
             prof.key_chatter_ms,
             prof.mouse_debounce_ms,
@@ -364,10 +513,13 @@ impl BackendEngine {
     }
 
     pub(crate) fn sync_fan_marker(&mut self) {
+        if self.headless {
+            return;
+        }
         let marker = fan_watchdog::FanOverrideMarker {
             pid: std::process::id(),
-            wmi_restore: (0..self.smart_fan_last_duty.len())
-                .filter(|&i| self.smart_fan_last_duty[i].is_some())
+            wmi_restore: (0..self.smart_fan_trackers.len())
+                .filter(|&i| self.smart_fan_trackers[i].last_duty().is_some())
                 .filter_map(|i| self.wmi_restore_config(i))
                 .collect(),
             superio_restore: opengear_mainboard::saved_superio_states(),
@@ -433,9 +585,11 @@ impl BackendEngine {
         self.input_engine.stop();
         reset_held_state();
 
+        let lighting_cfgs = self.config.active_profile_mut().device_lighting.clone();
         for dev in &mut self.driver_devices {
+            let id = dev.info().id;
             if let Some(lighting) = dev.lighting() {
-                let _ = lighting.release();
+                release_device_lighting(lighting, lighting_cfgs.get(&id));
             }
         }
         let mut remaining_cooling = Vec::new();
@@ -451,8 +605,8 @@ impl BackendEngine {
         }
 
         let mut remaining_wmi = Vec::new();
-        for i in 0..self.smart_fan_last_duty.len() {
-            if self.smart_fan_last_duty[i].take().is_some()
+        for i in 0..self.smart_fan_trackers.len() {
+            if self.smart_fan_trackers[i].last_duty().is_some()
                 && let Some(cfg) = self.wmi_restore_config(i)
                 && let Err(e) = apply_asus_wmi_curve(&cfg)
             {
@@ -462,6 +616,7 @@ impl BackendEngine {
                 );
                 remaining_wmi.push(cfg);
             }
+            self.smart_fan_trackers[i].reset();
         }
         let superio_logs = restore_all_superio_fans_auto();
         let superio_failed = superio_logs.iter().any(|l| {
@@ -629,6 +784,7 @@ impl BackendEngine {
                     }
 
                     if state_changed {
+                        self.sync_tray_state();
                         let st = self.full_state_json();
                         let _ = proxy.send_event(UserEvent::EvalJs(format!(
                             "window.__ogHotplug && window.__ogHotplug({st});"
@@ -638,7 +794,7 @@ impl BackendEngine {
                 last_fg_check = Instant::now();
             }
 
-            // 1. Live telemetry push
+            // 1. Live telemetry push (also keeps tray status tooltip fresh even when hidden)
             let tel_interval = if ui_open {
                 Duration::from_secs(1)
             } else {
@@ -648,6 +804,7 @@ impl BackendEngine {
                 && last_tel_push.elapsed() >= tel_interval
             {
                 self.last_tel = self.telemetry.sample();
+                self.sync_tray_state();
                 if ui_open {
                     let tel_json = self.telemetry_json();
                     let _ = proxy.send_event(UserEvent::EvalJs(format!(
@@ -657,59 +814,44 @@ impl BackendEngine {
                 last_tel_push = Instant::now();
             }
 
-            // 1b. Smart Cooling (GPU / Max(CPU, GPU) with hysteresis)
+            // 1b. Smart Cooling (GPU / Max(CPU, GPU) with EMA smoothing + hysteresis)
             if smart_fan_active && last_smart_fan.elapsed() >= Duration::from_secs(3) {
+                let dt_secs = last_smart_fan.elapsed().as_secs_f32();
                 let mut marker_dirty = false;
                 let sensors = self.latest_sensors();
-                let gpu_edge: Option<f32> = self
-                    .last_tel
-                    .gpu
-                    .edge_temp_c
-                    .or(self.last_tel.gpu.hotspot_temp_c);
-                let gpu_hot: Option<f32> = self
-                    .last_tel
-                    .gpu
-                    .hotspot_temp_c
-                    .or(self.last_tel.gpu.edge_temp_c);
-                let cpu_t: Option<f32> = sensors.cpu_temp_c;
+                let readings = SensorReadings {
+                    cpu: sensors.cpu_temp_c,
+                    gpu_edge: self
+                        .last_tel
+                        .gpu
+                        .edge_temp_c
+                        .or(self.last_tel.gpu.hotspot_temp_c),
+                    gpu_hotspot: self
+                        .last_tel
+                        .gpu
+                        .hotspot_temp_c
+                        .or(self.last_tel.gpu.edge_temp_c),
+                    nvme: sensors.nvme_temp_c,
+                    motherboard: sensors.motherboard_temp_c,
+                };
                 for (idx, ch) in self.cooling_channels.iter().enumerate() {
                     if ch.source == FanTempSource::CpuBios || idx >= 5 {
                         continue;
                     }
-                    let measured = match ch.source {
-                        FanTempSource::GpuEdge => gpu_edge,
-                        FanTempSource::GpuHotspot => gpu_hot,
-                        FanTempSource::MaxCpuGpu => match (cpu_t, gpu_edge) {
-                            (Some(c), Some(g)) => Some(c.max(g)),
-                            (c, g) => c.or(g),
-                        },
-                        FanTempSource::CpuBios => continue,
-                    };
-                    let raw_t = measured.unwrap_or(SMART_FAN_FAILSAFE_TEMP_C);
-                    let hyst = ch.hysteresis_c as f32;
-                    let ref_t = self.smart_fan_ref_temp[idx];
-                    // Rising: follow immediately. Falling: only once below the hysteresis band.
-                    let eff_t = if raw_t >= ref_t || raw_t <= ref_t - hyst {
-                        self.smart_fan_ref_temp[idx] = raw_t;
-                        raw_t
-                    } else {
-                        ref_t
-                    };
-                    let target_duty = ch
-                        .interpolate_duty(eff_t)
-                        .max(ch.header.min_safe_duty_pct());
-                    let changed = self.smart_fan_last_duty[idx]
-                        .map(|prev| prev.abs_diff(target_duty) >= 3)
-                        .unwrap_or(true);
-                    if changed {
+                    let measured =
+                        resolve_temp_reading(ch.source, ch.custom_mix.as_ref(), &readings);
+                    if let Some(target_duty) =
+                        self.smart_fan_trackers[idx].evaluate(ch, measured, dt_secs, 3)
+                    {
                         let mut flat = ch.clone();
                         flat.policy = FanPolicyMode::Manual;
                         for pt in &mut flat.curve {
                             pt.duty_pct = target_duty;
                         }
                         if apply_asus_wmi_curve(&flat).is_ok() {
-                            let newly_overridden = self.smart_fan_last_duty[idx].is_none();
-                            self.smart_fan_last_duty[idx] = Some(target_duty);
+                            let newly_overridden =
+                                self.smart_fan_trackers[idx].last_duty().is_none();
+                            self.smart_fan_trackers[idx].mark_applied(target_duty);
                             if newly_overridden {
                                 marker_dirty = true;
                             }
@@ -841,6 +983,7 @@ impl BackendEngine {
             }
             BackendMsg::TrayToggleSocd => {
                 self.tray_toggle_socd();
+                self.sync_tray_state();
                 if UI_VISIBLE.load(Ordering::Relaxed) {
                     let st = self.full_state_json();
                     let _ = proxy.send_event(UserEvent::EvalJs(format!(
@@ -850,6 +993,27 @@ impl BackendEngine {
             }
             BackendMsg::TrayToggleSync => {
                 self.tray_toggle_sync();
+                self.sync_tray_state();
+                if UI_VISIBLE.load(Ordering::Relaxed) {
+                    let st = self.full_state_json();
+                    let _ = proxy.send_event(UserEvent::EvalJs(format!(
+                        "window.__ogHotplug && window.__ogHotplug({st});"
+                    )));
+                }
+            }
+            BackendMsg::TraySwitchProfile(name) => {
+                self.tray_switch_profile(&name);
+                self.sync_tray_state();
+                if UI_VISIBLE.load(Ordering::Relaxed) {
+                    let st = self.full_state_json();
+                    let _ = proxy.send_event(UserEvent::EvalJs(format!(
+                        "window.__ogHotplug && window.__ogHotplug({st});"
+                    )));
+                }
+            }
+            BackendMsg::TrayApplyPreset(preset) => {
+                self.tray_apply_preset(&preset);
+                self.sync_tray_state();
                 if UI_VISIBLE.load(Ordering::Relaxed) {
                     let st = self.full_state_json();
                     let _ = proxy.send_event(UserEvent::EvalJs(format!(
@@ -889,7 +1053,7 @@ impl BackendEngine {
                 if req.cmd == "pawnio_install" || req.cmd == "run_selftest" {
                     self.spawn_async_job(req.id, &req.cmd, backend_tx.clone());
                 } else {
-                    let res = self.handle_cmd(&req.cmd, &req.payload, proxy);
+                    let res = self.handle_cmd(&req.cmd, &req.payload, Some(proxy));
                     send_reply(proxy, req.id, res);
                 }
             }
@@ -908,7 +1072,9 @@ impl BackendEngine {
             SysEvent::Resume => {
                 info!("Sortie de veille — reconnexion planifiée");
                 self.suspended = false;
-                self.smart_fan_last_duty = [None; 5];
+                for tr in &mut self.smart_fan_trackers {
+                    tr.reset();
+                }
                 self.resume_reconnect_at = Some(Instant::now() + Duration::from_millis(1200));
             }
             SysEvent::Lock => {
@@ -972,19 +1138,30 @@ impl BackendEngine {
                 continue;
             }
             let mut consider = |ov: &LightingOverride| {
+                let is_global = matches!(ov, LightingOverride::Global);
                 let kind = match ov {
                     LightingOverride::Global => prof.rgb.kind,
                     LightingOverride::Software { effect } => effect.kind,
                     LightingOverride::Hardware { .. } | LightingOverride::Off => return,
                 };
                 any_live = true;
-                match kind {
+                let check_kind = |k: EffectKind, animated: &mut bool, thermal: &mut bool| match k {
                     EffectKind::Static
                     | EffectKind::PerKey
                     | EffectKind::Gradient
                     | EffectKind::Off => {}
-                    EffectKind::Thermal => any_thermal = true,
-                    _ => any_animated = true,
+                    EffectKind::Thermal => *thermal = true,
+                    _ => *animated = true,
+                };
+                check_kind(kind, &mut any_animated, &mut any_thermal);
+                if is_global {
+                    for layer in prof
+                        .rgb_layers
+                        .iter()
+                        .filter(|l| l.enabled && l.opacity > 0.0)
+                    {
+                        check_kind(layer.effect.kind, &mut any_animated, &mut any_thermal);
+                    }
                 }
             };
             let base = cfg.mode.as_ref().unwrap_or(&LightingOverride::Global);
@@ -1015,7 +1192,7 @@ impl BackendEngine {
                         .zones
                         .values()
                         .any(|z| !matches!(z, LightingOverride::Hardware { .. })));
-            has_sw && !self.last_device_frame_at.contains_key(&id)
+            has_sw && !self.last_device_frames.contains_key(&id)
         })
     }
 
@@ -1029,7 +1206,7 @@ impl BackendEngine {
         thermal_rgb(temp)
     }
 
-    fn push_live_rgb_frame(&mut self) {
+    pub(crate) fn push_live_rgb_frame(&mut self) {
         let t = self.start_time.elapsed().as_secs_f32();
         let prof = self.config.active_profile_mut().clone();
         let thermal_col = self.compute_thermal_rgb();
@@ -1051,6 +1228,7 @@ impl BackendEngine {
             for ov in std::iter::once(cfg.mode.as_ref().unwrap_or(&LightingOverride::Global))
                 .chain(cfg.zones.values())
             {
+                let is_global = matches!(ov, LightingOverride::Global);
                 let kind = match ov {
                     LightingOverride::Global => prof.rgb.kind,
                     LightingOverride::Software { effect } => effect.kind,
@@ -1062,6 +1240,20 @@ impl BackendEngine {
                     EffectKind::ReactiveTyping => need_reactive = true,
                     _ => {}
                 }
+                if is_global {
+                    for layer in prof
+                        .rgb_layers
+                        .iter()
+                        .filter(|l| l.enabled && l.opacity > 0.0)
+                    {
+                        match layer.effect.kind {
+                            EffectKind::Ambilight => need_ambilight = true,
+                            EffectKind::AudioVisualizer => need_audio = true,
+                            EffectKind::ReactiveTyping => need_reactive = true,
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
 
@@ -1071,16 +1263,11 @@ impl BackendEngine {
         }
 
         if need_audio {
-            let raw = (read_output_peak() * 1.45).clamp(0.0, 1.0);
-            if raw > self.audio_smooth_peak {
-                self.audio_smooth_peak = self.audio_smooth_peak * 0.35 + raw * 0.65;
-            } else {
-                self.audio_smooth_peak *= 0.84;
-            }
+            self.audio_spectrum = read_audio_spectrum();
         }
 
         let reactive_centers: Vec<(f32, f32, f32)> = if need_reactive {
-            if !self.input_engine.is_running() {
+            if !self.headless && !self.input_engine.is_running() {
                 let _ = self.input_engine.start();
             }
             let ripples = self.input_engine.recent_key_ripples(1.1);
@@ -1094,7 +1281,7 @@ impl BackendEngine {
         };
 
         let amb = self.last_ambilight.clone();
-        let audio_peak = self.audio_smooth_peak;
+        let audio = self.audio_spectrum;
         let placements = self.config.device_placements.clone();
 
         for dev in &mut self.driver_devices {
@@ -1113,8 +1300,9 @@ impl BackendEngine {
 
             if !has_software_zone {
                 if self.live_active_devices.remove(&id) {
-                    let _ = lighting.release();
+                    release_device_lighting(lighting, prof.device_lighting.get(&id));
                 }
+                self.last_device_frames.remove(&id);
                 continue;
             }
 
@@ -1135,20 +1323,50 @@ impl BackendEngine {
                 t,
                 amb: amb.as_ref(),
                 reactive_centers: &reactive_centers,
-                audio_peak,
+                audio,
                 thermal_col,
             };
 
             for zone in &zones {
                 let ov = cfg.zones.get(&zone.id).unwrap_or(base);
                 match ov {
-                    LightingOverride::Off | LightingOverride::Hardware { .. } => {
+                    LightingOverride::Off => {
                         frame.extend(std::iter::repeat_n(Rgb::BLACK, zone.leds.len()));
                     }
+                    LightingOverride::Hardware { request } => {
+                        // Preserve hardware color on mixed devices rather than sending Rgb::BLACK.
+                        let fill = if request.effect.eq_ignore_ascii_case("Off")
+                            || request.effect.ends_with(":Off")
+                        {
+                            Rgb::BLACK
+                        } else {
+                            request.colors.first().copied().unwrap_or(Rgb::CYAN)
+                        };
+                        frame.extend(std::iter::repeat_n(fill, zone.leds.len()));
+                    }
                     LightingOverride::Global => {
-                        frame.extend(render_effect_for_zone(
-                            &prof.rgb, zone, &placement, &frame_ctx,
-                        ));
+                        let mut colors =
+                            render_effect_for_zone(&prof.rgb, zone, &placement, &frame_ctx);
+                        for layer in prof
+                            .rgb_layers
+                            .iter()
+                            .filter(|l| l.enabled && l.opacity > 0.0)
+                        {
+                            let over =
+                                render_effect_for_zone(&layer.effect, zone, &placement, &frame_ctx);
+                            for (i, led) in zone.leds.iter().enumerate() {
+                                let matches_mask = layer.key_filter.is_empty()
+                                    || led
+                                        .key_code
+                                        .as_ref()
+                                        .is_some_and(|kc| layer.key_filter.iter().any(|m| m == kc));
+                                if matches_mask {
+                                    colors[i] =
+                                        blend_rgb(colors[i], over[i], layer.blend, layer.opacity);
+                                }
+                            }
+                        }
+                        frame.extend(colors);
                     }
                     LightingOverride::Software { effect } => {
                         frame.extend(render_effect_for_zone(effect, zone, &placement, &frame_ctx));
@@ -1156,8 +1374,19 @@ impl BackendEngine {
                 }
             }
 
-            let _ = lighting.set_frame(&frame);
-            self.live_active_devices.insert(id.clone());
+            let first_activation = self.live_active_devices.insert(id.clone());
+            if !self
+                .last_device_frames
+                .get(&id)
+                .is_some_and(|prev| prev == &frame)
+            {
+                let _ = lighting.set_frame(&frame);
+                // Keep static frames un-cached on the very first activation so one confirmation
+                // frame is resent 35 ms later (covers MCUs like ASUS AULA3 transitioning to Direct).
+                if !first_activation {
+                    self.last_device_frames.insert(id.clone(), frame);
+                }
+            }
             self.last_device_frame_at.insert(id, Instant::now());
         }
     }
@@ -1176,34 +1405,57 @@ impl BackendEngine {
     }
 
     pub(crate) fn reconnect_vendors(&mut self, vendors: &[u16]) {
+        let enabled = &self.config.experimental_drivers;
+        let touched_prefixes: Vec<String> = self
+            .drivers
+            .iter()
+            .filter(|d| {
+                (!d.experimental() || enabled.contains(d.name()))
+                    && d.usb_vendor_ids().iter().any(|v| vendors.contains(v))
+            })
+            .map(|d| format!("{}:", d.name()))
+            .collect();
         self.rediscover_drivers_for(vendors);
         seed_and_resize_device_lighting(&mut self.config, &mut self.driver_devices);
-        self.last_device_frame_at.clear();
-        self.live_active_devices.clear();
+        for prefix in &touched_prefixes {
+            self.last_device_frame_at
+                .retain(|id, _| !id.starts_with(prefix));
+            self.last_device_frames
+                .retain(|id, _| !id.starts_with(prefix));
+            self.live_active_devices
+                .retain(|id| !id.starts_with(prefix));
+        }
         self.invalidate_keyboard_view();
         self.scanned_devices = scan_hid_devices(false).unwrap_or_default();
+        self.sync_tray_state();
     }
 
     pub(crate) fn reconnect_all(&mut self) {
         self.driver_devices =
             super::devices::discover_all(&self.drivers, &self.config.experimental_drivers);
         seed_and_resize_device_lighting(&mut self.config, &mut self.driver_devices);
-        self.last_device_frame_at.clear();
+        self.invalidate_rgb_frames();
         self.live_active_devices.clear();
         self.invalidate_keyboard_view();
 
         self.cooling_keepalive.clear();
-        let device_fans = device_cooling_owner(&mut self.driver_devices);
-        self.cooling_status = mainboard_cooling_status(device_fans.as_deref());
-        self.sync_cooling_marker();
-        self.power_plans = list_power_plans();
-        self.scanned_devices = scan_hid_devices(false).unwrap_or_default();
-        self.last_hid_sig = compute_hid_signature();
+        if !self.headless {
+            let device_fans = device_cooling_owner(&mut self.driver_devices);
+            self.cooling_status = mainboard_cooling_status(device_fans.as_deref());
+            self.sync_cooling_marker();
+            self.power_plans = list_power_plans();
+            self.scanned_devices = scan_hid_devices(false).unwrap_or_default();
+            self.last_hid_sig = compute_hid_signature();
+            self.sync_tray_state();
+        }
     }
 
     pub(crate) fn profile_needs_input_engine(&mut self) -> bool {
         let p = self.config.active_profile_mut();
         let any_reactive = p.rgb.kind == EffectKind::ReactiveTyping
+            || p.rgb_layers
+                .iter()
+                .any(|l| l.enabled && l.effect.kind == EffectKind::ReactiveTyping)
             || p.device_lighting.values().any(|cfg| {
                 cfg.enabled
                     && std::iter::once(cfg.mode.as_ref())
@@ -1222,6 +1474,9 @@ impl BackendEngine {
             || p.mouse_debounce_ms > 0
             || p.win_lock
             || !p.bindings.is_empty()
+            || !p.mouse_bindings.is_empty()
+            || p.layers.values().any(|m| !m.is_empty())
+            || p.mouse_layers.values().any(|m| !m.is_empty())
             || any_reactive
     }
 
@@ -1229,7 +1484,7 @@ impl BackendEngine {
         seed_and_resize_device_lighting(&mut self.config, &mut self.driver_devices);
         let prof = self.config.active_profile_mut().clone();
         self.blackout_applied = false;
-        self.last_device_frame_at.clear();
+        self.invalidate_rgb_frames();
         for dev in &mut self.driver_devices {
             let id = dev.info().id;
             let Some(lighting) = dev.lighting() else {
@@ -1237,7 +1492,7 @@ impl BackendEngine {
             };
             if let Some(cfg) = prof.device_lighting.get(&id) {
                 if !cfg.enabled {
-                    let _ = lighting.release();
+                    release_device_lighting(lighting, Some(cfg));
                 } else if let Some(LightingOverride::Hardware { request }) = &cfg.mode {
                     let _ = apply_validated_hw_effect(lighting, request);
                 }
@@ -1271,13 +1526,11 @@ impl BackendEngine {
 
     pub(crate) fn push_blackout_frame(&mut self) {
         for dev in &mut self.driver_devices {
-            let is_fast = dev
-                .as_any()
-                .is_some_and(|a| a.is::<CorsairDevice>() || a.is::<AuraMainboardController>());
-            if self.blackout_applied && !is_fast {
-                continue;
-            }
             if let Some(lighting) = dev.lighting() {
+                let is_fast = lighting.max_fps() >= 20;
+                if self.blackout_applied && !is_fast {
+                    continue;
+                }
                 let len = frame_len(&lighting.zones());
                 let _ = lighting.set_frame(&vec![Rgb::BLACK; len]);
             }
@@ -1285,6 +1538,7 @@ impl BackendEngine {
         if !self.blackout_applied {
             info!("Éclairage coupé (session verrouillée ou inactivité)");
         }
+        self.last_device_frames.clear();
         self.blackout_applied = true;
     }
 
@@ -1298,14 +1552,14 @@ impl BackendEngine {
             let cfg = prof.device_lighting.get(&id);
             let enabled = cfg.is_some_and(|c| c.enabled);
             if !enabled {
-                let _ = lighting.release();
+                release_device_lighting(lighting, cfg);
             } else if let Some(LightingOverride::Hardware { request }) =
                 cfg.and_then(|c| c.mode.as_ref())
             {
                 let _ = apply_validated_hw_effect(lighting, request);
             }
         }
-        self.last_device_frame_at.clear();
+        self.invalidate_rgb_frames();
         self.blackout_applied = false;
         info!("Éclairage rétabli");
     }
@@ -1446,11 +1700,12 @@ impl BackendEngine {
     }
 }
 
-/// Model of the first device whose fans OpenGear drives through `Cooling`, if any.
+/// Model of the first laptop device whose fans OpenGear drives through `Cooling`, if any.
+/// Desktop motherboard drivers (`asus_wmi_cooling`, `superio`) coexist with `cooling_channels`.
 pub(crate) fn device_cooling_owner(devices: &mut [Box<dyn Device>]) -> Option<String> {
     devices.iter_mut().find_map(|d| {
-        let model = d.info().model;
-        d.cooling().map(|_| model)
+        let info = d.info();
+        (info.kind == DeviceKind::Laptop && d.cooling().is_some()).then_some(info.model)
     })
 }
 
@@ -1486,14 +1741,9 @@ pub(crate) fn seed_and_resize_device_lighting(
     for prof in &mut config.profiles {
         for d in devices.iter_mut() {
             let id = d.info().id;
-            let is_corsair = d.as_any().is_some_and(|a| a.is::<CorsairDevice>());
-            let is_asus = d
-                .as_any()
-                .is_some_and(|a| a.is::<AuraMainboardController>());
-            // Legacy `omen_sync_rgb` only seeds the first lighting config of the HP OMEN
-            // keyboard (matched by its device id, no downcast).
+            let is_corsair = id.starts_with("corsair:");
+            let is_asus = id.starts_with("asus_aura:");
             let is_omen = id.starts_with("hp_omen:");
-            let _is_ram = d.as_any().is_some_and(|a| a.is::<RamRgbDevice>());
             if d.lighting().is_none() {
                 continue;
             }
@@ -1567,11 +1817,53 @@ pub(crate) fn apply_validated_hw_effect(
     lighting.apply_hardware_effect(&validated)
 }
 
+/// Releases software control and, when a hardware effect (`last_hardware` / `last_zone_hardware`)
+/// was previously configured on this device, restores it in volatile RAM (`save = false`) instead
+/// of leaving controllers such as ASUS Aura on their fallback mode.
+pub(crate) fn release_device_lighting(
+    lighting: &mut dyn opengear_core::lighting::Lighting,
+    cfg: Option<&DeviceLightingConfig>,
+) {
+    if let Err(err) = lighting.release() {
+        tracing::warn!(?err, "Échec release éclairage matériel");
+    }
+    if let Some(c) = cfg {
+        if let Some(ref req) = c.last_hardware {
+            let mut restore = req.clone();
+            restore.save = false;
+            tracing::info!(
+                effect = %restore.effect,
+                colors = ?restore.colors.iter().map(|c| c.to_hex()).collect::<Vec<_>>(),
+                "Restauration effet matériel mémorisé (appareil)"
+            );
+            if let Err(err) = apply_validated_hw_effect(lighting, &restore) {
+                tracing::warn!(?err, effect = %restore.effect, "Échec restauration effet matériel appareil");
+            }
+        }
+        for (zid, req) in &c.last_zone_hardware {
+            let mut restore = req.clone();
+            restore.save = false;
+            if restore.zone.is_none() {
+                restore.zone = Some(zid.clone());
+            }
+            tracing::info!(
+                zone = %zid,
+                effect = %restore.effect,
+                colors = ?restore.colors.iter().map(|c| c.to_hex()).collect::<Vec<_>>(),
+                "Restauration effet matériel mémorisé (zone)"
+            );
+            if let Err(err) = apply_validated_hw_effect(lighting, &restore) {
+                tracing::warn!(?err, zone = %zid, effect = %restore.effect, "Échec restauration effet matériel zone");
+            }
+        }
+    }
+}
+
 struct LiveFrameCtx<'a> {
     t: f32,
     amb: Option<&'a AmbilightFrame>,
     reactive_centers: &'a [(f32, f32, f32)],
-    audio_peak: f32,
+    audio: AudioSpectrum,
     thermal_col: Rgb,
 }
 
@@ -1616,18 +1908,26 @@ fn render_effect_for_zone(
                 .collect()
         }
         EffectKind::AudioVisualizer => {
-            let lvl = ctx.audio_peak;
             let c1 = effect.primary;
             let c2 = effect.secondary;
             let br = effect.brightness;
+            let bands = ctx.audio.bands;
             zone.leds
                 .iter()
                 .map(|led| {
                     let (nx, ny) = placement.map(led);
-                    let dist = (nx - 0.5).abs() * 2.0;
-                    let bar = ((lvl - dist) * 5.0).clamp(0.0, 1.0);
-                    let bg = c2.scale(0.08);
-                    let peak_col = c1.lerp(c2, dist * 0.7 + (1.0 - ny) * 0.3);
+                    // Interpolate the 8 logarithmic FFT bands across horizontal position [0..1].
+                    let pos = nx.clamp(0.0, 1.0) * 7.0;
+                    let idx0 = (pos.floor() as usize).min(7);
+                    let idx1 = (idx0 + 1).min(7);
+                    let frac = pos - (idx0 as f32);
+                    let band_lvl =
+                        (bands[idx0] * (1.0 - frac) + bands[idx1] * frac).clamp(0.0, 1.0);
+                    let height_fill = 1.0 - ny.clamp(0.0, 1.0);
+                    let bar =
+                        ((band_lvl * 1.1 - height_fill) * 5.0 + band_lvl * 0.4).clamp(0.0, 1.0);
+                    let bg = c2.scale(0.07);
+                    let peak_col = c1.lerp(c2, nx * 0.65 + (1.0 - ny) * 0.35);
                     bg.lerp(peak_col, bar).scale(br)
                 })
                 .collect()

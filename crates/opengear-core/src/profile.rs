@@ -1,4 +1,4 @@
-use crate::color::RgbEffectConfig;
+use crate::color::{RgbEffectConfig, RgbLayer};
 use crate::device::{KeyboardLayout, PollingRate};
 use crate::keyboard::FormFactor;
 use crate::lighting::{DeviceLightingConfig, Placement};
@@ -18,6 +18,23 @@ pub struct MacroStep {
     pub delay_ms: u32,
 }
 
+/// How a macro action repeats when its trigger key/button is pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MacroMode {
+    /// Play the sequence once per press.
+    #[default]
+    Once,
+    /// Repeat continuously while the trigger key/button is held down.
+    WhileHeld,
+    /// Start repeating on first press, stop on the next press.
+    Toggle,
+}
+
+fn default_tap_ms() -> u16 {
+    200
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum KeyAction {
@@ -26,9 +43,25 @@ pub enum KeyAction {
     /// Disable the key completely
     Disable,
     /// Multi-step macro sequence
-    Macro { name: String, steps: Vec<MacroStep> },
+    Macro {
+        name: String,
+        steps: Vec<MacroStep>,
+        #[serde(default)]
+        mode: MacroMode,
+    },
     /// Send a text string
     Text { text: String, delay_ms: u32 },
+    /// Hold to activate a secondary key/mouse layer (Fn / G-Shift).
+    LayerHold { layer: String },
+    /// Press to toggle a secondary key/mouse layer on or off.
+    LayerToggle { layer: String },
+    /// Short tap sends `tap_key`, holding >= `threshold_ms` (or chording) holds `hold_key`.
+    TapHold {
+        tap_key: String,
+        hold_key: String,
+        #[serde(default = "default_tap_ms")]
+        threshold_ms: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +123,19 @@ pub struct KeyboardProfile {
     pub win_lock: bool,
     /// Key remaps/macros keyed by canonical key name (e.g. "CAPS", "F1", "SCROLL")
     pub bindings: BTreeMap<String, KeyAction>,
+    /// Universal software mouse button/wheel bindings keyed by `"MOUSE_MIDDLE"`, `"MOUSE_X1"`,
+    /// `"MOUSE_X2"`, `"WHEEL_UP"`, `"WHEEL_DOWN"`.
+    #[serde(default)]
+    pub mouse_bindings: BTreeMap<String, KeyAction>,
+    /// Secondary key bindings grouped by layer name (e.g. `"fn"`).
+    #[serde(default)]
+    pub layers: BTreeMap<String, BTreeMap<String, KeyAction>>,
+    /// Secondary mouse bindings grouped by layer name (e.g. `"fn"`).
+    #[serde(default)]
+    pub mouse_layers: BTreeMap<String, BTreeMap<String, KeyAction>>,
+    /// Overlay RGB layers composited on top of `rgb`.
+    #[serde(default)]
+    pub rgb_layers: Vec<RgbLayer>,
     /// Synchronize ASUS Aura motherboard + ARGB headers with OpenGear RGB effect
     #[serde(default)]
     pub sync_asus_aura: bool,
@@ -132,6 +178,10 @@ impl Default for KeyboardProfile {
             rgb: RgbEffectConfig::default(),
             win_lock: false,
             bindings: BTreeMap::new(),
+            mouse_bindings: BTreeMap::new(),
+            layers: BTreeMap::new(),
+            mouse_layers: BTreeMap::new(),
+            rgb_layers: Vec::new(),
             sync_asus_aura: false,
             asus_argb_led_counts: BTreeMap::new(),
             silent_loop3_argb_channel: None,
@@ -369,6 +419,7 @@ impl AppConfig {
         let h = p.height.clamp(0.05, 1.0);
         let x = p.x.clamp(0.0, 1.0 - w);
         let y = p.y.clamp(0.0, 1.0 - h);
+        let rotation_deg = p.rotation_deg.clamp(-180.0, 180.0);
         self.device_placements.insert(
             device_id.into(),
             Placement {
@@ -376,6 +427,7 @@ impl AppConfig {
                 y,
                 width: w,
                 height: h,
+                rotation_deg,
             },
         );
     }
@@ -423,6 +475,7 @@ mod tests {
                 y: 0.5,
                 width: 0.6,
                 height: 0.4,
+                rotation_deg: 0.0,
             },
         );
         {
@@ -589,6 +642,42 @@ CAPS = { type = "Remap", target = "F13" }
         assert!(warning.is_none());
         assert_eq!(cfg.profiles.len(), 1);
         assert!(cfg.experimental_drivers.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_macro_without_mode_and_profile_without_mouse_bindings_load() {
+        let dir = temp_dir("macro-mode-compat");
+        let path = dir.join(CONFIG_FILE_NAME);
+        let toml_body = r#"
+active_profile = "Default"
+
+[[profiles]]
+name = "Default"
+polling_rate = "Hz1000"
+hw_brightness_pct = 100
+enable_rgb = false
+win_lock = false
+
+[profiles.rgb]
+kind = "Static"
+primary = { r = 0, g = 210, b = 255 }
+secondary = { r = 255, g = 0, b = 140 }
+speed = 1.0
+brightness = 1.0
+reverse = false
+
+[profiles.bindings]
+F1 = { type = "Macro", name = "Test", steps = [{ key = "A", down = true, delay_ms = 10 }] }
+"#;
+        fs::write(&path, toml_body).unwrap();
+        let cfg = AppConfig::load(&path).unwrap();
+        let prof = &cfg.profiles[0];
+        assert!(prof.mouse_bindings.is_empty());
+        match prof.bindings.get("F1") {
+            Some(KeyAction::Macro { mode, .. }) => assert_eq!(*mode, MacroMode::Once),
+            other => panic!("unexpected binding: {other:?}"),
+        }
         let _ = fs::remove_dir_all(dir);
     }
 }

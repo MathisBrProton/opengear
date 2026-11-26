@@ -1,7 +1,7 @@
 use crate::chatter::ChatterFilter;
 use crate::keys::{key_name_to_vk, vk_to_key_name};
 use crate::socd::{SocdDecision, SocdKey, SocdMode, SocdPair, SocdResolver};
-use opengear_core::{KeyAction, MacroStep, SocdConfig};
+use opengear_core::{KeyAction, MacroMode, MacroStep, SocdConfig};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -16,8 +16,11 @@ use windows_sys::Win32::Foundation::{GetLastError, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardLayout, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MapVirtualKeyExW, SendInput,
+    GetKeyboardLayout, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyExW, SendInput,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -25,7 +28,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE,
     PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 const OPENGEAR_INJECTED_TAG: usize = 0x4F47_4541;
@@ -171,8 +175,178 @@ pub(crate) fn capped_delay(ms: u32, max_ms: u32) -> Duration {
 }
 
 static KEYS: KeyTracker = KeyTracker::new();
+static MOUSE_BUTTONS: MouseTracker = MouseTracker::new();
 /// Bumped to cancel every running macro / text action (engine stop).
 static MACRO_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum MouseSource {
+    Middle,
+    X1,
+    X2,
+    WheelUp,
+    WheelDown,
+}
+
+impl MouseSource {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_uppercase().as_str() {
+            "MOUSE_MIDDLE" => Some(Self::Middle),
+            "MOUSE_X1" => Some(Self::X1),
+            "MOUSE_X2" => Some(Self::X2),
+            "WHEEL_UP" => Some(Self::WheelUp),
+            "WHEEL_DOWN" => Some(Self::WheelDown),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn hold_slot(self) -> Option<usize> {
+        match self {
+            Self::Middle => Some(0),
+            Self::X1 => Some(1),
+            Self::X2 => Some(2),
+            Self::WheelUp | Self::WheelDown => None,
+        }
+    }
+
+    pub(crate) fn trigger_id(self) -> u32 {
+        0x1000
+            + match self {
+                Self::Middle => 0,
+                Self::X1 => 1,
+                Self::X2 => 2,
+                Self::WheelUp => 3,
+                Self::WheelDown => 4,
+            }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MouseTarget {
+    Left,
+    Right,
+    Middle,
+    X1,
+    X2,
+    WheelUp,
+    WheelDown,
+}
+
+impl MouseTarget {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_uppercase().as_str() {
+            "MOUSE_LEFT" => Some(Self::Left),
+            "MOUSE_RIGHT" => Some(Self::Right),
+            "MOUSE_MIDDLE" => Some(Self::Middle),
+            "MOUSE_X1" => Some(Self::X1),
+            "MOUSE_X2" => Some(Self::X2),
+            "WHEEL_UP" => Some(Self::WheelUp),
+            "WHEEL_DOWN" => Some(Self::WheelDown),
+            _ => None,
+        }
+    }
+
+    fn encode_slot(self) -> u16 {
+        match self {
+            Self::Left => 1,
+            Self::Right => 2,
+            Self::Middle => 3,
+            Self::X1 => 4,
+            Self::X2 => 5,
+            Self::WheelUp => 6,
+            Self::WheelDown => 7,
+        }
+    }
+
+    fn decode_slot(v: u16) -> Option<Self> {
+        match v {
+            1 => Some(Self::Left),
+            2 => Some(Self::Right),
+            3 => Some(Self::Middle),
+            4 => Some(Self::X1),
+            5 => Some(Self::X2),
+            6 => Some(Self::WheelUp),
+            7 => Some(Self::WheelDown),
+            _ => None,
+        }
+    }
+}
+
+/// Lock-free state for the 3 holdable extra mouse sources (`M3`, `X1`, `X2`).
+/// Remap slot encoding: `0` = none, `1..=255` = keyboard VK, `0x100 + mouse_slot` = mouse target.
+pub(crate) struct MouseTracker {
+    held: [AtomicBool; 3],
+    suppressed_down: [AtomicBool; 3],
+    remapped_to: [AtomicU16; 3],
+}
+
+impl MouseTracker {
+    pub(crate) const fn new() -> Self {
+        Self {
+            held: [const { AtomicBool::new(false) }; 3],
+            suppressed_down: [const { AtomicBool::new(false) }; 3],
+            remapped_to: [const { AtomicU16::new(0) }; 3],
+        }
+    }
+
+    pub(crate) fn note_physical(&self, slot: usize, down: bool) -> bool {
+        if slot >= 3 {
+            return false;
+        }
+        if down {
+            self.held[slot].swap(true, Ordering::SeqCst)
+        } else {
+            self.held[slot].store(false, Ordering::SeqCst);
+            false
+        }
+    }
+
+    pub(crate) fn mark_suppressed(&self, slot: usize, suppressed: bool) {
+        if slot < 3 {
+            self.suppressed_down[slot].store(suppressed, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn take_suppressed(&self, slot: usize) -> bool {
+        slot < 3 && self.suppressed_down[slot].swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn begin_remap_vk(&self, slot: usize, vk: u16) {
+        if slot < 3 {
+            self.remapped_to[slot].store(vk, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn begin_remap_mouse(&self, slot: usize, target: MouseTarget) {
+        if slot < 3 {
+            self.remapped_to[slot].store(0x100 | target.encode_slot(), Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn end_remap(&self, slot: usize) -> Option<u16> {
+        if slot >= 3 {
+            return None;
+        }
+        Some(self.remapped_to[slot].swap(0, Ordering::SeqCst)).filter(|&t| t != 0)
+    }
+
+    pub(crate) fn take_all_remaps(&self) -> Vec<u16> {
+        self.remapped_to
+            .iter()
+            .map(|t| t.swap(0, Ordering::SeqCst))
+            .filter(|&t| t != 0)
+            .collect()
+    }
+
+    pub(crate) fn clear_held(&self) {
+        for h in &self.held {
+            h.store(false, Ordering::SeqCst);
+        }
+        for s in &self.suppressed_down {
+            s.store(false, Ordering::SeqCst);
+        }
+    }
+}
 
 /// Sleep for `total`, waking early if macros of `generation` get cancelled.
 /// Returns `false` when cancelled.
@@ -262,16 +436,107 @@ pub fn movement_keys_effective() -> [bool; 4] {
 struct RuntimeRules {
     win_lock: bool,
     by_vk: HashMap<u16, KeyAction>,
+    mouse_bindings: HashMap<MouseSource, KeyAction>,
+    layers_vk: HashMap<String, HashMap<u16, KeyAction>>,
+    layers_mouse: HashMap<String, HashMap<MouseSource, KeyAction>>,
     socd_enabled: bool,
     socd_pairs: Vec<SocdPair>,
     key_chatter_ms: u16,
     mouse_debounce_ms: u16,
 }
 
+impl RuntimeRules {
+    fn needs_mouse_hook(&self) -> bool {
+        self.mouse_debounce_ms > 0
+            || !self.mouse_bindings.is_empty()
+            || self.layers_mouse.values().any(|m| !m.is_empty())
+    }
+
+    fn resolve_vk(&self, vk: u16, active_layer: Option<&str>) -> Option<&KeyAction> {
+        if let Some(layer) = active_layer
+            && let Some(act) = self.layers_vk.get(layer).and_then(|m| m.get(&vk))
+        {
+            return Some(act);
+        }
+        self.by_vk.get(&vk)
+    }
+
+    fn resolve_mouse(&self, src: MouseSource, active_layer: Option<&str>) -> Option<&KeyAction> {
+        if let Some(layer) = active_layer
+            && let Some(act) = self.layers_mouse.get(layer).and_then(|m| m.get(&src))
+        {
+            return Some(act);
+        }
+        self.mouse_bindings.get(&src)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingTapHold {
+    src_vk: u16,
+    tap_vk: u16,
+    hold_vk: u16,
+    deadline: Instant,
+}
+
 #[derive(Debug, Default)]
 struct EngineState {
     socd: SocdResolver,
     chatter: ChatterFilter,
+    toggled_layer: Option<String>,
+    held_layer_stack: Vec<(u32, String)>,
+    pending_tap_hold: Option<PendingTapHold>,
+}
+
+impl EngineState {
+    fn active_layer(&self) -> Option<&str> {
+        self.held_layer_stack
+            .last()
+            .map(|(_, l)| l.as_str())
+            .or(self.toggled_layer.as_deref())
+    }
+
+    fn push_layer_hold(&mut self, trigger_id: u32, layer: String) {
+        if !self
+            .held_layer_stack
+            .iter()
+            .any(|(id, _)| *id == trigger_id)
+        {
+            self.held_layer_stack.push((trigger_id, layer));
+        }
+    }
+
+    fn release_layer_hold(&mut self, trigger_id: u32) -> bool {
+        let before = self.held_layer_stack.len();
+        self.held_layer_stack.retain(|(id, _)| *id != trigger_id);
+        self.held_layer_stack.len() != before
+    }
+
+    fn toggle_layer(&mut self, layer: String) {
+        if self.toggled_layer.as_deref() == Some(layer.as_str()) {
+            self.toggled_layer = None;
+        } else {
+            self.toggled_layer = Some(layer);
+        }
+    }
+
+    fn take_pending_for(&mut self, src_vk: u16) -> Option<PendingTapHold> {
+        if self
+            .pending_tap_hold
+            .as_ref()
+            .is_some_and(|p| p.src_vk == src_vk)
+        {
+            self.pending_tap_hold.take()
+        } else {
+            None
+        }
+    }
+
+    fn clear_layers_and_taphold(&mut self) {
+        self.toggled_layer = None;
+        self.held_layer_stack.clear();
+        self.pending_tap_hold = None;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -285,6 +550,11 @@ static GLOBAL_RULES: OnceLock<RwLock<RuntimeRules>> = OnceLock::new();
 static RUNTIME_STATE: OnceLock<Mutex<EngineState>> = OnceLock::new();
 static MACRO_RECORDER: OnceLock<Mutex<MacroRecorderState>> = OnceLock::new();
 static REACTIVE_RIPPLES: OnceLock<Mutex<VecDeque<(&'static str, Instant)>>> = OnceLock::new();
+static ACTIVE_REPEATS: OnceLock<Mutex<HashMap<u32, Arc<AtomicBool>>>> = OnceLock::new();
+
+fn active_repeats_store() -> &'static Mutex<HashMap<u32, Arc<AtomicBool>>> {
+    ACTIVE_REPEATS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 static HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SOCD_SUSPENDED: AtomicBool = AtomicBool::new(false);
@@ -339,6 +609,96 @@ fn layout_scan_ex(vk: u16) -> (u16, bool) {
         let hkl = GetKeyboardLayout(tid);
         let raw = MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC_EX, hkl);
         decode_vsc_ex(raw)
+    }
+}
+
+/// Inject a mouse button or wheel event (`OPENGEAR_INJECTED_TAG` prevents re-entry).
+#[cfg(windows)]
+fn send_mouse_target(target: MouseTarget, down: bool) -> bool {
+    let (flags, data): (u32, i32) = match target {
+        MouseTarget::Left => (
+            if down {
+                MOUSEEVENTF_LEFTDOWN
+            } else {
+                MOUSEEVENTF_LEFTUP
+            },
+            0,
+        ),
+        MouseTarget::Right => (
+            if down {
+                MOUSEEVENTF_RIGHTDOWN
+            } else {
+                MOUSEEVENTF_RIGHTUP
+            },
+            0,
+        ),
+        MouseTarget::Middle => (
+            if down {
+                MOUSEEVENTF_MIDDLEDOWN
+            } else {
+                MOUSEEVENTF_MIDDLEUP
+            },
+            0,
+        ),
+        MouseTarget::X1 => (
+            if down {
+                MOUSEEVENTF_XDOWN
+            } else {
+                MOUSEEVENTF_XUP
+            },
+            1,
+        ),
+        MouseTarget::X2 => (
+            if down {
+                MOUSEEVENTF_XDOWN
+            } else {
+                MOUSEEVENTF_XUP
+            },
+            2,
+        ),
+        MouseTarget::WheelUp => {
+            if !down {
+                return true;
+            }
+            (MOUSEEVENTF_WHEEL, 120)
+        }
+        MouseTarget::WheelDown => {
+            if !down {
+                return true;
+            }
+            (MOUSEEVENTF_WHEEL, -120)
+        }
+    };
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: data as u32,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: OPENGEAR_INJECTED_TAG,
+            },
+        },
+    };
+    let ok = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 1 };
+    if ok {
+        INJECTED_OK_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        INJECTED_FAILED_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    ok
+}
+
+#[cfg(windows)]
+fn release_encoded_target(encoded: u16) {
+    if encoded >= 0x100 {
+        if let Some(mt) = MouseTarget::decode_slot(encoded & 0xFF) {
+            send_mouse_target(mt, false);
+        }
+    } else if encoded != 0 {
+        send_vk(encoded, false);
     }
 }
 
@@ -476,6 +836,55 @@ enum MacroJob {
 }
 
 #[cfg(windows)]
+fn play_macro_steps_once(
+    steps: &[MacroStep],
+    generation: u32,
+    stop_flag: Option<&AtomicBool>,
+) -> bool {
+    let mut pressed: Vec<u16> = Vec::new();
+    let mut completed = true;
+    for step in steps {
+        if MACRO_GENERATION.load(Ordering::SeqCst) != generation
+            || stop_flag.is_some_and(|s| s.load(Ordering::Relaxed))
+        {
+            completed = false;
+            break;
+        }
+        if let Some(vk) = key_name_to_vk(&step.key)
+            && send_vk(vk, step.down)
+        {
+            track_pressed(&mut pressed, vk, step.down);
+        } else if let Some(mt) = MouseTarget::from_name(&step.key) {
+            let _ = send_mouse_target(mt, step.down);
+        }
+        if step.delay_ms > 0 {
+            let delay = capped_delay(step.delay_ms, MAX_MACRO_STEP_DELAY_MS);
+            let deadline = Instant::now() + delay;
+            loop {
+                if MACRO_GENERATION.load(Ordering::SeqCst) != generation
+                    || stop_flag.is_some_and(|s| s.load(Ordering::Relaxed))
+                {
+                    completed = false;
+                    break;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                thread::sleep((deadline - now).min(MACRO_CANCEL_POLL));
+            }
+            if !completed {
+                break;
+            }
+        }
+    }
+    for vk in pressed {
+        send_vk(vk, false);
+    }
+    completed
+}
+
+#[cfg(windows)]
 fn macro_worker_tx() -> &'static Sender<MacroJob> {
     static TX: OnceLock<Sender<MacroJob>> = OnceLock::new();
     TX.get_or_init(|| {
@@ -486,28 +895,7 @@ fn macro_worker_tx() -> &'static Sender<MacroJob> {
                 while let Ok(job) = rx.recv() {
                     match job {
                         MacroJob::Steps { steps, generation } => {
-                            let mut pressed: Vec<u16> = Vec::new();
-                            for step in steps {
-                                if MACRO_GENERATION.load(Ordering::SeqCst) != generation {
-                                    break;
-                                }
-                                if let Some(vk) = key_name_to_vk(&step.key)
-                                    && send_vk(vk, step.down)
-                                {
-                                    track_pressed(&mut pressed, vk, step.down);
-                                }
-                                if step.delay_ms > 0
-                                    && !sleep_unless_cancelled(
-                                        capped_delay(step.delay_ms, MAX_MACRO_STEP_DELAY_MS),
-                                        generation,
-                                    )
-                                {
-                                    break;
-                                }
-                            }
-                            for vk in pressed {
-                                send_vk(vk, false);
-                            }
+                            let _ = play_macro_steps_once(&steps, generation, None);
                         }
                         MacroJob::Text {
                             text,
@@ -542,6 +930,102 @@ fn run_macro_steps(steps: Vec<MacroStep>) {
     let _ = macro_worker_tx().send(MacroJob::Steps { steps, generation });
 }
 
+fn stop_repeat_macro(trigger_id: u32) {
+    if let Ok(mut map) = active_repeats_store().lock()
+        && let Some(flag) = map.remove(&trigger_id)
+    {
+        flag.store(true, Ordering::SeqCst);
+    }
+}
+
+fn stop_all_repeat_macros() {
+    if let Ok(mut map) = active_repeats_store().lock() {
+        for (_, flag) in map.drain() {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn start_repeat_macro(trigger_id: u32, steps: Vec<MacroStep>) {
+    if steps.is_empty() {
+        return;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    if let Ok(mut map) = active_repeats_store().lock()
+        && let Some(prev) = map.insert(trigger_id, Arc::clone(&stop))
+    {
+        prev.store(true, Ordering::SeqCst);
+    }
+    let generation = MACRO_GENERATION.load(Ordering::SeqCst);
+    let _ = thread::Builder::new()
+        .name(format!("opengear-macro-rep-{trigger_id:x}"))
+        .spawn(move || {
+            let min_loop_gap = Duration::from_millis(8);
+            loop {
+                if MACRO_GENERATION.load(Ordering::SeqCst) != generation
+                    || stop.load(Ordering::Relaxed)
+                {
+                    break;
+                }
+                let iter_start = Instant::now();
+                if !play_macro_steps_once(&steps, generation, Some(&stop)) {
+                    break;
+                }
+                let elapsed = iter_start.elapsed();
+                if elapsed < min_loop_gap {
+                    thread::sleep(min_loop_gap - elapsed);
+                }
+            }
+            if let Ok(mut map) = active_repeats_store().lock()
+                && map
+                    .get(&trigger_id)
+                    .is_some_and(|cur| Arc::ptr_eq(cur, &stop))
+            {
+                map.remove(&trigger_id);
+            }
+        });
+}
+
+#[cfg(windows)]
+fn trigger_macro(
+    trigger_id: u32,
+    steps: Vec<MacroStep>,
+    mode: MacroMode,
+    is_down: bool,
+    is_repeat: bool,
+) {
+    match mode {
+        MacroMode::Once => {
+            if is_down && !is_repeat {
+                run_macro_steps(steps);
+            }
+        }
+        MacroMode::WhileHeld => {
+            if is_down && !is_repeat {
+                start_repeat_macro(trigger_id, steps);
+            } else if !is_down {
+                stop_repeat_macro(trigger_id);
+            }
+        }
+        MacroMode::Toggle => {
+            if is_down && !is_repeat {
+                let was_running = active_repeats_store()
+                    .lock()
+                    .ok()
+                    .and_then(|mut map| map.remove(&trigger_id))
+                    .map(|flag| {
+                        flag.store(true, Ordering::SeqCst);
+                    })
+                    .is_some();
+                if !was_running {
+                    start_repeat_macro(trigger_id, steps);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 fn run_text_macro(text: String, delay_ms: u32) {
     let generation = MACRO_GENERATION.load(Ordering::SeqCst);
@@ -552,12 +1036,16 @@ fn run_text_macro(text: String, delay_ms: u32) {
     });
 }
 
-/// Cancel running macros and release every key OpenGear is holding down on the user's behalf.
+/// Cancel running macros and release every key/button OpenGear is holding down on the user's behalf.
 #[cfg(windows)]
 fn release_all_injected_keys() {
     MACRO_GENERATION.fetch_add(1, Ordering::SeqCst);
+    stop_all_repeat_macros();
     for target in KEYS.take_all_remaps() {
-        send_vk(target, false);
+        release_encoded_target(target);
+    }
+    for target in MOUSE_BUTTONS.take_all_remaps() {
+        release_encoded_target(target);
     }
 }
 
@@ -566,9 +1054,13 @@ pub fn reset_held_state() {
     #[cfg(windows)]
     release_all_injected_keys();
     #[cfg(not(windows))]
-    MACRO_GENERATION.fetch_add(1, Ordering::SeqCst);
+    {
+        MACRO_GENERATION.fetch_add(1, Ordering::SeqCst);
+        stop_all_repeat_macros();
+    }
 
     KEYS.clear_held();
+    MOUSE_BUTTONS.clear_held();
     for slot in &EFFECTIVE_DOWN {
         slot.store(false, Ordering::Relaxed);
     }
@@ -601,7 +1093,7 @@ fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             let scan = info.scanCode as u16;
 
             // Snapshot rules under a short read lock, then drop before any state lock or SendInput.
-            let (key_chatter_ms, win_lock, matched_pair, action) =
+            let (key_chatter_ms, win_lock, matched_pair) =
                 if let Ok(rules) = rules_store().try_read() {
                     let pair = if rules.socd_enabled && !SOCD_SUSPENDED.load(Ordering::Relaxed) {
                         rules
@@ -611,14 +1103,9 @@ fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     } else {
                         None
                     };
-                    (
-                        rules.key_chatter_ms,
-                        rules.win_lock,
-                        pair,
-                        rules.by_vk.get(&vk).cloned(),
-                    )
+                    (rules.key_chatter_ms, rules.win_lock, pair)
                 } else {
-                    (0, false, None, None)
+                    (0, false, None)
                 };
 
             // 0. Software Anti-Chatter BEFORE note_physical, ripples, or macro recorder so
@@ -637,14 +1124,78 @@ fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             let is_repeat = KEYS.note_physical(vk, is_down);
             KEYS.note_scan(vk, info.scanCode, (info.flags & LLKHF_EXTENDED) != 0);
 
+            // Release any active held layer trigger before rule lookup so releasing inside a layer works cleanly.
+            if is_up
+                && state_store()
+                    .try_lock()
+                    .map(|mut st| st.release_layer_hold(vk as u32))
+                    .unwrap_or(false)
+            {
+                let _ = KEYS.take_suppressed(vk);
+                return 1;
+            }
+
+            // Handle pending TapHold state transitions (tap on quick release, promote on chord/timeout).
+            if let Ok(mut st) = state_store().try_lock() {
+                if let Some(pending) = st.pending_tap_hold.clone() {
+                    if pending.src_vk == vk {
+                        if is_up {
+                            let _ = st.take_pending_for(vk);
+                            drop(st);
+                            let _ = KEYS.take_suppressed(vk);
+                            if now < pending.deadline {
+                                send_vk(pending.tap_vk, true);
+                                send_vk(pending.tap_vk, false);
+                            } else {
+                                send_vk(pending.hold_vk, true);
+                                send_vk(pending.hold_vk, false);
+                            }
+                            return 1;
+                        } else if now >= pending.deadline {
+                            let _ = st.take_pending_for(vk);
+                            drop(st);
+                            if send_vk(pending.hold_vk, true) {
+                                KEYS.begin_remap(vk, pending.hold_vk);
+                            }
+                            return 1;
+                        } else {
+                            return 1;
+                        }
+                    } else if is_down && !is_repeat {
+                        // Permissive hold: chording another key promotes pending TapHold immediately.
+                        let promoted = st.pending_tap_hold.take();
+                        drop(st);
+                        if let Some(p) = promoted
+                            && send_vk(p.hold_vk, true)
+                        {
+                            KEYS.begin_remap(p.src_vk, p.hold_vk);
+                        }
+                    }
+                }
+            }
+
+            // Re-read keyboard action with active layer resolution now that layer/taphold transitions settled.
+            let active_layer = state_store()
+                .try_lock()
+                .ok()
+                .and_then(|st| st.active_layer().map(str::to_string));
+            let action = if let Ok(rules) = rules_store().try_read() {
+                rules.resolve_vk(vk, active_layer.as_deref()).cloned()
+            } else {
+                None
+            };
+
             // 1. Active remap release / repeat (guarantees remaps never stick if rules change mid-hold).
             if is_up {
-                if let Some(target_vk) = KEYS.end_remap(vk) {
-                    send_vk(target_vk, false);
+                if let Some(encoded) = KEYS.end_remap(vk) {
+                    release_encoded_target(encoded);
                     return 1;
                 }
-            } else if let Some(target_vk) = KEYS.remap_target(vk) {
-                send_vk(target_vk, true);
+            } else if let Some(encoded) = KEYS.remap_target(vk) {
+                // Only repeat keyboard VKs on OS auto-repeat; mouse clicks stay held without re-pressing.
+                if encoded < 0x100 {
+                    send_vk(encoded, true);
+                }
                 return 1;
             }
 
@@ -739,18 +1290,22 @@ fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                         }
                     }
                     KeyAction::Remap { target } => {
-                        if is_down
-                            && let Some(target_vk) = key_name_to_vk(&target)
-                            && send_vk(target_vk, true)
-                        {
-                            KEYS.begin_remap(vk, target_vk);
-                            return 1;
+                        if is_down {
+                            if let Some(target_vk) = key_name_to_vk(&target)
+                                && send_vk(target_vk, true)
+                            {
+                                KEYS.begin_remap(vk, target_vk);
+                                return 1;
+                            } else if let Some(mt) = MouseTarget::from_name(&target)
+                                && send_mouse_target(mt, true)
+                            {
+                                KEYS.begin_remap(vk, 0x100 | mt.encode_slot());
+                                return 1;
+                            }
                         }
                     }
-                    KeyAction::Macro { steps, .. } => {
-                        if is_down && !is_repeat {
-                            run_macro_steps(steps);
-                        }
+                    KeyAction::Macro { steps, mode, .. } => {
+                        trigger_macro(vk as u32, steps, mode, is_down, is_repeat);
                         if is_down {
                             KEYS.mark_suppressed(vk, true);
                             return 1;
@@ -765,6 +1320,54 @@ fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                         if is_down {
                             KEYS.mark_suppressed(vk, true);
                             return 1;
+                        } else if KEYS.take_suppressed(vk) {
+                            return 1;
+                        }
+                    }
+                    KeyAction::LayerHold { layer } => {
+                        if is_down {
+                            if !is_repeat && let Ok(mut st) = state_store().try_lock() {
+                                st.push_layer_hold(vk as u32, layer);
+                            }
+                            KEYS.mark_suppressed(vk, true);
+                            return 1;
+                        } else if KEYS.take_suppressed(vk) {
+                            return 1;
+                        }
+                    }
+                    KeyAction::LayerToggle { layer } => {
+                        if is_down {
+                            if !is_repeat && let Ok(mut st) = state_store().try_lock() {
+                                st.toggle_layer(layer);
+                            }
+                            KEYS.mark_suppressed(vk, true);
+                            return 1;
+                        } else if KEYS.take_suppressed(vk) {
+                            return 1;
+                        }
+                    }
+                    KeyAction::TapHold {
+                        tap_key,
+                        hold_key,
+                        threshold_ms,
+                    } => {
+                        if is_down && !is_repeat {
+                            if let (Some(tap_vk), Some(hold_vk)) =
+                                (key_name_to_vk(&tap_key), key_name_to_vk(&hold_key))
+                            {
+                                let deadline = now
+                                    + Duration::from_millis(threshold_ms.clamp(50, 1000) as u64);
+                                if let Ok(mut st) = state_store().try_lock() {
+                                    st.pending_tap_hold = Some(PendingTapHold {
+                                        src_vk: vk,
+                                        tap_vk,
+                                        hold_vk,
+                                        deadline,
+                                    });
+                                }
+                                KEYS.mark_suppressed(vk, true);
+                                return 1;
+                            }
                         } else if KEYS.take_suppressed(vk) {
                             return 1;
                         }
@@ -799,6 +1402,34 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
 }
 
 #[cfg(windows)]
+fn decode_mouse_event(wp: u32, info: &MSLLHOOKSTRUCT) -> Option<(MouseSource, bool)> {
+    match wp {
+        WM_MBUTTONDOWN => Some((MouseSource::Middle, true)),
+        WM_MBUTTONUP => Some((MouseSource::Middle, false)),
+        WM_XBUTTONDOWN | WM_XBUTTONUP => {
+            let xbtn = (info.mouseData >> 16) & 0xFFFF;
+            let src = match xbtn {
+                1 => MouseSource::X1,
+                2 => MouseSource::X2,
+                _ => return None,
+            };
+            Some((src, wp == WM_XBUTTONDOWN))
+        }
+        WM_MOUSEWHEEL => {
+            let delta = (info.mouseData >> 16) as i16;
+            if delta > 0 {
+                Some((MouseSource::WheelUp, true))
+            } else if delta < 0 {
+                Some((MouseSource::WheelDown, true))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
 fn mouse_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && HOOK_ACTIVE.load(Ordering::Relaxed) {
         let wp = wparam as u32;
@@ -828,6 +1459,201 @@ fn mouse_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                         MOUSE_DBLCLICK_BLOCKED_COUNT.fetch_add(1, Ordering::Relaxed);
                         return 1;
                     }
+                }
+            }
+        } else if matches!(
+            wp,
+            WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP | WM_MOUSEWHEEL
+        ) {
+            let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+            let is_injected =
+                (info.flags & LLMHF_INJECTED) != 0 || info.dwExtraInfo == OPENGEAR_INJECTED_TAG;
+            if !is_injected && let Some((src, is_down)) = decode_mouse_event(wp, info) {
+                let slot = src.hold_slot();
+                let is_repeat = slot.is_some_and(|s| MOUSE_BUTTONS.note_physical(s, is_down));
+                let layer_trigger = 0x0001_0000 | src.trigger_id();
+
+                if !is_down
+                    && state_store()
+                        .try_lock()
+                        .map(|mut st| st.release_layer_hold(layer_trigger))
+                        .unwrap_or(false)
+                {
+                    if let Some(s) = slot {
+                        let _ = MOUSE_BUTTONS.take_suppressed(s);
+                    }
+                    return 1;
+                }
+
+                // Promote any pending TapHold modifier when clicking/scrolling so TapHold+Click/Scroll works seamlessly.
+                let active_layer = if let Ok(mut st) = state_store().try_lock() {
+                    if is_down && st.pending_tap_hold.is_some() {
+                        let promoted = st.pending_tap_hold.take();
+                        let active = st.active_layer().map(str::to_string);
+                        drop(st);
+                        if let Some(p) = promoted
+                            && send_vk(p.hold_vk, true)
+                        {
+                            KEYS.begin_remap(p.src_vk, p.hold_vk);
+                        }
+                        active
+                    } else {
+                        st.active_layer().map(str::to_string)
+                    }
+                } else {
+                    None
+                };
+
+                if !is_down
+                    && let Some(s) = slot
+                    && let Some(encoded) = MOUSE_BUTTONS.end_remap(s)
+                {
+                    release_encoded_target(encoded);
+                    return 1;
+                }
+
+                let action = rules_store()
+                    .try_read()
+                    .ok()
+                    .and_then(|r| r.resolve_mouse(src, active_layer.as_deref()).cloned());
+
+                if let Some(action) = action {
+                    match action {
+                        KeyAction::Disable => {
+                            if let Some(s) = slot {
+                                if is_down {
+                                    MOUSE_BUTTONS.mark_suppressed(s, true);
+                                    return 1;
+                                } else if MOUSE_BUTTONS.take_suppressed(s) {
+                                    return 1;
+                                }
+                            } else {
+                                return 1;
+                            }
+                        }
+                        KeyAction::Remap { target } => {
+                            if is_down {
+                                if let Some(target_vk) = key_name_to_vk(&target) {
+                                    if send_vk(target_vk, true) {
+                                        if let Some(s) = slot {
+                                            MOUSE_BUTTONS.begin_remap_vk(s, target_vk);
+                                        } else {
+                                            send_vk(target_vk, false);
+                                        }
+                                        return 1;
+                                    }
+                                } else if let Some(mt) = MouseTarget::from_name(&target)
+                                    && send_mouse_target(mt, true)
+                                {
+                                    if let Some(s) = slot {
+                                        MOUSE_BUTTONS.begin_remap_mouse(s, mt);
+                                    } else {
+                                        send_mouse_target(mt, false);
+                                    }
+                                    return 1;
+                                }
+                            }
+                        }
+                        KeyAction::Macro { steps, mode, .. } => {
+                            let effective_mode = if slot.is_none() && mode == MacroMode::WhileHeld {
+                                MacroMode::Once
+                            } else {
+                                mode
+                            };
+                            trigger_macro(
+                                src.trigger_id(),
+                                steps,
+                                effective_mode,
+                                is_down,
+                                is_repeat,
+                            );
+                            if let Some(s) = slot {
+                                if is_down {
+                                    MOUSE_BUTTONS.mark_suppressed(s, true);
+                                    return 1;
+                                } else if MOUSE_BUTTONS.take_suppressed(s) {
+                                    return 1;
+                                }
+                            } else {
+                                return 1;
+                            }
+                        }
+                        KeyAction::Text { text, delay_ms } => {
+                            if is_down && !is_repeat {
+                                run_text_macro(text, delay_ms);
+                            }
+                            if let Some(s) = slot {
+                                if is_down {
+                                    MOUSE_BUTTONS.mark_suppressed(s, true);
+                                    return 1;
+                                } else if MOUSE_BUTTONS.take_suppressed(s) {
+                                    return 1;
+                                }
+                            } else {
+                                return 1;
+                            }
+                        }
+                        KeyAction::LayerHold { layer } => {
+                            if let Some(s) = slot {
+                                if is_down {
+                                    if !is_repeat && let Ok(mut st) = state_store().try_lock() {
+                                        st.push_layer_hold(layer_trigger, layer);
+                                    }
+                                    MOUSE_BUTTONS.mark_suppressed(s, true);
+                                    return 1;
+                                } else if MOUSE_BUTTONS.take_suppressed(s) {
+                                    return 1;
+                                }
+                            } else {
+                                if is_down && let Ok(mut st) = state_store().try_lock() {
+                                    st.toggle_layer(layer);
+                                }
+                                return 1;
+                            }
+                        }
+                        KeyAction::LayerToggle { layer } => {
+                            if is_down
+                                && !is_repeat
+                                && let Ok(mut st) = state_store().try_lock()
+                            {
+                                st.toggle_layer(layer);
+                            }
+                            if let Some(s) = slot {
+                                if is_down {
+                                    MOUSE_BUTTONS.mark_suppressed(s, true);
+                                    return 1;
+                                } else if MOUSE_BUTTONS.take_suppressed(s) {
+                                    return 1;
+                                }
+                            } else {
+                                return 1;
+                            }
+                        }
+                        KeyAction::TapHold { tap_key, .. } => {
+                            if is_down
+                                && !is_repeat
+                                && let Some(tap_vk) = key_name_to_vk(&tap_key)
+                            {
+                                send_vk(tap_vk, true);
+                                send_vk(tap_vk, false);
+                            }
+                            if let Some(s) = slot {
+                                if is_down {
+                                    MOUSE_BUTTONS.mark_suppressed(s, true);
+                                    return 1;
+                                } else if MOUSE_BUTTONS.take_suppressed(s) {
+                                    return 1;
+                                }
+                            } else {
+                                return 1;
+                            }
+                        }
+                    }
+                } else if !is_down
+                    && let Some(s) = slot
+                    && MOUSE_BUTTONS.take_suppressed(s)
+                {
+                    return 1;
                 }
             }
         }
@@ -905,10 +1731,14 @@ impl InputEngine {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_rules(
         &self,
         win_lock: bool,
         bindings: &BTreeMap<String, KeyAction>,
+        mouse_bindings: &BTreeMap<String, KeyAction>,
+        layers: &BTreeMap<String, BTreeMap<String, KeyAction>>,
+        mouse_layers: &BTreeMap<String, BTreeMap<String, KeyAction>>,
         socd: &SocdConfig,
         key_chatter_ms: u16,
         mouse_debounce_ms: u16,
@@ -918,6 +1748,32 @@ impl InputEngine {
             if let Some(vk) = key_name_to_vk(key_name) {
                 by_vk.insert(vk, action.clone());
             }
+        }
+        let mut parsed_mouse = HashMap::new();
+        for (btn_name, action) in mouse_bindings {
+            if let Some(src) = MouseSource::from_name(btn_name) {
+                parsed_mouse.insert(src, action.clone());
+            }
+        }
+        let mut layers_vk = HashMap::new();
+        for (lname, map) in layers {
+            let mut lmap = HashMap::new();
+            for (key_name, action) in map {
+                if let Some(vk) = key_name_to_vk(key_name) {
+                    lmap.insert(vk, action.clone());
+                }
+            }
+            layers_vk.insert(lname.clone(), lmap);
+        }
+        let mut layers_mouse = HashMap::new();
+        for (lname, map) in mouse_layers {
+            let mut lmap = HashMap::new();
+            for (btn_name, action) in map {
+                if let Some(src) = MouseSource::from_name(btn_name) {
+                    lmap.insert(src, action.clone());
+                }
+            }
+            layers_mouse.insert(lname.clone(), lmap);
         }
         let mut socd_pairs = Vec::new();
         for p in &socd.pairs {
@@ -942,9 +1798,13 @@ impl InputEngine {
                 });
             }
         }
+        stop_all_repeat_macros();
         if let Ok(mut guard) = rules_store().write() {
             guard.win_lock = win_lock;
             guard.by_vk = by_vk;
+            guard.mouse_bindings = parsed_mouse;
+            guard.layers_vk = layers_vk;
+            guard.layers_mouse = layers_mouse;
             guard.socd_enabled = socd.enabled;
             guard.socd_pairs = socd_pairs;
             guard.key_chatter_ms = key_chatter_ms.min(80);
@@ -952,6 +1812,7 @@ impl InputEngine {
         }
         if let Ok(mut st) = state_store().lock() {
             st.socd.clear();
+            st.clear_layers_and_taphold();
         }
         // Dynamically attach/detach WH_MOUSE_LL so high-polling mice have ZERO overhead when disabled.
         #[cfg(windows)]
@@ -1069,7 +1930,7 @@ impl InputEngine {
                 }
                 let want_mouse = rules_store()
                     .read()
-                    .map(|r| r.mouse_debounce_ms > 0)
+                    .map(|r| r.needs_mouse_hook())
                     .unwrap_or(false);
                 let mut mouse_hook: HHOOK = if want_mouse {
                     SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), std::ptr::null_mut(), 0)
@@ -1086,7 +1947,7 @@ impl InputEngine {
                     if msg.message == WM_SYNC_MOUSE_HOOK {
                         let need = rules_store()
                             .read()
-                            .map(|r| r.mouse_debounce_ms > 0)
+                            .map(|r| r.needs_mouse_hook())
                             .unwrap_or(false);
                         if need && mouse_hook.is_null() {
                             mouse_hook = SetWindowsHookExW(
@@ -1348,5 +2209,95 @@ mod tests {
         canceller.join().unwrap();
         let g = MACRO_GENERATION.load(Ordering::SeqCst);
         assert!(sleep_unless_cancelled(Duration::from_millis(5), g));
+    }
+
+    #[test]
+    fn mouse_sources_and_targets_roundtrip_and_tracker_releases_remaps() {
+        assert_eq!(MouseSource::from_name("mouse_x1"), Some(MouseSource::X1));
+        assert_eq!(
+            MouseSource::from_name("wheel_up"),
+            Some(MouseSource::WheelUp)
+        );
+        assert_eq!(MouseSource::from_name("MOUSE_LEFT"), None);
+        assert_eq!(
+            MouseTarget::from_name("mouse_left"),
+            Some(MouseTarget::Left)
+        );
+        assert_eq!(
+            MouseTarget::decode_slot(MouseTarget::X2.encode_slot()),
+            Some(MouseTarget::X2)
+        );
+
+        let mt = MouseTracker::new();
+        assert!(!mt.note_physical(1, true));
+        assert!(mt.note_physical(1, true));
+        mt.begin_remap_vk(1, 0x7C);
+        assert_eq!(mt.end_remap(1), Some(0x7C));
+        mt.begin_remap_mouse(2, MouseTarget::Middle);
+        assert_eq!(
+            mt.take_all_remaps(),
+            vec![0x100 | MouseTarget::Middle.encode_slot()]
+        );
+        mt.clear_held();
+        assert!(!mt.note_physical(1, true));
+    }
+
+    #[test]
+    fn stop_repeat_macro_cancels_active_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        active_repeats_store()
+            .lock()
+            .unwrap()
+            .insert(0xDEAD, Arc::clone(&flag));
+        stop_repeat_macro(0xDEAD);
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn layers_and_taphold_state_transitions_work() {
+        let mut rules = RuntimeRules::default();
+        rules
+            .by_vk
+            .insert(0x49, KeyAction::Remap { target: "I".into() });
+        let mut fn_layer = HashMap::new();
+        fn_layer.insert(
+            0x49,
+            KeyAction::Remap {
+                target: "Up".into(),
+            },
+        );
+        rules.layers_vk.insert("fn".into(), fn_layer);
+
+        let mut st = EngineState::default();
+        assert_eq!(st.active_layer(), None);
+        assert!(matches!(
+            rules.resolve_vk(0x49, st.active_layer()),
+            Some(KeyAction::Remap { target }) if target == "I"
+        ));
+
+        st.push_layer_hold(0x14, "fn".into());
+        assert_eq!(st.active_layer(), Some("fn"));
+        assert!(matches!(
+            rules.resolve_vk(0x49, st.active_layer()),
+            Some(KeyAction::Remap { target }) if target == "Up"
+        ));
+        assert!(st.release_layer_hold(0x14));
+        assert_eq!(st.active_layer(), None);
+
+        st.toggle_layer("fn".into());
+        assert_eq!(st.active_layer(), Some("fn"));
+        st.toggle_layer("fn".into());
+        assert_eq!(st.active_layer(), None);
+
+        st.pending_tap_hold = Some(PendingTapHold {
+            src_vk: 0x14,
+            tap_vk: 0x1B,
+            hold_vk: 0xA2,
+            deadline: Instant::now() + Duration::from_millis(200),
+        });
+        assert!(st.take_pending_for(0x41).is_none());
+        let taken = st.take_pending_for(0x14).expect("pending taphold");
+        assert_eq!(taken.tap_vk, 0x1B);
+        assert_eq!(taken.hold_vk, 0xA2);
     }
 }

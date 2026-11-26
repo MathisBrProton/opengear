@@ -356,6 +356,27 @@ pub fn vk_to_key_name(vk: u16) -> Option<&'static str> {
         .map(|(k, _)| *k)
 }
 
+/// Software-remappable mouse sources (left/right click are intentionally excluded so users cannot
+/// lock themselves out of Windows).
+pub const ALL_MOUSE_BUTTONS: &[(&str, &str)] = &[
+    ("MOUSE_MIDDLE", "Clic molette (M3)"),
+    ("MOUSE_X1", "Bouton latéral Arrière (M4)"),
+    ("MOUSE_X2", "Bouton latéral Avant (M5)"),
+    ("WHEEL_UP", "Molette haut"),
+    ("WHEEL_DOWN", "Molette bas"),
+];
+
+/// Mouse actions accepted as remap targets (`KeyAction::Remap`).
+pub const ALL_MOUSE_TARGETS: &[(&str, &str)] = &[
+    ("MOUSE_LEFT", "Clic gauche (M1)"),
+    ("MOUSE_RIGHT", "Clic droit (M2)"),
+    ("MOUSE_MIDDLE", "Clic molette (M3)"),
+    ("MOUSE_X1", "Bouton Arrière (M4)"),
+    ("MOUSE_X2", "Bouton Avant (M5)"),
+    ("WHEEL_UP", "Molette haut"),
+    ("WHEEL_DOWN", "Molette bas"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

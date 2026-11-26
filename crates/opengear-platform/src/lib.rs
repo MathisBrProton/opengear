@@ -11,6 +11,7 @@ pub mod laptop_display;
 pub mod named_mutex;
 pub mod pawnio;
 pub mod power;
+pub mod storage_temp;
 pub mod telemetry;
 pub mod wmi;
 
@@ -23,4 +24,5 @@ pub use laptop::{
 pub use laptop_display::{LaptopDisplayDevice, LaptopDisplayDriver};
 pub use pawnio::PawnIoAvailability;
 pub use power::{PowerPlan, list_power_plans, set_active_power_plan};
+pub use storage_temp::read_nvme_max_temp_c;
 pub use telemetry::{GpuTelemetry, StaticSystemInfo, SystemTelemetry, TelemetryCollector};

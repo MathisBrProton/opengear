@@ -251,6 +251,12 @@ pub struct DeviceLightingConfig {
     /// Custom LED counts for resizable zones (`zone.id` -> LED count).
     #[serde(default)]
     pub zone_led_counts: std::collections::BTreeMap<String, u16>,
+    /// Last whole-device hardware effect applied or flashed, restored when releasing software sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hardware: Option<EffectRequest>,
+    /// Last per-zone hardware effects applied or flashed, restored when releasing software sync.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub last_zone_hardware: std::collections::BTreeMap<String, EffectRequest>,
 }
 
 impl Default for DeviceLightingConfig {
@@ -260,17 +266,22 @@ impl Default for DeviceLightingConfig {
             mode: None,
             zones: std::collections::BTreeMap::new(),
             zone_led_counts: std::collections::BTreeMap::new(),
+            last_hardware: None,
+            last_zone_hardware: std::collections::BTreeMap::new(),
         }
     }
 }
 
-/// Where a device sits on the shared desk canvas (`0.0..=1.0` on both axes).
+/// Where a device sits on the shared desk canvas (`0.0..=1.0` on both axes), with optional
+/// clockwise rotation in degrees around the device's centre.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Placement {
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    #[serde(default)]
+    pub rotation_deg: f32,
 }
 
 impl Default for Placement {
@@ -281,16 +292,26 @@ impl Default for Placement {
             y: 0.0,
             width: 1.0,
             height: 1.0,
+            rotation_deg: 0.0,
         }
     }
 }
 
 impl Placement {
-    /// Canvas position of a LED of a device placed here.
+    /// Canvas position of a LED of a device placed here (including optional rotation).
     pub fn map(&self, led: &Led) -> (f32, f32) {
+        let (lx, ly) = if self.rotation_deg.abs() > 0.01 {
+            let rad = self.rotation_deg.to_radians();
+            let (s, c) = rad.sin_cos();
+            let dx = led.x - 0.5;
+            let dy = led.y - 0.5;
+            (0.5 + dx * c - dy * s, 0.5 + dx * s + dy * c)
+        } else {
+            (led.x, led.y)
+        };
         (
-            (self.x + led.x * self.width).clamp(0.0, 1.0),
-            (self.y + led.y * self.height).clamp(0.0, 1.0),
+            (self.x + lx * self.width).clamp(0.0, 1.0),
+            (self.y + ly * self.height).clamp(0.0, 1.0),
         )
     }
 }
@@ -412,6 +433,13 @@ mod tests {
         let led = Led::at("a", 0.0, 0.0);
         assert_eq!(right.map(&led), (0.5, 0.0));
         assert_eq!(right.map(&Led::at("b", 1.0, 1.0)), (1.0, 1.0));
+
+        let rotated = Placement {
+            rotation_deg: 90.0,
+            ..Default::default()
+        };
+        let (rx, ry) = rotated.map(&Led::at("r", 1.0, 0.5));
+        assert!((rx - 0.5).abs() < 1e-4 && (ry - 1.0).abs() < 1e-4);
     }
 
     #[test]

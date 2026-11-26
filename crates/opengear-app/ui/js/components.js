@@ -103,6 +103,7 @@ export function sensorChips(tel) {
   if (s.cpu_temp_c != null) chips.push(`<div class="sensor-chip">Processeur <strong>${num(s.cpu_temp_c).toFixed(1)} °C</strong></div>`);
   if (tel && tel.gpu && tel.gpu.temp_c != null) chips.push(`<div class="sensor-chip">Carte graphique <strong>${Math.round(tel.gpu.temp_c)} °C</strong></div>`);
   if (s.motherboard_temp_c != null) chips.push(`<div class="sensor-chip">Carte mère <strong>${num(s.motherboard_temp_c).toFixed(1)} °C</strong></div>`);
+  if (s.nvme_temp_c != null) chips.push(`<div class="sensor-chip">SSD NVMe <strong>${num(s.nvme_temp_c).toFixed(0)} °C</strong></div>`);
   if (s.aio_pump_rpm != null) chips.push(`<div class="sensor-chip">Pompe <strong>${num(s.aio_pump_rpm)} tr/min</strong></div>`);
   arr(s.fans).forEach((f) => chips.push(`<div class="sensor-chip">${esc(f.name)} <strong>${num(f.rpm)} tr/min</strong></div>`));
   const lb = tel && tel.laptop_battery;
@@ -149,12 +150,13 @@ export function updateTelemetryDom(tel) {
     setTxt("tel-ram-val", `${ramUsed.toFixed(1)} Go`);
     setTxt("tel-ram-sub", ramTot ? `sur ${Math.round(ramTot)} Go (${Math.round(num(tel.ram_usage_pct))} %)` : "");
     setBar("tel-ram-bar", tel.ram_usage_pct);
-    const hot = [cpuT, sensors.motherboard_temp_c, gpuT].filter((x) => x != null);
+    const hot = [cpuT, sensors.motherboard_temp_c, sensors.nvme_temp_c, gpuT].filter((x) => x != null);
     if (hot.length) {
       const mx = Math.max(...hot);
       setTxt("tel-temp-val", `${Math.round(mx)} °C`);
       const sub2 = [];
       if (sensors.motherboard_temp_c != null) sub2.push(`Carte mère ${Math.round(sensors.motherboard_temp_c)} °C`);
+      if (sensors.nvme_temp_c != null) sub2.push(`NVMe ${Math.round(sensors.nvme_temp_c)} °C`);
       if (sensors.aio_pump_rpm != null) sub2.push(`Pompe ${num(sensors.aio_pump_rpm)} tr/min`);
       setTxt("tel-temp-sub", sub2.join(" · ") || "Composant le plus chaud");
       setBar("tel-temp-bar", (mx / 95) * 100);

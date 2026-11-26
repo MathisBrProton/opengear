@@ -198,6 +198,7 @@ pub struct AuraMainboardController {
     dev: Box<dyn AuraIo>,
     pub info: AuraMainboardInfo,
     channel_direct: Vec<bool>,
+    last_hw_effects: Vec<Option<(AuraHwMode, Rgb)>>,
 }
 
 /// Build the 65-byte Aura Direct packets for `colors`, splitting cleanly at LED 256 so a single
@@ -359,6 +360,7 @@ impl AuraMainboardController {
             dev,
             info,
             channel_direct: vec![false; channel_count],
+            last_hw_effects: vec![None; channel_count],
         };
         if ctrl.info.argb_5v_headers > 0 {
             ctrl.set_gen1()?;
@@ -490,6 +492,20 @@ impl AuraMainboardController {
             .ok_or(AuraError::InvalidChannel(channel_idx))?
             .clone();
 
+        let was_direct = self
+            .channel_direct
+            .get(channel_idx)
+            .copied()
+            .unwrap_or(false);
+        info!(
+            channel = channel_idx,
+            effect_channel = ch.effect_channel,
+            mode = ?mode,
+            color = %color.to_hex(),
+            shutdown_effect,
+            was_direct,
+            "Application mode matériel ASUS Aura"
+        );
         self.send_effect_cmd(ch.effect_channel, mode, shutdown_effect)?;
 
         if mode == AuraHwMode::Direct {
@@ -500,6 +516,10 @@ impl AuraMainboardController {
         }
         if let Some(flag) = self.channel_direct.get_mut(channel_idx) {
             *flag = false;
+        }
+        if was_direct {
+            #[cfg(not(test))]
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
 
         let mut start_led = 0usize;
@@ -514,6 +534,9 @@ impl AuraMainboardController {
             AuraChannelKind::AddressableGen2 => 1,
         };
         self.send_effect_color(start_led, hw_led_count, color, shutdown_effect)?;
+        if !shutdown_effect && let Some(slot) = self.last_hw_effects.get_mut(channel_idx) {
+            *slot = Some((mode, color));
+        }
         Ok(())
     }
 
@@ -584,6 +607,10 @@ impl AuraMainboardController {
             if let Some(flag) = self.channel_direct.get_mut(channel_idx) {
                 *flag = true;
             }
+            // AULA3-AR32 MCUs clear their direct buffer and need a brief settle window after
+            // switching out of a hardware effect before accepting CMD_DIRECT color packets.
+            #[cfg(not(test))]
+            std::thread::sleep(std::time::Duration::from_millis(12));
         }
 
         for pkt in build_direct_packets(ch.direct_channel, colors) {
@@ -599,6 +626,7 @@ impl AuraMainboardController {
             dev,
             info,
             channel_direct: vec![false; count],
+            last_hw_effects: vec![None; count],
         }
     }
 }
@@ -743,12 +771,36 @@ impl Lighting for AuraMainboardController {
     }
 
     fn set_frame(&mut self, colors: &[Rgb]) -> anyhow::Result<()> {
+        // Switch every channel receiving software data into Direct upfront before writing
+        // CMD_DIRECT packets: sending CMD_EFFECT(Direct) for ch_1..ch_3 after CMD_DIRECT(ch_0)
+        // can disturb MainboardFixed (logo) output on AULA3-AR32 MCUs.
+        let mut transitioned = false;
         let mut offset = 0usize;
-        for idx in 0..self.info.channels.len() {
+        let channel_count = self.info.channels.len();
+        let mut slices = Vec::with_capacity(channel_count);
+        for idx in 0..channel_count {
             let count = self.info.channels[idx].led_count;
             let end = (offset + count).min(colors.len());
             let slice = &colors[offset..end];
             offset = end;
+            slices.push(slice);
+            if !slice.is_empty() && !self.channel_direct.get(idx).copied().unwrap_or(false) {
+                let eff_ch = self.info.channels[idx].effect_channel;
+                self.send_effect_cmd(eff_ch, AuraHwMode::Direct, false)
+                    .context("Passage ASUS Aura en mode Direct")?;
+                if let Some(flag) = self.channel_direct.get_mut(idx) {
+                    *flag = true;
+                }
+                transitioned = true;
+            }
+        }
+        if transitioned {
+            // AULA3-AR32 MCUs clear their direct buffer and need a brief settle window after
+            // switching out of a hardware effect before accepting CMD_DIRECT color packets.
+            #[cfg(not(test))]
+            std::thread::sleep(std::time::Duration::from_millis(12));
+        }
+        for (idx, slice) in slices.into_iter().enumerate() {
             if !slice.is_empty() {
                 self.send_channel_direct(idx, slice)
                     .context("Envoi trame Direct ASUS Aura")?;
@@ -787,9 +839,22 @@ impl Lighting for AuraMainboardController {
     }
 
     fn release(&mut self) -> anyhow::Result<()> {
+        let sibling_hw = self.last_hw_effects.iter().flatten().copied().next();
         for idx in 0..self.info.channels.len() {
             if self.channel_direct.get(idx).copied().unwrap_or(false) {
-                self.set_channel_hw_mode(idx, AuraHwMode::Rainbow, Rgb::CYAN, false)
+                let (mode, color) = self
+                    .last_hw_effects
+                    .get(idx)
+                    .and_then(|x| *x)
+                    .or(sibling_hw)
+                    .unwrap_or((AuraHwMode::Static, Rgb::CYAN));
+                info!(
+                    channel = idx,
+                    mode = ?mode,
+                    color = %color.to_hex(),
+                    "Libération canal ASUS Aura"
+                );
+                self.set_channel_hw_mode(idx, mode, color, false)
                     .context("Restauration mode matériel ASUS Aura")?;
             }
         }
@@ -891,6 +956,7 @@ mod tests {
             ..Default::default()
         };
         let t = 0.42f32;
+        old_ctrl.enter_direct_mode().unwrap();
         for (ch_idx, ch) in old_ctrl.info.channels.clone().iter().enumerate() {
             let leds: Vec<Rgb> = (0..ch.led_count)
                 .map(|i| {
@@ -959,5 +1025,104 @@ mod tests {
             *io_old.writes.lock().unwrap(),
             *io_new.writes.lock().unwrap()
         );
+    }
+
+    #[test]
+    fn release_restores_last_applied_hardware_mode_instead_of_rainbow() {
+        let io = MockAuraIo::default();
+        let mut ctrl = AuraMainboardController::from_test_io(Box::new(io.clone()), test_info());
+        ctrl.apply_hardware_effect(&EffectRequest {
+            effect: "Static".into(),
+            zone: None,
+            colors: vec![Rgb::new(12, 34, 56)],
+            speed: None,
+            brightness: None,
+            reverse: false,
+            save: false,
+        })
+        .unwrap();
+        let frame = vec![Rgb::RED; 4 + 24];
+        ctrl.set_frame(&frame).unwrap();
+        io.writes.lock().unwrap().clear();
+
+        ctrl.release().unwrap();
+        let writes = io.writes.lock().unwrap();
+        // Should emit Static (0x01) + color (12, 34, 56) for both channels, never Rainbow (0x05).
+        assert!(
+            writes
+                .iter()
+                .any(|p| p[1] == CMD_EFFECT && p[5] == AuraHwMode::Static as u8)
+        );
+        assert!(
+            !writes
+                .iter()
+                .any(|p| p[1] == CMD_EFFECT && p[5] == AuraHwMode::Rainbow as u8)
+        );
+    }
+
+    #[test]
+    fn release_without_prior_hw_effect_uses_sibling_or_static_instead_of_rainbow() {
+        // Case 1: Only ch_0 had Static configured, ch_1 inherits Static instead of Rainbow.
+        let io = MockAuraIo::default();
+        let mut ctrl = AuraMainboardController::from_test_io(Box::new(io.clone()), test_info());
+        ctrl.apply_hardware_effect(&EffectRequest {
+            effect: "Static".into(),
+            zone: Some("ch_0".into()),
+            colors: vec![Rgb::new(0xAA, 0xBB, 0xCC)],
+            speed: None,
+            brightness: None,
+            reverse: false,
+            save: false,
+        })
+        .unwrap();
+        ctrl.set_frame(&vec![Rgb::BLUE; 4 + 24]).unwrap();
+        io.writes.lock().unwrap().clear();
+        ctrl.release().unwrap();
+        let writes = io.writes.lock().unwrap();
+        let ch_effects: Vec<u8> = writes
+            .iter()
+            .filter(|p| p[1] == CMD_EFFECT)
+            .map(|p| p[5])
+            .collect();
+        assert_eq!(
+            ch_effects,
+            vec![AuraHwMode::Static as u8, AuraHwMode::Static as u8]
+        );
+        drop(writes);
+
+        // Case 2: No channel had an explicit effect -> still Static, never Rainbow.
+        let io2 = MockAuraIo::default();
+        let mut fresh = AuraMainboardController::from_test_io(Box::new(io2.clone()), test_info());
+        fresh.set_frame(&vec![Rgb::GREEN; 4 + 24]).unwrap();
+        io2.writes.lock().unwrap().clear();
+        fresh.release().unwrap();
+        let writes2 = io2.writes.lock().unwrap();
+        assert!(
+            !writes2
+                .iter()
+                .any(|p| p[1] == CMD_EFFECT && p[5] == AuraHwMode::Rainbow as u8)
+        );
+        assert!(
+            writes2
+                .iter()
+                .any(|p| p[1] == CMD_EFFECT && p[5] == AuraHwMode::Static as u8)
+        );
+    }
+
+    #[test]
+    fn set_frame_switches_all_channels_to_direct_before_writing_direct_packets() {
+        let io = MockAuraIo::default();
+        let mut ctrl = AuraMainboardController::from_test_io(Box::new(io.clone()), test_info());
+        ctrl.set_frame(&vec![Rgb::RED; 4 + 24]).unwrap();
+        let writes = io.writes.lock().unwrap();
+        let last_eff = writes
+            .iter()
+            .rposition(|p| p[1] == CMD_EFFECT)
+            .expect("CMD_EFFECT expected");
+        let first_dir = writes
+            .iter()
+            .position(|p| p[1] == CMD_DIRECT)
+            .expect("CMD_DIRECT expected");
+        assert!(last_eff < first_dir);
     }
 }

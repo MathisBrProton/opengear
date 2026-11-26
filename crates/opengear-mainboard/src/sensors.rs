@@ -13,6 +13,7 @@ pub struct HardwareSensorsSnapshot {
     pub available: bool,
     pub cpu_temp_c: Option<f32>,
     pub motherboard_temp_c: Option<f32>,
+    pub nvme_temp_c: Option<f32>,
     pub aio_pump_rpm: Option<u32>,
     pub cpu_fan_rpm: Option<u32>,
     pub fans: Vec<FanRpmReading>,
@@ -139,6 +140,14 @@ pub fn read_hardware_sensors() -> HardwareSensorsSnapshot {
             }
             break;
         }
+    }
+
+    if let Some(nvme_t) = opengear_platform::read_nvme_max_temp_c() {
+        snap.nvme_temp_c = Some((nvme_t * 10.0).round() / 10.0);
+        if !snap.available {
+            snap.source = "NVMe SMART (StorageDeviceTemperatureProperty)".to_string();
+        }
+        snap.available = true;
     }
 
     if snap.available {

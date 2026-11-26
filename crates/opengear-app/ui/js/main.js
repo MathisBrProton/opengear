@@ -327,16 +327,38 @@ const ACT = {
     const devId = el.dataset.devId;
     const zoneId = el.dataset.zoneId || null;
     const ov = buildOverridePayload(devId, zoneId);
+    const saveFlash = el.dataset.save === "1";
+    if (saveFlash && !confirm("Écrire cet effet directement dans la mémoire flash / EEPROM de l'appareil ?")) {
+      return;
+    }
     if (ov && ov.mode === "hardware" && ov.request) {
-      ov.request.save = el.dataset.save === "1";
+      ov.request.save = saveFlash;
     }
     call("lighting_set_device", {
       device_id: devId,
       ...(zoneId ? { zone_id: zoneId } : {}),
       override: ov,
-    }, { btn: el, ok: el.dataset.save === "1" ? "Effet enregistré dans l'appareil" : "Éclairage mis à jour" });
+    }, { btn: el, ok: saveFlash ? "Effet enregistré dans l'appareil" : "Éclairage mis à jour" });
   },
-  "canvas-reset": (el) => call("lighting_set_placement", { device_id: el.dataset.devId, x: 0, y: 0, width: 1, height: 1 }, { btn: el, ok: "Placement réinitialisé" }),
+  "canvas-reset": (el) => call("lighting_set_placement", { device_id: el.dataset.devId, x: 0, y: 0, width: 1, height: 1, rotation_deg: 0 }, { btn: el, ok: "Placement réinitialisé" }),
+  "rgb-layer-add": (el) => {
+    const cur = clone(arr(S && S.config && S.config.profile && S.config.profile.rgb_layers));
+    cur.push({
+      name: `Calque ${cur.length + 1}`,
+      enabled: true,
+      blend: "Add",
+      opacity: 0.85,
+      key_filter: [],
+      effect: { kind: "ReactiveTyping", primary: "#FF3D63", secondary: "#00D4FF", speed: 1.2, brightness: 1.0, reverse: false },
+    });
+    call("set_rgb_layers", { layers: cur }, { btn: el, ok: "Calque RGB ajouté" });
+  },
+  "rgb-layer-del": (el) => {
+    const idx = Number(el.dataset.idx);
+    const cur = clone(arr(S && S.config && S.config.profile && S.config.profile.rgb_layers));
+    cur.splice(idx, 1);
+    call("set_rgb_layers", { layers: cur }, { btn: el, ok: "Calque RGB supprimé" });
+  },
   // Shared device model: choice buttons (`data-val`) and quick actions (`data-json`).
   "dev-set": (el) => setDeviceSetting(el, el.dataset.json !== undefined ? JSON.parse(el.dataset.json) : el.dataset.val, el),
   "kb-key": (el) => {
@@ -448,7 +470,7 @@ const ACT = {
   "cool-apply": (el) => {
     const ch = S.cooling.channels[local.selectedCoolingIdx];
     if (!ch) return;
-    call("cooling_update_channel", { index: local.selectedCoolingIdx, policy: ch.policy, source: ch.source || "CpuBios", hysteresis_c: num(ch.hysteresis_c, 3), curve: ch.curve, apply: true }, { btn: el, ok: `${ch.short_label || ch.label} : réglage appliqué à la carte mère` });
+    call("cooling_update_channel", { index: local.selectedCoolingIdx, policy: ch.policy, source: ch.source || "CpuBios", hysteresis_c: num(ch.hysteresis_c, 3), smoothing_secs: num(ch.smoothing_secs, 0), curve: ch.curve, apply: true }, { btn: el, ok: `${ch.short_label || ch.label} : réglage appliqué à la carte mère` });
   },
   "sio-refresh": (el) => call("superio_refresh", {}, { btn: el, ok: "Vitesses actualisées" }),
   "sio-apply": (el) => call("superio_set_pwm", { channel: Number(el.dataset.ch), duty_pct: Number(inputVal(`sio-${el.dataset.ch}`) ?? 50) }, { btn: el }),
@@ -465,13 +487,38 @@ const ACT = {
 
   // Input / Macros
   "input-engine-on": (el) => call("input_set_enabled", { enabled: true }, { btn: el, ok: "Moteur d'entrée démarré" }),
-  "bind-remap": (el) => call("input_set_binding", { key: local.selectedKeyId, kind: "remap", target: inputVal("mac-remap") }, { btn: el, ok: `${local.selectedKeyId} → ${inputVal("mac-remap")}` }),
-  "bind-disable": (el) => call("input_set_binding", { key: local.selectedKeyId, kind: "disable" }, { btn: el, ok: `${local.selectedKeyId} désactivée` }),
-  "bind-reset": (el) => call("input_remove_binding", { key: local.selectedKeyId }, { btn: el, ok: `${local.selectedKeyId} rétablie` }),
+  "input-layer": (el) => { local.activeLayer = el.dataset.val || "base"; render(); },
+  "bind-remap": (el) => {
+    const layer = local.activeLayer || "base";
+    const cmd = layer === "base" ? "input_set_binding" : "input_set_layer_binding";
+    call(cmd, { ...(layer !== "base" ? { layer } : {}), key: local.selectedKeyId, kind: "remap", target: inputVal("mac-remap") }, { btn: el, ok: `${local.selectedKeyId} → ${inputVal("mac-remap")}` });
+  },
+  "bind-disable": (el) => {
+    const layer = local.activeLayer || "base";
+    const cmd = layer === "base" ? "input_set_binding" : "input_set_layer_binding";
+    call(cmd, { ...(layer !== "base" ? { layer } : {}), key: local.selectedKeyId, kind: "disable" }, { btn: el, ok: `${local.selectedKeyId} désactivée` });
+  },
+  "bind-reset": (el) => {
+    const layer = local.activeLayer || "base";
+    const cmd = layer === "base" ? "input_remove_binding" : "input_remove_layer_binding";
+    call(cmd, { ...(layer !== "base" ? { layer } : {}), key: local.selectedKeyId }, { btn: el, ok: `${local.selectedKeyId} rétablie` });
+  },
+  "bind-layer-hold": (el) => call("input_set_binding", { key: local.selectedKeyId, kind: "layer_hold", layer: el.dataset.layer || "fn" }, { btn: el, ok: `${local.selectedKeyId} → Maintenir Fn` }),
+  "bind-layer-toggle": (el) => call("input_set_binding", { key: local.selectedKeyId, kind: "layer_toggle", layer: el.dataset.layer || "fn" }, { btn: el, ok: `${local.selectedKeyId} → Basculer Fn` }),
+  "bind-taphold": (el) => {
+    const tap = inputVal("mac-th-tap");
+    const hold = inputVal("mac-th-hold");
+    const tap_ms = Math.min(1000, Math.max(50, Number(inputVal("mac-th-ms")) || 200));
+    const layer = local.activeLayer || "base";
+    const cmd = layer === "base" ? "input_set_binding" : "input_set_layer_binding";
+    call(cmd, { ...(layer !== "base" ? { layer } : {}), key: local.selectedKeyId, kind: "tap_hold", tap, hold, tap_ms }, { btn: el, ok: `${local.selectedKeyId} : ${tap} / ${hold}` });
+  },
   "bind-text": (el) => {
     const t = inputVal("mac-text") || "";
     if (!t) { toast("Saisis d'abord le texte à taper.", "err"); return; }
-    call("input_set_binding", { key: local.selectedKeyId, kind: "text", text: t, delay_ms: 15 }, { btn: el, ok: `Texte assigné à ${local.selectedKeyId}` });
+    const layer = local.activeLayer || "base";
+    const cmd = layer === "base" ? "input_set_binding" : "input_set_layer_binding";
+    call(cmd, { ...(layer !== "base" ? { layer } : {}), key: local.selectedKeyId, kind: "text", text: t, delay_ms: 15 }, { btn: el, ok: `Texte assigné à ${local.selectedKeyId}` });
   },
   "rec-start": (el) => call("input_macro_record_start", {}, { btn: el, ok: "Enregistrement démarré : tape ta combinaison." }),
   "rec-stop": async (el) => {
@@ -500,9 +547,52 @@ const ACT = {
   "macro-clear": () => { local.macroSteps = []; render(); },
   "bind-macro": (el) => {
     if (!local.macroSteps.length) { toast("La macro est vide : ajoute ou enregistre des étapes.", "err"); return; }
-    call("input_set_binding", { key: local.selectedKeyId, kind: "macro", name: inputVal("mac-name") || "Macro", steps: local.macroSteps }, { btn: el, ok: `Macro assignée à ${local.selectedKeyId}` });
+    const layer = local.activeLayer || "base";
+    const cmd = layer === "base" ? "input_set_binding" : "input_set_layer_binding";
+    call(cmd, { ...(layer !== "base" ? { layer } : {}), key: local.selectedKeyId, kind: "macro", name: inputVal("mac-name") || "Macro", mode: inputVal("mac-mode") || "once", steps: local.macroSteps }, { btn: el, ok: `Macro assignée à ${local.selectedKeyId}` });
   },
-  "bind-remove": (el) => call("input_remove_binding", { key: el.dataset.key }, { btn: el, ok: `Règle ${el.dataset.key} supprimée` }),
+  "bind-remove": (el) => {
+    const layer = local.activeLayer || "base";
+    const cmd = layer === "base" ? "input_remove_binding" : "input_remove_layer_binding";
+    call(cmd, { ...(layer !== "base" ? { layer } : {}), key: el.dataset.key }, { btn: el, ok: `Règle ${el.dataset.key} supprimée` });
+  },
+  "m-bind-remap": (el) => {
+    const btn = inputVal("m-src-btn");
+    const target = inputVal("m-remap-target");
+    const layer = local.activeLayer || "base";
+    const cmd = layer === "base" ? "input_set_mouse_binding" : "input_set_mouse_layer_binding";
+    call(cmd, { ...(layer !== "base" ? { layer } : {}), button: btn, kind: "remap", target }, { btn: el, ok: `${btn} → ${target}` });
+  },
+  "m-bind-disable": (el) => {
+    const btn = inputVal("m-src-btn");
+    const layer = local.activeLayer || "base";
+    const cmd = layer === "base" ? "input_set_mouse_binding" : "input_set_mouse_layer_binding";
+    call(cmd, { ...(layer !== "base" ? { layer } : {}), button: btn, kind: "disable" }, { btn: el, ok: `${btn} désactivé` });
+  },
+  "m-bind-layer-hold": (el) => {
+    const btn = inputVal("m-src-btn");
+    call("input_set_mouse_binding", { button: btn, kind: "layer_hold", layer: el.dataset.layer || "fn" }, { btn: el, ok: `${btn} → Maintenir Fn` });
+  },
+  "m-bind-text": (el) => {
+    const btn = inputVal("m-src-btn");
+    const t = inputVal("m-bind-text") || "";
+    if (!t) { toast("Saisis d'abord le texte à taper.", "err"); return; }
+    const layer = local.activeLayer || "base";
+    const cmd = layer === "base" ? "input_set_mouse_binding" : "input_set_mouse_layer_binding";
+    call(cmd, { ...(layer !== "base" ? { layer } : {}), button: btn, kind: "text", text: t, delay_ms: 15 }, { btn: el, ok: `Texte assigné à ${btn}` });
+  },
+  "m-bind-macro": (el) => {
+    if (!local.macroSteps.length) { toast("La macro est vide : ajoute ou enregistre des étapes dans l'onglet Touches & macros.", "err"); return; }
+    const btn = inputVal("m-src-btn");
+    const layer = local.activeLayer || "base";
+    const cmd = layer === "base" ? "input_set_mouse_binding" : "input_set_mouse_layer_binding";
+    call(cmd, { ...(layer !== "base" ? { layer } : {}), button: btn, kind: "macro", name: inputVal("mac-name") || "Macro souris", mode: inputVal("m-macro-mode") || "once", steps: local.macroSteps }, { btn: el, ok: `Macro assignée à ${btn}` });
+  },
+  "m-bind-remove": (el) => {
+    const layer = local.activeLayer || "base";
+    const cmd = layer === "base" ? "input_remove_mouse_binding" : "input_remove_mouse_layer_binding";
+    call(cmd, { ...(layer !== "base" ? { layer } : {}), button: el.dataset.button }, { btn: el, ok: `Règle ${el.dataset.button} supprimée` });
+  },
   "socd-blocked": (el) => {
     const list = String(inputVal("socd-blocked") || "").split(",").map((s) => s.trim()).filter(Boolean);
     call("input_set_esports", { blocked_apps: list }, { btn: el, ok: `Jeux protégés : ${list.join(", ") || "aucun"}` });
@@ -656,22 +746,75 @@ const CHANGE = {
   },
   "canvas-coord": (el) => {
     const devId = el.dataset.devId;
-    const pl = Object.assign({ x: 0, y: 0, width: 1, height: 1 }, (S.config.device_placements || {})[devId] || {});
-    pl[el.dataset.field] = clamp(Number(el.value) / 100, 0, 1);
+    const pl = Object.assign({ x: 0, y: 0, width: 1, height: 1, rotation_deg: 0 }, (S.config.device_placements || {})[devId] || {});
+    if (el.dataset.field === "rotation_deg") {
+      pl.rotation_deg = clamp(Number(el.value) || 0, -180, 180);
+    } else {
+      pl[el.dataset.field] = clamp(Number(el.value) / 100, 0, 1);
+    }
     call("lighting_set_placement", { device_id: devId, ...pl }, { silent: true });
+  },
+  "rgb-layer-en": (el) => {
+    const idx = Number(el.dataset.idx);
+    const cur = clone(arr(S && S.config && S.config.profile && S.config.profile.rgb_layers));
+    if (cur[idx]) { cur[idx].enabled = el.checked; call("set_rgb_layers", { layers: cur }, { silent: true }); }
+  },
+  "rgb-layer-blend": (el) => {
+    const idx = Number(el.dataset.idx);
+    const cur = clone(arr(S && S.config && S.config.profile && S.config.profile.rgb_layers));
+    if (cur[idx]) { cur[idx].blend = el.value; call("set_rgb_layers", { layers: cur }, { silent: true }); }
+  },
+  "rgb-layer-kind": (el) => {
+    const idx = Number(el.dataset.idx);
+    const cur = clone(arr(S && S.config && S.config.profile && S.config.profile.rgb_layers));
+    if (cur[idx]) { cur[idx].effect.kind = el.value; call("set_rgb_layers", { layers: cur }, { silent: true }); }
+  },
+  "rgb-layer-color": (el) => {
+    const idx = Number(el.dataset.idx);
+    const cur = clone(arr(S && S.config && S.config.profile && S.config.profile.rgb_layers));
+    if (cur[idx]) { cur[idx].effect[el.dataset.field] = safeHex(el.value); call("set_rgb_layers", { layers: cur }, { silent: true }); }
+  },
+  "rgb-layer-keys": (el) => {
+    const idx = Number(el.dataset.idx);
+    const cur = clone(arr(S && S.config && S.config.profile && S.config.profile.rgb_layers));
+    if (cur[idx]) {
+      cur[idx].key_filter = String(el.value || "").split(",").map((s) => s.trim()).filter(Boolean);
+      call("set_rgb_layers", { layers: cur }, { silent: true });
+    }
+  },
+  "rgb-layer-opacity": (el) => {
+    const idx = Number(el.dataset.idx);
+    const cur = clone(arr(S && S.config && S.config.profile && S.config.profile.rgb_layers));
+    if (cur[idx]) { cur[idx].opacity = clamp(Number(el.value), 0, 1); call("set_rgb_layers", { layers: cur }, { silent: true }); }
   },
   "rgb-reverse": (el) => call("set_rgb_config", { reverse: el.checked, commit: true }, { silent: true }),
   "cool-src": (el) => {
     const ch = S.cooling.channels[local.selectedCoolingIdx];
     if (!ch) return;
     ch.source = el.value;
-    call("cooling_update_channel", { index: local.selectedCoolingIdx, source: ch.source, hysteresis_c: num(ch.hysteresis_c, 3), apply: false }, { ok: "Température de référence modifiée" });
+    call("cooling_update_channel", { index: local.selectedCoolingIdx, source: ch.source, ...(ch.custom_mix ? { custom_mix: ch.custom_mix } : {}), hysteresis_c: num(ch.hysteresis_c, 3), smoothing_secs: num(ch.smoothing_secs, 0), apply: false }, { ok: "Température de référence modifiée" });
+  },
+  "cool-mix": () => {
+    const ch = S.cooling.channels[local.selectedCoolingIdx];
+    if (!ch) return;
+    ch.custom_mix = {
+      op: inputVal("cool-mix-op") || "Max",
+      a: inputVal("cool-mix-a") || "Cpu",
+      b: inputVal("cool-mix-b") || "GpuEdge",
+    };
+    call("cooling_update_channel", { index: local.selectedCoolingIdx, source: "CustomMix", custom_mix: ch.custom_mix, hysteresis_c: num(ch.hysteresis_c, 3), smoothing_secs: num(ch.smoothing_secs, 0), apply: false }, { ok: "Source composée mise à jour" });
   },
   "cool-hyst": (el) => {
     const ch = S.cooling.channels[local.selectedCoolingIdx];
     if (!ch) return;
     ch.hysteresis_c = Number(el.value);
-    call("cooling_update_channel", { index: local.selectedCoolingIdx, source: ch.source || "CpuBios", hysteresis_c: ch.hysteresis_c, apply: false }, { ok: `Hystérésis : ${ch.hysteresis_c} °C` });
+    call("cooling_update_channel", { index: local.selectedCoolingIdx, source: ch.source || "CpuBios", hysteresis_c: ch.hysteresis_c, smoothing_secs: num(ch.smoothing_secs, 0), apply: false }, { ok: `Hystérésis : ${ch.hysteresis_c} °C` });
+  },
+  "cool-smooth": (el) => {
+    const ch = S.cooling.channels[local.selectedCoolingIdx];
+    if (!ch) return;
+    ch.smoothing_secs = Number(el.value);
+    call("cooling_update_channel", { index: local.selectedCoolingIdx, source: ch.source || "CpuBios", hysteresis_c: num(ch.hysteresis_c, 3), smoothing_secs: ch.smoothing_secs, apply: false }, { ok: ch.smoothing_secs ? `Lissage : ${ch.smoothing_secs} s` : "Lissage désactivé" });
   },
   "curve-pt": (el) => {
     const ch = S.cooling.channels[local.selectedCoolingIdx];
@@ -894,18 +1037,26 @@ window.__ogHotplug = (st) => {
 startSocdPolling();
 startRgbPreviewLoop();
 
-rpc("get_state")
-  .then((st) => {
+async function bootWithRetry(retriesLeft = 2) {
+  try {
+    const st = await rpc("get_state", {}, 25_000);
     applyState(st);
     const n = arr(S.device_list).length;
     setStatus(n ? `Prêt : ${plural(n, "appareil actif", "appareils actifs")}.` : "Prêt : aucun appareil détecté pour l'instant.");
     loadDiagnostics();
     if (!ui().onboarding_done) openWizard();
-  })
-  .catch((e) => {
+  } catch (e) {
+    if (retriesLeft > 0) {
+      setStatus("Reconnexion au moteur OpenGear…");
+      setTimeout(() => bootWithRetry(retriesLeft - 1), 1500);
+      return;
+    }
     document.getElementById("main-content").innerHTML = `
       <div class="alert err" role="alert"><span class="alert-icon">${ICONS.warn}</span>
         <div><div class="alert-title">OpenGear n'a pas pu démarrer l'interface</div><div class="muted">${esc(humanError(e && e.message))}</div></div>
       </div>`;
     setStatus("Erreur de démarrage");
-  });
+  }
+}
+
+bootWithRetry();

@@ -68,15 +68,23 @@ export function viewInput() {
 function inputKeys() {
   const prof = S.config.profile;
   const sp = S.system_prefs;
-  const bindings = Object.entries(prof.bindings || {});
+  const layer = local.activeLayer || "base";
+  const layerMap = layer === "base" ? (prof.bindings || {}) : ((prof.layers && prof.layers[layer]) || {});
+  const bindings = Object.entries(layerMap);
   const kb = S.corsair_devices.find((d) => d.kind === "Keyboard") || null;
   const keyOpts = (sel) => S.bindable_keys.map((k) => `<option value="${esc(k)}" ${k === sel ? "selected" : ""}>${esc(keyLabel(k))}</option>`).join("");
   return `
+    <div class="card mb-12">
+      <div class="row-between">
+        <div><strong>Couche active (Layers QMK/Fn)</strong><div class="muted small">Édite la couche principale ou la couche secondaire Fn, activable par maintien/bascule d'une touche ou d'un bouton souris.</div></div>
+        ${seg([["base", "Couche Base"], ["fn", "Couche Fn"]], layer, "input-layer", {}, "purple")}
+      </div>
+    </div>
     ${keyboardSetup()}
     ${renderKeyboard("macro", kb)}
     <div class="grid-2 mt-16">
       <div class="card">
-        <div class="card-head"><h2 class="card-title">Touche sélectionnée</h2><span class="pill purple">${esc(keyLabel(local.selectedKeyId))}</span></div>
+        <div class="card-head"><h2 class="card-title">Touche sélectionnée</h2><span class="pill purple">${esc(keyLabel(local.selectedKeyId))}${layer !== "base" ? ` · ${esc(layer)}` : ""}</span></div>
         <div class="row">
           <label class="field-label" for="mac-remap">Remplacer par</label>
           <select id="mac-remap" class="og-select grow">${keyOpts("F13")}</select>
@@ -85,6 +93,19 @@ function inputKeys() {
         <div class="row mt-12">
           <button type="button" class="btn btn-secondary btn-sm" data-act="bind-disable">Désactiver la touche</button>
           <button type="button" class="btn btn-secondary btn-sm" data-act="bind-reset">Rétablir la touche d'origine</button>
+        </div>
+        ${layer === "base" ? `
+          <div class="row mt-8">
+            <button type="button" class="btn btn-secondary btn-sm" data-act="bind-layer-hold" data-layer="fn">Maintenir → Couche Fn</button>
+            <button type="button" class="btn btn-secondary btn-sm" data-act="bind-layer-toggle" data-layer="fn">Basculer → Couche Fn</button>
+          </div>` : ""}
+        <div class="divider"></div>
+        <div class="row">
+          <span class="field-label">Appui court / Maintien</span>
+          <select id="mac-th-tap" class="og-select auto" aria-label="Touche appui court">${keyOpts("ESC")}</select>
+          <select id="mac-th-hold" class="og-select auto" aria-label="Touche maintien">${keyOpts("LCTRL")}</select>
+          <input id="mac-th-ms" type="number" class="og-input" style="width:68px" min="50" max="1000" value="200" aria-label="Seuil ms" />
+          <button type="button" class="btn btn-secondary btn-sm" data-act="bind-taphold">Tap-Hold</button>
         </div>
         <div class="divider"></div>
         <div class="row">
@@ -100,10 +121,15 @@ function inputKeys() {
             : `<button type="button" class="btn btn-sm btn-primary" data-act="rec-start">Enregistrer en direct</button>`}
         </div>
         <div class="row mt-8">
-          <input id="mac-name" class="og-input" style="width:130px" value="Macro 1" aria-label="Nom de la macro" />
+          <input id="mac-name" class="og-input" style="width:120px" value="Macro 1" aria-label="Nom de la macro" />
+          <select id="mac-mode" class="og-select auto" aria-label="Mode de lecture">
+            <option value="once">Une fois</option>
+            <option value="while_held">Tant que maintenu</option>
+            <option value="toggle">Bascule On/Off</option>
+          </select>
           <select id="mac-step-key" class="og-select auto" aria-label="Touche à ajouter">${keyOpts("")}</select>
-          <input id="mac-step-ms" type="number" class="og-input" style="width:76px" value="15" min="0" aria-label="Délai en millisecondes" />
-          <button type="button" class="btn btn-secondary btn-sm" data-act="macro-add">Ajouter un appui</button>
+          <input id="mac-step-ms" type="number" class="og-input" style="width:70px" value="15" min="0" aria-label="Délai en millisecondes" />
+          <button type="button" class="btn btn-secondary btn-sm" data-act="macro-add">Ajouter</button>
           <button type="button" class="btn btn-ghost btn-sm" data-act="macro-clear">Vider</button>
         </div>
         <div class="mono muted mt-12 scroll-y selectable" style="max-height:110px;overflow:auto;background:#0b0e16;padding:8px 10px;border-radius:8px" aria-live="polite">
@@ -119,19 +145,34 @@ function inputKeys() {
           <table class="meta-table">
             <thead><tr><th>Touche</th><th>Action</th><th><span class="sr-only">Supprimer</span></th></tr></thead>
             <tbody>
-              ${bindings.map(([k, act]) => {
-                let desc = "";
-                if (act.type === "Remap") desc = `→ ${keyLabel(act.target)}`;
-                else if (act.type === "Disable") desc = "Désactivée";
-                else if (act.type === "Text") desc = `Texte « ${act.text} »`;
-                else if (act.type === "Macro") desc = `Macro « ${act.name} » (${arr(act.steps).length} étapes)`;
-                else desc = String(act.type || "Action");
-                return `<tr><td class="mono" style="color:var(--cyan);font-weight:700" title="${esc(k)}">${esc(keyLabel(k))}</td><td>${esc(desc)}</td><td style="text-align:right"><button type="button" class="btn btn-sm btn-secondary" data-act="bind-remove" data-key="${esc(k)}" aria-label="Supprimer la règle ${esc(keyLabel(k))}">Supprimer</button></td></tr>`;
-              }).join("")}
+              ${bindings.map(([k, act]) => `<tr><td class="mono" style="color:var(--cyan);font-weight:700" title="${esc(k)}">${esc(keyLabel(k))}</td><td>${esc(describeAction(act))}</td><td style="text-align:right"><button type="button" class="btn btn-sm btn-secondary" data-act="bind-remove" data-key="${esc(k)}" aria-label="Supprimer la règle ${esc(keyLabel(k))}">Supprimer</button></td></tr>`).join("")}
             </tbody>
           </table>`}
       </div>
     </div>`;
+}
+
+function macroModeLabel(m) {
+  if (m === "while_held") return "Tant que maintenu";
+  if (m === "toggle") return "Bascule";
+  return "Une fois";
+}
+
+function targetLabel(t) {
+  const m = arr(S.bindable_mouse_targets).find((x) => x.id === t);
+  return m ? m.label : keyLabel(t);
+}
+
+function describeAction(act) {
+  if (!act) return "Action";
+  if (act.type === "Remap") return `→ ${targetLabel(act.target)}`;
+  if (act.type === "Disable") return "Désactivée";
+  if (act.type === "Text") return `Texte « ${act.text} »`;
+  if (act.type === "Macro") return `Macro « ${act.name} » (${arr(act.steps).length} étapes · ${macroModeLabel(act.mode)})`;
+  if (act.type === "LayerHold") return `Maintien couche « ${act.layer} »`;
+  if (act.type === "LayerToggle") return `Bascule couche « ${act.layer} »`;
+  if (act.type === "TapHold") return `Court: ${targetLabel(act.tap_key)} / Long (${num(act.threshold_ms, 200)} ms): ${targetLabel(act.hold_key)}`;
+  return String(act.type || "Action");
 }
 
 function flashtapCard() {
@@ -231,12 +272,80 @@ function inputEsports() {
     </div>`;
 }
 
+function softwareMouseCard() {
+  const prof = S.config.profile;
+  const layer = local.activeLayer || "base";
+  const layerMap = layer === "base" ? (prof.mouse_bindings || {}) : ((prof.mouse_layers && prof.mouse_layers[layer]) || {});
+  const mb = Object.entries(layerMap);
+  const btns = arr(S.bindable_mouse_buttons);
+  const targets = [
+    ...arr(S.bindable_mouse_targets).map((t) => `<option value="${esc(t.id)}">${esc(t.label)}</option>`),
+    ...arr(S.bindable_keys).map((k) => `<option value="${esc(k)}">${esc(keyLabel(k))}</option>`),
+  ].join("");
+  const btnLabel = (id) => (btns.find((b) => b.id === id) || {}).label || id;
+  return `
+    <div class="card mb-12">
+      <div class="row-between">
+        <div><strong>Couche souris active</strong><div class="muted small">Assignations de base ou activées quand la couche Fn est active (G-Shift).</div></div>
+        ${seg([["base", "Couche Base"], ["fn", "Couche Fn"]], layer, "input-layer", {}, "purple")}
+      </div>
+    </div>
+    <div class="grid-2 mb-16">
+      <div class="card accent-cyan">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">Boutons souris (remappage universel)</h2>
+            <div class="card-desc">Fonctionne avec toute souris (boutons latéraux, molette) sans écrire en flash et sans modifier le mouvement.</div>
+          </div>
+        </div>
+        <div class="row">
+          <label class="field-label" for="m-src-btn">Bouton</label>
+          <select id="m-src-btn" class="og-select grow">${btns.map((b) => `<option value="${esc(b.id)}">${esc(b.label)}</option>`).join("")}</select>
+        </div>
+        <div class="row mt-12">
+          <label class="field-label" for="m-remap-target">Remplacer par</label>
+          <select id="m-remap-target" class="og-select grow">${targets}</select>
+          <button type="button" class="btn btn-primary btn-sm" data-act="m-bind-remap">Appliquer</button>
+        </div>
+        <div class="row mt-12">
+          <button type="button" class="btn btn-secondary btn-sm" data-act="m-bind-disable">Désactiver ce bouton</button>
+          ${layer === "base" ? `<button type="button" class="btn btn-secondary btn-sm" data-act="m-bind-layer-hold" data-layer="fn">Maintenir → Couche Fn</button>` : ""}
+        </div>
+        <div class="divider"></div>
+        <div class="row">
+          <label class="field-label" for="m-bind-text">Texte</label>
+          <input id="m-bind-text" class="og-input grow" placeholder="Ex. : /dance" />
+          <button type="button" class="btn btn-secondary btn-sm" data-act="m-bind-text">Assigner</button>
+        </div>
+        <div class="divider"></div>
+        <div class="row">
+          <select id="m-macro-mode" class="og-select auto" aria-label="Mode macro souris">
+            <option value="once">Une fois</option>
+            <option value="while_held">Tant que maintenu</option>
+            <option value="toggle">Bascule On/Off</option>
+          </select>
+          <button type="button" class="btn btn-primary btn-sm grow" data-act="m-bind-macro">Assigner la macro (${arr(local.macroSteps).length} étapes)</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2 class="card-title">Règles souris actives</h2><span class="pill">${plural(mb.length, "règle", "règles")}</span></div>
+        ${mb.length === 0 ? `<div class="muted">Aucun bouton de souris remappé sur ce profil.</div>` : `
+          <table class="meta-table">
+            <thead><tr><th>Bouton</th><th>Action</th><th><span class="sr-only">Supprimer</span></th></tr></thead>
+            <tbody>
+              ${mb.map(([btn, act]) => `<tr><td><strong>${esc(btnLabel(btn))}</strong></td><td>${esc(describeAction(act))}</td><td style="text-align:right"><button type="button" class="btn btn-sm btn-secondary" data-act="m-bind-remove" data-button="${esc(btn)}">Supprimer</button></td></tr>`).join("")}
+            </tbody>
+          </table>`}
+      </div>
+    </div>`;
+}
+
 function inputMouse() {
+  const swCard = softwareMouseCard();
   if (!S.logi_mice.length) {
-    return emptyState("Aucune souris Logitech détectée", "Branche le récepteur LIGHTSPEED / Bolt ou le câble USB de ta souris Logitech G, puis bouge-la pour la sortir de veille.",
-      `<button type="button" class="btn btn-primary" data-act="rescan">Relancer la recherche</button>`);
+    return `${swCard}${emptyState("Aucune souris à mémoire embarquée détectée", "Les boutons latéraux et molette ci-dessus fonctionnent déjà avec toute souris. Pour éditer la mémoire flash d'une Logitech G, branche son câble ou récepteur.")}`;
   }
-  return `<div class="stack">${S.logi_mice.map((m, i) => cardLogiOnboard(m, i)).join("")}</div>`;
+  return `${swCard}<div class="stack">${S.logi_mice.map((m, i) => cardLogiOnboard(m, i)).join("")}</div>`;
 }
 
 function mouseStage(m, i, buttons, btnCount) {

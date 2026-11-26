@@ -10,6 +10,7 @@ pub use aura::{
     AuraMainboardController, AuraMainboardInfo,
 };
 pub use cooling::{
-    AsusWmiCoolingStatus, apply_asus_wmi_curve, probe_asus_wmi_cooling, read_asus_wmi_channel,
+    AsusWmiCoolingDevice, AsusWmiCoolingDriver, AsusWmiCoolingStatus, apply_asus_wmi_curve,
+    probe_asus_wmi_cooling, read_asus_wmi_channel,
 };
 pub use ram_wmi::AsusWmiRamBackend;

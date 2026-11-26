@@ -320,6 +320,26 @@ pub mod setting_ids {
     pub const BACKLIGHT: &str = "backlight";
 }
 
+/// Physical geometry of one key on a device-specific keyboard map.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DeviceKeyGeom {
+    pub code: Option<&'static str>,
+    pub fallback_label: &'static str,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub led_index: usize,
+}
+
+/// Device-reported keyboard layout geometry (when exact key coordinates are known).
+#[derive(Debug, Clone)]
+pub struct DeviceKeyboardLayout {
+    pub product_name: String,
+    pub standard: crate::device::KeyboardLayout,
+    pub keys: Vec<DeviceKeyGeom>,
+}
+
 /// One physical device handled by a driver crate.
 pub trait Device: Send {
     fn info(&self) -> DeviceInfo;
@@ -340,6 +360,26 @@ pub trait Device: Send {
 
     /// Fans of the device, if OpenGear can drive them (see [`crate::fans`]).
     fn cooling(&mut self) -> Option<&mut dyn crate::fans::Cooling> {
+        None
+    }
+
+    /// Pointer (mouse) DPI & stage controls, if applicable.
+    fn pointer(&mut self) -> Option<&mut dyn crate::pointer::PointerDevice> {
+        None
+    }
+
+    /// Hardware audio equalizer, if applicable.
+    fn equalizer(&mut self) -> Option<&mut dyn crate::audio::Equalizer> {
+        None
+    }
+
+    /// Onboard hardware profile slots, if applicable.
+    fn onboard(&mut self) -> Option<&mut dyn crate::onboard::OnboardMemory> {
+        None
+    }
+
+    /// Exact physical keyboard key geometry, if known by the driver.
+    fn keyboard_layout(&self) -> Option<DeviceKeyboardLayout> {
         None
     }
 

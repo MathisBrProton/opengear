@@ -7,7 +7,6 @@
 
 use opengear_core::keyboard::{char_key_scan, default_label};
 use opengear_core::{AppConfig, FormFactor, KeyboardLayout, physical_layout};
-use opengear_corsair::{CorsairDevice, CorsairDeviceKind, keys_for_layout, layout_for_device};
 use opengear_input::{fixed_vk_for_code, us_vk_for_code, vk_to_key_name};
 use opengear_platform::KeyResolver;
 use serde_json::{Value, json};
@@ -98,13 +97,6 @@ impl KeyboardView {
         let resolver = KeyResolver::for_foreground();
         let os = resolver.describe();
 
-        let device = devices.iter().find_map(|dev| {
-            let d = dev.as_any()?.downcast_ref::<CorsairDevice>()?;
-            (d.info.kind == CorsairDeviceKind::Keyboard)
-                .then(|| layout_for_device(d.info.vid, d.info.pid).map(|desc| (d, desc)))
-                .flatten()
-        });
-
         let form_factor_auto = config.keyboard_form_factor.is_none();
         let form_factor = config.keyboard_form_factor.unwrap_or(if is_laptop {
             FormFactor::Compact75
@@ -112,10 +104,13 @@ impl KeyboardView {
             FormFactor::Full
         });
 
+        let device_layout = devices.iter().find_map(|dev| dev.keyboard_layout());
+
         // The device knows its own physical standard; otherwise the user choice, otherwise the
         // usual standard for the Windows language.
-        let device_std = device
-            .map(|(d, _)| d.info.layout)
+        let device_std = device_layout
+            .as_ref()
+            .map(|l| l.standard)
             .filter(|l| !matches!(l, KeyboardLayout::Unknown(_)));
         let standard_auto = device_std.is_some() || config.keyboard_standard.is_none();
         let standard = device_std
@@ -123,17 +118,18 @@ impl KeyboardView {
             .unwrap_or(os.suggested_standard);
         let iso = !matches!(standard, KeyboardLayout::Ansi);
 
-        let (device_name, keys, width, height) = match device {
-            Some((d, desc)) => {
-                let keys: Vec<KeyView> = keys_for_layout(&desc, standard)
+        let (device_name, keys, width, height) = match device_layout {
+            Some(layout) => {
+                let keys: Vec<KeyView> = layout
+                    .keys
                     .into_iter()
                     .map(|k| {
-                        let (id, label) = match k.code() {
+                        let (id, label) = match k.code {
                             Some(code) => resolve_key(code, &resolver, iso),
-                            None => (None, k.label_qwerty.to_string()),
+                            None => (None, k.fallback_label.to_string()),
                         };
                         KeyView {
-                            code: k.code(),
+                            code: k.code,
                             id,
                             label,
                             x: k.x,
@@ -146,7 +142,7 @@ impl KeyboardView {
                     .collect();
                 let width = keys.iter().map(|k| k.x + k.w).fold(0.0, f32::max);
                 let height = keys.iter().map(|k| k.y + k.h).fold(0.0, f32::max);
-                (Some(d.info.product_name.clone()), keys, width, height)
+                (Some(layout.product_name), keys, width, height)
             }
             None => {
                 let (phys, width, height) = physical_layout(form_factor, standard);

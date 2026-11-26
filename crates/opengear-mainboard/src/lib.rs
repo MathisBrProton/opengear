@@ -19,8 +19,8 @@ pub use ram::{
 pub use sensors::{FanRpmReading, HardwareSensorsSnapshot, read_hardware_sensors};
 pub use smbus::diagnose_smbus_readonly;
 pub use superio::{
-    SUPERIO_MIN_PWM_PCT, SuperIoFanChannel, SuperIoSavedState, SuperIoSnapshot,
-    read_superio_snapshot, restore_all_superio_fans_auto, restore_superio_fan_auto,
-    restore_superio_saved_states, safe_superio_duty, saved_superio_states, set_superio_fan_pwm,
-    set_superio_fan_pwm_with_floor,
+    SUPERIO_MIN_PWM_PCT, SuperIoCoolingDevice, SuperIoCoolingDriver, SuperIoFanChannel,
+    SuperIoSavedState, SuperIoSnapshot, read_superio_snapshot, restore_all_superio_fans_auto,
+    restore_superio_fan_auto, restore_superio_saved_states, safe_superio_duty,
+    saved_superio_states, set_superio_fan_pwm, set_superio_fan_pwm_with_floor,
 };

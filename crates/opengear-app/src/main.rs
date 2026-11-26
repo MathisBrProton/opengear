@@ -241,8 +241,9 @@ fn main() -> Result<()> {
         attach_parent_console_for_cli();
     }
 
-    // GUI has no console: log to %LOCALAPPDATA%\OpenGear\logs. CLI logs to the terminal.
-    app_log::init(is_gui, is_gui);
+    // GUI and Selftest log to %LOCALAPPDATA%\OpenGear\logs; other CLI subcommands log to terminal.
+    let is_selftest = matches!(cli.command, Some(Commands::Selftest));
+    app_log::init(is_gui || is_selftest, is_gui);
     if is_gui {
         tracing::info!("OpenGear {} démarré", env!("CARGO_PKG_VERSION"));
     }

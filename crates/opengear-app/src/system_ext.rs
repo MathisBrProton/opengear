@@ -154,9 +154,296 @@ impl AmbilightFrame {
     }
 }
 
-/// Capture the primary screen downscaled to 16×6 pixels via Win32 GDI `StretchBlt` (~1 ms, <0.3% CPU).
+/// Downsamples a raw top-down BGRA framebuffer into a `dst_w × dst_h` saturated Ambilight grid.
+pub fn downsample_bgra_grid(
+    bgra: &[u8],
+    row_pitch: usize,
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+    prev: Option<&AmbilightFrame>,
+) -> AmbilightFrame {
+    let mut pixels = Vec::with_capacity(dst_w * dst_h);
+    if src_w == 0 || src_h == 0 || row_pitch < src_w * 4 {
+        return AmbilightFrame {
+            w: dst_w,
+            h: dst_h,
+            pixels: vec![Rgb::BLACK; dst_w * dst_h],
+        };
+    }
+    for gy in 0..dst_h {
+        let y0 = (gy * src_h) / dst_h;
+        let y1 = (((gy + 1) * src_h) / dst_h).max(y0 + 1).min(src_h);
+        // Sample up to 4 rows x 8 cols per grid cell for fast, noise-free averaging (~0.02 ms).
+        let y_step = ((y1 - y0) / 4).max(1);
+        for gx in 0..dst_w {
+            let x0 = (gx * src_w) / dst_w;
+            let x1 = (((gx + 1) * src_w) / dst_w).max(x0 + 1).min(src_w);
+            let x_step = ((x1 - x0) / 8).max(1);
+
+            let mut r_sum = 0u32;
+            let mut g_sum = 0u32;
+            let mut b_sum = 0u32;
+            let mut count = 0u32;
+            let mut y = y0;
+            while y < y1 {
+                let row_off = y * row_pitch;
+                let mut x = x0;
+                while x < x1 {
+                    let px = row_off + x * 4;
+                    if px + 2 < bgra.len() {
+                        b_sum += bgra[px] as u32;
+                        g_sum += bgra[px + 1] as u32;
+                        r_sum += bgra[px + 2] as u32;
+                        count += 1;
+                    }
+                    x += x_step;
+                }
+                y += y_step;
+            }
+            let c = if count > 0 {
+                boost_saturation(Rgb::new(
+                    (r_sum / count) as u8,
+                    (g_sum / count) as u8,
+                    (b_sum / count) as u8,
+                ))
+            } else {
+                Rgb::BLACK
+            };
+            let idx = gy * dst_w + gx;
+            let smoothed = if let Some(p) = prev {
+                p.pixels.get(idx).copied().unwrap_or(c).lerp(c, 0.35)
+            } else {
+                c
+            };
+            pixels.push(smoothed);
+        }
+    }
+    AmbilightFrame {
+        w: dst_w,
+        h: dst_h,
+        pixels,
+    }
+}
+
+#[cfg(windows)]
+mod dxgi_ambilight {
+    use super::{AmbilightFrame, downsample_bgra_grid};
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+        D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice,
+        ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::{
+        DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, IDXGIDevice, IDXGIOutput1,
+        IDXGIOutputDuplication, IDXGIResource,
+    };
+    use windows::core::Interface;
+
+    struct DxgiSession {
+        _device: ID3D11Device,
+        ctx: ID3D11DeviceContext,
+        dupl: IDXGIOutputDuplication,
+        staging: ID3D11Texture2D,
+        width: u32,
+        height: u32,
+    }
+
+    struct DxgiCapture {
+        session: Option<DxgiSession>,
+        last_init_fail: Option<Instant>,
+    }
+
+    struct AcquiredFrame<'a>(&'a IDXGIOutputDuplication);
+    impl Drop for AcquiredFrame<'_> {
+        fn drop(&mut self) {
+            let _ = unsafe { self.0.ReleaseFrame() };
+        }
+    }
+
+    thread_local! {
+        static DXGI_CAPTURE: RefCell<DxgiCapture> = const {
+            RefCell::new(DxgiCapture {
+                session: None,
+                last_init_fail: None,
+            })
+        };
+    }
+
+    impl DxgiSession {
+        fn init() -> windows::core::Result<Self> {
+            let mut dev_opt: Option<ID3D11Device> = None;
+            let mut ctx_opt: Option<ID3D11DeviceContext> = None;
+            unsafe {
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_FLAG(0),
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut dev_opt),
+                    None,
+                    Some(&mut ctx_opt),
+                )?;
+            }
+            let device = dev_opt.ok_or_else(windows::core::Error::from_win32)?;
+            let ctx = ctx_opt.ok_or_else(windows::core::Error::from_win32)?;
+            let dxgi_dev: IDXGIDevice = device.cast()?;
+            let adapter = unsafe { dxgi_dev.GetAdapter()? };
+            let output = unsafe { adapter.EnumOutputs(0)? };
+            let output1: IDXGIOutput1 = output.cast()?;
+            let dupl = unsafe { output1.DuplicateOutput(&device)? };
+
+            let desc = unsafe { dupl.GetDesc() };
+            if desc.ModeDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+                return Err(windows::core::Error::new(
+                    windows::core::HRESULT(-1i32),
+                    "Unsupported DXGI desktop pixel format (HDR fallback to GDI)",
+                ));
+            }
+            let width = desc.ModeDesc.Width.max(1);
+            let height = desc.ModeDesc.Height.max(1);
+
+            let tex_desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut staging_opt: Option<ID3D11Texture2D> = None;
+            unsafe { device.CreateTexture2D(&tex_desc, None, Some(&mut staging_opt))? };
+            let staging = staging_opt.ok_or_else(windows::core::Error::from_win32)?;
+
+            Ok(Self {
+                _device: device,
+                ctx,
+                dupl,
+                staging,
+                width,
+                height,
+            })
+        }
+    }
+
+    pub fn try_sample(prev: Option<&AmbilightFrame>) -> Option<AmbilightFrame> {
+        DXGI_CAPTURE.with(|cell| {
+            let mut st = cell.borrow_mut();
+            if st.session.is_none() {
+                if st
+                    .last_init_fail
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+                {
+                    return None;
+                }
+                match DxgiSession::init() {
+                    Ok(s) => st.session = Some(s),
+                    Err(_) => {
+                        st.last_init_fail = Some(Instant::now());
+                        return None;
+                    }
+                }
+            }
+
+            let session = st.session.as_ref()?;
+            let timeout_ms = if prev.is_some() { 0 } else { 16 };
+            let mut info = Default::default();
+            let mut res: Option<IDXGIResource> = None;
+            let hr = unsafe {
+                session
+                    .dupl
+                    .AcquireNextFrame(timeout_ms, &mut info, &mut res)
+            };
+            match hr {
+                Ok(()) => {
+                    let _frame_lock = AcquiredFrame(&session.dupl);
+                    let tex: ID3D11Texture2D = match res.and_then(|r| r.cast().ok()) {
+                        Some(t) => t,
+                        None => return prev.cloned(),
+                    };
+                    let dst_res: ID3D11Resource = session.staging.cast().ok()?;
+                    let src_res: ID3D11Resource = tex.cast().ok()?;
+                    unsafe { session.ctx.CopyResource(&dst_res, &src_res) };
+
+                    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                    unsafe {
+                        session
+                            .ctx
+                            .Map(&dst_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                            .ok()?;
+                    }
+                    let row_pitch = mapped.RowPitch as usize;
+                    let total_bytes = row_pitch * (session.height as usize);
+                    let frame = if mapped.pData.is_null() || total_bytes == 0 {
+                        prev.cloned()
+                    } else {
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(mapped.pData as *const u8, total_bytes)
+                        };
+                        Some(downsample_bgra_grid(
+                            slice,
+                            row_pitch,
+                            session.width as usize,
+                            session.height as usize,
+                            16,
+                            6,
+                            prev,
+                        ))
+                    };
+                    unsafe { session.ctx.Unmap(&dst_res, 0) };
+                    frame
+                }
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => prev.cloned(),
+                Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                    st.session = None;
+                    st.last_init_fail = Some(Instant::now());
+                    None
+                }
+                Err(_) => {
+                    st.session = None;
+                    st.last_init_fail = Some(Instant::now());
+                    None
+                }
+            }
+        })
+    }
+}
+
+/// Capture the primary screen downscaled to 16×6 pixels.
+/// Tries DXGI Desktop Duplication first (hardware-accelerated, catches fullscreen/borderless games)
+/// and falls back cleanly to Win32 GDI `StretchBlt`.
 pub fn sample_ambilight_screen(prev: Option<&AmbilightFrame>) -> Option<AmbilightFrame> {
     #[cfg(windows)]
+    {
+        if let Some(frame) = dxgi_ambilight::try_sample(prev) {
+            return Some(frame);
+        }
+        sample_ambilight_gdi(prev)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = prev;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn sample_ambilight_gdi(prev: Option<&AmbilightFrame>) -> Option<AmbilightFrame> {
     unsafe {
         use windows_sys::Win32::Graphics::Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
@@ -231,11 +518,6 @@ pub fn sample_ambilight_screen(prev: Option<&AmbilightFrame>) -> Option<Ambiligh
         }
         Some(AmbilightFrame { w: W, h: H, pixels })
     }
-    #[cfg(not(windows))]
-    {
-        let _ = prev;
-        None
-    }
 }
 
 fn boost_saturation(c: Rgb) -> Rgb {
@@ -249,4 +531,31 @@ fn boost_saturation(c: Rgb) -> Rgb {
         ((avg + (g - avg) * boost).clamp(0.0, 1.0) * 255.0) as u8,
         ((avg + (b - avg) * boost).clamp(0.0, 1.0) * 255.0) as u8,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downsamples_bgra_quadrants_accurately() {
+        // 4x2 BGRA image: left half pure red, right half pure blue
+        let w = 4usize;
+        let h = 2usize;
+        let mut buf = Vec::with_capacity(w * h * 4);
+        for _y in 0..h {
+            for x in 0..w {
+                if x < 2 {
+                    buf.extend_from_slice(&[0, 0, 255, 255]); // B, G, R, A
+                } else {
+                    buf.extend_from_slice(&[255, 0, 0, 255]);
+                }
+            }
+        }
+        let frame = downsample_bgra_grid(&buf, w * 4, w, h, 2, 1, None);
+        assert_eq!(frame.w, 2);
+        assert_eq!(frame.h, 1);
+        assert!(frame.pixels[0].r > 200 && frame.pixels[0].b < 20);
+        assert!(frame.pixels[1].b > 200 && frame.pixels[1].r < 20);
+    }
 }

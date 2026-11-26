@@ -12,6 +12,10 @@ use opengear_core::driver::{
     Setting, Value, polling_rate_options, setting_ids,
 };
 use opengear_core::lighting::{EffectParams, EffectRequest, HardwareEffect, Lighting, Zone};
+use opengear_core::{
+    EqInfo, EqPresetInfo, Equalizer, OnboardMemory, OnboardProfileSummary, PointerDevice,
+    PointerDpiInfo,
+};
 
 /// Driver discovering all Logitech HID++ 2.0 mice, keyboards and headsets.
 pub struct LogitechDriver;
@@ -230,6 +234,15 @@ impl Device for LogitechMouse {
 
     fn lighting(&mut self) -> Option<&mut dyn Lighting> {
         (!self.info.led_zones.is_empty()).then_some(self as &mut dyn Lighting)
+    }
+
+    fn pointer(&mut self) -> Option<&mut dyn PointerDevice> {
+        (self.info.dpi.is_some() || self.info.report_rate.is_some())
+            .then_some(self as &mut dyn PointerDevice)
+    }
+
+    fn onboard(&mut self) -> Option<&mut dyn OnboardMemory> {
+        (!self.info.onboard_profiles.is_empty()).then_some(self as &mut dyn OnboardMemory)
     }
 
     fn refresh_status(&mut self) {
@@ -472,6 +485,13 @@ impl Device for LogitechHeadset {
 
     fn lighting(&mut self) -> Option<&mut dyn Lighting> {
         (self.info.led_zones_count > 0).then_some(self as &mut dyn Lighting)
+    }
+
+    fn equalizer(&mut self) -> Option<&mut dyn Equalizer> {
+        self.info
+            .equalizer
+            .is_some()
+            .then_some(self as &mut dyn Equalizer)
     }
 
     fn refresh_status(&mut self) {
@@ -819,6 +839,120 @@ impl Lighting for LogitechHeadset {
 
     fn max_fps(&self) -> u8 {
         5
+    }
+}
+
+impl PointerDevice for LogitechMouse {
+    fn pointer_info(&self) -> Option<PointerDpiInfo> {
+        let dpi = self.info.dpi.as_ref();
+        let rr = self.info.report_rate.as_ref();
+        if dpi.is_none() && rr.is_none() {
+            return None;
+        }
+        let active_stages = self
+            .info
+            .onboard
+            .as_ref()
+            .and_then(|ob| {
+                self.info
+                    .onboard_profiles
+                    .iter()
+                    .find(|p| u16::from(p.slot_index) == ob.active_profile)
+                    .map(|p| p.dpi_stages.to_vec())
+            })
+            .unwrap_or_default();
+        Some(PointerDpiInfo {
+            dpi_x: dpi.map(|d| d.dpi_x).unwrap_or(0),
+            dpi_y: dpi.map(|d| d.dpi_y).unwrap_or(0),
+            min_dpi: dpi.map(|d| d.min_dpi).unwrap_or(100),
+            max_dpi: dpi.map(|d| d.max_dpi).unwrap_or(32000),
+            step_dpi: dpi.map(|d| d.step_dpi).unwrap_or(50),
+            independent_xy: dpi.is_some_and(|d| d.supports_independent_xy),
+            stages: active_stages,
+            active_stage: self
+                .info
+                .onboard
+                .as_ref()
+                .map(|o| o.active_dpi_index as usize),
+            report_rate_hz: rr.map(|r| r.current_hz),
+            supported_rates_hz: rr.map(|r| r.supported_hz.clone()).unwrap_or_default(),
+        })
+    }
+
+    fn set_dpi(&mut self, x: u16, y: Option<u16>) -> Result<()> {
+        let lod = self.info.dpi.as_ref().and_then(|d| d.lod);
+        LogitechMouse::set_dpi(self, x, y, lod).map_err(anyhow::Error::from)
+    }
+
+    fn set_active_dpi_stage(&mut self, stage: usize) -> Result<()> {
+        LogitechMouse::set_active_dpi_stage(self, stage as u8).map_err(anyhow::Error::from)?;
+        self.refresh_telemetry();
+        Ok(())
+    }
+}
+
+impl OnboardMemory for LogitechMouse {
+    fn onboard_profiles(&self) -> Vec<OnboardProfileSummary> {
+        let active_slot = self
+            .info
+            .onboard
+            .as_ref()
+            .map(|o| o.active_profile)
+            .unwrap_or(1);
+        self.info
+            .onboard_profiles
+            .iter()
+            .map(|p| OnboardProfileSummary {
+                slot: u16::from(p.slot_index),
+                name: if p.name.is_empty() {
+                    format!("Profil {}", p.slot_index)
+                } else {
+                    p.name.clone()
+                },
+                active: u16::from(p.slot_index) == active_slot,
+                dpi_stages: p.dpi_stages.to_vec(),
+                report_rate_hz: Some(p.report_rate_hz),
+                editable: !p.from_rom,
+            })
+            .collect()
+    }
+
+    fn set_active_onboard_profile(&mut self, slot: u16) -> Result<()> {
+        LogitechMouse::set_active_profile(self, slot).map_err(anyhow::Error::from)?;
+        self.refresh_telemetry();
+        Ok(())
+    }
+
+    fn reload_onboard_profiles(&mut self) -> Result<()> {
+        LogitechMouse::reload_onboard_profiles(self).map_err(anyhow::Error::from)?;
+        self.refresh_telemetry();
+        Ok(())
+    }
+}
+
+impl Equalizer for LogitechHeadset {
+    fn eq_info(&self) -> Option<EqInfo> {
+        let eq = self.info.equalizer.as_ref()?;
+        Some(EqInfo {
+            band_count: eq.band_count,
+            min_db: eq.min_db,
+            max_db: eq.max_db,
+            frequencies_hz: eq.frequencies_hz.clone(),
+            gains_db: eq.gains_db.clone(),
+            presets: crate::EQ_PRESETS
+                .iter()
+                .enumerate()
+                .map(|(i, p)| EqPresetInfo {
+                    id: format!("preset_{i}"),
+                    name: p.name.to_string(),
+                    gains_db: p.gains_5.to_vec(),
+                })
+                .collect(),
+        })
+    }
+
+    fn set_eq_gains(&mut self, gains: &[i8]) -> Result<()> {
+        LogitechHeadset::set_equalizer_gains(self, gains).map_err(anyhow::Error::from)
     }
 }
 

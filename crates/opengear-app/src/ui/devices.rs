@@ -5,9 +5,7 @@
 
 use super::backend::BackendEngine;
 use opengear_core::PollingRate;
-use opengear_core::driver::{
-    Connection, Device, DeviceKind, Driver, Value, setting_ids, validate_setting,
-};
+use opengear_core::driver::{Device, DeviceKind, Driver, Value, setting_ids, validate_setting};
 use opengear_core::fans::{Cooling, FanTarget, clamp_target};
 use serde_json::{Value as Json, json};
 
@@ -40,7 +38,43 @@ pub(crate) fn clamp_for(
     }
 }
 
-/// Re-discover the devices of every registered driver (start-up, rescan).
+/// Re-discover only the USB drivers whose `usb_vendor_ids()` intersects `vendors`,
+/// keeping untouched drivers' devices intact.
+pub(crate) fn rediscover_for_vendors(
+    driver_devices: &mut Vec<Box<dyn Device>>,
+    drivers: &[Box<dyn Driver>],
+    enabled_experimental: &std::collections::BTreeSet<String>,
+    vendors: &[u16],
+) -> Vec<String> {
+    let touched_prefixes: Vec<String> = drivers
+        .iter()
+        .filter(|d| {
+            (!d.experimental() || enabled_experimental.contains(d.name()))
+                && d.usb_vendor_ids().iter().any(|v| vendors.contains(v))
+        })
+        .map(|d| format!("{}:", d.name()))
+        .collect();
+    if touched_prefixes.is_empty() {
+        return touched_prefixes;
+    }
+
+    let mut rebuilt: Vec<Box<dyn Device>> = driver_devices
+        .drain(..)
+        .filter(|d| {
+            let id = d.info().id;
+            !touched_prefixes.iter().any(|p| id.starts_with(p))
+        })
+        .collect();
+    for drv in drivers {
+        let allowed = !drv.experimental() || enabled_experimental.contains(drv.name());
+        if allowed && drv.usb_vendor_ids().iter().any(|v| vendors.contains(v)) {
+            rebuilt.extend(drv.discover());
+        }
+    }
+    *driver_devices = rebuilt;
+    touched_prefixes
+}
+
 /// Discover the devices of every registered driver; experimental drivers only when the user
 /// enabled them (`enabled_experimental` = `AppConfig::experimental_drivers`).
 pub(crate) fn discover_all(
@@ -76,28 +110,10 @@ impl BackendEngine {
             .nth(idx)
     }
 
-    /// Re-discover USB driver devices whose vendor matches a hotplug change.
+    /// Re-discover only the USB driver(s) whose vendor matches a hotplug change.
     pub(crate) fn rediscover_drivers_for(&mut self, vendors: &[u16]) {
-        let touched = self
-            .drivers
-            .iter()
-            .any(|d| d.usb_vendor_ids().iter().any(|v| vendors.contains(v)));
-        if !touched {
-            return;
-        }
-        let mut rebuilt: Vec<Box<dyn Device>> = self
-            .driver_devices
-            .drain(..)
-            .filter(|d| d.info().connection == Connection::Internal)
-            .collect();
         let enabled = &self.config.experimental_drivers;
-        for drv in &self.drivers {
-            let allowed = !drv.experimental() || enabled.contains(drv.name());
-            if allowed && !drv.usb_vendor_ids().is_empty() {
-                rebuilt.extend(drv.discover());
-            }
-        }
-        self.driver_devices = rebuilt;
+        rediscover_for_vendors(&mut self.driver_devices, &self.drivers, enabled, vendors);
     }
 
     /// Experimental drivers and whether the user enabled them (Système → Pilotes expérimentaux).
@@ -157,12 +173,18 @@ impl BackendEngine {
                     "placement": placement,
                 })
             });
+            let pointer = d.pointer().and_then(|p| p.pointer_info());
+            let equalizer = d.equalizer().and_then(|e| e.eq_info());
+            let onboard = d.onboard().map(|o| o.onboard_profiles());
             out.push(json!({
                 "info": info,
                 "status": status,
                 "settings": settings,
                 "lighting": lighting,
                 "cooling": cooling,
+                "pointer": pointer,
+                "equalizer": equalizer,
+                "onboard": onboard,
             }));
         }
         Json::Array(out)
@@ -313,5 +335,50 @@ mod tests {
         assert_eq!(discover_all(&drivers, &enabled).len(), 2);
         enabled.insert("exp".to_string());
         assert_eq!(discover_all(&drivers, &enabled).len(), 3);
+    }
+
+    struct OtherDevice;
+    impl Device for OtherDevice {
+        fn info(&self) -> DeviceInfo {
+            DeviceInfo {
+                id: "other:1".into(),
+                vendor: "Other".into(),
+                model: "Other".into(),
+                kind: DeviceKind::Keyboard,
+                connection: Connection::Usb,
+                firmware: None,
+            }
+        }
+    }
+
+    struct CountingOtherDriver(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl Driver for CountingOtherDriver {
+        fn name(&self) -> &'static str {
+            "other"
+        }
+        fn usb_vendor_ids(&self) -> &'static [u16] {
+            &[0x9999]
+        }
+        fn discover(&self) -> Vec<Box<dyn Device>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![Box::new(OtherDevice)]
+        }
+    }
+
+    #[test]
+    fn targeted_hotplug_skips_unrelated_usb_drivers() {
+        let other_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drivers: Vec<Box<dyn Driver>> = vec![
+            Box::new(FakeDriver),
+            Box::new(CountingOtherDriver(other_calls.clone())),
+        ];
+        let enabled = std::collections::BTreeSet::new();
+        let mut devs = discover_all(&drivers, &enabled);
+        assert_eq!(other_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let touched = rediscover_for_vendors(&mut devs, &drivers, &enabled, &[0x1234]);
+        assert_eq!(touched, vec!["fake:".to_string()]);
+        assert_eq!(other_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(devs.len(), 3);
     }
 }

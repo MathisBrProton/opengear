@@ -12,9 +12,11 @@ export const SWATCHES = [
 ];
 
 export const CONFIG_CMDS = new Set([
-  "set_rgb_config", "lighting_sync_all", "lighting_set_device", "lighting_resize_zone", "lighting_set_placement",
+  "set_rgb_config", "set_rgb_layers", "lighting_sync_all", "lighting_set_device", "lighting_resize_zone", "lighting_set_placement",
   "set_per_key_color", "clear_per_key", "set_keyboard_layout",
-  "input_set_binding", "input_remove_binding", "input_set_esports", "input_set_winlock",
+  "input_set_binding", "input_remove_binding", "input_set_layer_binding", "input_remove_layer_binding",
+  "input_set_mouse_binding", "input_remove_mouse_binding", "input_set_mouse_layer_binding", "input_remove_mouse_layer_binding",
+  "input_set_esports", "input_set_winlock",
   "apply_preset", "switch_profile", "create_profile", "profile_set_linked_apps", "profile_import_json",
 ]);
 
@@ -57,6 +59,8 @@ export const LABEL_FMT = {
   leds: (v) => `${v} LEDs`,
   dpi: (v) => `${v} DPI`,
   deg: (v) => `${v} °C`,
+  rot: (v) => `${v} °`,
+  sec: (v) => (Number(v) ? `${v} s` : "Instantané"),
   ms: (v) => (Number(v) ? `${v} ms` : "Désactivé"),
   ramspeed: (v) => ["Très rapide", "Rapide", "Normal", "Lent", "Très lent"][Number(v)] || "Normal",
 };

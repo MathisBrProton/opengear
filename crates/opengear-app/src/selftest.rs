@@ -5,6 +5,9 @@
 use crate::audio_ext::read_audio_state;
 use opengear_asus::{AuraMainboardController, read_asus_wmi_channel};
 use opengear_core::cooling::FanHeaderKind;
+use opengear_core::driver::{Control, Value as DriverValue};
+use opengear_core::lighting::{Placement, frame_len, render_frame};
+use opengear_core::{AppConfig, RgbEffectConfig};
 use opengear_corsair::CorsairDevice;
 use opengear_hp::probe_hp_omen;
 use opengear_logitech::{LogitechHeadset, LogitechMouse};
@@ -15,6 +18,7 @@ use opengear_platform::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelfTestCheck {
@@ -336,12 +340,115 @@ pub fn run_full_selftest() -> SelfTestReport {
         });
     }
 
+    // 9. Unified Driver & Capability Invariant Audit (Settings, Lighting frame math, Cooling floors)
+    let cfg_path = AppConfig::default_config_path();
+    let (cfg, _) = AppConfig::load_or_recover(&cfg_path);
+    let unified_drivers = crate::drivers::device_drivers();
+    let mut discovered =
+        crate::ui::devices::discover_all(&unified_drivers, &cfg.experimental_drivers);
+    let mut drv_warns = Vec::new();
+    let mut drv_summaries = Vec::new();
+    for dev in &mut discovered {
+        let info_d = dev.info();
+        let settings = dev.settings();
+        for s in &settings {
+            match (&s.control, &s.value) {
+                (Control::Slider { min, max, .. }, DriverValue::Number(v))
+                    if *v < *min || *v > *max =>
+                {
+                    drv_warns.push(format!("{}.{}: {} hors [{min}, {max}]", info_d.id, s.id, v));
+                }
+                (Control::Choice { options }, DriverValue::Text(v))
+                    if !options.iter().any(|o| &o.id == v) =>
+                {
+                    drv_warns.push(format!("{}.{}: choix inconnu {:?}", info_d.id, s.id, v));
+                }
+                _ => {}
+            }
+        }
+        let zone_count = if let Some(l) = dev.lighting() {
+            let zones = l.zones();
+            let expected = frame_len(&zones);
+            let rendered = render_frame(
+                &zones,
+                &Placement::default(),
+                &RgbEffectConfig::default(),
+                0.25,
+            );
+            if rendered.len() != expected {
+                drv_warns.push(format!(
+                    "{}: render_frame={} != frame_len={}",
+                    info_d.id,
+                    rendered.len(),
+                    expected
+                ));
+            }
+            zones.len()
+        } else {
+            0
+        };
+        let fan_count = dev.cooling().map(|c| c.fans().len()).unwrap_or(0);
+        drv_summaries.push(format!(
+            "{}(settings={}, zones={}, fans={})",
+            info_d.id,
+            settings.len(),
+            zone_count,
+            fan_count
+        ));
+    }
+    checks.push(SelfTestCheck {
+        name: "Audit Drivers Unifiés & Capacités".into(),
+        status: if drv_warns.is_empty() { "PASS" } else { "WARN" }.into(),
+        detail: if drv_warns.is_empty() {
+            format!(
+                "{} appareil(s) validé(s) : {}",
+                discovered.len(),
+                drv_summaries.join(", ")
+            )
+        } else {
+            format!(
+                "Anomalies : {} | {}",
+                drv_warns.join(" ; "),
+                drv_summaries.join(", ")
+            )
+        },
+    });
+
+    // 10. Exhaustive IPC Endpoint Audit (sandboxed headless BackendEngine in %TEMP%)
+    let ep_results = crate::ui::endpoint_tests::run_all_endpoint_checks();
+    let ep_total = ep_results.len();
+    let ep_failed: Vec<_> = ep_results.iter().filter(|r| !r.passed).collect();
+    let ep_ms: u128 = ep_results.iter().map(|r| r.elapsed_ms).sum();
+    if ep_failed.is_empty() {
+        checks.push(SelfTestCheck {
+            name: "Endpoints IPC OpenGear".into(),
+            status: "PASS".into(),
+            detail: format!("{ep_total}/{ep_total} suites d'endpoints vérifiées en {ep_ms} ms"),
+        });
+    } else {
+        for f in &ep_failed {
+            checks.push(SelfTestCheck {
+                name: format!("Endpoint FAIL : {}", f.name),
+                status: "FAIL".into(),
+                detail: f.detail.clone(),
+            });
+        }
+    }
+
+    for c in &checks {
+        match c.status.as_str() {
+            "FAIL" => error!(check = %c.name, detail = %c.detail, "Auto-test FAIL"),
+            "WARN" => warn!(check = %c.name, detail = %c.detail, "Auto-test WARN"),
+            _ => info!(check = %c.name, status = %c.status, detail = %c.detail, "Auto-test"),
+        }
+    }
+
     let passed = checks.iter().filter(|c| c.status == "PASS").count();
     let warned = checks.iter().filter(|c| c.status == "WARN").count();
     let failed = checks.iter().filter(|c| c.status == "FAIL").count();
     let skipped_admin = checks.iter().filter(|c| c.status == "SKIP_ADMIN").count();
 
-    let report_path = save_report_file(admin, &checks);
+    let report_path = save_report_file(admin, &checks, &ep_results);
 
     SelfTestReport {
         is_admin: admin,
@@ -354,11 +461,24 @@ pub fn run_full_selftest() -> SelfTestReport {
     }
 }
 
-fn save_report_file(is_admin: bool, checks: &[SelfTestCheck]) -> PathBuf {
+fn save_report_file(
+    is_admin: bool,
+    checks: &[SelfTestCheck],
+    ep_results: &[crate::ui::endpoint_tests::EndpointCheckResult],
+) -> PathBuf {
     let path = std::env::temp_dir().join("opengear_selftest.txt");
-    let mut txt = format!("=== OpenGear Hardware Self-Test Report (Admin={is_admin}) ===\n");
+    let mut txt =
+        format!("=== OpenGear Hardware & Endpoint Self-Test Report (Admin={is_admin}) ===\n");
     for c in checks {
         txt.push_str(&format!("[{:^10}] {} => {}\n", c.status, c.name, c.detail));
+    }
+    txt.push_str("\n=== Detail Endpoints IPC ===\n");
+    for ep in ep_results {
+        let tag = if ep.passed { "PASS" } else { "FAIL" };
+        txt.push_str(&format!(
+            "[{:^4}] {:<45} ({:>3} ms) => {}\n",
+            tag, ep.name, ep.elapsed_ms, ep.detail
+        ));
     }
     let _ = std::fs::write(&path, txt);
     path
