@@ -12,7 +12,10 @@ crates/opengear-logitech/        @MathisBrProton
 crates/opengear-corsair/         @MathisBrProton
 crates/opengear-asus/            @MathisBrProton
 crates/opengear-hp/              @MathisBrProton
+crates/opengear-openrgb/         @MathisBrProton
 crates/opengear-razer/           @MathisBrProton
+crates/opengear-steelseries/     @MathisBrProton
+crates/opengear-hyperx/          @MathisBrProton
 
 # Governance and build chain
 /.github/                        @MathisBrProton

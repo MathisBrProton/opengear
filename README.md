@@ -24,8 +24,6 @@ Vérifie l'intégrité avec `SHA256SUMS.txt`.
 
 ### Lancer l'application
 
-### Lancer l'application
-
 ```powershell
 cargo run --release
 ```
