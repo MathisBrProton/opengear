@@ -602,11 +602,18 @@ impl CorsairDevice {
         if !self.transport.path.starts_with("mock://") {
             match send_res {
                 Ok(()) | Err(BragiError::Hid(_)) | Err(BragiError::Timeout) => {
+                    let was_sw = self.info.mode == OperatingMode::Software;
                     self.lighting_handle_open = false;
                     std::thread::sleep(Duration::from_millis(450));
                     self.transport.reopen()?;
-                    if self.info.mode == OperatingMode::Software {
-                        let _ = self.transport.set_property(PROP_MODE, MODE_SOFTWARE);
+                    if was_sw {
+                        // USB re-enumeration drops the MCU's software mode and clears LED RAM:
+                        // run the full Software transition (PROP_MODE + CTRL_REG + HANDLE_LIGHTING).
+                        self.info.mode = OperatingMode::Hardware;
+                        if self.set_mode(OperatingMode::Software).is_err() {
+                            std::thread::sleep(Duration::from_millis(150));
+                            let _ = self.set_mode(OperatingMode::Software);
+                        }
                     }
                     let actual = self
                         .transport

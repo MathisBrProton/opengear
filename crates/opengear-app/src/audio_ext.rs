@@ -333,14 +333,12 @@ mod win_audio {
         if LOOPBACK_RUNNING
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-        {
-            if std::thread::Builder::new()
+            && std::thread::Builder::new()
                 .name("opengear-wasapi-fft".into())
                 .spawn(run_loopback_worker)
                 .is_err()
-            {
-                LOOPBACK_RUNNING.store(false, Ordering::Release);
-            }
+        {
+            LOOPBACK_RUNNING.store(false, Ordering::Release);
         }
 
         let spec = spectrum_store().lock().map(|g| *g).unwrap_or_default();

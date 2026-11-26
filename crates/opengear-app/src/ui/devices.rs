@@ -208,7 +208,7 @@ impl BackendEngine {
         let kind = device.info().kind;
         // Some settings change fan control (Max Fan, thermal profile): keep the crash marker in sync.
         self.sync_cooling_marker();
-        Ok(self.after_setting(kind, setting_id, &value))
+        Ok(self.after_setting(device_id, kind, setting_id, &value))
     }
 
     /// Set one fan (or every fan, `fan = None`) of a device, clamped to its safety floor.
@@ -236,20 +236,30 @@ impl BackendEngine {
     /// App-wide consequences of shared settings.
     fn after_setting(
         &mut self,
+        device_id: &str,
         kind: DeviceKind,
         setting_id: &str,
         value: &Value,
     ) -> Option<String> {
         match setting_id {
-            // The keyboard polling rate and brightness are part of the profile (re-applied when
-            // switching profiles).
-            setting_ids::POLLING_RATE if kind == DeviceKind::Keyboard => {
-                let rate = value
-                    .as_str()
-                    .and_then(|s| s.parse().ok())
-                    .and_then(PollingRate::from_hz)?;
-                self.config.active_profile_mut().polling_rate = rate;
-                self.persist_config();
+            // Polling rate changes on USB devices (e.g. Corsair AXON keyboards) can trigger USB
+            // re-enumeration that clears the device's live LED framebuffer: force an immediate
+            // frame resend (+ confirmation frame) whenever software lighting is active.
+            setting_ids::POLLING_RATE => {
+                if kind == DeviceKind::Keyboard
+                    && let Some(rate) = value
+                        .as_str()
+                        .and_then(|s| s.parse().ok())
+                        .and_then(PollingRate::from_hz)
+                {
+                    self.config.active_profile_mut().polling_rate = rate;
+                    self.persist_config();
+                }
+                self.invalidate_rgb_frame_for(device_id);
+                self.live_active_devices.remove(device_id);
+                if self.lighting_activity_flags().0 {
+                    self.push_live_rgb_frame();
+                }
                 None
             }
             setting_ids::HW_BRIGHTNESS if kind == DeviceKind::Keyboard => {

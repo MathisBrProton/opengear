@@ -1075,7 +1075,7 @@ mod tests {
             save: false,
         })
         .unwrap();
-        ctrl.set_frame(&vec![Rgb::BLUE; 4 + 24]).unwrap();
+        ctrl.set_frame(&[Rgb::BLUE; 4 + 24]).unwrap();
         io.writes.lock().unwrap().clear();
         ctrl.release().unwrap();
         let writes = io.writes.lock().unwrap();
@@ -1093,7 +1093,7 @@ mod tests {
         // Case 2: No channel had an explicit effect -> still Static, never Rainbow.
         let io2 = MockAuraIo::default();
         let mut fresh = AuraMainboardController::from_test_io(Box::new(io2.clone()), test_info());
-        fresh.set_frame(&vec![Rgb::GREEN; 4 + 24]).unwrap();
+        fresh.set_frame(&[Rgb::GREEN; 4 + 24]).unwrap();
         io2.writes.lock().unwrap().clear();
         fresh.release().unwrap();
         let writes2 = io2.writes.lock().unwrap();
@@ -1113,7 +1113,7 @@ mod tests {
     fn set_frame_switches_all_channels_to_direct_before_writing_direct_packets() {
         let io = MockAuraIo::default();
         let mut ctrl = AuraMainboardController::from_test_io(Box::new(io.clone()), test_info());
-        ctrl.set_frame(&vec![Rgb::RED; 4 + 24]).unwrap();
+        ctrl.set_frame(&[Rgb::RED; 4 + 24]).unwrap();
         let writes = io.writes.lock().unwrap();
         let last_eff = writes
             .iter()

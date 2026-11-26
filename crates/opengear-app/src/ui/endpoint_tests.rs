@@ -82,7 +82,7 @@ struct MockFullDevice {
 }
 
 impl MockFullDevice {
-    fn new(id: &str) -> (Box<dyn Device>, Arc<Mutex<MockDevState>>) {
+    fn build(id: &str) -> (Box<dyn Device>, Arc<Mutex<MockDevState>>) {
         let state = Arc::new(Mutex::new(MockDevState {
             polling_choice: "1000".into(),
             winlock: false,
@@ -337,7 +337,7 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
             .map(|d| d.as_millis())
             .unwrap_or(0)
     ));
-    let (mock_dev, mock_state) = MockFullDevice::new("audit:mock_0");
+    let (mock_dev, mock_state) = MockFullDevice::build("audit:mock_0");
     let mut eng =
         BackendEngine::new_headless(temp_cfg.clone(), AppConfig::default(), vec![mock_dev]);
     eng.drivers.push(Box::new(MockAuditDriver {
@@ -591,8 +591,33 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
         )?;
         eng.invalidate_rgb_frames();
         eng.push_live_rgb_frame();
+        // Changing POLLING_RATE while live RGB is active must invalidate & re-push the LED frame.
         cmd_ok(&mut eng, "lighting_sync_all", json!({ "enabled": true }))?;
+        eng.invalidate_rgb_frames();
+        eng.push_live_rgb_frame();
+        let before_poll_frames = mock_state.lock().unwrap().frames.len();
+        cmd_ok(
+            &mut eng,
+            "device_set",
+            json!({ "device": "audit:mock_0", "setting": setting_ids::POLLING_RATE, "value": "1000" }),
+        )?;
+        let after_poll_frames = mock_state.lock().unwrap().frames.len();
         cmd_ok(&mut eng, "lighting_sync_all", json!({ "enabled": false }))?;
+        let st = mock_state.lock().unwrap();
+        let has_preserved = st
+            .frames
+            .first()
+            .is_some_and(|f| f.len() == 14 && f[0] == Rgb::new(0xFF, 0x88, 0x00));
+        if after_poll_frames <= before_poll_frames {
+            return Err("POLLING_RATE n'a pas réémis la trame RGB après ré-énumération USB".into());
+        }
+        if !has_preserved {
+            return Err("La zone Hardware mixte n'a pas conservé sa couleur #FF8800".into());
+        }
+        if st.released == 0 || st.hw_applied.len() < 2 {
+            return Err("release_device_lighting ou apply_hardware_effect non appelé".into());
+        }
+        drop(st);
         cmd_err(
             &mut eng,
             "lighting_set_device",
@@ -601,17 +626,6 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
                 "override": { "mode": "hardware", "request": { "effect": "Static" } }
             }),
         )?;
-        let st = mock_state.lock().unwrap();
-        let has_preserved = st
-            .frames
-            .first()
-            .is_some_and(|f| f.len() == 14 && f[0] == Rgb::new(0xFF, 0x88, 0x00));
-        if !has_preserved {
-            return Err("La zone Hardware mixte n'a pas conservé sa couleur #FF8800".into());
-        }
-        if st.released == 0 || st.hw_applied.len() < 2 {
-            return Err("release_device_lighting ou apply_hardware_effect non appelé".into());
-        }
         Ok("Sync/Mixed/Release/Resize/Layers vérifiés".into())
     });
 

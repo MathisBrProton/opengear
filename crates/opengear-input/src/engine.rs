@@ -1136,40 +1136,40 @@ fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             }
 
             // Handle pending TapHold state transitions (tap on quick release, promote on chord/timeout).
-            if let Ok(mut st) = state_store().try_lock() {
-                if let Some(pending) = st.pending_tap_hold.clone() {
-                    if pending.src_vk == vk {
-                        if is_up {
-                            let _ = st.take_pending_for(vk);
-                            drop(st);
-                            let _ = KEYS.take_suppressed(vk);
-                            if now < pending.deadline {
-                                send_vk(pending.tap_vk, true);
-                                send_vk(pending.tap_vk, false);
-                            } else {
-                                send_vk(pending.hold_vk, true);
-                                send_vk(pending.hold_vk, false);
-                            }
-                            return 1;
-                        } else if now >= pending.deadline {
-                            let _ = st.take_pending_for(vk);
-                            drop(st);
-                            if send_vk(pending.hold_vk, true) {
-                                KEYS.begin_remap(vk, pending.hold_vk);
-                            }
-                            return 1;
-                        } else {
-                            return 1;
-                        }
-                    } else if is_down && !is_repeat {
-                        // Permissive hold: chording another key promotes pending TapHold immediately.
-                        let promoted = st.pending_tap_hold.take();
+            if let Ok(mut st) = state_store().try_lock()
+                && let Some(pending) = st.pending_tap_hold.clone()
+            {
+                if pending.src_vk == vk {
+                    if is_up {
+                        let _ = st.take_pending_for(vk);
                         drop(st);
-                        if let Some(p) = promoted
-                            && send_vk(p.hold_vk, true)
-                        {
-                            KEYS.begin_remap(p.src_vk, p.hold_vk);
+                        let _ = KEYS.take_suppressed(vk);
+                        if now < pending.deadline {
+                            send_vk(pending.tap_vk, true);
+                            send_vk(pending.tap_vk, false);
+                        } else {
+                            send_vk(pending.hold_vk, true);
+                            send_vk(pending.hold_vk, false);
                         }
+                        return 1;
+                    } else if now >= pending.deadline {
+                        let _ = st.take_pending_for(vk);
+                        drop(st);
+                        if send_vk(pending.hold_vk, true) {
+                            KEYS.begin_remap(vk, pending.hold_vk);
+                        }
+                        return 1;
+                    } else {
+                        return 1;
+                    }
+                } else if is_down && !is_repeat {
+                    // Permissive hold: chording another key promotes pending TapHold immediately.
+                    let promoted = st.pending_tap_hold.take();
+                    drop(st);
+                    if let Some(p) = promoted
+                        && send_vk(p.hold_vk, true)
+                    {
+                        KEYS.begin_remap(p.src_vk, p.hold_vk);
                     }
                 }
             }
