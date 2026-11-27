@@ -1,4 +1,5 @@
-//! Universal SuperIO (Nuvoton `NCT6791D`..`NCT6799D` and ITE `IT86xx`/`IT87xx`) live Fan RPM & PWM
+//! Universal SuperIO (Nuvoton `NCT677x`/`NCT679xD`/`NCT6701D`/`NCT5585D`, Nuvoton eSIO EC
+//! `NCT6683D`/`NCT6686D`/`NCT6687D`/`NCT6687DR`, and ITE `IT86xx`/`IT87xx`) live Fan RPM & PWM
 //! controller via Microsoft WHQL-signed **PawnIO** (`LpcIO.bin`).
 
 use anyhow::{Context, Result};
@@ -14,14 +15,15 @@ use opengear_platform::pawnio::{PawnIoSession, load_pawnio_module, pawnio_availa
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
 
+const MAX_SUPERIO_CHANNELS: usize = 16;
+
+// Nuvoton banked LPC HWM registers (`base + 5` index / `base + 6` data)
 const BANK_SELECT_REG: u8 = 0x4E;
 const VENDOR_ID_HIGH_REG: u16 = 0x804F;
 const VENDOR_ID_LOW_REG: u16 = 0x004F;
 const NUVOTON_VENDOR_ID: u16 = 0x5CA3;
 
-const ITE_VENDOR_ID_REG: u8 = 0x58;
-const ITE_VENDOR_ID: u8 = 0x90;
-
+const FAN_RPM_REGS_6771: [u16; 3] = [0x656, 0x658, 0x65A];
 const FAN_RPM_REGS_95: [u16; 7] = [0x4C0, 0x4C2, 0x4C4, 0x4C6, 0x4C8, 0x4CA, 0x4CE];
 const FAN_RPM_REGS_96: [u16; 7] = [0x4B0, 0x4B2, 0x4B4, 0x4B6, 0x4B8, 0x4BA, 0x4CC];
 const FAN_PWM_OUT_REGS_98: [u16; 7] = [0x001, 0x003, 0x011, 0x013, 0x015, 0xA09, 0xB09];
@@ -29,19 +31,163 @@ const FAN_PWM_OUT_REGS_95: [u16; 7] = [0x001, 0x003, 0x011, 0x013, 0x015, 0x017,
 const FAN_PWM_CMD_REGS: [u16; 7] = [0x109, 0x209, 0x309, 0x809, 0x909, 0xA09, 0xB09];
 const FAN_CTRL_MODE_REGS: [u16; 7] = [0x102, 0x202, 0x302, 0x802, 0x902, 0xA02, 0xB02];
 
-const ITE_TACH_LSB_REGS: [u8; 5] = [0x0D, 0x0E, 0x0F, 0x80, 0x82];
-const ITE_TACH_MSB_REGS: [u8; 5] = [0x18, 0x19, 0x1A, 0x81, 0x83];
-const ITE_PWM_CTRL_REGS: [u8; 5] = [0x15, 0x16, 0x17, 0x7F, 0xA7];
-const ITE_PWM_DUTY_REGS: [u8; 5] = [0x63, 0x6B, 0x73, 0x7B, 0xA3];
+// Nuvoton NCT668x eSIO indirect EC space registers (`base + 4` page / `+ 5` index / `+ 6` data)
+const EC_PAGE_REG_OFFSET: u16 = 0x04;
+const EC_INDEX_REG_OFFSET: u16 = 0x05;
+const EC_DATA_REG_OFFSET: u16 = 0x06;
+const EC_PAGE_SELECT_FREE: u8 = 0xFF;
+const EC_HWM_CFG_REG: u16 = 0x0180;
+const EC_CUSTOMER_ID_REG: u16 = 0x0602;
+const EC_FAN_MODE_REG: u16 = 0x0A00;
+const EC_FAN_CFG_CTRL_REG: u16 = 0x0A01;
+const EC_FAN_CFG_REQ_BIT: u8 = 0x80;
+const EC_FAN_CFG_DONE_BIT: u8 = 0x40;
+const EC_DR_ENGINE_STS_REG: u16 = 0x0CF8;
+const EC_DR_CFG_LOCK: u8 = 1 << 6;
+const EC_DR_CFG_CHECK_DONE: u8 = 1 << 5;
+const EC_DR_CFG_INVALID: u8 = 1 << 4;
+const EC_DR_CFG_PHASE: u8 = 1 << 3;
+
+// ITE IT86xx / IT87xx EC registers
+const ITE_VENDOR_ID_REG: u8 = 0x58;
+const ITE_VENDOR_IDS: [u8; 2] = [0x90, 0x7F];
+const ITE_FAN_MAIN_CTRL_REG: u8 = 0x13;
+
+const ITE_TACH_LSB_REGS: [u8; 6] = [0x0D, 0x0E, 0x0F, 0x80, 0x82, 0x4C];
+const ITE_TACH_MSB_REGS: [u8; 6] = [0x18, 0x19, 0x1A, 0x81, 0x83, 0x4D];
+const ITE_TACH_LSB_ALT_REGS: [u8; 6] = [0x0D, 0x0E, 0x0F, 0x80, 0x82, 0x93];
+const ITE_TACH_MSB_ALT_REGS: [u8; 6] = [0x18, 0x19, 0x1A, 0x81, 0x83, 0x94];
+const ITE_PWM_CTRL_REGS: [u8; 6] = [0x15, 0x16, 0x17, 0x7F, 0xA7, 0xAF];
+const ITE_PWM_CTRL_ALT_REGS: [u8; 6] = [0x15, 0x16, 0x17, 0x1E, 0x1F, 0x92];
+const ITE_PWM_DUTY_REGS: [u8; 6] = [0x63, 0x6B, 0x73, 0x7B, 0xA3, 0xAB];
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EcChannelRegs {
+    pub index: usize,
+    pub rpm_reg: u16,
+    pub pwm_out_reg: u16,
+    pub pwm_cmd_reg: u16,
+    pub mode_reg: u16,
+    pub mode_bit: u8,
+}
+
+const EC_DR_CHANNEL_MAP: [EcChannelRegs; 11] = [
+    EcChannelRegs {
+        index: 0,
+        rpm_reg: 0x0140,
+        pwm_out_reg: 0x0160,
+        pwm_cmd_reg: 0x0A28,
+        mode_reg: 0x0A00,
+        mode_bit: 0,
+    },
+    EcChannelRegs {
+        index: 1,
+        rpm_reg: 0x0142,
+        pwm_out_reg: 0x0161,
+        pwm_cmd_reg: 0x0A29,
+        mode_reg: 0x0A00,
+        mode_bit: 1,
+    },
+    EcChannelRegs {
+        index: 2,
+        rpm_reg: 0x0144,
+        pwm_out_reg: 0x0162,
+        pwm_cmd_reg: 0x0A2A,
+        mode_reg: 0x0A00,
+        mode_bit: 2,
+    },
+    EcChannelRegs {
+        index: 3,
+        rpm_reg: 0x0146,
+        pwm_out_reg: 0x0163,
+        pwm_cmd_reg: 0x0A2B,
+        mode_reg: 0x0A00,
+        mode_bit: 3,
+    },
+    EcChannelRegs {
+        index: 9,
+        rpm_reg: 0x0152,
+        pwm_out_reg: 0x0C93,
+        pwm_cmd_reg: 0x08E9,
+        mode_reg: 0x080F,
+        mode_bit: 1,
+    },
+    EcChannelRegs {
+        index: 10,
+        rpm_reg: 0x015E,
+        pwm_out_reg: 0x0E05,
+        pwm_cmd_reg: 0x0265,
+        mode_reg: 0x080F,
+        mode_bit: 7,
+    },
+    EcChannelRegs {
+        index: 11,
+        rpm_reg: 0x015C,
+        pwm_out_reg: 0x0E04,
+        pwm_cmd_reg: 0x0264,
+        mode_reg: 0x080F,
+        mode_bit: 6,
+    },
+    EcChannelRegs {
+        index: 12,
+        rpm_reg: 0x015A,
+        pwm_out_reg: 0x0E03,
+        pwm_cmd_reg: 0x0263,
+        mode_reg: 0x080F,
+        mode_bit: 5,
+    },
+    EcChannelRegs {
+        index: 13,
+        rpm_reg: 0x0158,
+        pwm_out_reg: 0x0E02,
+        pwm_cmd_reg: 0x0262,
+        mode_reg: 0x080F,
+        mode_bit: 4,
+    },
+    EcChannelRegs {
+        index: 14,
+        rpm_reg: 0x0156,
+        pwm_out_reg: 0x0E01,
+        pwm_cmd_reg: 0x0261,
+        mode_reg: 0x080F,
+        mode_bit: 3,
+    },
+    EcChannelRegs {
+        index: 15,
+        rpm_reg: 0x0154,
+        pwm_out_reg: 0x0E00,
+        pwm_cmd_reg: 0x0260,
+        mode_reg: 0x080F,
+        mode_bit: 2,
+    },
+];
+
+pub(crate) fn ec_standard_channel(index: usize) -> Option<EcChannelRegs> {
+    if index >= 8 {
+        return None;
+    }
+    Some(EcChannelRegs {
+        index,
+        rpm_reg: 0x0140 + (index as u16) * 2,
+        pwm_out_reg: 0x0160 + (index as u16),
+        pwm_cmd_reg: 0x0A28 + (index as u16),
+        mode_reg: EC_FAN_MODE_REG,
+        mode_bit: index as u8,
+    })
+}
+
+pub(crate) fn ec_dr_channel(index: usize) -> Option<EcChannelRegs> {
+    EC_DR_CHANNEL_MAP.iter().copied().find(|c| c.index == index)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuperIoFanChannel {
-    /// 0-based SuperIO channel index (0..7)
+    /// 0-based physical SuperIO channel index (`0..16`)
     pub index: usize,
     pub label: String,
     pub rpm: u32,
     pub pwm_pct: u8,
-    /// Raw control mode byte (bits 7:4 == 0 -> Manual, non-zero -> SmartFan / BIOS auto)
+    /// Raw control mode byte (meaning depends on chip family)
     pub mode_raw: u8,
     pub is_manual: bool,
 }
@@ -57,14 +203,35 @@ pub struct SuperIoSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NuvotonRpmMode {
+    /// Legacy NCT6771F / NCT6776F (`0x656..0x65A` direct 16-bit RPM)
+    Rpm656Direct,
+    /// NCT6791D..NCT6795D (`0x4C0..0x4CE` direct 16-bit RPM)
+    Rpm4C0Direct,
+    /// NCT6779D / NCT6796D+ / NCT6701D / NCT5585D (`0x4B0..0x4CC` 13-bit period counter)
+    Rpm4B0Count13,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IteChipSpec {
+    pub name: &'static str,
+    pub fan_count: usize,
+    pub pwm_8bit: bool,
+    pub alt_regs: bool,
+    pub ctrl_0x7f_quirk: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChipFamily {
-    Nuvoton {
+    NuvotonBank {
         use_98_pwm_out: bool,
-        use_96_rpm_regs: bool,
+        rpm_mode: NuvotonRpmMode,
+        allow_no_vendor_id: bool,
     },
-    Ite {
-        pwm_8bit: bool,
+    NuvotonEc {
+        dr_handshake: bool,
     },
+    Ite(IteChipSpec),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -91,7 +258,7 @@ pub fn safe_superio_duty(duty_pct: u8) -> u8 {
     safe_superio_duty_with_floor(duty_pct, SUPERIO_MIN_PWM_PCT)
 }
 
-/// Preserve lower bits `3:0` when switching `FAN_CTRL_MODE_REGS` to manual mode (`bits 7:4 == 0`).
+/// Preserve lower bits `3:0` when switching Nuvoton banked `FAN_CTRL_MODE_REGS` to manual mode (`bits 7:4 == 0`).
 pub(crate) fn manual_mode_byte(cur_mode: u8) -> u8 {
     cur_mode & 0x0F
 }
@@ -100,6 +267,7 @@ pub(crate) fn manual_mode_byte(cur_mode: u8) -> u8 {
 struct SavedFanState {
     mode: u8,
     cmd: u8,
+    extra: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,18 +275,22 @@ pub struct SuperIoSavedState {
     pub index: usize,
     pub mode: u8,
     pub cmd: u8,
+    /// Optional auxiliary register state (e.g. ITE `FAN_MAIN_CTRL` 0x13 bit).
+    #[serde(default)]
+    pub extra: u8,
 }
 
 pub fn saved_superio_states() -> Vec<SuperIoSavedState> {
     saved_states()
         .lock()
         .map(|g| {
-            (0..7)
+            (0..MAX_SUPERIO_CHANNELS)
                 .filter_map(|i| {
                     g[i].map(|s| SuperIoSavedState {
                         index: i,
                         mode: s.mode,
                         cmd: s.cmd,
+                        extra: s.extra,
                     })
                 })
                 .collect()
@@ -126,51 +298,194 @@ pub fn saved_superio_states() -> Vec<SuperIoSavedState> {
         .unwrap_or_default()
 }
 
-static SAVED_INITIAL_STATES: OnceLock<Mutex<[Option<SavedFanState>; 7]>> = OnceLock::new();
+static SAVED_INITIAL_STATES: OnceLock<Mutex<[Option<SavedFanState>; MAX_SUPERIO_CHANNELS]>> =
+    OnceLock::new();
 
-fn saved_states() -> &'static Mutex<[Option<SavedFanState>; 7]> {
-    SAVED_INITIAL_STATES.get_or_init(|| Mutex::new([None; 7]))
+fn saved_states() -> &'static Mutex<[Option<SavedFanState>; MAX_SUPERIO_CHANNELS]> {
+    SAVED_INITIAL_STATES.get_or_init(|| Mutex::new([None; MAX_SUPERIO_CHANNELS]))
 }
 
-/// Return `(name, fan_count, use_98_pwm_out, use_96_rpm_regs)`.
-pub(crate) fn identify_nuvoton(id: u16) -> Option<(&'static str, usize, bool, bool)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NuvotonBankSpec {
+    pub name: &'static str,
+    pub fan_count: usize,
+    pub use_98_pwm_out: bool,
+    pub rpm_mode: NuvotonRpmMode,
+    pub allow_no_vendor_id: bool,
+}
+
+pub(crate) fn identify_nuvoton_bank(id: u16) -> Option<NuvotonBankSpec> {
     match id & 0xFFF0 {
-        0xC800 => Some(("Nuvoton NCT6791D", 6, false, false)),
-        0xC910 => Some(("Nuvoton NCT6792D", 6, false, false)),
-        0xD120 => Some(("Nuvoton NCT6793D/NCT6795D", 6, false, false)),
-        0xD350 => Some(("Nuvoton NCT6796D", 6, false, true)),
+        0xB470 => Some(NuvotonBankSpec {
+            name: "Nuvoton NCT6771F",
+            fan_count: 3,
+            use_98_pwm_out: false,
+            rpm_mode: NuvotonRpmMode::Rpm656Direct,
+            allow_no_vendor_id: false,
+        }),
+        0xC330 => Some(NuvotonBankSpec {
+            name: "Nuvoton NCT6776F",
+            fan_count: 3,
+            use_98_pwm_out: false,
+            rpm_mode: NuvotonRpmMode::Rpm656Direct,
+            allow_no_vendor_id: false,
+        }),
+        0xC560 => Some(NuvotonBankSpec {
+            name: "Nuvoton NCT6779D",
+            fan_count: 5,
+            use_98_pwm_out: false,
+            rpm_mode: NuvotonRpmMode::Rpm4B0Count13,
+            allow_no_vendor_id: false,
+        }),
+        0xC800 => Some(NuvotonBankSpec {
+            name: "Nuvoton NCT6791D",
+            fan_count: 6,
+            use_98_pwm_out: false,
+            rpm_mode: NuvotonRpmMode::Rpm4C0Direct,
+            allow_no_vendor_id: false,
+        }),
+        0xC910 => Some(NuvotonBankSpec {
+            name: "Nuvoton NCT6792D",
+            fan_count: 6,
+            use_98_pwm_out: false,
+            rpm_mode: NuvotonRpmMode::Rpm4C0Direct,
+            allow_no_vendor_id: false,
+        }),
+        0xD120 => Some(NuvotonBankSpec {
+            name: "Nuvoton NCT6793D/NCT6795D",
+            fan_count: 6,
+            use_98_pwm_out: false,
+            rpm_mode: NuvotonRpmMode::Rpm4C0Direct,
+            allow_no_vendor_id: false,
+        }),
+        0xD350 => Some(NuvotonBankSpec {
+            name: "Nuvoton NCT6796D",
+            fan_count: 6,
+            use_98_pwm_out: false,
+            rpm_mode: NuvotonRpmMode::Rpm4B0Count13,
+            allow_no_vendor_id: false,
+        }),
         0xD420 => {
-            if id == 0xD42B || id == 0xD428 {
-                Some(("Nuvoton NCT6798D", 7, true, true))
-            } else {
-                Some(("Nuvoton NCT6796D-R/S", 7, true, true))
-            }
+            let (name, fan_count) = match id {
+                0xD423 => ("Nuvoton NCT6796D", 6),
+                0xD428 | 0xD42B => ("Nuvoton NCT6798D", 7),
+                0xD42A => ("Nuvoton NCT6796D-R/NCT5585D", 7),
+                _ => ("Nuvoton NCT6796D-R/S", 7),
+            };
+            Some(NuvotonBankSpec {
+                name,
+                fan_count,
+                use_98_pwm_out: true,
+                rpm_mode: NuvotonRpmMode::Rpm4B0Count13,
+                allow_no_vendor_id: false,
+            })
         }
-        0xD450 => Some(("Nuvoton NCT6797D", 7, true, true)),
-        0xD800 => Some(("Nuvoton NCT6799D", 7, true, true)),
-        0xD590 => Some(("Nuvoton NCT6796D-S", 7, true, true)),
+        0xD450 => Some(NuvotonBankSpec {
+            name: "Nuvoton NCT6797D",
+            fan_count: 7,
+            use_98_pwm_out: true,
+            rpm_mode: NuvotonRpmMode::Rpm4B0Count13,
+            allow_no_vendor_id: false,
+        }),
+        0xD800 => {
+            let (name, allow_no_vendor_id) = match id {
+                0xD806 => ("Nuvoton NCT6701D", true),
+                0xD802 => ("Nuvoton NCT6799D/NCT6796D-S", false),
+                _ => ("Nuvoton NCT6799D", false),
+            };
+            Some(NuvotonBankSpec {
+                name,
+                fan_count: 7,
+                use_98_pwm_out: true,
+                rpm_mode: NuvotonRpmMode::Rpm4B0Count13,
+                allow_no_vendor_id,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Return `(name, fan_count, use_98_pwm_out, use_96_rpm_regs)` for banked Nuvoton chips.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn identify_nuvoton(id: u16) -> Option<(&'static str, usize, bool, bool)> {
+    identify_nuvoton_bank(id).map(|s| {
+        (
+            s.name,
+            s.fan_count,
+            s.use_98_pwm_out,
+            s.rpm_mode == NuvotonRpmMode::Rpm4B0Count13,
+        )
+    })
+}
+
+/// Return the base EC-space model name for Nuvoton `NCT6683D` / `NCT6686D` / `NCT6687D`.
+pub(crate) fn identify_nuvoton_ec(id: u16) -> Option<&'static str> {
+    match id & 0xFFF0 {
+        0xC730 => Some("Nuvoton NCT6683D"),
+        0xD440 => Some("Nuvoton NCT6686D"),
+        0xD590 => Some("Nuvoton NCT6687D"),
+        _ => None,
+    }
+}
+
+/// True when the SMBIOS baseboard product string names an 800-series chipset known to pair
+/// `NCT6687D` (`0xD592`) with the `0xCF8` handshake EC firmware (`NCT6687D-R`).
+pub(crate) fn is_800_series_ec_dr_board(chip_id: u16, board_product: &str) -> bool {
+    if chip_id != 0xD592 {
+        return false;
+    }
+    let up = board_product.to_ascii_uppercase();
+    ["B840", "B850", "B860", "X870", "Z890"]
+        .iter()
+        .any(|tag| up.contains(tag))
+}
+
+/// Return full chip capabilities for supported ITE EC/SuperIO chips.
+pub(crate) fn identify_ite_spec(id: u16) -> Option<IteChipSpec> {
+    let spec = |name, fan_count, pwm_8bit, alt_regs, ctrl_0x7f_quirk| IteChipSpec {
+        name,
+        fan_count,
+        pwm_8bit,
+        alt_regs,
+        ctrl_0x7f_quirk,
+    };
+    match id {
+        0x8613 => Some(spec("ITE IT8613E", 4, true, false, false)),
+        0x8620 => Some(spec("ITE IT8620E", 5, true, false, false)),
+        0x8622 => Some(spec("ITE IT8622E", 5, true, false, false)),
+        0x8623 => Some(spec("ITE IT8623E", 3, true, false, false)),
+        0x8625 => Some(spec("ITE IT8625E", 6, true, true, false)),
+        0x8628 => Some(spec("ITE IT8628E", 6, true, false, false)),
+        0x8631 => Some(spec("ITE IT8631E", 2, true, false, false)),
+        0x8638 => Some(spec("ITE IT8638E", 2, true, false, false)),
+        0x8655 => Some(spec("ITE IT8655E", 3, true, false, false)),
+        0x8665 => Some(spec("ITE IT8665E", 6, true, true, false)),
+        0x8686 => Some(spec("ITE IT8686E", 5, true, false, false)),
+        0x8688 => Some(spec("ITE IT8688E", 5, true, false, false)),
+        0x8689 => Some(spec("ITE IT8689E", 6, true, false, true)),
+        0x8695 => Some(spec("ITE IT87952E", 3, true, false, false)),
+        0x8696 => Some(spec("ITE IT8696E", 6, true, false, false)),
+        0x8705 => Some(spec("ITE IT8705F", 3, false, false, false)),
+        0x8712 => Some(spec("ITE IT8712F", 3, false, false, false)),
+        0x8716 => Some(spec("ITE IT8716F", 3, false, false, false)),
+        0x8718 => Some(spec("ITE IT8718F", 3, false, false, false)),
+        0x8720 => Some(spec("ITE IT8720F", 3, false, false, false)),
+        0x8721 => Some(spec("ITE IT8721F", 3, true, false, false)),
+        0x8726 => Some(spec("ITE IT8726F", 3, false, false, false)),
+        0x8728 => Some(spec("ITE IT8728F", 5, false, false, false)),
+        0x8733 => Some(spec("ITE IT8792E/IT8795E", 3, true, false, false)),
+        0x8771 => Some(spec("ITE IT8771E", 3, false, false, false)),
+        0x8772 => Some(spec("ITE IT8772E", 3, true, false, false)),
+        0x8790 => Some(spec("ITE IT8790E", 3, true, false, false)),
+        0x8792 | 0x8795 => Some(spec("ITE IT8792E/IT8795E", 3, true, false, false)),
         _ => None,
     }
 }
 
 /// Return `(name, fan_count, pwm_8bit)` for supported ITE EC/SuperIO chips.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn identify_ite(id: u16) -> Option<(&'static str, usize, bool)> {
-    match id {
-        0x8613 => Some(("ITE IT8613E", 5, true)),
-        0x8620 => Some(("ITE IT8620E", 5, true)),
-        0x8625 => Some(("ITE IT8625E", 5, true)),
-        0x8628 => Some(("ITE IT8628E", 5, true)),
-        0x8655 => Some(("ITE IT8655E", 3, true)),
-        0x8665 => Some(("ITE IT8665E", 5, true)),
-        0x8686 => Some(("ITE IT8686E", 5, true)),
-        0x8688 => Some(("ITE IT8688E", 5, true)),
-        0x8689 => Some(("ITE IT8689E", 5, true)),
-        0x8696 => Some(("ITE IT8696E", 5, true)),
-        0x8790 | 0x8792 | 0x8795 => Some(("ITE IT8792E/IT8795E", 3, true)),
-        0x8728 => Some(("ITE IT8728F", 5, false)),
-        0x8771 | 0x8772 => Some(("ITE IT8771E/IT8772E", 3, false)),
-        _ => None,
-    }
+    identify_ite_spec(id).map(|s| (s.name, s.fan_count, s.pwm_8bit))
 }
 
 pub(crate) fn ite_rpm_from_count(count: u32) -> u32 {
@@ -181,11 +496,45 @@ pub(crate) fn ite_rpm_from_count(count: u32) -> u32 {
     if (100..15_000).contains(&rpm) { rpm } else { 0 }
 }
 
-pub(crate) fn ite_manual_target(cur_ctrl: u8, duty_pct: u8, pwm_8bit: bool) -> (u8, u8) {
+/// Decode Nuvoton fan RPM from `(hi, lo)` bytes.
+///
+/// NCT6779D / NCT6796D+ (`0x4B0..0x4CC`) expose a 13-bit tachometer period counter
+/// (`(hi << 5) | (lo & 0x1F)`) clocked at 1.35 MHz, whereas NCT6771F/NCT6776F (`0x656..0x65A`),
+/// NCT6791D..NCT6795D (`0x4C0..0x4CE`) and NCT668x (`0x140..0x15E`) report direct 16-bit RPM.
+pub(crate) fn nuvoton_rpm_from_regs(hi: u8, lo: u8, is_13bit_count: bool) -> u32 {
+    if is_13bit_count {
+        let count = ((hi as u32) << 5) | ((lo as u32) & 0x1F);
+        if count == 0 || count >= 0x1FFF {
+            return 0;
+        }
+        let rpm = 1_350_000u32 / count;
+        if (100..15_000).contains(&rpm) { rpm } else { 0 }
+    } else {
+        let raw_rpm = ((hi as u32) << 8) | (lo as u32);
+        if (100..15_000).contains(&raw_rpm) {
+            raw_rpm
+        } else {
+            0
+        }
+    }
+}
+
+pub(crate) fn ite_manual_target(
+    cur_ctrl: u8,
+    duty_pct: u8,
+    pwm_8bit: bool,
+    ctrl_0x7f_quirk: bool,
+) -> (u8, u8) {
     if pwm_8bit {
         let raw = ((duty_pct.min(100) as u32 * 255 + 50) / 100).min(255) as u8;
-        // Bit 7 = 0 switches channel from SmartGuardian auto to direct software duty.
-        (cur_ctrl & 0x7F, raw)
+        // IT8689E requires writing `0x7F` (detaching all 7 temp-map bits) before duty takes effect;
+        // other ITE 8-bit chips preserve the lower 7 bits while clearing bit 7 (manual mode).
+        let ctrl = if ctrl_0x7f_quirk {
+            0x7F
+        } else {
+            cur_ctrl & 0x7F
+        };
+        (ctrl, raw)
     } else {
         let raw = ((duty_pct.min(100) as u32 * 127 + 50) / 100).min(127) as u8;
         (raw & 0x7F, raw)
@@ -195,6 +544,7 @@ pub(crate) fn ite_manual_target(cur_ctrl: u8, duty_pct: u8, pwm_8bit: bool) -> (
 #[cfg(windows)]
 mod win_sio {
     use super::*;
+    use std::time::{Duration, Instant};
 
     fn pio_outb(s: &PawnIoSession, port: u16, val: u8) -> Result<()> {
         s.execute("ioctl_pio_outb", &[port as i64, val as i64], 0)?;
@@ -255,6 +605,145 @@ mod win_sio {
         (((hi as u16) << 8) | (lo as u16)) == NUVOTON_VENDOR_ID
     }
 
+    fn ec_acquire_page_port(s: &PawnIoSession, base: u16) -> Result<()> {
+        let page_port = base + EC_PAGE_REG_OFFSET;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            if pio_inb(s, page_port)? == EC_PAGE_SELECT_FREE {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                pio_outb(s, page_port, EC_PAGE_SELECT_FREE)?;
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn ec_read(s: &PawnIoSession, base: u16, addr: u16) -> Result<u8> {
+        let page = (addr >> 8) as u8;
+        let index = (addr & 0xFF) as u8;
+        ec_acquire_page_port(s, base)?;
+        pio_outb(s, base + EC_PAGE_REG_OFFSET, page)?;
+        pio_outb(s, base + EC_INDEX_REG_OFFSET, index)?;
+        let val = pio_inb(s, base + EC_DATA_REG_OFFSET);
+        let _ = pio_outb(s, base + EC_PAGE_REG_OFFSET, EC_PAGE_SELECT_FREE);
+        val
+    }
+
+    fn ec_write(s: &PawnIoSession, base: u16, addr: u16, val: u8) -> Result<()> {
+        let page = (addr >> 8) as u8;
+        let index = (addr & 0xFF) as u8;
+        ec_acquire_page_port(s, base)?;
+        pio_outb(s, base + EC_PAGE_REG_OFFSET, page)?;
+        pio_outb(s, base + EC_INDEX_REG_OFFSET, index)?;
+        let res = pio_outb(s, base + EC_DATA_REG_OFFSET, val);
+        let _ = pio_outb(s, base + EC_PAGE_REG_OFFSET, EC_PAGE_SELECT_FREE);
+        res
+    }
+
+    fn ec_update(s: &PawnIoSession, base: u16, addr: u16, and_mask: u8, or_mask: u8) -> Result<()> {
+        let cur = ec_read(s, base, addr)?;
+        ec_write(s, base, addr, (cur & and_mask) | or_mask)
+    }
+
+    fn ec_verify_alive(s: &PawnIoSession, base: u16) -> bool {
+        let cfg = ec_read(s, base, EC_HWM_CFG_REG).unwrap_or(0xFF);
+        let cid_hi = ec_read(s, base, EC_CUSTOMER_ID_REG).unwrap_or(0xFF);
+        let cid_lo = ec_read(s, base, EC_CUSTOMER_ID_REG + 1).unwrap_or(0xFF);
+        !(cfg == 0xFF && cid_hi == 0xFF && cid_lo == 0xFF)
+    }
+
+    fn ec_dr_start_cfg(s: &PawnIoSession, base: u16) -> Result<bool> {
+        let sts = ec_read(s, base, EC_DR_ENGINE_STS_REG)?;
+        if (sts & EC_DR_CFG_LOCK) == 0 && (sts & EC_DR_CFG_PHASE) != 0 {
+            return Ok(true);
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            let sts = ec_read(s, base, EC_DR_ENGINE_STS_REG)?;
+            if (sts & EC_DR_CFG_PHASE) == 0 {
+                let req = ec_read(s, base, EC_FAN_CFG_CTRL_REG)?;
+                if (req & EC_FAN_CFG_REQ_BIT) == 0 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        ec_update(
+            s,
+            base,
+            EC_FAN_CFG_CTRL_REG,
+            !EC_FAN_CFG_REQ_BIT,
+            EC_FAN_CFG_REQ_BIT,
+        )?;
+        std::thread::sleep(Duration::from_millis(10));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            let sts = ec_read(s, base, EC_DR_ENGINE_STS_REG)?;
+            if (sts & EC_DR_CFG_LOCK) == 0 && (sts & EC_DR_CFG_PHASE) != 0 {
+                return Ok(true);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(false)
+    }
+
+    fn ec_dr_complete_cfg(s: &PawnIoSession, base: u16) -> Result<bool> {
+        let sts = ec_read(s, base, EC_DR_ENGINE_STS_REG)?;
+        if (sts & EC_DR_CFG_LOCK) != 0 || (sts & EC_DR_CFG_PHASE) == 0 {
+            return Ok(false);
+        }
+        ec_update(
+            s,
+            base,
+            EC_FAN_CFG_CTRL_REG,
+            !EC_FAN_CFG_DONE_BIT,
+            EC_FAN_CFG_DONE_BIT,
+        )?;
+        std::thread::sleep(Duration::from_millis(10));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            let sts = ec_read(s, base, EC_DR_ENGINE_STS_REG)?;
+            if (sts & EC_DR_CFG_CHECK_DONE) != 0 {
+                return Ok((sts & EC_DR_CFG_INVALID) == 0);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let sts = ec_read(s, base, EC_DR_ENGINE_STS_REG)?;
+        Ok((sts & EC_DR_CFG_INVALID) == 0)
+    }
+
+    fn ec_channel_for(dr_handshake: bool, index: usize) -> Option<EcChannelRegs> {
+        if dr_handshake {
+            ec_dr_channel(index)
+        } else {
+            ec_standard_channel(index)
+        }
+    }
+
+    fn ec_channels(dr_handshake: bool) -> Vec<EcChannelRegs> {
+        if dr_handshake {
+            EC_DR_CHANNEL_MAP.to_vec()
+        } else {
+            (0..8).filter_map(ec_standard_channel).collect()
+        }
+    }
+
+    fn query_baseboard_product() -> String {
+        opengear_platform::wmi::WmiConn::connect(r"root\cimv2")
+            .ok()
+            .and_then(|c| c.query("SELECT Product FROM Win32_BaseBoard").ok())
+            .and_then(|rows| {
+                rows.into_iter().next().and_then(|r| {
+                    r.get("Product")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                })
+            })
+            .unwrap_or_default()
+    }
+
     fn enter_ite(s: &PawnIoSession, reg_port: u16) -> Result<()> {
         let last = if reg_port == 0x4E { 0xAA } else { 0x55 };
         pio_outb(s, reg_port, 0x87)?;
@@ -279,13 +768,17 @@ mod win_sio {
     }
 
     fn verify_ite_vendor(s: &PawnIoSession, base: u16) -> bool {
-        ite_ec_read(s, base, ITE_VENDOR_ID_REG).unwrap_or(0) == ITE_VENDOR_ID
+        let v = ite_ec_read(s, base, ITE_VENDOR_ID_REG).unwrap_or(0);
+        ITE_VENDOR_IDS.contains(&v)
     }
 
     fn verify_chip_vendor(s: &PawnIoSession, chip: DetectedChip) -> bool {
         match chip.family {
-            ChipFamily::Nuvoton { .. } => verify_nuvoton_vendor(s, chip.hwm_base),
-            ChipFamily::Ite { .. } => verify_ite_vendor(s, chip.hwm_base),
+            ChipFamily::NuvotonBank {
+                allow_no_vendor_id, ..
+            } => allow_no_vendor_id || verify_nuvoton_vendor(s, chip.hwm_base),
+            ChipFamily::NuvotonEc { .. } => ec_verify_alive(s, chip.hwm_base),
+            ChipFamily::Ite(_) => verify_ite_vendor(s, chip.hwm_base),
         }
     }
 
@@ -298,9 +791,33 @@ mod win_sio {
             }
             if enter_nuvoton(&sess, reg_port).is_ok() {
                 let chip_id = sio_inw(&sess, 0x20).unwrap_or(0xFFFF);
-                if let Some((chip_name, fan_count, use_98_pwm_out, use_96_rpm_regs)) =
-                    identify_nuvoton(chip_id)
-                {
+                if let Some(base_name) = identify_nuvoton_ec(chip_id) {
+                    let _ = sess.execute("ioctl_find_bars", &[], 0);
+                    let _ = sio_outb(&sess, 0x07, 0x0B);
+                    let hwm_base = sio_inw(&sess, 0x60).unwrap_or(0);
+                    exit_nuvoton(&sess, reg_port);
+
+                    if hwm_base >= 0x100 && hwm_base != 0xFFFF && ec_verify_alive(&sess, hwm_base) {
+                        let board = query_baseboard_product();
+                        let dr_handshake = is_800_series_ec_dr_board(chip_id, &board);
+                        let (chip_name, fan_count) = if dr_handshake {
+                            ("Nuvoton NCT6687D-R", EC_DR_CHANNEL_MAP.len())
+                        } else {
+                            (base_name, 8)
+                        };
+                        return Ok((
+                            sess,
+                            DetectedChip {
+                                slot,
+                                hwm_base,
+                                chip_id,
+                                chip_name,
+                                fan_count,
+                                family: ChipFamily::NuvotonEc { dr_handshake },
+                            },
+                        ));
+                    }
+                } else if let Some(spec) = identify_nuvoton_bank(chip_id) {
                     let _ = sess.execute("ioctl_find_bars", &[], 0);
                     let _ = sio_outb(&sess, 0x07, 0x0B);
                     let hwm_base = sio_inw(&sess, 0x60).unwrap_or(0);
@@ -320,18 +837,19 @@ mod win_sio {
                             exit_nuvoton(&sess, reg_port);
                         }
 
-                        if verify_nuvoton_vendor(&sess, hwm_base) {
+                        if spec.allow_no_vendor_id || verify_nuvoton_vendor(&sess, hwm_base) {
                             return Ok((
                                 sess,
                                 DetectedChip {
                                     slot,
                                     hwm_base,
                                     chip_id,
-                                    chip_name,
-                                    fan_count,
-                                    family: ChipFamily::Nuvoton {
-                                        use_98_pwm_out,
-                                        use_96_rpm_regs,
+                                    chip_name: spec.name,
+                                    fan_count: spec.fan_count,
+                                    family: ChipFamily::NuvotonBank {
+                                        use_98_pwm_out: spec.use_98_pwm_out,
+                                        rpm_mode: spec.rpm_mode,
+                                        allow_no_vendor_id: spec.allow_no_vendor_id,
                                     },
                                 },
                             ));
@@ -344,7 +862,7 @@ mod win_sio {
 
             if enter_ite(&sess, reg_port).is_ok() {
                 let chip_id = sio_inw(&sess, 0x20).unwrap_or(0xFFFF);
-                if let Some((chip_name, fan_count, pwm_8bit)) = identify_ite(chip_id) {
+                if let Some(spec) = identify_ite_spec(chip_id) {
                     let _ = sess.execute("ioctl_find_bars", &[], 0);
                     let _ = sio_outb(&sess, 0x07, 0x04);
                     let hwm_base = sio_inw(&sess, 0x60).unwrap_or(0);
@@ -357,9 +875,9 @@ mod win_sio {
                                 slot,
                                 hwm_base,
                                 chip_id,
-                                chip_name,
-                                fan_count,
-                                family: ChipFamily::Ite { pwm_8bit },
+                                chip_name: spec.name,
+                                fan_count: spec.fan_count,
+                                family: ChipFamily::Ite(spec),
                             },
                         ));
                     }
@@ -369,7 +887,7 @@ mod win_sio {
             }
         }
         anyhow::bail!(
-            "Aucune puce SuperIO Nuvoton NCT679xD / ITE IT86xx-IT87xx détectée sur 0x2E/0x4E"
+            "Aucune puce SuperIO Nuvoton NCT668x/NCT677x-NCT679xD ou ITE IT86xx-IT87xx détectée sur 0x2E/0x4E"
         )
     }
 
@@ -431,20 +949,22 @@ mod win_sio {
 
         let mut fans = Vec::new();
         match chip.family {
-            ChipFamily::Nuvoton {
+            ChipFamily::NuvotonBank {
                 use_98_pwm_out,
-                use_96_rpm_regs,
+                rpm_mode,
+                ..
             } => {
-                let rpm_regs = if use_96_rpm_regs {
-                    &FAN_RPM_REGS_96
-                } else {
-                    &FAN_RPM_REGS_95
+                let rpm_regs: &[u16] = match rpm_mode {
+                    NuvotonRpmMode::Rpm656Direct => &FAN_RPM_REGS_6771,
+                    NuvotonRpmMode::Rpm4C0Direct => &FAN_RPM_REGS_95,
+                    NuvotonRpmMode::Rpm4B0Count13 => &FAN_RPM_REGS_96,
                 };
                 let pwm_out_regs = if use_98_pwm_out {
                     &FAN_PWM_OUT_REGS_98
                 } else {
                     &FAN_PWM_OUT_REGS_95
                 };
+                let is_13bit = rpm_mode == NuvotonRpmMode::Rpm4B0Count13;
 
                 for i in 0..chip.fan_count {
                     let Ok(hi) = hwm_read(sess, chip.hwm_base, rpm_regs[i]) else {
@@ -461,12 +981,7 @@ mod win_sio {
                             ..Default::default()
                         };
                     };
-                    let raw_rpm = ((hi as u32) << 8) | (lo as u32);
-                    let rpm = if (100..15000).contains(&raw_rpm) {
-                        raw_rpm
-                    } else {
-                        0
-                    };
+                    let rpm = nuvoton_rpm_from_regs(hi, lo, is_13bit);
 
                     let pwm_raw = hwm_read(sess, chip.hwm_base, pwm_out_regs[i]).unwrap_or(0);
                     let pwm_pct = ((pwm_raw as u32 * 100 + 127) / 255).min(100) as u8;
@@ -483,10 +998,51 @@ mod win_sio {
                     });
                 }
             }
-            ChipFamily::Ite { pwm_8bit } => {
+            ChipFamily::NuvotonEc { dr_handshake } => {
+                for (disp_idx, ch) in ec_channels(dr_handshake).into_iter().enumerate() {
+                    let Ok(hi) = ec_read(sess, chip.hwm_base, ch.rpm_reg) else {
+                        *guard = None;
+                        return SuperIoSnapshot {
+                            diagnostic: "Erreur lecture RPM SuperIO EC.".into(),
+                            ..Default::default()
+                        };
+                    };
+                    let Ok(lo) = ec_read(sess, chip.hwm_base, ch.rpm_reg + 1) else {
+                        *guard = None;
+                        return SuperIoSnapshot {
+                            diagnostic: "Erreur lecture RPM SuperIO EC.".into(),
+                            ..Default::default()
+                        };
+                    };
+                    let rpm = nuvoton_rpm_from_regs(hi, lo, false);
+                    let pwm_raw = ec_read(sess, chip.hwm_base, ch.pwm_out_reg).unwrap_or(0);
+                    let pwm_pct = ((pwm_raw as u32 * 100 + 127) / 255).min(100) as u8;
+                    let mode_raw = ec_read(sess, chip.hwm_base, ch.mode_reg).unwrap_or(0);
+                    let is_manual = (mode_raw & (1 << ch.mode_bit)) != 0;
+
+                    fans.push(SuperIoFanChannel {
+                        index: ch.index,
+                        label: format!("Fan Header #{}", disp_idx + 1),
+                        rpm,
+                        pwm_pct,
+                        mode_raw,
+                        is_manual,
+                    });
+                }
+            }
+            ChipFamily::Ite(spec) => {
                 let reg_16bit = ite_ec_read(sess, chip.hwm_base, 0x0C).unwrap_or(0);
+                let (tach_lsb, tach_msb, pwm_ctrl) = if spec.alt_regs {
+                    (
+                        &ITE_TACH_LSB_ALT_REGS,
+                        &ITE_TACH_MSB_ALT_REGS,
+                        &ITE_PWM_CTRL_ALT_REGS,
+                    )
+                } else {
+                    (&ITE_TACH_LSB_REGS, &ITE_TACH_MSB_REGS, &ITE_PWM_CTRL_REGS)
+                };
                 for i in 0..chip.fan_count {
-                    let Ok(lsb) = ite_ec_read(sess, chip.hwm_base, ITE_TACH_LSB_REGS[i]) else {
+                    let Ok(lsb) = ite_ec_read(sess, chip.hwm_base, tach_lsb[i]) else {
                         *guard = None;
                         return SuperIoSnapshot {
                             diagnostic: "Erreur lecture RPM ITE SuperIO.".into(),
@@ -495,7 +1051,7 @@ mod win_sio {
                     };
                     let is_16bit = i >= 3 || (reg_16bit & (1 << i)) != 0;
                     let count = if is_16bit {
-                        let Ok(msb) = ite_ec_read(sess, chip.hwm_base, ITE_TACH_MSB_REGS[i]) else {
+                        let Ok(msb) = ite_ec_read(sess, chip.hwm_base, tach_msb[i]) else {
                             *guard = None;
                             return SuperIoSnapshot {
                                 diagnostic: "Erreur lecture RPM ITE SuperIO.".into(),
@@ -509,10 +1065,9 @@ mod win_sio {
                         lsb as u32
                     };
                     let rpm = ite_rpm_from_count(count);
-                    let ctrl =
-                        ite_ec_read(sess, chip.hwm_base, ITE_PWM_CTRL_REGS[i]).unwrap_or(0x80);
+                    let ctrl = ite_ec_read(sess, chip.hwm_base, pwm_ctrl[i]).unwrap_or(0x80);
                     let is_manual = (ctrl & 0x80) == 0;
-                    let pwm_pct = if pwm_8bit {
+                    let pwm_pct = if spec.pwm_8bit {
                         let raw =
                             ite_ec_read(sess, chip.hwm_base, ITE_PWM_DUTY_REGS[i]).unwrap_or(0);
                         ((raw as u32 * 100 + 127) / 255).min(100) as u8
@@ -534,8 +1089,12 @@ mod win_sio {
         }
 
         let vendor_note = match chip.family {
-            ChipFamily::Nuvoton { .. } => "Vendor 0x5CA3 vérifié",
-            ChipFamily::Ite { .. } => "Vendor 0x90 ITE vérifié",
+            ChipFamily::NuvotonBank { .. } => "Nuvoton Bank vérifié",
+            ChipFamily::NuvotonEc { dr_handshake: true } => "Nuvoton eSIO EC (DR) vérifié",
+            ChipFamily::NuvotonEc {
+                dr_handshake: false,
+            } => "Nuvoton eSIO EC vérifié",
+            ChipFamily::Ite(_) => "Vendor ITE vérifié",
         };
         SuperIoSnapshot {
             detected: true,
@@ -544,142 +1103,250 @@ mod win_sio {
             hwm_base_hex: format!("0x{:04X} (slot {})", chip.hwm_base, chip.slot),
             diagnostic: format!(
                 "{} (0x{:04X}) @ 0x{:04X} — {} canaux PWM/RPM actifs ({vendor_note})",
-                chip.chip_name, chip.chip_id, chip.hwm_base, chip.fan_count
+                chip.chip_name,
+                chip.chip_id,
+                chip.hwm_base,
+                fans.len()
             ),
             fans,
         }
     }
 
+    fn ec_apply_state(
+        sess: &PawnIoSession,
+        base: u16,
+        dr_handshake: bool,
+        ch: EcChannelRegs,
+        set_manual_bit: bool,
+        cmd_raw: u8,
+    ) -> Result<()> {
+        let bit_mask = 1u8 << ch.mode_bit;
+        let or_mask = if set_manual_bit { bit_mask } else { 0 };
+        if dr_handshake {
+            for _attempt in 0..3 {
+                if !ec_dr_start_cfg(sess, base)? {
+                    continue;
+                }
+                ec_update(sess, base, ch.mode_reg, !bit_mask, or_mask)?;
+                ec_write(sess, base, ch.pwm_cmd_reg, cmd_raw)?;
+                if ec_dr_complete_cfg(sess, base)? {
+                    return Ok(());
+                }
+            }
+            anyhow::bail!("Handshake EC NCT6687D-R refusé par le contrôleur");
+        } else {
+            ec_write(sess, base, EC_FAN_CFG_CTRL_REG, EC_FAN_CFG_REQ_BIT)?;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            ec_update(sess, base, ch.mode_reg, !bit_mask, or_mask)?;
+            ec_write(sess, base, ch.pwm_cmd_reg, cmd_raw)?;
+            ec_write(sess, base, EC_FAN_CFG_CTRL_REG, EC_FAN_CFG_DONE_BIT)?;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            Ok(())
+        }
+    }
+
     pub fn set_fan_pwm(channel_idx: usize, duty_pct: u8, min_floor_pct: u8) -> Result<String> {
         let duty_pct = safe_superio_duty_with_floor(duty_pct, min_floor_pct);
-        if channel_idx >= 7 {
+        if channel_idx >= MAX_SUPERIO_CHANNELS {
             anyhow::bail!("Canal SuperIO invalide ({channel_idx})");
         }
 
-        let _lock_or_ite = {
-            let _lock =
-                NamedMutexGuard::acquire(ISA_MUTEX, 1500).context("Bus SuperIO ISA occupé")?;
-            let (sess, chip) = detect_and_prepare()?;
-            if channel_idx >= chip.fan_count {
-                anyhow::bail!("Canal #{channel_idx} hors plage pour {}", chip.chip_name);
-            }
-            match chip.family {
-                ChipFamily::Nuvoton { use_98_pwm_out, .. } => {
-                    let mode_reg = FAN_CTRL_MODE_REGS[channel_idx];
-                    let cmd_reg = FAN_PWM_CMD_REGS[channel_idx];
-                    let pwm_out_reg = if use_98_pwm_out {
-                        FAN_PWM_OUT_REGS_98[channel_idx]
-                    } else {
-                        FAN_PWM_OUT_REGS_95[channel_idx]
-                    };
-
-                    let cur_mode = hwm_read(&sess, chip.hwm_base, mode_reg)?;
-                    let cur_cmd = hwm_read(&sess, chip.hwm_base, cmd_reg)?;
-                    if let Ok(mut guard) = saved_states().lock()
-                        && guard[channel_idx].is_none()
-                    {
-                        guard[channel_idx] = Some(SavedFanState {
-                            mode: cur_mode,
-                            cmd: cur_cmd,
-                        });
-                    }
-
-                    let target_raw = ((duty_pct.min(100) as u32 * 255 + 50) / 100).min(255) as u8;
-                    let new_mode = manual_mode_byte(cur_mode);
-                    hwm_write(&sess, chip.hwm_base, mode_reg, new_mode)?;
-                    if let Err(e) = hwm_write(&sess, chip.hwm_base, cmd_reg, target_raw) {
-                        let _ = hwm_write(&sess, chip.hwm_base, mode_reg, cur_mode);
-                        return Err(e);
-                    }
-                    drop(_lock);
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                    let _lock = NamedMutexGuard::acquire(ISA_MUTEX, 1500)
-                        .context("Bus SuperIO ISA occupé lors de la vérification")?;
-                    let rb_mode = hwm_read(&sess, chip.hwm_base, mode_reg)?;
-                    let rb_cmd = hwm_read(&sess, chip.hwm_base, cmd_reg)?;
-                    let rb_out = hwm_read(&sess, chip.hwm_base, pwm_out_reg)?;
-                    let rb_pct = ((rb_out as u32 * 100 + 127) / 255).min(100) as u8;
-
-                    if (rb_mode >> 4) != 0 || rb_cmd.abs_diff(target_raw) > 2 {
-                        let _ = hwm_write(&sess, chip.hwm_base, cmd_reg, cur_cmd);
-                        let _ = hwm_write(&sess, chip.hwm_base, mode_reg, cur_mode);
-                        anyhow::bail!(
-                            "Échec vérification SuperIO ch#{} (rollback appliqué): écrit mode=0x{:02X}/cmd={target_raw}, relu mode=0x{rb_mode:02X}/cmd={rb_cmd} (sortie={rb_pct}%)",
-                            channel_idx + 1,
-                            new_mode
-                        );
-                    }
-                    return Ok(format!(
-                        "SuperIO {} ch#{} -> {}% vérifié (cmd={}, sortie={}%, mode=Manuel)",
-                        chip.chip_name,
-                        channel_idx + 1,
-                        duty_pct.min(100),
-                        rb_cmd,
-                        rb_pct
-                    ));
+        let _lock = NamedMutexGuard::acquire(ISA_MUTEX, 1500).context("Bus SuperIO ISA occupé")?;
+        let (sess, chip) = detect_and_prepare()?;
+        match chip.family {
+            ChipFamily::NuvotonBank { use_98_pwm_out, .. } => {
+                if channel_idx >= chip.fan_count {
+                    anyhow::bail!("Canal #{channel_idx} hors plage pour {}", chip.chip_name);
                 }
-                ChipFamily::Ite { pwm_8bit } => {
-                    let ctrl_reg = ITE_PWM_CTRL_REGS[channel_idx];
-                    let duty_reg = ITE_PWM_DUTY_REGS[channel_idx];
-                    let cur_ctrl = ite_ec_read(&sess, chip.hwm_base, ctrl_reg)?;
-                    let cur_duty = if pwm_8bit {
-                        ite_ec_read(&sess, chip.hwm_base, duty_reg)?
-                    } else {
-                        cur_ctrl & 0x7F
-                    };
-                    if let Ok(mut guard) = saved_states().lock()
-                        && guard[channel_idx].is_none()
-                    {
-                        guard[channel_idx] = Some(SavedFanState {
-                            mode: cur_ctrl,
-                            cmd: cur_duty,
-                        });
-                    }
-                    let (target_ctrl, target_duty) =
-                        ite_manual_target(cur_ctrl, duty_pct, pwm_8bit);
-                    ite_ec_write(&sess, chip.hwm_base, ctrl_reg, target_ctrl)?;
-                    if pwm_8bit
-                        && let Err(e) = ite_ec_write(&sess, chip.hwm_base, duty_reg, target_duty)
-                    {
-                        let _ = ite_ec_write(&sess, chip.hwm_base, ctrl_reg, cur_ctrl);
-                        return Err(e);
-                    }
-                    drop(_lock);
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                    let _lock = NamedMutexGuard::acquire(ISA_MUTEX, 1500)
-                        .context("Bus SuperIO ISA occupé lors de la vérification")?;
-                    let rb_ctrl = ite_ec_read(&sess, chip.hwm_base, ctrl_reg)?;
-                    let rb_duty = if pwm_8bit {
-                        ite_ec_read(&sess, chip.hwm_base, duty_reg)?
-                    } else {
-                        rb_ctrl & 0x7F
-                    };
-                    if (rb_ctrl & 0x80) != 0 || rb_duty.abs_diff(target_duty) > 2 {
-                        if pwm_8bit {
-                            let _ = ite_ec_write(&sess, chip.hwm_base, duty_reg, cur_duty);
-                        }
-                        let _ = ite_ec_write(&sess, chip.hwm_base, ctrl_reg, cur_ctrl);
-                        anyhow::bail!(
-                            "Échec vérification SuperIO ITE ch#{} (rollback appliqué): ctrl=0x{rb_ctrl:02X}, duty={rb_duty}",
-                            channel_idx + 1
-                        );
-                    }
-                    return Ok(format!(
-                        "SuperIO {} ch#{} -> {}% vérifié (duty={}, mode=Manuel)",
-                        chip.chip_name,
-                        channel_idx + 1,
-                        duty_pct.min(100),
-                        rb_duty
-                    ));
+                let mode_reg = FAN_CTRL_MODE_REGS[channel_idx];
+                let cmd_reg = FAN_PWM_CMD_REGS[channel_idx];
+                let pwm_out_reg = if use_98_pwm_out {
+                    FAN_PWM_OUT_REGS_98[channel_idx]
+                } else {
+                    FAN_PWM_OUT_REGS_95[channel_idx]
+                };
+
+                let cur_mode = hwm_read(&sess, chip.hwm_base, mode_reg)?;
+                let cur_cmd = hwm_read(&sess, chip.hwm_base, cmd_reg)?;
+                if let Ok(mut guard) = saved_states().lock()
+                    && guard[channel_idx].is_none()
+                {
+                    guard[channel_idx] = Some(SavedFanState {
+                        mode: cur_mode,
+                        cmd: cur_cmd,
+                        extra: 0,
+                    });
                 }
+
+                let target_raw = ((duty_pct.min(100) as u32 * 255 + 50) / 100).min(255) as u8;
+                let new_mode = manual_mode_byte(cur_mode);
+                hwm_write(&sess, chip.hwm_base, mode_reg, new_mode)?;
+                if let Err(e) = hwm_write(&sess, chip.hwm_base, cmd_reg, target_raw) {
+                    let _ = hwm_write(&sess, chip.hwm_base, mode_reg, cur_mode);
+                    return Err(e);
+                }
+                drop(_lock);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                let _lock = NamedMutexGuard::acquire(ISA_MUTEX, 1500)
+                    .context("Bus SuperIO ISA occupé lors de la vérification")?;
+                let rb_mode = hwm_read(&sess, chip.hwm_base, mode_reg)?;
+                let rb_cmd = hwm_read(&sess, chip.hwm_base, cmd_reg)?;
+                let rb_out = hwm_read(&sess, chip.hwm_base, pwm_out_reg)?;
+                let rb_pct = ((rb_out as u32 * 100 + 127) / 255).min(100) as u8;
+
+                if (rb_mode >> 4) != 0 || rb_cmd.abs_diff(target_raw) > 2 {
+                    let _ = hwm_write(&sess, chip.hwm_base, cmd_reg, cur_cmd);
+                    let _ = hwm_write(&sess, chip.hwm_base, mode_reg, cur_mode);
+                    anyhow::bail!(
+                        "Échec vérification SuperIO ch#{} (rollback appliqué): écrit mode=0x{:02X}/cmd={target_raw}, relu mode=0x{rb_mode:02X}/cmd={rb_cmd} (sortie={rb_pct}%)",
+                        channel_idx + 1,
+                        new_mode
+                    );
+                }
+                Ok(format!(
+                    "SuperIO {} ch#{} -> {}% vérifié (cmd={}, sortie={}%, mode=Manuel)",
+                    chip.chip_name,
+                    channel_idx + 1,
+                    duty_pct.min(100),
+                    rb_cmd,
+                    rb_pct
+                ))
             }
-        };
-        #[allow(unreachable_code)]
-        Ok(_lock_or_ite)
+            ChipFamily::NuvotonEc { dr_handshake } => {
+                let ch = ec_channel_for(dr_handshake, channel_idx).ok_or_else(|| {
+                    anyhow::anyhow!("Canal #{channel_idx} hors plage pour {}", chip.chip_name)
+                })?;
+                let bit_mask = 1u8 << ch.mode_bit;
+                let cur_mode = ec_read(&sess, chip.hwm_base, ch.mode_reg)?;
+                let cur_cmd = ec_read(&sess, chip.hwm_base, ch.pwm_cmd_reg)?;
+                if let Ok(mut guard) = saved_states().lock()
+                    && guard[channel_idx].is_none()
+                {
+                    guard[channel_idx] = Some(SavedFanState {
+                        mode: cur_mode & bit_mask,
+                        cmd: cur_cmd,
+                        extra: 0,
+                    });
+                }
+
+                let target_raw = ((duty_pct.min(100) as u32 * 255 + 50) / 100).min(255) as u8;
+                ec_apply_state(&sess, chip.hwm_base, dr_handshake, ch, true, target_raw)?;
+
+                let rb_mode = ec_read(&sess, chip.hwm_base, ch.mode_reg)?;
+                let rb_cmd = ec_read(&sess, chip.hwm_base, ch.pwm_cmd_reg)?;
+                let rb_out = ec_read(&sess, chip.hwm_base, ch.pwm_out_reg)?;
+                let rb_pct = ((rb_out as u32 * 100 + 127) / 255).min(100) as u8;
+                if (rb_mode & bit_mask) == 0 || rb_cmd.abs_diff(target_raw) > 2 {
+                    let _ = ec_apply_state(
+                        &sess,
+                        chip.hwm_base,
+                        dr_handshake,
+                        ch,
+                        (cur_mode & bit_mask) != 0,
+                        cur_cmd,
+                    );
+                    anyhow::bail!(
+                        "Échec vérification SuperIO EC ch#{} (rollback appliqué): relu mode=0x{rb_mode:02X}/cmd={rb_cmd}",
+                        channel_idx + 1
+                    );
+                }
+                Ok(format!(
+                    "SuperIO {} ch#{} -> {}% vérifié (cmd={}, sortie={}%, mode=Manuel)",
+                    chip.chip_name,
+                    channel_idx + 1,
+                    duty_pct.min(100),
+                    rb_cmd,
+                    rb_pct
+                ))
+            }
+            ChipFamily::Ite(spec) => {
+                if channel_idx >= chip.fan_count {
+                    anyhow::bail!("Canal #{channel_idx} hors plage pour {}", chip.chip_name);
+                }
+                let ctrl_regs = if spec.alt_regs {
+                    &ITE_PWM_CTRL_ALT_REGS
+                } else {
+                    &ITE_PWM_CTRL_REGS
+                };
+                let ctrl_reg = ctrl_regs[channel_idx];
+                let duty_reg = ITE_PWM_DUTY_REGS[channel_idx];
+                let cur_ctrl = ite_ec_read(&sess, chip.hwm_base, ctrl_reg)?;
+                let cur_duty = if spec.pwm_8bit {
+                    ite_ec_read(&sess, chip.hwm_base, duty_reg)?
+                } else {
+                    cur_ctrl & 0x7F
+                };
+                let main_ctrl = if channel_idx < 3 {
+                    ite_ec_read(&sess, chip.hwm_base, ITE_FAN_MAIN_CTRL_REG).unwrap_or(0)
+                } else {
+                    0
+                };
+                let main_was_enabled = channel_idx < 3 && (main_ctrl & (1 << channel_idx)) != 0;
+                if let Ok(mut guard) = saved_states().lock()
+                    && guard[channel_idx].is_none()
+                {
+                    guard[channel_idx] = Some(SavedFanState {
+                        mode: cur_ctrl,
+                        cmd: cur_duty,
+                        extra: u8::from(channel_idx < 3 && !main_was_enabled),
+                    });
+                }
+
+                if channel_idx < 3 && !main_was_enabled {
+                    ite_ec_write(
+                        &sess,
+                        chip.hwm_base,
+                        ITE_FAN_MAIN_CTRL_REG,
+                        main_ctrl | (1 << channel_idx),
+                    )?;
+                }
+
+                let (target_ctrl, target_duty) =
+                    ite_manual_target(cur_ctrl, duty_pct, spec.pwm_8bit, spec.ctrl_0x7f_quirk);
+                ite_ec_write(&sess, chip.hwm_base, ctrl_reg, target_ctrl)?;
+                if spec.pwm_8bit
+                    && let Err(e) = ite_ec_write(&sess, chip.hwm_base, duty_reg, target_duty)
+                {
+                    let _ = ite_ec_write(&sess, chip.hwm_base, ctrl_reg, cur_ctrl);
+                    return Err(e);
+                }
+                drop(_lock);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                let _lock = NamedMutexGuard::acquire(ISA_MUTEX, 1500)
+                    .context("Bus SuperIO ISA occupé lors de la vérification")?;
+                let rb_ctrl = ite_ec_read(&sess, chip.hwm_base, ctrl_reg)?;
+                let rb_duty = if spec.pwm_8bit {
+                    ite_ec_read(&sess, chip.hwm_base, duty_reg)?
+                } else {
+                    rb_ctrl & 0x7F
+                };
+                if (rb_ctrl & 0x80) != 0 || rb_duty.abs_diff(target_duty) > 2 {
+                    if spec.pwm_8bit {
+                        let _ = ite_ec_write(&sess, chip.hwm_base, duty_reg, cur_duty);
+                    }
+                    let _ = ite_ec_write(&sess, chip.hwm_base, ctrl_reg, cur_ctrl);
+                    if channel_idx < 3 && !main_was_enabled {
+                        let _ =
+                            ite_ec_write(&sess, chip.hwm_base, ITE_FAN_MAIN_CTRL_REG, main_ctrl);
+                    }
+                    anyhow::bail!(
+                        "Échec vérification SuperIO ITE ch#{} (rollback appliqué): ctrl=0x{rb_ctrl:02X}, duty={rb_duty}",
+                        channel_idx + 1
+                    );
+                }
+                Ok(format!(
+                    "SuperIO {} ch#{} -> {}% vérifié (duty={}, mode=Manuel)",
+                    chip.chip_name,
+                    channel_idx + 1,
+                    duty_pct.min(100),
+                    rb_duty
+                ))
+            }
+        }
     }
 
     pub fn restore_fan_auto(channel_idx: usize) -> Result<String> {
-        if channel_idx >= 7 {
+        if channel_idx >= MAX_SUPERIO_CHANNELS {
             anyhow::bail!("Canal SuperIO invalide ({channel_idx})");
         }
         let _lock = NamedMutexGuard::acquire(ISA_MUTEX, 1500).context("Bus SuperIO ISA occupé")?;
@@ -692,7 +1359,7 @@ mod win_sio {
         };
         let (sess, chip) = detect_and_prepare()?;
         match chip.family {
-            ChipFamily::Nuvoton { .. } => {
+            ChipFamily::NuvotonBank { .. } => {
                 hwm_write(
                     &sess,
                     chip.hwm_base,
@@ -706,8 +1373,26 @@ mod win_sio {
                     saved.mode,
                 )?;
             }
-            ChipFamily::Ite { pwm_8bit } => {
-                if pwm_8bit {
+            ChipFamily::NuvotonEc { dr_handshake } => {
+                if let Some(ch) = ec_channel_for(dr_handshake, channel_idx) {
+                    let bit_mask = 1u8 << ch.mode_bit;
+                    ec_apply_state(
+                        &sess,
+                        chip.hwm_base,
+                        dr_handshake,
+                        ch,
+                        (saved.mode & bit_mask) != 0,
+                        saved.cmd,
+                    )?;
+                }
+            }
+            ChipFamily::Ite(spec) => {
+                let ctrl_regs = if spec.alt_regs {
+                    &ITE_PWM_CTRL_ALT_REGS
+                } else {
+                    &ITE_PWM_CTRL_REGS
+                };
+                if spec.pwm_8bit {
                     ite_ec_write(
                         &sess,
                         chip.hwm_base,
@@ -715,12 +1400,17 @@ mod win_sio {
                         saved.cmd,
                     )?;
                 }
-                ite_ec_write(
-                    &sess,
-                    chip.hwm_base,
-                    ITE_PWM_CTRL_REGS[channel_idx],
-                    saved.mode,
-                )?;
+                ite_ec_write(&sess, chip.hwm_base, ctrl_regs[channel_idx], saved.mode)?;
+                if saved.extra != 0 && channel_idx < 3 {
+                    let cur_main =
+                        ite_ec_read(&sess, chip.hwm_base, ITE_FAN_MAIN_CTRL_REG).unwrap_or(0);
+                    let _ = ite_ec_write(
+                        &sess,
+                        chip.hwm_base,
+                        ITE_FAN_MAIN_CTRL_REG,
+                        cur_main & !(1 << channel_idx),
+                    );
+                }
             }
         }
         if let Ok(mut guard) = saved_states().lock() {
@@ -748,25 +1438,77 @@ mod win_sio {
         };
         states
             .iter()
-            .filter(|s| s.index < chip.fan_count)
             .map(|s| {
                 let r = match chip.family {
-                    ChipFamily::Nuvoton { .. } => {
-                        hwm_write(&sess, chip.hwm_base, FAN_PWM_CMD_REGS[s.index], s.cmd).and_then(
-                            |_| {
-                                hwm_write(&sess, chip.hwm_base, FAN_CTRL_MODE_REGS[s.index], s.mode)
-                            },
-                        )
-                    }
-                    ChipFamily::Ite { pwm_8bit } => {
-                        let res = if pwm_8bit {
-                            ite_ec_write(&sess, chip.hwm_base, ITE_PWM_DUTY_REGS[s.index], s.cmd)
-                        } else {
+                    ChipFamily::NuvotonBank { .. } => {
+                        if s.index >= chip.fan_count {
                             Ok(())
-                        };
-                        res.and_then(|_| {
-                            ite_ec_write(&sess, chip.hwm_base, ITE_PWM_CTRL_REGS[s.index], s.mode)
-                        })
+                        } else {
+                            hwm_write(&sess, chip.hwm_base, FAN_PWM_CMD_REGS[s.index], s.cmd)
+                                .and_then(|_| {
+                                    hwm_write(
+                                        &sess,
+                                        chip.hwm_base,
+                                        FAN_CTRL_MODE_REGS[s.index],
+                                        s.mode,
+                                    )
+                                })
+                        }
+                    }
+                    ChipFamily::NuvotonEc { dr_handshake } => {
+                        match ec_channel_for(dr_handshake, s.index) {
+                            Some(ch) => {
+                                let bit_mask = 1u8 << ch.mode_bit;
+                                ec_apply_state(
+                                    &sess,
+                                    chip.hwm_base,
+                                    dr_handshake,
+                                    ch,
+                                    (s.mode & bit_mask) != 0,
+                                    s.cmd,
+                                )
+                            }
+                            None => Ok(()),
+                        }
+                    }
+                    ChipFamily::Ite(spec) => {
+                        if s.index >= chip.fan_count {
+                            Ok(())
+                        } else {
+                            let ctrl_regs = if spec.alt_regs {
+                                &ITE_PWM_CTRL_ALT_REGS
+                            } else {
+                                &ITE_PWM_CTRL_REGS
+                            };
+                            let res = if spec.pwm_8bit {
+                                ite_ec_write(
+                                    &sess,
+                                    chip.hwm_base,
+                                    ITE_PWM_DUTY_REGS[s.index],
+                                    s.cmd,
+                                )
+                            } else {
+                                Ok(())
+                            };
+                            res.and_then(|_| {
+                                ite_ec_write(&sess, chip.hwm_base, ctrl_regs[s.index], s.mode)
+                            })
+                            .and_then(|_| {
+                                if s.extra != 0 && s.index < 3 {
+                                    let cur_main =
+                                        ite_ec_read(&sess, chip.hwm_base, ITE_FAN_MAIN_CTRL_REG)
+                                            .unwrap_or(0);
+                                    ite_ec_write(
+                                        &sess,
+                                        chip.hwm_base,
+                                        ITE_FAN_MAIN_CTRL_REG,
+                                        cur_main & !(1 << s.index),
+                                    )
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                        }
                     }
                 };
                 match r {
@@ -978,7 +1720,7 @@ impl Cooling for SuperIoCoolingDevice {
     }
 
     fn overridden(&self) -> bool {
-        !saved_superio_states().is_empty() || self.snap.fans.iter().any(|f| f.is_manual)
+        !saved_superio_states().is_empty()
     }
 
     fn restore_firmware_control(&mut self) -> Result<()> {
@@ -1014,15 +1756,49 @@ mod tests {
     }
 
     #[test]
+    fn expanded_nuvoton_ids_and_ec_distinction() {
+        // Legacy NCT6771F / NCT6776F & NCT6779D & NCT6701D / NCT5585D
+        let b71 = identify_nuvoton_bank(0xB470).unwrap();
+        assert_eq!(b71.rpm_mode, NuvotonRpmMode::Rpm656Direct);
+        let b79 = identify_nuvoton_bank(0xC560).unwrap();
+        assert_eq!(b79.rpm_mode, NuvotonRpmMode::Rpm4B0Count13);
+        let b01 = identify_nuvoton_bank(0xD806).unwrap();
+        assert_eq!(b01.name, "Nuvoton NCT6701D");
+        assert!(b01.allow_no_vendor_id);
+        let b5585 = identify_nuvoton_bank(0xD42A).unwrap();
+        assert_eq!(b5585.fan_count, 7);
+
+        // 0xD592 must resolve to NCT6687D eSIO EC rather than banked NCT6796D-S
+        assert!(identify_nuvoton_bank(0xD592).is_none());
+        assert_eq!(identify_nuvoton_ec(0xC732), Some("Nuvoton NCT6683D"));
+        assert_eq!(identify_nuvoton_ec(0xD441), Some("Nuvoton NCT6686D"));
+        assert_eq!(identify_nuvoton_ec(0xD592), Some("Nuvoton NCT6687D"));
+        assert!(is_800_series_ec_dr_board(0xD592, "MAG B850 TOMAHAWK WIFI"));
+        assert!(!is_800_series_ec_dr_board(0xD592, "B550-A PRO"));
+
+        // EC channel register mappings stay bounded and non-overlapping
+        assert_eq!(ec_standard_channel(2).unwrap().pwm_cmd_reg, 0x0A2A);
+        assert!(ec_standard_channel(8).is_none());
+        assert_eq!(ec_dr_channel(10).unwrap().mode_reg, 0x080F);
+        assert_eq!(ec_dr_channel(10).unwrap().mode_bit, 7);
+        assert!(ec_dr_channel(4).is_none());
+    }
+
+    #[test]
     fn ite_chip_identification_rpm_and_manual_pwm() {
         assert_eq!(identify_ite(0x8688), Some(("ITE IT8688E", 5, true)));
         assert_eq!(identify_ite(0x8728), Some(("ITE IT8728F", 5, false)));
+        assert_eq!(identify_ite(0x8733), Some(("ITE IT8792E/IT8795E", 3, true)));
+        assert_eq!(identify_ite(0x8695), Some(("ITE IT87952E", 3, true)));
+        assert!(identify_ite_spec(0x8689).unwrap().ctrl_0x7f_quirk);
+        assert!(identify_ite_spec(0x8665).unwrap().alt_regs);
         assert_eq!(identify_ite(0x9999), None);
         assert_eq!(ite_rpm_from_count(0), 0);
         assert_eq!(ite_rpm_from_count(0xFFFF), 0);
         assert_eq!(ite_rpm_from_count(675), 1000);
-        assert_eq!(ite_manual_target(0x90, 50, true), (0x10, 128));
-        assert_eq!(ite_manual_target(0x80, 100, false), (127, 127));
+        assert_eq!(ite_manual_target(0x90, 50, true, false), (0x10, 128));
+        assert_eq!(ite_manual_target(0x90, 50, true, true), (0x7F, 128));
+        assert_eq!(ite_manual_target(0x80, 100, false, false), (127, 127));
     }
 
     #[test]
@@ -1041,5 +1817,15 @@ mod tests {
         assert_eq!(info.id, "fan_1");
         assert_eq!(info.min_pct, SUPERIO_MIN_PWM_PCT);
         assert_eq!(info.manual_pct, Some(40));
+    }
+
+    #[test]
+    fn nuvoton_13bit_count_decodes_real_nct6798d_samples() {
+        // Real NCT6798D register pairs captured at 30 % and 80 % PWM.
+        assert_eq!(nuvoton_rpm_from_regs(0x2D, 0x07, true), 932);
+        assert_eq!(nuvoton_rpm_from_regs(0x14, 0x10, true), 2057);
+        assert_eq!(nuvoton_rpm_from_regs(0xFF, 0x1F, true), 0);
+        // Legacy direct RPM mode (NCT6791D..NCT6795D, NCT6771F/6776F, NCT668x).
+        assert_eq!(nuvoton_rpm_from_regs(0x04, 0xB0, false), 1200);
     }
 }

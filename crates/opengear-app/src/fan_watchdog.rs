@@ -317,6 +317,7 @@ mod tests {
                 index: 1,
                 mode: 0x40,
                 cmd: 128,
+                extra: 0,
             }],
             cooling_devices: vec!["hp_omen:keyboard".into()],
         };

@@ -143,6 +143,14 @@ export function riskOf(cmd, p = {}) {
         details: ["Une vitesse trop basse peut faire chauffer le composant refroidi (processeur, pompe…)."],
         confirm: "Forcer la vitesse",
       };
+    case "device_fan_calibrate":
+      if (p.cancel) return null;
+      return {
+        title: "Calibrer ce ventilateur ?",
+        body: "OpenGear va faire varier ce ventilateur de 100 % jusqu'à son plancher de sécurité (~10 secondes) pour mesurer ses vitesses réelles et son seuil de démarrage, puis le remettre en mode automatique.",
+        details: ["La calibration est sauvegardée pour affiner la courbe et repérer le seuil 0 tr/min."],
+        confirm: "Lancer la calibration",
+      };
     case "device_curve_set":
       if (!p.apply) return null;
       return {

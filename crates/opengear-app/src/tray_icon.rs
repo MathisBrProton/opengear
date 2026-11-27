@@ -1030,6 +1030,10 @@ fn delete_scheduled_task(task_name: &str) {
         .output();
 }
 
+fn parse_task_xml_enabled(xml: &str) -> bool {
+    !xml.contains("<Enabled>false</Enabled>")
+}
+
 #[cfg(windows)]
 fn task_enabled_state(task_name: &str) -> Option<bool> {
     use std::os::windows::process::CommandExt;
@@ -1042,7 +1046,7 @@ fn task_enabled_state(task_name: &str) -> Option<bool> {
         return None;
     }
     let xml = decode_task_xml_stdout(&out.stdout);
-    Some(!xml.contains("<Enabled>false</Enabled>"))
+    Some(parse_task_xml_enabled(&xml))
 }
 
 /// Attempt to hand off launch to the pre-authorized elevated Task Scheduler task (`0 UAC`).
@@ -1193,7 +1197,13 @@ pub fn set_autostart_enabled(enabled: bool, start_minimized: bool) -> Result<()>
                 register_elevated_task(TASK_LAUNCH, &exe, "--elevated-entry", None, false, true);
             return Ok(());
         }
-        if task_enabled_state(TASK_AUTOSTART).is_some() {
+        if let Some(current) = task_enabled_state(TASK_AUTOSTART) {
+            if !enabled {
+                let _ = set_run_autostart_enabled(false, false);
+            }
+            if current == enabled {
+                return Ok(());
+            }
             use std::os::windows::process::CommandExt;
             let flag = if enabled { "/ENABLE" } else { "/DISABLE" };
             let ok = std::process::Command::new("schtasks")
@@ -1205,9 +1215,9 @@ pub fn set_autostart_enabled(enabled: bool, start_minimized: bool) -> Result<()>
             if ok {
                 return Ok(());
             }
-            anyhow::bail!(
-                "Relancez OpenGear en administrateur pour modifier le démarrage automatique élevé."
-            );
+            let schtasks = opengear_platform::wmi::system32_path("schtasks.exe");
+            let args = format!(r#"/Change /TN "{TASK_AUTOSTART}" {flag}"#);
+            return opengear_platform::run_elevated_command(&schtasks, &args);
         }
         set_run_autostart_enabled(enabled, start_minimized)
     }
@@ -1469,13 +1479,14 @@ pub fn install_to_windows(
         let is_admin = opengear_platform::is_elevated();
         if is_admin {
             let _ = set_run_autostart_enabled(false, false);
+            let autostart_enabled = task_enabled_state(TASK_AUTOSTART).unwrap_or(true);
             let _ = register_elevated_task(
                 TASK_AUTOSTART,
                 &dst_exe,
                 "--minimized --elevated-entry",
                 install_user,
                 true,
-                true,
+                autostart_enabled,
             );
             let _ = register_elevated_task(
                 TASK_LAUNCH,
@@ -1641,6 +1652,17 @@ mod tests {
         assert!(xml.contains(r"<UserId>PC\A&amp;B</UserId>"));
         assert!(xml.contains("<Arguments>--minimized --elevated-entry</Arguments>"));
         assert!(xml.contains("<LogonTrigger>"));
+        assert!(parse_task_xml_enabled(&xml));
+
+        let disabled = build_task_xml(
+            Path::new(r"C:\OpenGear\OpenGear.exe"),
+            "--elevated-entry",
+            None,
+            true,
+            false,
+        );
+        assert!(!parse_task_xml_enabled(&disabled));
+        assert!(parse_task_xml_enabled("<Task><Settings></Settings></Task>"));
     }
 
     #[test]

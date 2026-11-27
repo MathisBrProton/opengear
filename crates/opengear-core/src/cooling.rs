@@ -107,6 +107,8 @@ pub enum FanTempSource {
     /// Hardware BIOS curve handles it natively (0 background polling needed).
     #[default]
     CpuBios,
+    /// Driven dynamically by the live CPU temperature sensor (for software curves).
+    Cpu,
     /// Driven dynamically by AMD ADL2 / NVIDIA NVML GPU Edge temperature.
     GpuEdge,
     /// Driven dynamically by AMD ADL2 GPU Hotspot temperature.
@@ -127,6 +129,7 @@ impl FanTempSource {
     pub fn id(self) -> &'static str {
         match self {
             Self::CpuBios => "cpu_bios",
+            Self::Cpu => "cpu",
             Self::GpuEdge => "gpu_edge",
             Self::GpuHotspot => "gpu_hotspot",
             Self::MaxCpuGpu => "max_cpu_gpu",
@@ -139,6 +142,7 @@ impl FanTempSource {
 
     pub fn from_id(s: &str) -> Self {
         match s {
+            "cpu" | "Cpu" => Self::Cpu,
             "gpu_edge" => Self::GpuEdge,
             "gpu_hotspot" => Self::GpuHotspot,
             "max_cpu_gpu" => Self::MaxCpuGpu,
@@ -220,6 +224,7 @@ pub fn resolve_temp_reading(
 ) -> Option<f32> {
     match source {
         FanTempSource::CpuBios => None,
+        FanTempSource::Cpu => r.cpu,
         FanTempSource::GpuEdge => r.gpu_edge.or(r.gpu_hotspot),
         FanTempSource::GpuHotspot => r.gpu_hotspot.or(r.gpu_edge),
         FanTempSource::Nvme => r.nvme,
@@ -577,7 +582,25 @@ impl FanCurveTracker {
         dt_secs: f32,
         deadband_pct: u8,
     ) -> Option<u8> {
-        let floor = cfg.header.min_safe_duty_pct();
+        self.evaluate_with_floor(
+            cfg,
+            cfg.header.min_safe_duty_pct(),
+            measured,
+            dt_secs,
+            deadband_pct,
+        )
+    }
+
+    /// Evaluate the next target duty (%) using an explicit safety floor `floor`.
+    pub fn evaluate_with_floor(
+        &mut self,
+        cfg: &FanChannelConfig,
+        floor: u8,
+        measured: Option<f32>,
+        dt_secs: f32,
+        deadband_pct: u8,
+    ) -> Option<u8> {
+        let floor = floor.min(100);
         let raw_t = match measured {
             Some(t) if t.is_finite() => t,
             _ => {
@@ -618,6 +641,307 @@ impl FanCurveTracker {
         let target = cfg.interpolate_duty(eff_t).max(floor);
         let changed = self
             .last_duty
+            .is_none_or(|prev| prev.abs_diff(target) >= deadband_pct);
+        changed.then_some(target)
+    }
+}
+
+/// Stable storage key for a specific fan on a specific device (`"{device_id}::{fan_id}"`).
+pub fn fan_rule_key(device_id: &str, fan_id: &str) -> String {
+    format!("{device_id}::{fan_id}")
+}
+
+/// Control mode for a universal software-driven fan channel (`Cooling` capability).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SoftwareFanMode {
+    /// Firmware / BIOS manages this fan automatically.
+    #[default]
+    Auto,
+    /// Fixed manual duty cycle (%).
+    Fixed,
+    /// Single 8-point software curve driven by any sensor or composed formula.
+    Curve,
+    /// Dual-curve Mix (e.g. max(CPU curve, GPU curve), like FanControl).
+    Mix,
+}
+
+/// How two independent curves are combined in [`SoftwareFanMode::Mix`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CurveMixOp {
+    #[default]
+    Max,
+    Avg,
+}
+
+fn default_fixed_pct() -> u8 {
+    60
+}
+
+fn default_software_curve() -> [CurvePoint; 8] {
+    FanChannelConfig::default_for(FanHeaderKind::ChassisFan1).curve
+}
+
+fn default_software_source() -> FanTempSource {
+    FanTempSource::Cpu
+}
+
+fn default_mix_source() -> FanTempSource {
+    FanTempSource::GpuEdge
+}
+
+/// Universal per-fan software cooling configuration stored per profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SoftwareFanRule {
+    #[serde(default)]
+    pub mode: SoftwareFanMode,
+    #[serde(default = "default_fixed_pct")]
+    pub fixed_pct: u8,
+    #[serde(default = "default_software_source")]
+    pub source: FanTempSource,
+    #[serde(default)]
+    pub custom_mix: Option<TempMixConfig>,
+    #[serde(default = "default_software_curve")]
+    pub curve: [CurvePoint; 8],
+    #[serde(default = "default_hysteresis")]
+    pub hysteresis_c: u8,
+    #[serde(default)]
+    pub smoothing_secs: u8,
+    /// Maximum duty slew rate in %/s (0 = instant).
+    #[serde(default)]
+    pub ramp_pct_per_sec: u8,
+    #[serde(default = "default_mix_source")]
+    pub mix_source: FanTempSource,
+    #[serde(default)]
+    pub mix_custom: Option<TempMixConfig>,
+    #[serde(default = "default_software_curve")]
+    pub mix_curve: [CurvePoint; 8],
+    #[serde(default)]
+    pub mix_op: CurveMixOp,
+}
+
+impl Default for SoftwareFanRule {
+    fn default() -> Self {
+        Self {
+            mode: SoftwareFanMode::Auto,
+            fixed_pct: default_fixed_pct(),
+            source: FanTempSource::Cpu,
+            custom_mix: None,
+            curve: default_software_curve(),
+            hysteresis_c: default_hysteresis(),
+            smoothing_secs: 2,
+            ramp_pct_per_sec: 0,
+            mix_source: FanTempSource::GpuEdge,
+            mix_custom: None,
+            mix_curve: default_software_curve(),
+            mix_op: CurveMixOp::Max,
+        }
+    }
+}
+
+impl SoftwareFanRule {
+    /// True when the background software cooling loop must evaluate and drive this fan.
+    pub fn is_software_curve(&self) -> bool {
+        matches!(self.mode, SoftwareFanMode::Curve | SoftwareFanMode::Mix)
+    }
+
+    fn channel_cfg(
+        source: FanTempSource,
+        custom_mix: Option<TempMixConfig>,
+        curve: [CurvePoint; 8],
+        hysteresis_c: u8,
+        smoothing_secs: u8,
+    ) -> FanChannelConfig {
+        FanChannelConfig {
+            header: FanHeaderKind::ChassisFan1,
+            policy: FanPolicyMode::Manual,
+            curve,
+            source,
+            hysteresis_c,
+            smoothing_secs,
+            custom_mix,
+        }
+    }
+}
+
+/// Measured PWM <-> RPM calibration profile for one physical fan header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FanCalibration {
+    /// Lowest tested PWM % where RPM > 0 (fan actually spinning).
+    #[serde(default)]
+    pub min_spinning_pct: Option<u8>,
+    /// True if at least one tested low PWM % produced 0 RPM while higher PWM % spun.
+    #[serde(default)]
+    pub zero_rpm_supported: bool,
+    #[serde(default)]
+    pub max_rpm: Option<u32>,
+    /// `(duty_pct, measured_rpm)` samples ordered ascending by duty.
+    #[serde(default)]
+    pub samples: Vec<(u8, u32)>,
+}
+
+impl FanCalibration {
+    pub fn from_samples(mut samples: Vec<(u8, u32)>) -> Self {
+        samples.sort_by_key(|(d, _)| *d);
+        samples.dedup_by_key(|(d, _)| *d);
+        let min_spinning_pct = samples
+            .iter()
+            .filter(|(_, rpm)| *rpm > 0)
+            .map(|(d, _)| *d)
+            .min();
+        let has_zero = samples.iter().any(|(_, rpm)| *rpm == 0);
+        let max_rpm = samples.iter().map(|(_, rpm)| *rpm).max().filter(|&r| r > 0);
+        Self {
+            min_spinning_pct,
+            zero_rpm_supported: has_zero && min_spinning_pct.is_some(),
+            max_rpm,
+            samples,
+        }
+    }
+}
+
+/// Stateful evaluator for [`SoftwareFanRule`] supporting single curves, dual-curve Mix, ramp rate
+/// limiting, hardware safety floors, and immediate failsafe on missing sensors.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SoftwareFanTracker {
+    primary: FanCurveTracker,
+    secondary: FanCurveTracker,
+    ramp_duty: Option<f32>,
+    last_applied: Option<u8>,
+}
+
+impl SoftwareFanTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        self.primary.reset();
+        self.secondary.reset();
+        self.ramp_duty = None;
+        self.last_applied = None;
+    }
+
+    pub fn last_applied(&self) -> Option<u8> {
+        self.last_applied
+    }
+
+    pub fn mark_applied(&mut self, duty: u8) {
+        self.last_applied = Some(duty);
+        self.ramp_duty = Some(duty as f32);
+        self.primary.mark_applied(duty);
+        self.secondary.mark_applied(duty);
+    }
+
+    fn resolve_for_software(
+        source: FanTempSource,
+        custom_mix: Option<&TempMixConfig>,
+        readings: &SensorReadings,
+    ) -> Option<f32> {
+        match source {
+            // In software curve mode, `CpuBios` acts as live CPU temperature fallback.
+            FanTempSource::CpuBios => readings.cpu,
+            other => resolve_temp_reading(other, custom_mix, readings),
+        }
+    }
+
+    /// Evaluate the next PWM duty (%) to send for `rule` respecting `min_floor`.
+    /// Returns `Some(duty)` only when a hardware write is needed.
+    pub fn evaluate(
+        &mut self,
+        rule: &SoftwareFanRule,
+        min_floor: u8,
+        readings: &SensorReadings,
+        dt_secs: f32,
+        deadband_pct: u8,
+    ) -> Option<u8> {
+        let floor = min_floor.min(100);
+        let (desired, bypass_ramp) = match rule.mode {
+            SoftwareFanMode::Auto => return None,
+            SoftwareFanMode::Fixed => (rule.fixed_pct.clamp(floor, 100), true),
+            SoftwareFanMode::Curve => {
+                let cfg = SoftwareFanRule::channel_cfg(
+                    rule.source,
+                    rule.custom_mix,
+                    rule.curve,
+                    rule.hysteresis_c,
+                    rule.smoothing_secs,
+                );
+                let measured =
+                    Self::resolve_for_software(rule.source, rule.custom_mix.as_ref(), readings);
+                if !measured.is_some_and(f32::is_finite) {
+                    self.primary.reset();
+                    (100, true)
+                } else {
+                    let next = self
+                        .primary
+                        .evaluate_with_floor(&cfg, floor, measured, dt_secs, 0)
+                        .unwrap_or_else(|| self.primary.last_duty().unwrap_or(floor));
+                    self.primary.mark_applied(next);
+                    (next, false)
+                }
+            }
+            SoftwareFanMode::Mix => {
+                let cfg_a = SoftwareFanRule::channel_cfg(
+                    rule.source,
+                    rule.custom_mix,
+                    rule.curve,
+                    rule.hysteresis_c,
+                    rule.smoothing_secs,
+                );
+                let cfg_b = SoftwareFanRule::channel_cfg(
+                    rule.mix_source,
+                    rule.mix_custom,
+                    rule.mix_curve,
+                    rule.hysteresis_c,
+                    rule.smoothing_secs,
+                );
+                let ma =
+                    Self::resolve_for_software(rule.source, rule.custom_mix.as_ref(), readings);
+                let mb =
+                    Self::resolve_for_software(rule.mix_source, rule.mix_custom.as_ref(), readings);
+                if !ma.is_some_and(f32::is_finite) || !mb.is_some_and(f32::is_finite) {
+                    self.primary.reset();
+                    self.secondary.reset();
+                    (100, true)
+                } else {
+                    let da = self
+                        .primary
+                        .evaluate_with_floor(&cfg_a, floor, ma, dt_secs, 0)
+                        .unwrap_or_else(|| self.primary.last_duty().unwrap_or(floor));
+                    let db = self
+                        .secondary
+                        .evaluate_with_floor(&cfg_b, floor, mb, dt_secs, 0)
+                        .unwrap_or_else(|| self.secondary.last_duty().unwrap_or(floor));
+                    self.primary.mark_applied(da);
+                    self.secondary.mark_applied(db);
+                    let combined = match rule.mix_op {
+                        CurveMixOp::Max => da.max(db),
+                        CurveMixOp::Avg => ((u16::from(da) + u16::from(db)) / 2) as u8,
+                    };
+                    (combined.clamp(floor, 100), false)
+                }
+            }
+        };
+
+        let target = if bypass_ramp || rule.ramp_pct_per_sec == 0 || dt_secs <= 0.0 {
+            self.ramp_duty = Some(desired as f32);
+            desired
+        } else {
+            let max_step = (rule.ramp_pct_per_sec as f32) * dt_secs;
+            let cur = self.ramp_duty.unwrap_or(desired as f32);
+            let next_f = if (desired as f32) > cur {
+                (cur + max_step).min(desired as f32)
+            } else {
+                (cur - max_step).max(desired as f32)
+            };
+            self.ramp_duty = Some(next_f);
+            (next_f.round() as i32).clamp(floor as i32, 100) as u8
+        };
+
+        let changed = self
+            .last_applied
             .is_none_or(|prev| prev.abs_diff(target) >= deadband_pct);
         changed.then_some(target)
     }
@@ -795,5 +1119,98 @@ mod safety_tests {
             resolve_temp_reading(FanTempSource::CustomMix, Some(&delta), &missing_delta),
             None
         );
+    }
+
+    #[test]
+    fn software_fan_mix_takes_highest_curve_duty_not_temp() {
+        let mut rule = SoftwareFanRule {
+            mode: SoftwareFanMode::Mix,
+            source: FanTempSource::Cpu,
+            mix_source: FanTempSource::GpuEdge,
+            mix_op: CurveMixOp::Max,
+            smoothing_secs: 0,
+            hysteresis_c: 0,
+            ramp_pct_per_sec: 0,
+            ..Default::default()
+        };
+        // CPU curve stays gentle at 70 C (40 %), GPU curve ramps hard at 65 C (85 %).
+        for pt in &mut rule.curve {
+            pt.duty_pct = 40;
+        }
+        for pt in &mut rule.mix_curve {
+            pt.duty_pct = 85;
+        }
+        let r = SensorReadings {
+            cpu: Some(70.0),
+            gpu_edge: Some(65.0),
+            ..Default::default()
+        };
+        let mut tr = SoftwareFanTracker::new();
+        assert_eq!(tr.evaluate(&rule, 20, &r, 2.0, 1), Some(85));
+    }
+
+    #[test]
+    fn software_fan_tracker_enforces_floor_ramp_and_failsafe() {
+        let mut rule = SoftwareFanRule {
+            mode: SoftwareFanMode::Curve,
+            source: FanTempSource::Cpu,
+            smoothing_secs: 0,
+            hysteresis_c: 0,
+            ramp_pct_per_sec: 10,
+            ..Default::default()
+        };
+        for pt in &mut rule.curve {
+            pt.duty_pct = 10;
+        }
+        let mut tr = SoftwareFanTracker::new();
+        // Hardware floor 30 % clamps the 10 % curve point.
+        let d0 = tr
+            .evaluate(
+                &rule,
+                30,
+                &SensorReadings {
+                    cpu: Some(40.0),
+                    ..Default::default()
+                },
+                2.0,
+                1,
+            )
+            .unwrap();
+        assert_eq!(d0, 30);
+        tr.mark_applied(d0);
+
+        // Curve jumps to 90 %, but ramp = 10 %/s * 2 s -> capped at 30 + 20 = 50 %.
+        for pt in &mut rule.curve {
+            pt.duty_pct = 90;
+        }
+        let d1 = tr
+            .evaluate(
+                &rule,
+                30,
+                &SensorReadings {
+                    cpu: Some(80.0),
+                    ..Default::default()
+                },
+                2.0,
+                1,
+            )
+            .unwrap();
+        assert_eq!(d1, 50);
+        tr.mark_applied(d1);
+
+        // Missing sensor bypasses ramp and fails safe to 100 % immediately.
+        assert_eq!(
+            tr.evaluate(&rule, 30, &SensorReadings::default(), 2.0, 1),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn fan_calibration_computes_min_spinning_and_zero_rpm() {
+        let cal = FanCalibration::from_samples(vec![(100, 1800), (60, 1050), (35, 620), (20, 0)]);
+        assert_eq!(cal.min_spinning_pct, Some(35));
+        assert!(cal.zero_rpm_supported);
+        assert_eq!(cal.max_rpm, Some(1800));
+        assert_eq!(cal.samples.first(), Some(&(20, 0)));
     }
 }

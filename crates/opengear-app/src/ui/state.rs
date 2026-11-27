@@ -384,6 +384,13 @@ impl BackendEngine {
                         opengear_platform::pawnio::pawnio_availability(),
                         opengear_platform::PawnIoAvailability::Ready
                     ),
+                "fan_calibration_active": self.fan_calibration.as_ref().map(|c| json!({
+                    "device_id": c.device_id,
+                    "fan_id": c.fan_id,
+                    "fan_name": c.fan_name,
+                    "step": c.step_idx + 1,
+                    "total": c.steps.len(),
+                })),
             },
             "firmware_inventory": fw_inventory,
             "local_assets": self.local_assets.summary(),
@@ -392,6 +399,7 @@ impl BackendEngine {
                 "active_profile": self.config.active_profile,
                 "profiles": profile_names,
                 "device_placements": self.config.device_placements,
+                "fan_calibrations": self.config.fan_calibrations,
                 "profile": {
                     "name": active_profile.name,
                     "polling_rate_hz": active_profile.polling_rate.hz(),
@@ -407,6 +415,7 @@ impl BackendEngine {
                     "mouse_debounce_ms": active_profile.mouse_debounce_ms,
                     "linked_apps": active_profile.linked_apps,
                     "device_lighting": active_profile.device_lighting,
+                    "fan_rules": active_profile.fan_rules,
                     "rgb_layers": rgb_layers_json,
                     "rgb": {
                         "kind": format!("{:?}", active_profile.rgb.kind),

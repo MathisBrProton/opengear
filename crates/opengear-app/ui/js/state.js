@@ -10,6 +10,9 @@ export const local = {
   paintColor: "#00D4FF",
   kbViewMode: "interactive",
   selectedCoolingIdx: 0,
+  selectedFanKey: "",
+  selectedSwCurveIdx: 0,
+  fanRuleDrafts: {},
   selectedMouseVariant: 0,
   selectedHeadsetVariant: 0,
   uiModeOverride: null,
@@ -80,10 +83,12 @@ export function normalizeState() {
   S.config = S.config || {};
   S.config.profiles = arr(S.config.profiles);
   S.config.device_placements = S.config.device_placements || {};
+  S.config.fan_calibrations = S.config.fan_calibrations || {};
   const p = (S.config.profile = S.config.profile || {});
   p.rgb = p.rgb || { kind: "Static", primary: "#00D4FF", secondary: "#9B3CFF", speed: 1, brightness: 1, reverse: false, per_key: {} };
   p.rgb.per_key = p.rgb.per_key || {};
   p.device_lighting = p.device_lighting || {};
+  p.fan_rules = p.fan_rules || {};
   p.bindings = p.bindings || {};
   p.linked_apps = arr(p.linked_apps);
   if (S.ui && local.uiModeOverride && !S.ui.mode) S.ui.mode = local.uiModeOverride;
@@ -185,9 +190,9 @@ export function settingOf(id, settingId) {
 
 const KIND_LABEL = {
   keyboard: "Clavier", mouse: "Souris", headset: "Casque", mousepad: "Tapis", controller: "Manette", motherboard: "Carte mère",
-  memory: "Mémoire", cooler: "Refroidissement", led_controller: "Contrôleur LED", laptop: "PC portable", display: "Écran", other: "Appareil",
+  memory: "Mémoire", cooler: "Refroidissement", gpu: "Carte graphique", led_controller: "Contrôleur LED", laptop: "PC portable", display: "Écran", other: "Appareil",
 };
-const KIND_ICON = { keyboard: "keyboard", mouse: "mouse", headset: "headset", cooler: "fan", motherboard: "board", laptop: "laptop", display: "laptop" };
+const KIND_ICON = { keyboard: "keyboard", mouse: "mouse", headset: "headset", cooler: "fan", gpu: "fan", motherboard: "board", laptop: "laptop", display: "laptop" };
 
 export function k70Image() {
   const imgs = arr(S && S.local_assets.k70_images);
@@ -213,6 +218,7 @@ export function devicesList() {
     mouse: "/assets/mouse.webp",
     headset: "/assets/headset.webp",
     cooler: "/assets/aio.webp",
+    gpu: "/assets/generic_device.webp",
     laptop: "/assets/laptop.webp",
     led_controller: "/assets/generic_device.webp",
     other: "/assets/generic_device.webp",
@@ -267,7 +273,9 @@ export function devicesList() {
       quick.push(qa(cur > 0 ? "Couper le retour micro" : "Activer le retour micro", "dev-set", { device: id, setting: side.id, json: cur > 0 ? 0 : 50 }));
     }
     if (kind === "keyboard" && d.lighting) {
-      quick.push(qa(prof.enable_rgb ? "Couper l'éclairage" : "Allumer l'éclairage", "rgb-enable", { on: prof.enable_rgb ? "0" : "1" }));
+      const dl = (prof.device_lighting && prof.device_lighting[id]) || {};
+      const lit = dl.enabled !== false && !(dl.mode && dl.mode.mode === "off") && (dl.enabled || prof.enable_rgb !== false);
+      quick.push(qa(lit ? "Couper l'éclairage" : "Allumer l'éclairage", "rgb-enable", { id, on: lit ? "0" : "1" }));
     }
     const hwBr = findS("hw_brightness");
     if (hwBr) {

@@ -67,3 +67,54 @@ pub fn relaunch_as_admin() -> Result<()> {
 pub fn relaunch_as_admin() -> Result<()> {
     anyhow::bail!("Non supporté hors Windows")
 }
+
+/// Run an executable elevated via Windows UAC (`ShellExecuteExW("runas")`) and wait for completion.
+#[cfg(windows)]
+pub fn run_elevated_command(exe: &std::path::Path, args: &str) -> Result<()> {
+    use anyhow::Context;
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    use windows_sys::Win32::UI::Shell::{
+        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    let verb: Vec<u16> = OsStr::new("runas").encode_wide().chain(Some(0)).collect();
+    let file: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+    let params: Vec<u16> = OsStr::new(args).encode_wide().chain(Some(0)).collect();
+    let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = verb.as_ptr();
+    sei.lpFile = file.as_ptr();
+    sei.lpParameters = params.as_ptr();
+    sei.nShow = SW_HIDE;
+
+    let ok = unsafe { ShellExecuteExW(&mut sei) };
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(err).context("Élévation UAC refusée ou échouée");
+    }
+    if sei.hProcess.is_null() {
+        anyhow::bail!("Processus élevé introuvable après ShellExecuteExW");
+    }
+    let wait_rc = unsafe { WaitForSingleObject(sei.hProcess, 15_000) };
+    let mut exit_code: u32 = 1;
+    let got_code = unsafe { GetExitCodeProcess(sei.hProcess, &mut exit_code) };
+    unsafe { CloseHandle(sei.hProcess) };
+
+    if wait_rc != WAIT_OBJECT_0 {
+        anyhow::bail!("Délai dépassé en attendant la commande élevée (code {wait_rc})");
+    }
+    if got_code == 0 || exit_code != 0 {
+        anyhow::bail!("La commande élevée a échoué (code {exit_code})");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn run_elevated_command(_exe: &std::path::Path, _args: &str) -> Result<()> {
+    anyhow::bail!("Non supporté hors Windows")
+}

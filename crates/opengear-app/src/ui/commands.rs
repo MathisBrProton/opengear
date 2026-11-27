@@ -12,7 +12,8 @@ use crate::tray_icon::{
     create_windows_shortcuts, is_autostart_enabled, release_single_instance, set_autostart_enabled,
 };
 use opengear_core::cooling::{
-    CurvePoint, FanPolicyMode, FanTempSource, SensorKind, TempMixConfig, TempMixOp,
+    CurveMixOp, CurvePoint, FanPolicyMode, FanTempSource, SensorKind, SoftwareFanMode,
+    SoftwareFanTracker, TempMixConfig, TempMixOp, fan_rule_key,
 };
 use opengear_core::driver::{DeviceKind, Value as DriverValue, setting_ids};
 use opengear_core::fans::FanTarget;
@@ -73,12 +74,14 @@ fn undo_label_for(cmd: &str) -> Option<&'static str> {
         "profile_set_linked_apps" => "Applications liées au profil",
         "profile_import_json" => "Import de profil",
         "apply_preset" => "Préréglage",
+        "device_fan_rule_set" => "Règle de ventilation",
         _ => return None,
     })
 }
 
 pub(crate) fn parse_temp_source(s: &str) -> FanTempSource {
     match s {
+        "Cpu" | "cpu" => FanTempSource::Cpu,
         "GpuLive" | "GpuEdge" | "gpu_edge" => FanTempSource::GpuEdge,
         "GpuHotspot" | "gpu_hotspot" => FanTempSource::GpuHotspot,
         "Nvme" | "nvme" => FanTempSource::Nvme,
@@ -87,6 +90,38 @@ pub(crate) fn parse_temp_source(s: &str) -> FanTempSource {
         "MaxAll" | "max_all" => FanTempSource::MaxAll,
         "CustomMix" | "custom_mix" => FanTempSource::CustomMix,
         _ => FanTempSource::CpuBios,
+    }
+}
+
+fn parse_temp_mix(mix: &Value) -> TempMixConfig {
+    let op = match mix["op"].as_str().unwrap_or("Max") {
+        "Avg" | "avg" => TempMixOp::Avg,
+        "Delta" | "delta" => TempMixOp::Delta,
+        _ => TempMixOp::Max,
+    };
+    let a = parse_sensor_kind(
+        mix.get("a")
+            .or_else(|| mix.get("sensor_a"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Cpu"),
+    );
+    let b = parse_sensor_kind(
+        mix.get("b")
+            .or_else(|| mix.get("sensor_b"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("GpuEdge"),
+    );
+    TempMixConfig { op, a, b }
+}
+
+fn parse_curve_points(pts: &[Value], dst: &mut [CurvePoint; 8]) {
+    for (i, item) in pts.iter().take(8).enumerate() {
+        let t = item["temp_c"].as_u64().unwrap_or(50).clamp(20, 100) as u8;
+        let d = item["duty_pct"].as_u64().unwrap_or(50).clamp(0, 100) as u8;
+        dst[i] = CurvePoint {
+            temp_c: t,
+            duty_pct: d,
+        };
     }
 }
 
@@ -1394,14 +1429,7 @@ impl BackendEngine {
                         };
                     }
                     if let Some(pts) = p["curve"].as_array() {
-                        for (i, item) in pts.iter().take(8).enumerate() {
-                            let t = item["temp_c"].as_u64().unwrap_or(50).clamp(20, 100) as u8;
-                            let d = item["duty_pct"].as_u64().unwrap_or(50).clamp(0, 100) as u8;
-                            ch.curve[i] = CurvePoint {
-                                temp_c: t,
-                                duty_pct: d,
-                            };
-                        }
+                        parse_curve_points(pts, &mut ch.curve);
                     }
                     let mut reset = false;
                     if let Some(src) = p["source"].as_str() {
@@ -1409,24 +1437,7 @@ impl BackendEngine {
                         reset = true;
                     }
                     if let Some(mix) = p.get("custom_mix").filter(|v| v.is_object()) {
-                        let op = match mix["op"].as_str().unwrap_or("Max") {
-                            "Avg" => TempMixOp::Avg,
-                            "Delta" => TempMixOp::Delta,
-                            _ => TempMixOp::Max,
-                        };
-                        let a = parse_sensor_kind(
-                            mix.get("a")
-                                .or_else(|| mix.get("sensor_a"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Cpu"),
-                        );
-                        let b = parse_sensor_kind(
-                            mix.get("b")
-                                .or_else(|| mix.get("sensor_b"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("GpuEdge"),
-                        );
-                        ch.custom_mix = Some(TempMixConfig { op, a, b });
+                        ch.custom_mix = Some(parse_temp_mix(mix));
                         reset = true;
                     } else if ch.source == FanTempSource::CustomMix && ch.custom_mix.is_none() {
                         ch.custom_mix = Some(TempMixConfig::default());
@@ -1816,6 +1827,140 @@ impl BackendEngine {
                 let target: FanTarget =
                     serde_json::from_value(p["target"].clone()).map_err(|e| e.to_string())?;
                 self.set_device_fan(device, fan, target)?;
+                if let Some(fan_id) = fan {
+                    let key = fan_rule_key(device, fan_id);
+                    self.software_fan_trackers.remove(&key);
+                    let prof = self.config.active_profile_mut();
+                    match target {
+                        FanTarget::Auto => {
+                            prof.fan_rules.remove(&key);
+                        }
+                        FanTarget::Fixed(pct) => {
+                            let entry = prof.fan_rules.entry(key).or_default();
+                            entry.mode = SoftwareFanMode::Fixed;
+                            entry.fixed_pct = pct;
+                        }
+                    }
+                    self.persist_config();
+                }
+                Ok(self.full_state_json())
+            }
+            "device_fan_rule_set" => {
+                let device = p["device"].as_str().ok_or("device manquant")?.to_string();
+                let fan = p["fan"].as_str().ok_or("fan manquant")?.to_string();
+                let min_floor = {
+                    let dev = self
+                        .device_mut(&device)
+                        .ok_or_else(|| format!("Appareil introuvable : {device}"))?;
+                    let c = dev
+                        .cooling()
+                        .ok_or_else(|| format!("Ventilateurs non pilotables sur {device}"))?;
+                    c.fans()
+                        .into_iter()
+                        .find(|f| f.id == fan)
+                        .ok_or_else(|| format!("Ventilateur introuvable : {fan}"))?
+                        .min_pct
+                };
+                let key = fan_rule_key(&device, &fan);
+                let mut rule = self
+                    .config
+                    .active_profile_mut()
+                    .fan_rules
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(mode) = p["mode"].as_str() {
+                    rule.mode = match mode {
+                        "fixed" | "Fixed" => SoftwareFanMode::Fixed,
+                        "curve" | "Curve" => SoftwareFanMode::Curve,
+                        "mix" | "Mix" => SoftwareFanMode::Mix,
+                        _ => SoftwareFanMode::Auto,
+                    };
+                }
+                if let Some(pct) = p["fixed_pct"].as_u64() {
+                    rule.fixed_pct = (pct.min(100) as u8).max(min_floor);
+                }
+                if let Some(src) = p["source"].as_str() {
+                    rule.source = parse_temp_source(src);
+                }
+                if let Some(mix) = p.get("custom_mix").filter(|v| v.is_object()) {
+                    rule.custom_mix = Some(parse_temp_mix(mix));
+                } else if rule.source == FanTempSource::CustomMix && rule.custom_mix.is_none() {
+                    rule.custom_mix = Some(TempMixConfig::default());
+                }
+                if let Some(pts) = p["curve"].as_array() {
+                    parse_curve_points(pts, &mut rule.curve);
+                }
+                if let Some(h) = p["hysteresis_c"].as_u64() {
+                    rule.hysteresis_c = (h as u8).min(12);
+                }
+                if let Some(sm) = p["smoothing_secs"].as_u64() {
+                    rule.smoothing_secs = (sm as u8).min(20);
+                }
+                if let Some(rp) = p["ramp_pct_per_sec"].as_u64() {
+                    rule.ramp_pct_per_sec = (rp as u8).min(100);
+                }
+                if let Some(src) = p["mix_source"].as_str() {
+                    rule.mix_source = parse_temp_source(src);
+                }
+                if let Some(mix) = p.get("mix_custom").filter(|v| v.is_object()) {
+                    rule.mix_custom = Some(parse_temp_mix(mix));
+                } else if rule.mix_source == FanTempSource::CustomMix && rule.mix_custom.is_none() {
+                    rule.mix_custom = Some(TempMixConfig::default());
+                }
+                if let Some(pts) = p["mix_curve"].as_array() {
+                    parse_curve_points(pts, &mut rule.mix_curve);
+                }
+                if let Some(op) = p["mix_op"].as_str() {
+                    rule.mix_op = match op {
+                        "avg" | "Avg" => CurveMixOp::Avg,
+                        _ => CurveMixOp::Max,
+                    };
+                }
+
+                let mut tracker = SoftwareFanTracker::new();
+                let target = match rule.mode {
+                    SoftwareFanMode::Auto => FanTarget::Auto,
+                    SoftwareFanMode::Fixed => {
+                        FanTarget::Fixed(rule.fixed_pct.clamp(min_floor, 100))
+                    }
+                    SoftwareFanMode::Curve | SoftwareFanMode::Mix => {
+                        let readings = self.sensor_readings();
+                        let duty = tracker
+                            .evaluate(&rule, min_floor, &readings, 0.0, 1)
+                            .unwrap_or_else(|| min_floor.max(50));
+                        FanTarget::Fixed(duty)
+                    }
+                };
+                self.set_device_fan(&device, Some(&fan), target)?;
+                if let FanTarget::Fixed(d) = target
+                    && rule.is_software_curve()
+                {
+                    tracker.mark_applied(d);
+                    self.software_fan_trackers.insert(key.clone(), tracker);
+                } else {
+                    self.software_fan_trackers.remove(&key);
+                }
+
+                {
+                    let prof = self.config.active_profile_mut();
+                    if rule.mode == SoftwareFanMode::Auto {
+                        prof.fan_rules.remove(&key);
+                    } else {
+                        prof.fan_rules.insert(key, rule);
+                    }
+                }
+                self.persist_config();
+                Ok(self.full_state_json())
+            }
+            "device_fan_calibrate" => {
+                if p["cancel"].as_bool() == Some(true) {
+                    self.cancel_fan_calibration();
+                    return Ok(self.full_state_json());
+                }
+                let device = p["device"].as_str().ok_or("device manquant")?;
+                let fan = p["fan"].as_str().ok_or("fan manquant")?;
+                self.start_fan_calibration(device, fan)?;
                 Ok(self.full_state_json())
             }
             "laptop_set_auto_battery" => {

@@ -1,4 +1,5 @@
 use crate::color::{RgbEffectConfig, RgbLayer};
+use crate::cooling::{FanCalibration, SoftwareFanRule};
 use crate::device::{KeyboardLayout, PollingRate};
 use crate::keyboard::FormFactor;
 use crate::lighting::{DeviceLightingConfig, Placement};
@@ -166,6 +167,9 @@ pub struct KeyboardProfile {
     /// Whether legacy vendor lighting fields (Aura/OMEN/numeric per-key) have been migrated.
     #[serde(default)]
     pub lighting_migrated: bool,
+    /// Per-fan universal software cooling rules keyed by `"{device_id}::{fan_id}"`.
+    #[serde(default)]
+    pub fan_rules: BTreeMap<String, SoftwareFanRule>,
 }
 
 impl Default for KeyboardProfile {
@@ -192,6 +196,7 @@ impl Default for KeyboardProfile {
             linked_apps: Vec::new(),
             device_lighting: BTreeMap::new(),
             lighting_migrated: true,
+            fan_rules: BTreeMap::new(),
         }
     }
 }
@@ -260,6 +265,9 @@ pub struct AppConfig {
     /// Experimental drivers explicitly enabled by the user (all disabled by default).
     #[serde(default)]
     pub experimental_drivers: BTreeSet<String>,
+    /// Measured fan calibrations keyed by `"{device_id}::{fan_id}"`.
+    #[serde(default)]
+    pub fan_calibrations: BTreeMap<String, FanCalibration>,
     pub profiles: Vec<KeyboardProfile>,
 }
 
@@ -292,6 +300,7 @@ impl Default for AppConfig {
             laptop_auto_battery_saver: false,
             device_placements: BTreeMap::new(),
             experimental_drivers: BTreeSet::new(),
+            fan_calibrations: BTreeMap::new(),
             profiles: vec![KeyboardProfile::default()],
         }
     }

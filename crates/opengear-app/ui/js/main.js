@@ -7,7 +7,7 @@ import { seg, updateTelemetryDom } from "./components.js";
 import { startRgbPreviewLoop } from "./rgb-preview.js";
 import { presetCard, viewHome } from "./views/home.js";
 import { viewLighting, buildOverridePayload } from "./views/lighting.js";
-import { renderFanCurve, viewPerformance } from "./views/performance.js";
+import { renderFanCurve, renderSwFanCurve, getSwFanDraft, unifiedCoolingFans, viewPerformance } from "./views/performance.js";
 import { startSocdPolling, viewInput } from "./views/input.js";
 import { viewProfiles } from "./views/profiles.js";
 import { renderEqSvg, viewDevices } from "./views/devices.js";
@@ -75,6 +75,7 @@ function render() {
 function afterRender() {
   local.lastPreviewSig = "";
   renderFanCurve();
+  renderSwFanCurve();
   document.querySelectorAll("[data-eq-svg]").forEach((svg) => renderEqSvg(svg.dataset.eqSvg));
   updateTelemetryDom(S.telemetry);
 }
@@ -310,6 +311,20 @@ const ACT = {
   "wizard-open": () => openWizard(),
 
   // Lighting
+  "rgb-enable": (el) => {
+    const on = el.dataset.on === "1";
+    const id = el.dataset.id;
+    if (!id) {
+      call("lighting_sync_all", { enabled: on }, { btn: el, ok: on ? "Éclairage allumé" : "Éclairage coupé" });
+      return;
+    }
+    delete local.lightingDrafts[`${id}|`];
+    call("lighting_set_device", {
+      device_id: id,
+      enabled: true,
+      override: { mode: on ? "global" : "off" },
+    }, { btn: el, ok: on ? "Éclairage allumé" : "Éclairage coupé" });
+  },
   "rgb-kind": (el) => call("set_rgb_config", { kind: el.dataset.kind, enable_rgb: true }, { btn: el, ok: `Effet : ${el.textContent.trim()}` }),
   "rgb-swatch": (el) => call("set_rgb_config", { primary: el.dataset.color, commit: true }, { btn: el, ok: "Couleur appliquée" }),
   "paint-toggle": () => { local.paintMode = !local.paintMode; render(); },
@@ -523,6 +538,55 @@ const ACT = {
     call("device_fan_set", { device: el.dataset.device, fan: el.dataset.fan, target: pct }, { btn: el, ok: `Ventilateurs forcés à ${pct} %` });
   },
   "sio-auto": (el) => call("device_fan_set", { device: el.dataset.device, fan: el.dataset.fan, target: "auto" }, { btn: el, ok: "Ventilateurs rendus au BIOS" }),
+  "sw-fan-ch": (el) => { local.selectedFanKey = el.dataset.val; render(); },
+  "sw-fan-sub": (el) => { local.selectedSwCurveIdx = Number(el.dataset.val) || 0; render(); },
+  "sw-fan-mode": (el) => {
+    const fan = unifiedCoolingFans().find((x) => x.key === el.dataset.key);
+    if (!fan) return;
+    const draft = getSwFanDraft(fan);
+    draft.mode = el.dataset.val;
+    if (draft.mode === "auto") {
+      call("device_fan_rule_set", { device: fan.deviceId, fan: fan.fan.id, mode: "auto" }, { btn: el, ok: "Ventilateur rendu au BIOS" }).then((r) => { if (r) delete local.fanRuleDrafts[fan.key]; });
+    } else {
+      render();
+    }
+  },
+  "sw-fan-mix-op": (el) => {
+    const fan = unifiedCoolingFans().find((x) => x.key === el.dataset.key);
+    if (!fan) return;
+    getSwFanDraft(fan).mix_op = el.dataset.val;
+    render();
+  },
+  "sw-fan-apply": async (el) => {
+    const fan = unifiedCoolingFans().find((x) => x.key === el.dataset.key);
+    if (!fan) return;
+    const d = getSwFanDraft(fan);
+    const r = await call("device_fan_rule_set", {
+      device: fan.deviceId,
+      fan: fan.fan.id,
+      mode: d.mode,
+      fixed_pct: d.fixed_pct,
+      source: d.source,
+      custom_mix: d.custom_mix,
+      curve: d.curve,
+      hysteresis_c: d.hysteresis_c,
+      smoothing_secs: d.smoothing_secs,
+      ramp_pct_per_sec: d.ramp_pct_per_sec,
+      mix_source: d.mix_source,
+      mix_custom: d.mix_custom,
+      mix_curve: d.mix_curve,
+      mix_op: d.mix_op,
+    }, { btn: el, ok: `${fan.fan.name} : règle appliquée` });
+    if (r) delete local.fanRuleDrafts[fan.key];
+  },
+  "sw-fan-auto": async (el) => {
+    const fan = unifiedCoolingFans().find((x) => x.key === el.dataset.key);
+    if (!fan) return;
+    const r = await call("device_fan_rule_set", { device: fan.deviceId, fan: fan.fan.id, mode: "auto" }, { btn: el, ok: `${fan.fan.name} rendu au BIOS` });
+    if (r) delete local.fanRuleDrafts[fan.key];
+  },
+  "sw-fan-calibrate": (el) => call("device_fan_calibrate", { device: el.dataset.device, fan: el.dataset.fan }, { btn: el, ok: "Calibration lancée…" }),
+  "sw-fan-cal-cancel": (el) => call("device_fan_calibrate", { cancel: true }, { btn: el, ok: "Calibration annulée" }),
   "pawnio-install": (el) => call("pawnio_install", {}, { btn: el }),
   "power-plan": (el) => call("set_power_plan", { guid: el.dataset.guid }, { btn: el, ok: "Mode d'alimentation activé" }),
 
@@ -925,6 +989,56 @@ const CHANGE = {
     ch.policy = "Manual";
     render();
   },
+  "sw-fan-fixed": (el) => {
+    const fan = unifiedCoolingFans().find((x) => x.key === el.dataset.key);
+    if (fan) getSwFanDraft(fan).fixed_pct = Number(el.value);
+  },
+  "sw-fan-src": (el) => {
+    const fan = unifiedCoolingFans().find((x) => x.key === el.dataset.key);
+    if (!fan) return;
+    const d = getSwFanDraft(fan);
+    if (Number(el.dataset.sub) === 1) d.mix_source = el.value;
+    else d.source = el.value;
+    render();
+  },
+  "sw-fan-mix": (el) => {
+    const fan = unifiedCoolingFans().find((x) => x.key === el.dataset.key);
+    if (!fan) return;
+    const d = getSwFanDraft(fan);
+    const target = Number(el.dataset.sub) === 1 ? (d.mix_custom = d.mix_custom || { op: "max", a: "cpu", b: "gpu_edge" }) : (d.custom_mix = d.custom_mix || { op: "max", a: "cpu", b: "gpu_edge" });
+    target[el.dataset.part] = el.value;
+  },
+  "sw-fan-hyst": (el) => {
+    const fan = unifiedCoolingFans().find((x) => x.key === el.dataset.key);
+    if (fan) getSwFanDraft(fan).hysteresis_c = Number(el.value);
+  },
+  "sw-fan-smooth": (el) => {
+    const fan = unifiedCoolingFans().find((x) => x.key === el.dataset.key);
+    if (fan) getSwFanDraft(fan).smoothing_secs = Number(el.value);
+  },
+  "sw-fan-ramp": (el) => {
+    const fan = unifiedCoolingFans().find((x) => x.key === el.dataset.key);
+    if (fan) getSwFanDraft(fan).ramp_pct_per_sec = Number(el.value);
+  },
+  "sw-curve-pt": (el) => {
+    const fan = unifiedCoolingFans().find((x) => x.key === el.dataset.key);
+    if (!fan) return;
+    const d = getSwFanDraft(fan);
+    const curve = Number(el.dataset.sub) === 1 ? d.mix_curve : d.curve;
+    const i = Number(el.dataset.pt);
+    const pt = Object.assign({}, curve[i]);
+    let v = Math.round(Number(el.value));
+    if (!Number.isFinite(v)) v = el.dataset.field === "temp_c" ? num(pt.temp_c, 50) : num(pt.duty_pct, 50);
+    if (el.dataset.field === "temp_c") {
+      const lo = i === 0 ? 20 : num(curve[i - 1].temp_c) + 1;
+      const hi = i === curve.length - 1 ? 100 - (curve.length - 1 - i) : num(curve[i + 1].temp_c) - 1;
+      pt.temp_c = clamp(v, lo, Math.max(lo, hi));
+    } else {
+      pt.duty_pct = clamp(v, num(fan.fan.min_pct, 30), 100);
+    }
+    curve[i] = pt;
+    render();
+  },
   "input-engine": (el) => call("input_set_enabled", { enabled: el.checked }, { ok: el.checked ? "Moteur d'entrée démarré" : "Moteur d'entrée arrêté" }),
   "input-winlock": (el) => call("input_set_winlock", { enabled: el.checked }, { ok: el.checked ? "Touche Windows bloquée" : "Touche Windows débloquée" }),
   "kb-form": (el) => call("set_keyboard_layout", { form_factor: el.value }, { ok: "Format du clavier mis à jour" }),
@@ -958,6 +1072,9 @@ const CHANGE = {
     render();
   },
   "bk-dev": (el) => { local.backups.deviceId = el.value; render(); },
+  "wa-vol": (el) => call("audio_set_volume", { is_mic: el.dataset.mic === "1", percent: Number(el.value) }, { rerender: false, ok: `${el.dataset.mic === "1" ? "Micro" : "Volume"} : ${el.value} %` }),
+  "sys-pref": (el) => call("sys_set_prefs", { [el.dataset.key]: el.checked }, { ok: "Préférence enregistrée" }).then((r) => { if (r === null) el.checked = !el.checked; }),
+  "sys-pref-num": (el) => call("sys_set_prefs", { [el.dataset.key]: Number(el.value) }, { ok: "Préférence enregistrée" }).then((r) => { if (r === null) render(); }),
   "laptop-auto-bat": (el) => call("laptop_set_auto_battery", { enabled: el.checked }, { ok: el.checked ? "Mode économie sur batterie activé" : "Mode économie sur batterie désactivé" }),
 };
 

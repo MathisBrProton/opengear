@@ -18,6 +18,7 @@ export const CONFIG_CMDS = new Set([
   "input_set_mouse_binding", "input_remove_mouse_binding", "input_set_mouse_layer_binding", "input_remove_mouse_layer_binding",
   "input_set_esports", "input_set_winlock",
   "apply_preset", "switch_profile", "create_profile", "profile_set_linked_apps", "profile_import_json",
+  "device_fan_rule_set",
 ]);
 
 export const SVG = (inner, vb = "0 0 20 20") =>

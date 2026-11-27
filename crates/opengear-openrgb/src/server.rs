@@ -377,6 +377,7 @@ fn openrgb_type(kind: DeviceKind) -> u32 {
     match kind {
         DeviceKind::Motherboard => 0,
         DeviceKind::Memory => 1,
+        DeviceKind::Gpu => 2,
         DeviceKind::Cooler => 3,
         DeviceKind::LedController => 4,
         DeviceKind::Keyboard | DeviceKind::Laptop => 5,

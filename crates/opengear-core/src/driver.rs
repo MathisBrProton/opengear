@@ -27,6 +27,7 @@ pub enum DeviceKind {
     Motherboard,
     Memory,
     Cooler,
+    Gpu,
     LedController,
     Display,
     Laptop,

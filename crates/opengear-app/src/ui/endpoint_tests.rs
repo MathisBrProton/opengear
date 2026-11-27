@@ -707,6 +707,11 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
         if st["config"]["profiles"].is_null() || st["config"]["active_profile"].is_null() {
             return Err("config.profiles ou config.active_profile absent".into());
         }
+        if st["config"]["fan_calibrations"].is_null()
+            || st["config"]["profile"]["fan_rules"].is_null()
+        {
+            return Err("config.fan_calibrations ou config.profile.fan_rules absent".into());
+        }
         Ok("Schéma complet présent".into())
     });
 
@@ -790,7 +795,88 @@ pub(crate) fn run_all_endpoint_checks() -> Vec<EndpointCheckResult> {
         if st.fan_targets.first().map(|t| t.1) != Some(FanTarget::Fixed(25)) {
             return Err(format!("Plancher non appliqué : {:?}", st.fan_targets));
         }
-        Ok("PWM plancher (10->25%) + retour Auto + rejet inconnu OK".into())
+        drop(st);
+
+        // Universal software fan rules: Fixed, Curve, Mix, and Auto + Calibration start/cancel.
+        eng.last_tel.gpu.edge_temp_c = Some(60.0);
+        cmd_ok(
+            &mut eng,
+            "device_fan_rule_set",
+            json!({
+                "device": "audit:mock_0",
+                "fan": "fan_0",
+                "mode": "fixed",
+                "fixed_pct": 12
+            }),
+        )?;
+        let st_fixed = cmd_ok(
+            &mut eng,
+            "device_fan_rule_set",
+            json!({
+                "device": "audit:mock_0",
+                "fan": "fan_0",
+                "mode": "mix",
+                "source": "GpuEdge",
+                "mix_source": "GpuEdge",
+                "mix_op": "max",
+                "hysteresis_c": 2,
+                "smoothing_secs": 0,
+                "ramp_pct_per_sec": 0,
+                "curve": [
+                    { "temp_c": 30, "duty_pct": 30 }, { "temp_c": 40, "duty_pct": 40 },
+                    { "temp_c": 50, "duty_pct": 50 }, { "temp_c": 60, "duty_pct": 55 },
+                    { "temp_c": 70, "duty_pct": 70 }, { "temp_c": 80, "duty_pct": 85 },
+                    { "temp_c": 88, "duty_pct": 95 }, { "temp_c": 95, "duty_pct": 100 }
+                ],
+                "mix_curve": [
+                    { "temp_c": 30, "duty_pct": 30 }, { "temp_c": 40, "duty_pct": 40 },
+                    { "temp_c": 50, "duty_pct": 60 }, { "temp_c": 60, "duty_pct": 75 },
+                    { "temp_c": 70, "duty_pct": 85 }, { "temp_c": 80, "duty_pct": 95 },
+                    { "temp_c": 88, "duty_pct": 100 }, { "temp_c": 95, "duty_pct": 100 }
+                ]
+            }),
+        )?;
+        if st_fixed["config"]["profile"]["fan_rules"]["audit:mock_0::fan_0"]["mode"] != "mix" {
+            return Err("fan_rules mix non enregistré".into());
+        }
+        let st_cal = cmd_ok(
+            &mut eng,
+            "device_fan_calibrate",
+            json!({ "device": "audit:mock_0", "fan": "fan_0" }),
+        )?;
+        if st_cal["system_prefs"]["fan_calibration_active"].is_null() {
+            return Err("fan_calibration_active absent après démarrage".into());
+        }
+        cmd_err(
+            &mut eng,
+            "device_fan_calibrate",
+            json!({ "device": "audit:mock_0", "fan": "fan_0" }),
+        )?;
+        let st_cancel = cmd_ok(&mut eng, "device_fan_calibrate", json!({ "cancel": true }))?;
+        if !st_cancel["system_prefs"]["fan_calibration_active"].is_null() {
+            return Err("fan_calibration_active non effacé après annulation".into());
+        }
+        cmd_ok(
+            &mut eng,
+            "device_fan_rule_set",
+            json!({ "device": "audit:mock_0", "fan": "fan_0", "mode": "auto" }),
+        )?;
+        cmd_err(
+            &mut eng,
+            "device_fan_rule_set",
+            json!({ "device": "audit:mock_0", "fan": "missing_fan", "mode": "auto" }),
+        )?;
+
+        let st = mock_state.lock().unwrap();
+        // Fixed(12) clamped to 25 %, Mix(GpuEdge=60 C) picked max(55, 75) = 75 %.
+        if !st
+            .fan_targets
+            .iter()
+            .any(|(_, t)| *t == FanTarget::Fixed(75))
+        {
+            return Err(format!("Règle Mix 75% attendue dans {:?}", st.fan_targets));
+        }
+        Ok("PWM plancher (10->25%) + règles Mix/Auto + Calibration + rejet inconnu OK".into())
     });
 
     check(

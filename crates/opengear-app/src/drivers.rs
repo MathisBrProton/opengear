@@ -11,7 +11,7 @@ use opengear_hyperx::HyperXDriver;
 use opengear_logitech::LogitechDriver;
 use opengear_mainboard::{PawnIoRamBackend, RamRgb, RamRgbDriver, SuperIoCoolingDriver};
 use opengear_openrgb::{OpenRgbDriver, OpenRgbRamBackend};
-use opengear_platform::LaptopDisplayDriver;
+use opengear_platform::{GpuCoolingDriver, LaptopDisplayDriver};
 use opengear_razer::RazerDriver;
 use opengear_steelseries::SteelSeriesDriver;
 
@@ -27,6 +27,7 @@ pub fn device_drivers() -> Vec<Box<dyn Driver>> {
         Box::new(AsusAuraDriver),
         Box::new(AsusWmiCoolingDriver),
         Box::new(SuperIoCoolingDriver),
+        Box::new(GpuCoolingDriver),
         Box::new(RamRgbDriver::new(ram_rgb())),
         Box::new(HpOmenDriver),
         Box::new(LaptopDisplayDriver),

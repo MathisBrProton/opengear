@@ -13,10 +13,12 @@ use crate::system_ext::{
 };
 use crate::tray_icon::{TrayMenuState, tray_notify, update_tray_state};
 use opengear_core::cooling::{
-    FanChannelConfig, FanCurveTracker, FanPolicyMode, FanTempSource, SensorReadings,
+    FanCalibration, FanChannelConfig, FanCurveTracker, FanPolicyMode, FanTempSource,
+    SensorReadings, SoftwareFanMode, SoftwareFanRule, SoftwareFanTracker, fan_rule_key,
     resolve_temp_reading,
 };
 use opengear_core::driver::{Control, Device, DeviceKind, Setting, Value, setting_ids};
+use opengear_core::fans::FanTarget;
 use opengear_core::lighting::{
     DeviceLightingConfig, EffectRequest, LightingOverride, Zone, frame_len, render_frame,
 };
@@ -49,6 +51,17 @@ pub(crate) struct CurveDeviceState {
     pub channels: Vec<FanChannelConfig>,
     pub initial: Vec<FanChannelConfig>,
     pub trackers: Vec<FanCurveTracker>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FanCalibrationState {
+    pub device_id: String,
+    pub fan_id: String,
+    pub fan_name: String,
+    pub steps: Vec<u8>,
+    pub step_idx: usize,
+    pub step_started: Instant,
+    pub samples: Vec<(u8, u32)>,
 }
 
 pub(crate) struct BackendEngine {
@@ -103,6 +116,10 @@ pub(crate) struct BackendEngine {
     /// Optional localhost OpenRGB SDK TCP bridge (`127.0.0.1:6742`).
     pub openrgb_server: Option<OpenRgbSdkServer>,
     pub openrgb_server_error: Option<String>,
+    /// Stateful software cooling trackers keyed by `"{device_id}::{fan_id}"`.
+    pub software_fan_trackers: BTreeMap<String, SoftwareFanTracker>,
+    /// Active non-blocking step-by-step PWM <-> RPM fan calibration.
+    pub fan_calibration: Option<FanCalibrationState>,
 }
 
 /// One change made by the battery saver: `(setting, new value, previous value)`.
@@ -318,9 +335,12 @@ impl BackendEngine {
             headless: false,
             openrgb_server: None,
             openrgb_server_error: None,
+            software_fan_trackers: BTreeMap::new(),
+            fan_calibration: None,
         };
         // A device may already be overridden (e.g. Max Fan left on): arm the crash safety net.
         eng.sync_cooling_marker();
+        eng.apply_profile_fan_rules();
         eng.manual_profile_name = eng.config.active_profile.clone();
         eng.sync_input_rules();
         let p0 = eng.config.active_profile_mut().clone();
@@ -393,6 +413,8 @@ impl BackendEngine {
             headless: true,
             openrgb_server: None,
             openrgb_server_error: None,
+            software_fan_trackers: BTreeMap::new(),
+            fan_calibration: None,
         }
     }
 
@@ -570,6 +592,259 @@ impl BackendEngine {
         self.sync_cooling_marker();
     }
 
+    pub(crate) fn sensor_readings(&self) -> SensorReadings {
+        let sensors = self.latest_sensors();
+        SensorReadings {
+            cpu: sensors.cpu_temp_c,
+            gpu_edge: self
+                .last_tel
+                .gpu
+                .edge_temp_c
+                .or(self.last_tel.gpu.hotspot_temp_c),
+            gpu_hotspot: self
+                .last_tel
+                .gpu
+                .hotspot_temp_c
+                .or(self.last_tel.gpu.edge_temp_c),
+            nvme: sensors.nvme_temp_c,
+            motherboard: sensors.motherboard_temp_c,
+        }
+    }
+
+    pub(crate) fn has_active_software_fan_curves(&self) -> bool {
+        self.config
+            .profiles
+            .iter()
+            .find(|p| p.name == self.config.active_profile)
+            .is_some_and(|p| p.fan_rules.values().any(SoftwareFanRule::is_software_curve))
+    }
+
+    /// Evaluate and apply all active `SoftwareFanRule` entries (`Curve` / `Mix`) across `Cooling`
+    /// devices, enforcing each fan's hardware safety floor and keeping the crash watchdog in sync.
+    pub(crate) fn tick_software_fans(&mut self, dt_secs: f32) {
+        let rules = self.config.active_profile_mut().fan_rules.clone();
+        if rules.is_empty() {
+            return;
+        }
+        let readings = self.sensor_readings();
+        let cal_dev = self
+            .fan_calibration
+            .as_ref()
+            .map(|c| (c.device_id.clone(), c.fan_id.clone()));
+
+        let mut plan: Vec<(String, String, u8)> = Vec::new();
+        for dev in &mut self.driver_devices {
+            let dev_id = dev.info().id;
+            let Some(c) = dev.cooling() else {
+                continue;
+            };
+            for fan in c.fans() {
+                if cal_dev
+                    .as_ref()
+                    .is_some_and(|(cd, cf)| cd == &dev_id && cf == &fan.id)
+                {
+                    continue;
+                }
+                let key = fan_rule_key(&dev_id, &fan.id);
+                let Some(rule) = rules.get(&key) else {
+                    continue;
+                };
+                if !rule.is_software_curve() {
+                    continue;
+                }
+                let tracker = self.software_fan_trackers.entry(key).or_default();
+                if let Some(target_duty) =
+                    tracker.evaluate(rule, fan.min_pct, &readings, dt_secs, 2)
+                {
+                    plan.push((dev_id.clone(), fan.id, target_duty));
+                }
+            }
+        }
+
+        for (dev_id, fan_id, duty) in plan {
+            let key = fan_rule_key(&dev_id, &fan_id);
+            if self
+                .set_device_fan(&dev_id, Some(&fan_id), FanTarget::Fixed(duty))
+                .is_ok()
+                && let Some(tr) = self.software_fan_trackers.get_mut(&key)
+            {
+                tr.mark_applied(duty);
+            }
+        }
+    }
+
+    /// Apply the active profile's `fan_rules` (e.g. after switching profiles or startup).
+    pub(crate) fn apply_profile_fan_rules(&mut self) {
+        self.software_fan_trackers.clear();
+        let rules = self.config.active_profile_mut().fan_rules.clone();
+        let readings = self.sensor_readings();
+        let mut actions: Vec<(String, String, FanTarget, bool)> = Vec::new();
+
+        for dev in &mut self.driver_devices {
+            let dev_id = dev.info().id;
+            let Some(c) = dev.cooling() else {
+                continue;
+            };
+            for fan in c.fans() {
+                let key = fan_rule_key(&dev_id, &fan.id);
+                match rules.get(&key) {
+                    Some(rule) if rule.mode == SoftwareFanMode::Fixed => {
+                        actions.push((
+                            dev_id.clone(),
+                            fan.id,
+                            FanTarget::Fixed(rule.fixed_pct),
+                            false,
+                        ));
+                    }
+                    Some(rule) if rule.is_software_curve() => {
+                        let mut tr = SoftwareFanTracker::new();
+                        if let Some(duty) = tr.evaluate(rule, fan.min_pct, &readings, 0.0, 1) {
+                            actions.push((dev_id.clone(), fan.id, FanTarget::Fixed(duty), true));
+                        }
+                        self.software_fan_trackers.insert(key, tr);
+                    }
+                    _ => {
+                        if fan.manual_pct.is_some() {
+                            actions.push((dev_id.clone(), fan.id, FanTarget::Auto, false));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (dev_id, fan_id, target, mark_tr) in actions {
+            if self.set_device_fan(&dev_id, Some(&fan_id), target).is_ok()
+                && mark_tr
+                && let FanTarget::Fixed(d) = target
+                && let Some(tr) = self
+                    .software_fan_trackers
+                    .get_mut(&fan_rule_key(&dev_id, &fan_id))
+            {
+                tr.mark_applied(d);
+            }
+        }
+    }
+
+    /// Begin a non-blocking step-by-step PWM <-> RPM calibration sweep on `(device_id, fan_id)`.
+    pub(crate) fn start_fan_calibration(
+        &mut self,
+        device_id: &str,
+        fan_id: &str,
+    ) -> Result<(), String> {
+        if self.fan_calibration.is_some() {
+            return Err("Une calibration de ventilateur est déjà en cours".into());
+        }
+        let (fan_name, min_pct) = {
+            let dev = self
+                .device_mut(device_id)
+                .ok_or_else(|| format!("Appareil introuvable : {device_id}"))?;
+            let c = dev
+                .cooling()
+                .ok_or_else(|| format!("Ventilateurs non pilotables sur {device_id}"))?;
+            let fan = c
+                .fans()
+                .into_iter()
+                .find(|f| f.id == fan_id)
+                .ok_or_else(|| format!("Ventilateur introuvable : {fan_id}"))?;
+            (fan.name, fan.min_pct.min(100))
+        };
+        let mut steps: Vec<u8> = [100u8, 80, 65, 50, 40, 30, 20, 10, 0]
+            .into_iter()
+            .filter(|&p| p >= min_pct)
+            .collect();
+        if !steps.contains(&min_pct) {
+            steps.push(min_pct);
+        }
+        let first = steps[0];
+        self.set_device_fan(device_id, Some(fan_id), FanTarget::Fixed(first))?;
+        self.fan_calibration = Some(FanCalibrationState {
+            device_id: device_id.to_string(),
+            fan_id: fan_id.to_string(),
+            fan_name,
+            steps,
+            step_idx: 0,
+            step_started: Instant::now(),
+            samples: Vec::new(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn cancel_fan_calibration(&mut self) {
+        let Some(cal) = self.fan_calibration.take() else {
+            return;
+        };
+        let _ = self.set_device_fan(&cal.device_id, Some(&cal.fan_id), FanTarget::Auto);
+        self.apply_profile_fan_rules();
+    }
+
+    fn tick_fan_calibration(&mut self, proxy: &EventLoopProxy<UserEvent>) {
+        let Some(ref cal) = self.fan_calibration else {
+            return;
+        };
+        let settle = if cal.step_idx == 0 {
+            Duration::from_millis(2500)
+        } else {
+            Duration::from_millis(2000)
+        };
+        if cal.step_started.elapsed() < settle {
+            return;
+        }
+        let (dev_id, fan_id, duty) = (
+            cal.device_id.clone(),
+            cal.fan_id.clone(),
+            cal.steps[cal.step_idx],
+        );
+        let measured_rpm = self
+            .device_mut(&dev_id)
+            .and_then(|d| d.cooling())
+            .and_then(|c| {
+                c.refresh();
+                c.fans()
+                    .into_iter()
+                    .find(|f| f.id == fan_id)
+                    .and_then(|f| f.rpm)
+            })
+            .unwrap_or(0);
+
+        let mut next_step: Option<u8> = None;
+        let mut finished_samples: Option<Vec<(u8, u32)>> = None;
+        if let Some(ref mut cal) = self.fan_calibration {
+            cal.samples.push((duty, measured_rpm));
+            cal.step_idx += 1;
+            if cal.step_idx < cal.steps.len() {
+                next_step = Some(cal.steps[cal.step_idx]);
+                cal.step_started = Instant::now();
+            } else {
+                finished_samples = Some(cal.samples.clone());
+            }
+        }
+
+        if let Some(next_duty) = next_step {
+            let _ = self.set_device_fan(&dev_id, Some(&fan_id), FanTarget::Fixed(next_duty));
+            if UI_VISIBLE.load(Ordering::Relaxed) {
+                let st = self.full_state_json();
+                let _ = proxy.send_event(UserEvent::EvalJs(format!(
+                    "window.__ogHotplug && window.__ogHotplug({st});"
+                )));
+            }
+        } else if let Some(samples) = finished_samples {
+            self.fan_calibration = None;
+            let _ = self.set_device_fan(&dev_id, Some(&fan_id), FanTarget::Auto);
+            let result = FanCalibration::from_samples(samples);
+            self.config
+                .fan_calibrations
+                .insert(fan_rule_key(&dev_id, &fan_id), result);
+            self.apply_profile_fan_rules();
+            self.persist_config();
+            if UI_VISIBLE.load(Ordering::Relaxed) {
+                let st = self.full_state_json();
+                let _ = proxy.send_event(UserEvent::EvalJs(format!(
+                    "window.__ogHotplug && window.__ogHotplug({st});"
+                )));
+            }
+        }
+    }
+
     pub(crate) fn restore_hardware_on_exit(&mut self) {
         self.openrgb_server = None;
         self.input_engine.stop();
@@ -655,14 +930,15 @@ impl BackendEngine {
             let (live_rgb_active, animated_rgb_active, thermal_rgb_active) =
                 self.lighting_activity_flags();
             let pending_static_rgb = live_rgb_active && self.has_pending_live_frame();
-            let smart_fan_active = self.curve_states.values().any(|st| {
-                st.is_admin
-                    && st.available
-                    && st
-                        .channels
-                        .iter()
-                        .any(|c| c.source != FanTempSource::CpuBios)
-            });
+            let smart_fan_active = self.has_active_software_fan_curves()
+                || self.curve_states.values().any(|st| {
+                    st.is_admin
+                        && st.available
+                        && st
+                            .channels
+                            .iter()
+                            .any(|c| c.source != FanTempSource::CpuBios)
+                });
             THERMAL_RGB_ACTIVE.store(thermal_rgb_active, Ordering::Relaxed);
             SMART_FAN_ACTIVE.store(smart_fan_active, Ordering::Relaxed);
 
@@ -676,7 +952,7 @@ impl BackendEngine {
                 && !self.suspended
             {
                 12
-            } else if ui_open || smart_fan_active {
+            } else if ui_open || smart_fan_active || self.fan_calibration.is_some() {
                 150
             } else {
                 500
@@ -744,6 +1020,7 @@ impl BackendEngine {
                                 self.config.active_profile = target_prof;
                                 self.auto_switched = true;
                                 self.sync_input_rules();
+                                self.apply_profile_fan_rules();
                                 state_changed = true;
                             }
                         } else if self.auto_switched
@@ -756,6 +1033,7 @@ impl BackendEngine {
                             self.config.active_profile = self.manual_profile_name.clone();
                             self.auto_switched = false;
                             self.sync_input_rules();
+                            self.apply_profile_fan_rules();
                             state_changed = true;
                         }
                     }
@@ -807,26 +1085,11 @@ impl BackendEngine {
                 last_tel_push = Instant::now();
             }
 
-            // 1b. Smart Cooling (GPU / Max(CPU, GPU) with EMA smoothing + hysteresis)
-            if smart_fan_active && last_smart_fan.elapsed() >= Duration::from_secs(3) {
+            // 1b. Smart Cooling (BIOS CurveCooling + universal software Cooling curves/mix)
+            if smart_fan_active && last_smart_fan.elapsed() >= Duration::from_secs(2) {
                 let dt_secs = last_smart_fan.elapsed().as_secs_f32();
                 let mut marker_dirty = false;
-                let sensors = self.latest_sensors();
-                let readings = SensorReadings {
-                    cpu: sensors.cpu_temp_c,
-                    gpu_edge: self
-                        .last_tel
-                        .gpu
-                        .edge_temp_c
-                        .or(self.last_tel.gpu.hotspot_temp_c),
-                    gpu_hotspot: self
-                        .last_tel
-                        .gpu
-                        .hotspot_temp_c
-                        .or(self.last_tel.gpu.edge_temp_c),
-                    nvme: sensors.nvme_temp_c,
-                    motherboard: sensors.motherboard_temp_c,
-                };
+                let readings = self.sensor_readings();
                 let mut pending_applies: Vec<(String, usize, u8, FanChannelConfig)> = Vec::new();
                 for (dev_id, st) in &mut self.curve_states {
                     if !st.is_admin || !st.available {
@@ -868,7 +1131,12 @@ impl BackendEngine {
                 if marker_dirty {
                     self.sync_fan_marker();
                 }
+                self.tick_software_fans(dt_secs);
                 last_smart_fan = Instant::now();
+            }
+
+            if !self.suspended && self.fan_calibration.is_some() {
+                self.tick_fan_calibration(&proxy);
             }
 
             // 2. Fallback hotplug poll only when UI is open (WM_DEVICECHANGE handles tray mode)
@@ -1591,6 +1859,7 @@ impl BackendEngine {
             self.input_engine.stop();
         }
         self.reapply_runtime_state();
+        self.apply_profile_fan_rules();
         self.persist_config();
     }
 
