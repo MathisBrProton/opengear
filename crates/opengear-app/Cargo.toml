@@ -30,5 +30,6 @@ opengear-openrgb.workspace = true
 opengear-razer.workspace = true
 opengear-steelseries.workspace = true
 opengear-hyperx.workspace = true
+opengear-nzxt.workspace = true
 opengear-logitech.workspace = true
 opengear-input.workspace = true

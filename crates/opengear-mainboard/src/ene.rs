@@ -159,7 +159,9 @@ const REG_DIRECTION: u16 = 0x8023;
 const REG_APPLY: u16 = 0x80A0;
 const REG_SLOT_INDEX: u16 = 0x80F8;
 const REG_I2C_ADDRESS: u16 = 0x80F9;
+const COLORS_DIRECT_V1: u16 = 0x8000;
 const COLORS_V1: u16 = 0x8010;
+const COLORS_DIRECT_V2: u16 = 0x8100;
 const COLORS_V2: u16 = 0x8160;
 const APPLY_NOW: u8 = 0x01;
 const APPLY_SAVE: u8 = 0xAA;
@@ -475,6 +477,46 @@ pub fn set_mode(bus: &(impl SmbusBus + ?Sized), module: &EneRamModule, mode: u8)
     Ok(true)
 }
 
+/// Write individual per-LED direct RGB values (`0x8000` on V1, `0x8100` on V2) onto one ENE
+/// module. When `enter_direct` is true, enables `REG_DIRECT = 1` + `APPLY_NOW` before streaming.
+/// Returns `Ok(false)` if the ENE fingerprint / non-Micron guard rejects the address.
+pub fn apply_direct(
+    bus: &(impl SmbusBus + ?Sized),
+    module: &EneRamModule,
+    colors: &[Rgb],
+    enter_direct: bool,
+) -> Result<bool> {
+    let addr = module.address_7bit;
+    if !is_writable_ene(bus, addr) {
+        warn!(
+            addr = format_args!("0x{addr:02X}"),
+            bus_arg = module.bus_arg,
+            backend = %module.backend,
+            "Trame Direct ENE annulée : empreinte absente ou Micron"
+        );
+        return Ok(false);
+    }
+    if enter_direct {
+        write_reg(bus, addr, REG_DIRECT, 1)?;
+        write_reg(bus, addr, REG_APPLY, APPLY_NOW)?;
+    }
+    let base_reg = if module.is_v2 {
+        COLORS_DIRECT_V2
+    } else {
+        COLORS_DIRECT_V1
+    };
+    let count = module.led_count.clamp(1, 16) as usize;
+    let fallback = colors.last().copied().unwrap_or(Rgb::BLACK);
+    for idx in 0..count {
+        let c = colors.get(idx).copied().unwrap_or(fallback);
+        let reg = base_reg + (idx as u16) * 3;
+        write_reg(bus, addr, reg, c.r)?;
+        write_reg(bus, addr, reg + 1, c.b)?;
+        write_reg(bus, addr, reg + 2, c.g)?;
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -672,5 +714,34 @@ pub(crate) mod tests {
         };
         assert!(fingerprint_ok(&bus, 0x70));
         assert!(*bus.dropped_once.borrow());
+    }
+
+    #[test]
+    fn apply_direct_writes_per_led_rbg_registers_on_v1_and_v2() {
+        let mut bus = FakeEneBus::with_module(0x70, "DIMM_LED-0102", 2);
+        bus.load(0x71, "AUDA0-E6K5-0101", 2);
+        bus.present.push(0x71);
+        let m_v1 = read_module(&bus, 0x70, 0, "fake").unwrap();
+        let m_v2 = read_module(&bus, 0x71, 0, "fake").unwrap();
+
+        let leds = [Rgb::new(0xAA, 0xBB, 0xCC), Rgb::new(0x10, 0x20, 0x30)];
+        assert!(apply_direct(&bus, &m_v1, &leds, true).unwrap());
+        assert!(apply_direct(&bus, &m_v2, &leds, false).unwrap());
+
+        let w = bus.writes.borrow();
+        assert!(w.contains(&(0x70, REG_DIRECT, 1)));
+        assert!(w.contains(&(0x70, REG_APPLY, APPLY_NOW)));
+        // V1 direct colors at 0x8000 (R, B, G order)
+        assert!(w.contains(&(0x70, 0x8000, 0xAA)));
+        assert!(w.contains(&(0x70, 0x8001, 0xCC)));
+        assert!(w.contains(&(0x70, 0x8002, 0xBB)));
+        assert!(w.contains(&(0x70, 0x8003, 0x10)));
+        assert!(w.contains(&(0x70, 0x8004, 0x30)));
+        assert!(w.contains(&(0x70, 0x8005, 0x20)));
+        // V2 direct colors at 0x8100 without re-sending REG_DIRECT
+        assert!(!w.iter().any(|&(a, r, _)| a == 0x71 && r == REG_DIRECT));
+        assert!(w.contains(&(0x71, 0x8100, 0xAA)));
+        assert!(w.contains(&(0x71, 0x8101, 0xCC)));
+        assert!(w.contains(&(0x71, 0x8102, 0xBB)));
     }
 }

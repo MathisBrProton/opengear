@@ -31,6 +31,7 @@ const VENDOR_MARKERS: &[(&str, &[&str])] = &[
         "opengear-hyperx",
         &["origins_core_packets", "pulsefire_dart_pkt"],
     ),
+    ("opengear-nzxt", &["kraken3", "nzxt_smart2"]),
 ];
 
 /// Low-level I/O that only driver crates may perform.

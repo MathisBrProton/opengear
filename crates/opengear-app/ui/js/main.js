@@ -1,7 +1,7 @@
 import { ICONS, LABEL_FMT, MACRO_PRESETS, arr, clamp, clone, devId, domId, downloadText, esc, inputVal, num, plural, safeHex, throttled, updateLabel } from "./utils.js";
 import { call, doUndo, humanError, rpc, setBusy, setStatus, toast } from "./ipc.js";
 import { modalStack, trapFocus } from "./modals.js";
-import { S, applyState, curveDevice, deviceById, devicesList, getDraftFor, getEq, local, registerHooks, ui, updateChrome } from "./state.js";
+import { S, applyState, curveDevice, deviceById, devicesList, getDraftFor, getEq, local, pushTelemetrySample, registerHooks, ui, updateChrome } from "./state.js";
 import { curLang, t, translateChrome, translateDom } from "./i18n.js";
 import { seg, updateTelemetryDom } from "./components.js";
 import { startRgbPreviewLoop } from "./rgb-preview.js";
@@ -1227,6 +1227,7 @@ const deviceSignature = () => {
 window.__ogTelemetry = (tel) => {
   if (!S || !tel) return;
   S.telemetry = tel;
+  pushTelemetrySample(tel);
   updateTelemetryDom(tel);
 };
 

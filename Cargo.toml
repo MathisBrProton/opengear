@@ -12,12 +12,13 @@ members = [
     "crates/opengear-razer",
     "crates/opengear-steelseries",
     "crates/opengear-hyperx",
+    "crates/opengear-nzxt",
     "crates/opengear-input",
     "crates/opengear-app",
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["OpenGear Contributors"]
@@ -86,6 +87,7 @@ opengear-openrgb = { path = "crates/opengear-openrgb" }
 opengear-razer = { path = "crates/opengear-razer" }
 opengear-steelseries = { path = "crates/opengear-steelseries" }
 opengear-hyperx = { path = "crates/opengear-hyperx" }
+opengear-nzxt = { path = "crates/opengear-nzxt" }
 opengear-corsair = { path = "crates/opengear-corsair" }
 opengear-asus = { path = "crates/opengear-asus" }
 opengear-logitech = { path = "crates/opengear-logitech" }

@@ -87,6 +87,51 @@ pub(crate) fn build_od8_manual_curve(
     (temps, [speed; 5])
 }
 
+/// Build `(temperature, speed)` pairs for an ADLX `IADLXManualFanTuningStateList` pinned to `target_pct`.
+///
+/// Mirrors [`build_od8_manual_curve`] for dynamic ADLX list lengths while preserving driver ranges and
+/// OpenGear's `GPU_MIN_FAN_PCT` safety floor.
+pub(crate) fn build_adlx_fan_curve_points(
+    count: usize,
+    speed_min: i32,
+    speed_max: i32,
+    temp_min: i32,
+    temp_max: i32,
+    existing_temps: &[i32],
+    target_pct: u8,
+) -> Vec<(i32, i32)> {
+    let n = count.clamp(1, 16);
+    let lo_t = temp_min.min(temp_max);
+    let hi_t = temp_max.max(lo_t);
+    let lo_s = speed_min.min(speed_max);
+    let hi_s = speed_max.max(lo_s);
+    let requested = if hi_s <= 100 {
+        target_pct.clamp(GPU_MIN_FAN_PCT, 100) as i32
+    } else {
+        odn_scale_pct_to_driver(target_pct, lo_s, hi_s)
+    };
+    let speed = requested.clamp(lo_s, hi_s);
+    let step = if n > 1 {
+        ((hi_t - lo_t) / (n as i32 - 1)).max(1)
+    } else {
+        0
+    };
+    let mut prev_t = lo_t;
+    (0..n)
+        .map(|i| {
+            let cand = existing_temps
+                .get(i)
+                .copied()
+                .filter(|&v| v > 0)
+                .unwrap_or(lo_t + (i as i32) * step)
+                .clamp(lo_t, hi_t);
+            let t = cand.max(prev_t);
+            prev_t = t;
+            (t, speed)
+        })
+        .collect()
+}
+
 trait GpuCoolingBackend: Send {
     fn id(&self) -> &str;
     fn vendor(&self) -> &str;
@@ -1147,9 +1192,656 @@ mod win_gpu {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // AMD ADLX (`System32\amdadlx64.dll`, COM-style C vtables from GPUOpen ADLX 2.0)
+    // Used cleanly as a fallback if `atiadlxx.dll` (Overdrive8/N) reports no GPU.
+    // -------------------------------------------------------------------------
+    const ADLX_OK: c_int = 0;
+    const ADLX_FULL_VERSION_2_0: u64 = (2u64 << 48) | 125u64;
+
+    type FnAdlxInit = unsafe extern "system" fn(u64, *mut *mut IAdlxSystem) -> c_int;
+    type FnAdlxInit2 =
+        unsafe extern "system" fn(u64, *mut *mut IAdlxSystem, *mut *mut c_void) -> c_int;
+    type FnAdlxTerminate = unsafe extern "system" fn() -> c_int;
+    type FnAdlxQueryFullVersion = unsafe extern "system" fn(*mut u64) -> c_int;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct AdlxIntRange {
+        min_value: c_int,
+        max_value: c_int,
+        step: c_int,
+    }
+
+    #[repr(C)]
+    struct IAdlxInterfaceVtbl {
+        acquire: unsafe extern "system" fn(*mut c_void) -> i32,
+        release: unsafe extern "system" fn(*mut c_void) -> i32,
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const u16, *mut *mut c_void) -> c_int,
+    }
+
+    #[repr(C)]
+    struct IAdlxSystem {
+        vtbl: *const IAdlxSystemVtbl,
+    }
+
+    #[repr(C)]
+    struct IAdlxSystemVtbl {
+        get_hybrid_graphics_type: unsafe extern "system" fn(*mut IAdlxSystem, *mut c_int) -> c_int,
+        get_gpus: unsafe extern "system" fn(*mut IAdlxSystem, *mut *mut c_void) -> c_int,
+        query_interface:
+            unsafe extern "system" fn(*mut IAdlxSystem, *const u16, *mut *mut c_void) -> c_int,
+        get_displays_services: *const c_void,
+        get_desktops_services: *const c_void,
+        get_gpus_changed_handling: *const c_void,
+        enable_log: *const c_void,
+        get_3d_settings_services: *const c_void,
+        get_gpu_tuning_services:
+            unsafe extern "system" fn(*mut IAdlxSystem, *mut *mut c_void) -> c_int,
+        get_performance_monitoring_services:
+            unsafe extern "system" fn(*mut IAdlxSystem, *mut *mut c_void) -> c_int,
+        total_system_ram: *const c_void,
+        get_i2c: *const c_void,
+    }
+
+    #[repr(C)]
+    struct IAdlxListVtbl {
+        base: IAdlxInterfaceVtbl,
+        size: unsafe extern "system" fn(*mut c_void) -> c_uint,
+        empty: unsafe extern "system" fn(*mut c_void) -> u8,
+        begin: unsafe extern "system" fn(*mut c_void) -> c_uint,
+        end: unsafe extern "system" fn(*mut c_void) -> c_uint,
+        at: unsafe extern "system" fn(*mut c_void, c_uint, *mut *mut c_void) -> c_int,
+        clear: *const c_void,
+        remove_back: *const c_void,
+        add_back: *const c_void,
+        at_typed: unsafe extern "system" fn(*mut c_void, c_uint, *mut *mut c_void) -> c_int,
+        add_back_typed: *const c_void,
+    }
+
+    #[repr(C)]
+    struct IAdlxGpuVtbl {
+        base: IAdlxInterfaceVtbl,
+        vendor_id: unsafe extern "system" fn(*mut c_void, *mut *const c_char) -> c_int,
+        asic_family_type: *const c_void,
+        gpu_type: *const c_void,
+        is_external: *const c_void,
+        name: unsafe extern "system" fn(*mut c_void, *mut *const c_char) -> c_int,
+    }
+
+    #[repr(C)]
+    struct IAdlxGpuTuningServicesVtbl {
+        base: IAdlxInterfaceVtbl,
+        get_changed_handling: *const c_void,
+        is_at_factory: *const c_void,
+        reset_to_factory: unsafe extern "system" fn(*mut c_void, *mut c_void) -> c_int,
+        is_supported_auto: *const c_void,
+        is_supported_preset: *const c_void,
+        is_supported_manual_gfx: *const c_void,
+        is_supported_manual_vram: *const c_void,
+        is_supported_manual_fan:
+            unsafe extern "system" fn(*mut c_void, *mut c_void, *mut u8) -> c_int,
+        is_supported_manual_power: *const c_void,
+        get_auto: *const c_void,
+        get_preset: *const c_void,
+        get_manual_gfx: *const c_void,
+        get_manual_vram: *const c_void,
+        get_manual_fan:
+            unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> c_int,
+    }
+
+    #[repr(C)]
+    struct IAdlxManualFanTuningVtbl {
+        base: IAdlxInterfaceVtbl,
+        get_fan_tuning_ranges:
+            unsafe extern "system" fn(*mut c_void, *mut AdlxIntRange, *mut AdlxIntRange) -> c_int,
+        get_fan_tuning_states: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> c_int,
+        get_empty_fan_tuning_states:
+            unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> c_int,
+        is_valid_fan_tuning_states:
+            unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_int) -> c_int,
+        set_fan_tuning_states: unsafe extern "system" fn(*mut c_void, *mut c_void) -> c_int,
+        is_supported_zero_rpm: unsafe extern "system" fn(*mut c_void, *mut u8) -> c_int,
+        get_zero_rpm_state: unsafe extern "system" fn(*mut c_void, *mut u8) -> c_int,
+        set_zero_rpm_state: unsafe extern "system" fn(*mut c_void, u8) -> c_int,
+        is_supported_min_acoustic: *const c_void,
+        get_min_acoustic_range: *const c_void,
+        get_min_acoustic: *const c_void,
+        set_min_acoustic: *const c_void,
+        is_supported_min_fan: *const c_void,
+        get_min_fan_range: *const c_void,
+        get_min_fan: *const c_void,
+        set_min_fan: *const c_void,
+        is_supported_target_fan: unsafe extern "system" fn(*mut c_void, *mut u8) -> c_int,
+        get_target_fan_range: unsafe extern "system" fn(*mut c_void, *mut AdlxIntRange) -> c_int,
+        get_target_fan: unsafe extern "system" fn(*mut c_void, *mut c_int) -> c_int,
+        set_target_fan: unsafe extern "system" fn(*mut c_void, c_int) -> c_int,
+    }
+
+    #[repr(C)]
+    struct IAdlxManualFanTuningStateVtbl {
+        base: IAdlxInterfaceVtbl,
+        get_fan_speed: unsafe extern "system" fn(*mut c_void, *mut c_int) -> c_int,
+        set_fan_speed: unsafe extern "system" fn(*mut c_void, c_int) -> c_int,
+        get_temperature: unsafe extern "system" fn(*mut c_void, *mut c_int) -> c_int,
+        set_temperature: unsafe extern "system" fn(*mut c_void, c_int) -> c_int,
+    }
+
+    #[repr(C)]
+    struct IAdlxPerfMonServicesVtbl {
+        base: IAdlxInterfaceVtbl,
+        get_sampling_range: *const c_void,
+        set_sampling: *const c_void,
+        get_sampling: *const c_void,
+        get_max_history_range: *const c_void,
+        set_max_history: *const c_void,
+        get_max_history: *const c_void,
+        clear_history: *const c_void,
+        get_cur_history: *const c_void,
+        start_tracking: *const c_void,
+        stop_tracking: *const c_void,
+        get_all_history: *const c_void,
+        get_gpu_history: *const c_void,
+        get_sys_history: *const c_void,
+        get_fps_history: *const c_void,
+        get_current_all: *const c_void,
+        get_current_gpu_metrics:
+            unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> c_int,
+    }
+
+    #[repr(C)]
+    struct IAdlxGpuMetricsVtbl {
+        base: IAdlxInterfaceVtbl,
+        time_stamp: *const c_void,
+        gpu_usage: *const c_void,
+        gpu_clock: *const c_void,
+        vram_clock: *const c_void,
+        gpu_temp: *const c_void,
+        hotspot_temp: *const c_void,
+        gpu_power: *const c_void,
+        total_board_power: *const c_void,
+        gpu_fan_speed: unsafe extern "system" fn(*mut c_void, *mut c_int) -> c_int,
+    }
+
+    /// Reference-counted RAII handle to any ADLX COM-style interface (`IADLXInterface` derived).
+    struct AdlxComPtr(*mut c_void);
+
+    impl AdlxComPtr {
+        unsafe fn from_raw(ptr: *mut c_void) -> Option<Self> {
+            (!ptr.is_null()).then_some(Self(ptr))
+        }
+
+        fn as_ptr(&self) -> *mut c_void {
+            self.0
+        }
+
+        unsafe fn vtbl<T>(&self) -> &T {
+            unsafe {
+                let pp = *(self.0 as *const *const T);
+                &*pp
+            }
+        }
+    }
+
+    impl Drop for AdlxComPtr {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let vtbl = self.vtbl::<IAdlxInterfaceVtbl>();
+                    (vtbl.release)(self.0);
+                }
+            }
+        }
+    }
+
+    struct AdlxSession {
+        sys: *mut IAdlxSystem,
+        fn_terminate: FnAdlxTerminate,
+        _lib: libloading::Library,
+    }
+
+    unsafe impl Send for AdlxSession {}
+    unsafe impl Sync for AdlxSession {}
+
+    impl Drop for AdlxSession {
+        fn drop(&mut self) {
+            unsafe {
+                (self.fn_terminate)();
+            }
+        }
+    }
+
+    /// Must be dropped in declaration order so all COM handles release before `_session` terminates ADLX.
+    pub(super) struct AmdAdlxGpuDevice {
+        id: String,
+        model: String,
+        gpu: AdlxComPtr,
+        tuning_svc: AdlxComPtr,
+        fan_tuning: AdlxComPtr,
+        perf_mon: Option<AdlxComPtr>,
+        saved_curve: Option<Vec<(i32, i32)>>,
+        saved_zero_rpm: Option<u8>,
+        saved_target_speed: Option<i32>,
+        live_rpm: Option<u32>,
+        manual_pct: Option<u8>,
+        _session: Arc<AdlxSession>,
+    }
+
+    unsafe impl Send for AmdAdlxGpuDevice {}
+
+    impl AmdAdlxGpuDevice {
+        fn read_state_list(list: &AdlxComPtr) -> Vec<(i32, i32)> {
+            let mut out = Vec::new();
+            unsafe {
+                let lv = list.vtbl::<IAdlxListVtbl>();
+                let n = (lv.size)(list.as_ptr());
+                for idx in 0..n {
+                    let mut st_ptr: *mut c_void = std::ptr::null_mut();
+                    if (lv.at_typed)(list.as_ptr(), idx, &mut st_ptr) != ADLX_OK {
+                        continue;
+                    }
+                    let Some(st) = AdlxComPtr::from_raw(st_ptr) else {
+                        continue;
+                    };
+                    let sv = st.vtbl::<IAdlxManualFanTuningStateVtbl>();
+                    let mut speed = 0;
+                    let mut temp = 0;
+                    let _ = (sv.get_fan_speed)(st.as_ptr(), &mut speed);
+                    let _ = (sv.get_temperature)(st.as_ptr(), &mut temp);
+                    out.push((temp, speed));
+                }
+            }
+            out
+        }
+
+        fn apply_curve_points(&self, points: &[(i32, i32)]) -> Result<()> {
+            unsafe {
+                let ft = self.fan_tuning.vtbl::<IAdlxManualFanTuningVtbl>();
+                let mut list_ptr: *mut c_void = std::ptr::null_mut();
+                let rc = (ft.get_empty_fan_tuning_states)(self.fan_tuning.as_ptr(), &mut list_ptr);
+                let Some(list) = (rc == ADLX_OK)
+                    .then(|| AdlxComPtr::from_raw(list_ptr))
+                    .flatten()
+                else {
+                    bail!("ADLX GetEmptyFanTuningStates refusé (code {rc})");
+                };
+                let lv = list.vtbl::<IAdlxListVtbl>();
+                let n = (lv.size)(list.as_ptr()) as usize;
+                for (idx, &(temp, speed)) in points.iter().take(n).enumerate() {
+                    let mut st_ptr: *mut c_void = std::ptr::null_mut();
+                    if (lv.at_typed)(list.as_ptr(), idx as c_uint, &mut st_ptr) != ADLX_OK {
+                        continue;
+                    }
+                    if let Some(st) = AdlxComPtr::from_raw(st_ptr) {
+                        let sv = st.vtbl::<IAdlxManualFanTuningStateVtbl>();
+                        let _ = (sv.set_temperature)(st.as_ptr(), temp);
+                        let _ = (sv.set_fan_speed)(st.as_ptr(), speed);
+                    }
+                }
+                let mut err_idx = -1;
+                let valid_rc = (ft.is_valid_fan_tuning_states)(
+                    self.fan_tuning.as_ptr(),
+                    list.as_ptr(),
+                    &mut err_idx,
+                );
+                if valid_rc != ADLX_OK {
+                    bail!("ADLX courbe invalide (code {valid_rc}, index={err_idx})");
+                }
+                let set_rc = (ft.set_fan_tuning_states)(self.fan_tuning.as_ptr(), list.as_ptr());
+                if set_rc != ADLX_OK {
+                    bail!("ADLX SetFanTuningStates refusé par le pilote (code {set_rc})");
+                }
+            }
+            Ok(())
+        }
+
+        pub(super) fn discover() -> Vec<Box<dyn GpuCoolingBackend>> {
+            let Ok(lib) = crate::wmi::load_system32_library("amdadlx64.dll") else {
+                return Vec::new();
+            };
+            unsafe {
+                let Ok(fn_terminate) = lib.get::<FnAdlxTerminate>(b"ADLXTerminate\0").map(|s| *s)
+                else {
+                    return Vec::new();
+                };
+                let mut ver = ADLX_FULL_VERSION_2_0;
+                if let Ok(fn_ver) = lib.get::<FnAdlxQueryFullVersion>(b"ADLXQueryFullVersion\0") {
+                    let mut q = 0u64;
+                    if fn_ver(&mut q) == ADLX_OK && q != 0 {
+                        ver = q;
+                    }
+                }
+                let mut sys: *mut IAdlxSystem = std::ptr::null_mut();
+                let init_ok = if let Ok(fn_init2) = lib.get::<FnAdlxInit2>(b"ADLXInitialize2\0") {
+                    let mut mapping: *mut c_void = std::ptr::null_mut();
+                    let rc = fn_init2(ver, &mut sys, &mut mapping);
+                    drop(AdlxComPtr::from_raw(mapping));
+                    rc == ADLX_OK
+                } else if let Ok(fn_init) = lib.get::<FnAdlxInit>(b"ADLXInitialize\0") {
+                    fn_init(ver, &mut sys) == ADLX_OK
+                } else {
+                    false
+                };
+                if !init_ok || sys.is_null() {
+                    return Vec::new();
+                }
+
+                let session = Arc::new(AdlxSession {
+                    sys,
+                    fn_terminate,
+                    _lib: lib,
+                });
+
+                let sv = &*(*session.sys).vtbl;
+                let mut gpus_ptr: *mut c_void = std::ptr::null_mut();
+                let mut tuning_ptr: *mut c_void = std::ptr::null_mut();
+                if (sv.get_gpus)(session.sys, &mut gpus_ptr) != ADLX_OK
+                    || (sv.get_gpu_tuning_services)(session.sys, &mut tuning_ptr) != ADLX_OK
+                {
+                    return Vec::new();
+                }
+                let (Some(gpus), Some(tuning_svc)) = (
+                    AdlxComPtr::from_raw(gpus_ptr),
+                    AdlxComPtr::from_raw(tuning_ptr),
+                ) else {
+                    return Vec::new();
+                };
+
+                let mut perf_ptr: *mut c_void = std::ptr::null_mut();
+                let perf_mon =
+                    if (sv.get_performance_monitoring_services)(session.sys, &mut perf_ptr)
+                        == ADLX_OK
+                    {
+                        AdlxComPtr::from_raw(perf_ptr)
+                    } else {
+                        None
+                    };
+
+                let gv_list = gpus.vtbl::<IAdlxListVtbl>();
+                let tv = tuning_svc.vtbl::<IAdlxGpuTuningServicesVtbl>();
+                let gpu_count = (gv_list.size)(gpus.as_ptr());
+                let mut out: Vec<Box<dyn GpuCoolingBackend>> = Vec::new();
+
+                for idx in 0..gpu_count {
+                    let mut gpu_ptr: *mut c_void = std::ptr::null_mut();
+                    if (gv_list.at_typed)(gpus.as_ptr(), idx, &mut gpu_ptr) != ADLX_OK {
+                        continue;
+                    }
+                    let Some(gpu) = AdlxComPtr::from_raw(gpu_ptr) else {
+                        continue;
+                    };
+                    let mut supported: u8 = 0;
+                    if (tv.is_supported_manual_fan)(
+                        tuning_svc.as_ptr(),
+                        gpu.as_ptr(),
+                        &mut supported,
+                    ) != ADLX_OK
+                        || supported == 0
+                    {
+                        continue;
+                    }
+                    let mut fan_iface_ptr: *mut c_void = std::ptr::null_mut();
+                    if (tv.get_manual_fan)(tuning_svc.as_ptr(), gpu.as_ptr(), &mut fan_iface_ptr)
+                        != ADLX_OK
+                    {
+                        continue;
+                    }
+                    let Some(fan_tuning) = AdlxComPtr::from_raw(fan_iface_ptr) else {
+                        continue;
+                    };
+                    let gvt = gpu.vtbl::<IAdlxGpuVtbl>();
+                    let mut name_ptr: *const c_char = std::ptr::null();
+                    let model = if (gvt.name)(gpu.as_ptr(), &mut name_ptr) == ADLX_OK
+                        && !name_ptr.is_null()
+                    {
+                        CStr::from_ptr(name_ptr)
+                            .to_string_lossy()
+                            .trim()
+                            .to_string()
+                    } else {
+                        format!("AMD Radeon GPU (ADLX) #{}", out.len() + 1)
+                    };
+
+                    let mut dev = AmdAdlxGpuDevice {
+                        id: format!("gpu:amd_adlx_{}", out.len()),
+                        model,
+                        gpu,
+                        tuning_svc: AdlxComPtr::from_raw({
+                            let iv = tuning_svc.vtbl::<IAdlxInterfaceVtbl>();
+                            (iv.acquire)(tuning_svc.as_ptr());
+                            tuning_svc.as_ptr()
+                        })
+                        .expect("acquired tuning service"),
+                        fan_tuning,
+                        perf_mon: perf_mon.as_ref().and_then(|pm| {
+                            let iv = pm.vtbl::<IAdlxInterfaceVtbl>();
+                            (iv.acquire)(pm.as_ptr());
+                            AdlxComPtr::from_raw(pm.as_ptr())
+                        }),
+                        saved_curve: None,
+                        saved_zero_rpm: None,
+                        saved_target_speed: None,
+                        live_rpm: None,
+                        manual_pct: None,
+                        _session: Arc::clone(&session),
+                    };
+                    dev.refresh();
+                    info!("ADLX GPU refroidissement prêt : {}", dev.model);
+                    out.push(Box::new(dev));
+                }
+                out
+            }
+        }
+    }
+
+    impl GpuCoolingBackend for AmdAdlxGpuDevice {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn vendor(&self) -> &str {
+            "AMD"
+        }
+
+        fn model(&self) -> &str {
+            &self.model
+        }
+
+        fn firmware(&self) -> Option<String> {
+            None
+        }
+
+        fn backend_label(&self) -> &str {
+            "AMD ADLX (amdadlx64.dll)"
+        }
+
+        fn fans(&self) -> Vec<FanInfo> {
+            vec![FanInfo {
+                id: "fan_0".into(),
+                name: format!("{} — Ventilateur GPU", self.model),
+                rpm: self.live_rpm,
+                max_rpm: None,
+                min_pct: GPU_MIN_FAN_PCT,
+                manual_pct: self.manual_pct,
+            }]
+        }
+
+        fn refresh(&mut self) {
+            let Some(ref pm) = self.perf_mon else {
+                return;
+            };
+            unsafe {
+                let pv = pm.vtbl::<IAdlxPerfMonServicesVtbl>();
+                let mut m_ptr: *mut c_void = std::ptr::null_mut();
+                if (pv.get_current_gpu_metrics)(pm.as_ptr(), self.gpu.as_ptr(), &mut m_ptr)
+                    != ADLX_OK
+                {
+                    return;
+                }
+                if let Some(metrics) = AdlxComPtr::from_raw(m_ptr) {
+                    let mv = metrics.vtbl::<IAdlxGpuMetricsVtbl>();
+                    let mut rpm = 0;
+                    if (mv.gpu_fan_speed)(metrics.as_ptr(), &mut rpm) == ADLX_OK {
+                        self.live_rpm = Some(rpm.max(0) as u32);
+                    }
+                }
+            }
+        }
+
+        fn set_fan(&mut self, fan: Option<&str>, target: FanTarget) -> Result<()> {
+            if let Some(fid) = fan
+                && fid != "fan_0"
+            {
+                bail!("Ventilateur GPU introuvable : {fid}");
+            }
+            let info = self.fans().into_iter().next().expect("single GPU fan");
+            match clamp_target(&info, target) {
+                FanTarget::Auto => self.restore_firmware_control(),
+                FanTarget::Fixed(pct) => unsafe {
+                    let ft = self.fan_tuning.vtbl::<IAdlxManualFanTuningVtbl>();
+                    let mut z_sup = 0u8;
+                    if (ft.is_supported_zero_rpm)(self.fan_tuning.as_ptr(), &mut z_sup) == ADLX_OK
+                        && z_sup != 0
+                    {
+                        if self.saved_zero_rpm.is_none() {
+                            let mut cur_z = 0u8;
+                            if (ft.get_zero_rpm_state)(self.fan_tuning.as_ptr(), &mut cur_z)
+                                == ADLX_OK
+                            {
+                                self.saved_zero_rpm = Some(cur_z);
+                            }
+                        }
+                        let _ = (ft.set_zero_rpm_state)(self.fan_tuning.as_ptr(), 0);
+                    }
+
+                    let mut speed_r = AdlxIntRange::default();
+                    let mut temp_r = AdlxIntRange::default();
+                    let mut cur_ptr: *mut c_void = std::ptr::null_mut();
+                    if (ft.get_fan_tuning_ranges)(
+                        self.fan_tuning.as_ptr(),
+                        &mut speed_r,
+                        &mut temp_r,
+                    ) == ADLX_OK
+                        && (ft.get_fan_tuning_states)(self.fan_tuning.as_ptr(), &mut cur_ptr)
+                            == ADLX_OK
+                        && let Some(cur_list) = AdlxComPtr::from_raw(cur_ptr)
+                    {
+                        let cur_points = Self::read_state_list(&cur_list);
+                        if !cur_points.is_empty() {
+                            if self.saved_curve.is_none() {
+                                self.saved_curve = Some(cur_points.clone());
+                            }
+                            let existing_temps: Vec<i32> =
+                                cur_points.iter().map(|(t, _)| *t).collect();
+                            let pts = build_adlx_fan_curve_points(
+                                cur_points.len(),
+                                speed_r.min_value,
+                                speed_r.max_value,
+                                temp_r.min_value,
+                                temp_r.max_value,
+                                &existing_temps,
+                                pct,
+                            );
+                            let applied_speed = pts[0].1;
+                            self.apply_curve_points(&pts)?;
+                            self.manual_pct = Some(if speed_r.max_value <= 100 {
+                                applied_speed.clamp(0, 100) as u8
+                            } else {
+                                odn_driver_to_pct(
+                                    applied_speed,
+                                    speed_r.min_value,
+                                    speed_r.max_value,
+                                    true,
+                                )
+                            });
+                            self.refresh();
+                            return Ok(());
+                        }
+                    }
+
+                    let mut t_sup = 0u8;
+                    if (ft.is_supported_target_fan)(self.fan_tuning.as_ptr(), &mut t_sup) == ADLX_OK
+                        && t_sup != 0
+                    {
+                        let mut tr = AdlxIntRange::default();
+                        if (ft.get_target_fan_range)(self.fan_tuning.as_ptr(), &mut tr) != ADLX_OK {
+                            tr = AdlxIntRange {
+                                min_value: GPU_MIN_FAN_PCT as i32,
+                                max_value: 100,
+                                step: 1,
+                            };
+                        }
+                        if self.saved_target_speed.is_none() {
+                            let mut cur_t = 0;
+                            if (ft.get_target_fan)(self.fan_tuning.as_ptr(), &mut cur_t) == ADLX_OK
+                            {
+                                self.saved_target_speed = Some(cur_t);
+                            }
+                        }
+                        let drv_val = odn_scale_pct_to_driver(pct, tr.min_value, tr.max_value);
+                        let rc = (ft.set_target_fan)(self.fan_tuning.as_ptr(), drv_val);
+                        if rc != ADLX_OK {
+                            bail!("ADLX SetTargetFanSpeed refusé (code {rc})");
+                        }
+                        self.manual_pct = Some(odn_driver_to_pct(
+                            drv_val,
+                            tr.min_value,
+                            tr.max_value,
+                            tr.max_value > 100,
+                        ));
+                        self.refresh();
+                        return Ok(());
+                    }
+
+                    bail!("ADLX : contrôle manuel ventilateur non supporté sur ce GPU");
+                },
+            }
+        }
+
+        fn overridden(&self) -> bool {
+            self.manual_pct.is_some()
+        }
+
+        fn restore_firmware_control(&mut self) -> Result<()> {
+            unsafe {
+                let ft = self.fan_tuning.vtbl::<IAdlxManualFanTuningVtbl>();
+                let mut restored = false;
+                if let Some(pts) = self.saved_curve.take()
+                    && self.apply_curve_points(&pts).is_ok()
+                {
+                    restored = true;
+                }
+                if let Some(t) = self.saved_target_speed.take()
+                    && (ft.set_target_fan)(self.fan_tuning.as_ptr(), t) == ADLX_OK
+                {
+                    restored = true;
+                }
+                if let Some(z) = self.saved_zero_rpm.take() {
+                    let _ = (ft.set_zero_rpm_state)(self.fan_tuning.as_ptr(), z);
+                }
+                if !restored {
+                    let tv = self.tuning_svc.vtbl::<IAdlxGpuTuningServicesVtbl>();
+                    let rc = (tv.reset_to_factory)(self.tuning_svc.as_ptr(), self.gpu.as_ptr());
+                    if rc != ADLX_OK {
+                        bail!("ADLX restauration VBIOS échouée (code {rc})");
+                    }
+                }
+            }
+            self.manual_pct = None;
+            self.refresh();
+            Ok(())
+        }
+    }
+
     pub(super) fn discover_all() -> Vec<Box<dyn GpuCoolingBackend>> {
         let mut out = NvidiaGpuDevice::discover();
-        out.extend(AmdAdlGpuDevice::discover());
+        let adl = AmdAdlGpuDevice::discover();
+        if !adl.is_empty() {
+            out.extend(adl);
+        } else {
+            out.extend(AmdAdlxGpuDevice::discover());
+        }
         out
     }
 }
@@ -1163,7 +1855,7 @@ impl Driver for GpuCoolingDriver {
     }
 
     fn display_name(&self) -> &'static str {
-        "Ventilation carte graphique (NVML / AMD ADL2)"
+        "Ventilation carte graphique (NVML / AMD ADL2 / ADLX)"
     }
 
     fn discover(&self) -> Vec<Box<dyn Device>> {
@@ -1442,5 +2134,41 @@ mod tests {
         cooling.refresh();
         println!("fans restored = {:?}", cooling.fans());
         assert!(!cooling.overridden());
+    }
+
+    #[test]
+    fn adlx_curve_builder_handles_dynamic_lengths_and_safety_floor() {
+        let pts = build_adlx_fan_curve_points(6, 20, 100, 30, 95, &[30, 50, 45, 70, 80, 90], 10);
+        assert_eq!(pts.len(), 6);
+        assert_eq!(
+            pts.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+            vec![30, 50, 50, 70, 80, 90]
+        );
+        assert!(pts.iter().all(|&(_, s)| s == GPU_MIN_FAN_PCT as i32));
+
+        let rpm_pts = build_adlx_fan_curve_points(5, 500, 2500, 30, 95, &[], 50);
+        assert_eq!(rpm_pts.len(), 5);
+        assert!(rpm_pts.iter().all(|&(_, s)| s == 1500));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires live AMD GPU hardware with amdadlx64.dll"]
+    fn live_probe_amd_adlx_cooling() {
+        let mut devs = win_gpu::AmdAdlxGpuDevice::discover();
+        assert!(!devs.is_empty(), "Expected live AMD GPU via amdadlx64.dll");
+        let gpu = &mut devs[0];
+        println!("ADLX GPU: {} fans={:?}", gpu.model(), gpu.fans());
+        gpu.set_fan(Some("fan_0"), FanTarget::Fixed(45))
+            .expect("ADLX set_fan(45%)");
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        gpu.refresh();
+        println!("ADLX at 45%: {:?}", gpu.fans());
+        assert!(gpu.overridden());
+        gpu.restore_firmware_control()
+            .expect("ADLX restore_firmware_control()");
+        gpu.refresh();
+        println!("ADLX restored: {:?}", gpu.fans());
+        assert!(!gpu.overridden());
     }
 }

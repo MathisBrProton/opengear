@@ -1,6 +1,32 @@
 import { arr, clone, num, plural } from "./utils.js";
 
 export let S = null;
+export const telemetryHistory = [];
+const MAX_TEL_HISTORY = 90;
+
+export function pushTelemetrySample(tel) {
+  if (!tel) return;
+  const now = Date.now();
+  const prev = telemetryHistory.length ? telemetryHistory[telemetryHistory.length - 1] : null;
+  if (prev && now - prev.ts < 450) return;
+  const sensors = tel.sensors || {};
+  const gpu = tel.gpu || {};
+  const fanRpms = arr(sensors.fans).map((f) => num(f.rpm)).filter((r) => r > 0);
+  const devFans = Object.values(tel.device_fans || {}).flatMap((c) => arr(c && c.fans).map((f) => num(f.rpm)).filter((r) => r > 0));
+  const allRpms = [...fanRpms, ...devFans];
+  if (sensors.aio_pump_rpm != null && num(sensors.aio_pump_rpm) > 0) allRpms.push(num(sensors.aio_pump_rpm));
+  telemetryHistory.push({
+    ts: now,
+    cpuT: sensors.cpu_temp_c != null ? num(sensors.cpu_temp_c) : null,
+    gpuT: gpu.temp_c != null ? num(gpu.temp_c) : null,
+    mbT: sensors.motherboard_temp_c != null ? num(sensors.motherboard_temp_c) : null,
+    nvmeT: sensors.nvme_temp_c != null ? num(sensors.nvme_temp_c) : null,
+    cpuPct: tel.cpu_usage_pct != null ? num(tel.cpu_usage_pct) : null,
+    gpuPct: gpu.activity_pct != null ? num(gpu.activity_pct) : null,
+    maxRpm: allRpms.length ? Math.max(...allRpms) : null,
+  });
+  while (telemetryHistory.length > MAX_TEL_HISTORY) telemetryHistory.shift();
+}
 export const local = {
   tab: "home",
   sub: { lighting: "global", performance: "mouse", input: "keys", system: "prefs" },
@@ -397,6 +423,7 @@ function escOption(s) {
 export function applyState(st, rerender = true) {
   S = st;
   normalizeState();
+  pushTelemetrySample(S.telemetry);
   syncDrafts();
   updateChrome();
   if (S.config_warning && !local.configWarningShown) {

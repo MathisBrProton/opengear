@@ -69,7 +69,7 @@
 
   const STATE = {
     static_info: { manufacturer: "ASUS", model: "ROG STRIX B650E", motherboard: "ROG STRIX B650E-F", bios_version: "3057", cpu_name: "AMD Ryzen 7 7800X3D", gpu_name: "AMD Radeon RX 7900 XT" },
-    app_version: "0.4.0",
+    app_version: "0.5.0",
     ui: { mode, language: lang, onboarding_done: scen !== "wizard", can_undo: false, undo_label: null },
     presets: [
       { id: "silent", label: "Silencieux", description: "Ventilateurs en profil silencieux, éclairage doux et tamisé, plan d'alimentation équilibré." },

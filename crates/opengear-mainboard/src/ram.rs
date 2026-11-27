@@ -63,6 +63,11 @@ pub trait RamRgbBackend: Send + Sync {
     fn apply(&self, modules: &[&EneRamModule], effect: &RamEffect) -> Result<String>;
     /// Switch modules to raw ENE modes; returns how many were updated.
     fn set_modes(&self, modules: &[(&EneRamModule, u8)]) -> Result<usize>;
+    /// Stream per-LED direct RGB frames (`(module, led_colors, enter_direct_mode)`). Backends
+    /// returning `Ok(None)` fall back to uniform Static updates via [`Self::apply`].
+    fn apply_direct(&self, _frames: &[(&EneRamModule, &[Rgb], bool)]) -> Result<Option<usize>> {
+        Ok(None)
+    }
 }
 
 /// Read installed physical RAM sticks via native COM `Win32_PhysicalMemory` (no Admin required).
@@ -335,6 +340,30 @@ impl RamRgb {
         Ok(applied)
     }
 
+    /// Stream per-LED direct RGB frames; returns `Ok(Some(n))` when every backend supports direct mode.
+    pub fn apply_direct(&self, frames: &[(&EneRamModule, &[Rgb], bool)]) -> Result<Option<usize>> {
+        if frames.is_empty() {
+            return Ok(Some(0));
+        }
+        let mut total = 0usize;
+        for backend in &self.backends {
+            let mine: Vec<(&EneRamModule, &[Rgb], bool)> = frames
+                .iter()
+                .filter(|(m, _, _)| backend.handles(&m.backend))
+                .copied()
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            self.check_rights(backend.as_ref())?;
+            let Some(n) = backend.apply_direct(&mine)? else {
+                return Ok(None);
+            };
+            total += n;
+        }
+        Ok(Some(total))
+    }
+
     /// Group targets by owning backend, in backend order.
     fn group<'a>(
         &self,
@@ -397,7 +426,8 @@ impl Driver for RamRgbDriver {
 pub struct RamRgbDevice {
     ram: Arc<RamRgb>,
     pub status: RamRgbStatus,
-    last_colors: Vec<Option<Rgb>>,
+    last_frames: Vec<Vec<Rgb>>,
+    direct_active: Vec<bool>,
 }
 
 impl RamRgbDevice {
@@ -406,7 +436,8 @@ impl RamRgbDevice {
         Self {
             ram,
             status,
-            last_colors: vec![None; count],
+            last_frames: vec![Vec::new(); count],
+            direct_active: vec![false; count],
         }
     }
 
@@ -528,8 +559,7 @@ impl Lighting for RamRgbDevice {
     }
 
     fn set_frame(&mut self, colors: &[Rgb]) -> Result<()> {
-        // Note: `ene::apply` currently exposes `REG_DIRECT = 0` (single uniform color per DIMM)
-        // rather than verified per-LED SMBus registers across V1/V2 revisions.
+        let mut slices: Vec<(usize, &[Rgb])> = Vec::with_capacity(self.status.ene_modules.len());
         let mut offset = 0usize;
         for idx in 0..self.status.ene_modules.len() {
             let count = (self.status.ene_modules[idx].led_count as usize).max(1);
@@ -539,8 +569,54 @@ impl Lighting for RamRgbDevice {
             if slice.is_empty() {
                 continue;
             }
+            if self
+                .last_frames
+                .get(idx)
+                .is_some_and(|prev| prev.as_slice() == slice)
+            {
+                continue;
+            }
+            slices.push((idx, slice));
+        }
+        if slices.is_empty() {
+            return Ok(());
+        }
+
+        let direct_req: Vec<(&EneRamModule, &[Rgb], bool)> = slices
+            .iter()
+            .map(|&(idx, slice)| {
+                let m = &self.status.ene_modules[idx];
+                let enter = !self.direct_active.get(idx).copied().unwrap_or(false);
+                (m, slice, enter)
+            })
+            .collect();
+        match self.ram.apply_direct(&direct_req) {
+            Ok(Some(_)) => {
+                for (idx, slice) in slices {
+                    if let Some(prev) = self.last_frames.get_mut(idx) {
+                        prev.clear();
+                        prev.extend_from_slice(slice);
+                    }
+                    if let Some(d) = self.direct_active.get_mut(idx) {
+                        *d = true;
+                    }
+                }
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(?err, "Échec trame Direct per-LED RAM RGB");
+                return Err(err);
+            }
+        }
+
+        for (idx, slice) in slices {
             let color = slice[slice.len() / 2];
-            if self.last_colors.get(idx).copied().flatten() == Some(color) {
+            if self
+                .last_frames
+                .get(idx)
+                .is_some_and(|prev| prev.len() == 1 && prev[0] == color)
+            {
                 continue;
             }
             let addr = self.status.ene_modules[idx].address_7bit;
@@ -559,8 +635,9 @@ impl Lighting for RamRgbDevice {
                 );
                 return Err(err);
             }
-            if let Some(slot) = self.last_colors.get_mut(idx) {
-                *slot = Some(color);
+            if let Some(prev) = self.last_frames.get_mut(idx) {
+                prev.clear();
+                prev.push(color);
             }
         }
         Ok(())
@@ -601,7 +678,8 @@ impl Lighting for RamRgbDevice {
                 m.current_mode = mode as u8;
             }
         }
-        self.last_colors.fill(None);
+        self.direct_active.fill(false);
+        self.last_frames.iter_mut().for_each(Vec::clear);
         Ok(())
     }
 
@@ -618,7 +696,8 @@ impl Lighting for RamRgbDevice {
                 Err(err) => warn!(?err, "Échec restauration modes RAM RGB à la libération"),
             }
         }
-        self.last_colors.fill(None);
+        self.direct_active.fill(false);
+        self.last_frames.iter_mut().for_each(Vec::clear);
         Ok(())
     }
 }
@@ -805,6 +884,15 @@ mod pawnio_backend {
         )?;
         Ok(applied)
     }
+
+    pub(super) fn apply_direct(frames: &[(&EneRamModule, &[Rgb], bool)]) -> Result<usize> {
+        let (applied, _, _) = for_each_module(
+            frames,
+            |t| t.0,
+            |bus, (m, cols, enter)| ene::apply_direct(bus, m, cols, *enter),
+        )?;
+        Ok(applied)
+    }
 }
 
 impl RamRgbBackend for PawnIoRamBackend {
@@ -849,6 +937,18 @@ impl RamRgbBackend for PawnIoRamBackend {
         #[cfg(not(windows))]
         {
             let _ = modules;
+            anyhow::bail!("Non supporté hors Windows")
+        }
+    }
+
+    fn apply_direct(&self, frames: &[(&EneRamModule, &[Rgb], bool)]) -> Result<Option<usize>> {
+        #[cfg(windows)]
+        {
+            Ok(Some(pawnio_backend::apply_direct(frames)?))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = frames;
             anyhow::bail!("Non supporté hors Windows")
         }
     }
@@ -1087,5 +1187,99 @@ mod tests {
         let st = ram.probe_with_dimms(vec![dimm("A2"), dimm("B2")]);
         assert_eq!(st.ene_modules.len(), 2);
         assert_eq!(st.ene_modules[0].backend, "b");
+    }
+
+    #[test]
+    fn ram_device_per_led_direct_mode_programs_v1_v2_and_releases_cleanly() {
+        use std::sync::Mutex as StdMutex;
+        struct DirectBus(StdMutex<crate::ene::tests::FakeEneBus>);
+        impl crate::smbus::SmbusBus for DirectBus {
+            fn read_byte_data(&self, addr7: u8, cmd: u8) -> Option<u8> {
+                self.0.lock().unwrap().read_byte_data(addr7, cmd)
+            }
+            fn write_byte_data(&self, addr7: u8, cmd: u8, val: u8) -> Result<()> {
+                self.0.lock().unwrap().write_byte_data(addr7, cmd, val)
+            }
+            fn write_word_data(&self, addr7: u8, cmd: u8, word: u16) -> Result<()> {
+                self.0.lock().unwrap().write_word_data(addr7, cmd, word)
+            }
+        }
+        struct DirectBackend(Arc<DirectBus>);
+        impl RamRgbBackend for DirectBackend {
+            fn label(&self) -> &'static str {
+                "direct_ene"
+            }
+            fn handles(&self, b: &str) -> bool {
+                b == "direct_ene"
+            }
+            fn requires_admin(&self) -> bool {
+                false
+            }
+            fn probe(&self) -> RamProbe {
+                RamProbe::default()
+            }
+            fn apply(&self, modules: &[&EneRamModule], effect: &RamEffect) -> Result<String> {
+                for m in modules {
+                    crate::ene::apply(self.0.as_ref(), m, effect)?;
+                }
+                Ok("ok".into())
+            }
+            fn set_modes(&self, modes: &[(&EneRamModule, u8)]) -> Result<usize> {
+                let mut n = 0;
+                for (m, mode) in modes {
+                    if crate::ene::set_mode(self.0.as_ref(), m, *mode)? {
+                        n += 1;
+                    }
+                }
+                Ok(n)
+            }
+            fn apply_direct(
+                &self,
+                frames: &[(&EneRamModule, &[Rgb], bool)],
+            ) -> Result<Option<usize>> {
+                let mut n = 0;
+                for (m, cols, enter) in frames {
+                    if crate::ene::apply_direct(self.0.as_ref(), m, cols, *enter)? {
+                        n += 1;
+                    }
+                }
+                Ok(Some(n))
+            }
+        }
+
+        let mut raw = crate::ene::tests::FakeEneBus::with_module(0x70, "DIMM_LED-0102", 2);
+        raw.load(0x71, "AUDA0-E6K5-0101", 2);
+        raw.present.push(0x71);
+        let shared = Arc::new(DirectBus(StdMutex::new(raw)));
+        let m0 = crate::ene::read_module(shared.as_ref(), 0x70, 0, "direct_ene").unwrap();
+        let m1 = crate::ene::read_module(shared.as_ref(), 0x71, 0, "direct_ene").unwrap();
+        let ram = Arc::new(RamRgb::new(vec![Box::new(DirectBackend(Arc::clone(
+            &shared,
+        )))]));
+        let mut dev = RamRgbDevice::from_test_modules(ram, vec![m0, m1]);
+
+        let frame1 = vec![Rgb::RED, Rgb::GREEN, Rgb::BLUE, Rgb::CYAN];
+        dev.set_frame(&frame1).unwrap();
+        dev.set_frame(&frame1).unwrap(); // identical frame skipped
+        let frame2 = vec![Rgb::CYAN, Rgb::GREEN, Rgb::BLUE, Rgb::RED];
+        dev.set_frame(&frame2).unwrap();
+        dev.release().unwrap();
+
+        let writes = shared.0.lock().unwrap().writes.borrow().clone();
+        // Frame 1 entered direct mode on both modules; frame 2 only updated DIMM 0 without REG_DIRECT.
+        assert_eq!(
+            writes.iter().filter(|&&w| w == (0x70, 0x8020, 1)).count(),
+            1
+        );
+        assert_eq!(
+            writes.iter().filter(|&&w| w == (0x71, 0x8020, 1)).count(),
+            1
+        );
+        assert!(writes.contains(&(0x70, 0x8000, 0xFF))); // LED0 red
+        assert!(writes.contains(&(0x71, 0x8100, 0x00))); // DIMM1 LED0 blue=(0,0,255) -> R=0
+        assert!(writes.contains(&(0x71, 0x8101, 0xFF))); // B=255
+        // Release exited direct mode (REG_DIRECT = 0) on both DIMMs
+        assert!(writes.contains(&(0x70, 0x8020, 0)));
+        assert!(writes.contains(&(0x71, 0x8020, 0)));
     }
 }

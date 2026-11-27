@@ -61,6 +61,15 @@ const ITE_PWM_CTRL_REGS: [u8; 6] = [0x15, 0x16, 0x17, 0x7F, 0xA7, 0xAF];
 const ITE_PWM_CTRL_ALT_REGS: [u8; 6] = [0x15, 0x16, 0x17, 0x1E, 0x1F, 0x92];
 const ITE_PWM_DUTY_REGS: [u8; 6] = [0x63, 0x6B, 0x73, 0x7B, 0xA3, 0xAB];
 
+// Fintek F718xx LPC/HWM registers (`base + 5` index / `base + 6` data)
+const FINTEK_VENDOR_ID_REG: u8 = 0x23;
+const FINTEK_VENDOR_ID: u16 = 0x1934;
+const FINTEK_TEMP_BASE_REG: u8 = 0x70;
+const FINTEK_PWM_ENABLE_REG: u8 = 0x96;
+const FINTEK_PWM_REGS: [u8; 4] = [0xA3, 0xB3, 0xC3, 0xD3];
+const FINTEK_TACH_REGS: [u8; 4] = [0xA0, 0xB0, 0xC0, 0xD0];
+const FINTEK_TARGET_REGS: [u8; 4] = [0xA2, 0xB2, 0xC2, 0xD2];
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EcChannelRegs {
     pub index: usize,
@@ -192,12 +201,22 @@ pub struct SuperIoFanChannel {
     pub is_manual: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuperIoTempSensor {
+    pub label: String,
+    pub temp_c: f32,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SuperIoSnapshot {
     pub detected: bool,
     pub chip_name: String,
     pub chip_id_hex: String,
     pub hwm_base_hex: String,
+    #[serde(default)]
+    pub motherboard_temp_c: Option<f32>,
+    #[serde(default)]
+    pub temps: Vec<SuperIoTempSensor>,
     pub fans: Vec<SuperIoFanChannel>,
     pub diagnostic: String,
 }
@@ -222,6 +241,17 @@ pub(crate) struct IteChipSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FintekChipSpec {
+    pub name: &'static str,
+    pub ldn: u8,
+    pub tach_count: usize,
+    pub pwm_count: usize,
+    pub has_pwm_enable: bool,
+    pub temp_count: usize,
+    pub is_f71858: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChipFamily {
     NuvotonBank {
         use_98_pwm_out: bool,
@@ -232,6 +262,7 @@ pub(crate) enum ChipFamily {
         dr_handshake: bool,
     },
     Ite(IteChipSpec),
+    Fintek(FintekChipSpec),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -541,6 +572,84 @@ pub(crate) fn ite_manual_target(
     }
 }
 
+pub(crate) fn identify_fintek(id: u16) -> Option<FintekChipSpec> {
+    let f =
+        |name, ldn, tach_count, pwm_count, has_pwm_enable, temp_count, is_f71858| FintekChipSpec {
+            name,
+            ldn,
+            tach_count,
+            pwm_count,
+            has_pwm_enable,
+            temp_count,
+            is_f71858,
+        };
+    match id {
+        0x0507 => Some(f("Fintek F71858", 0x02, 4, 0, false, 3, true)),
+        0x0541 => Some(f("Fintek F71882", 0x04, 4, 4, false, 3, false)),
+        0x0601 => Some(f("Fintek F71862", 0x04, 3, 0, false, 3, false)),
+        0x0723 => Some(f("Fintek F71889F", 0x04, 3, 0, false, 3, false)),
+        0x0814 => Some(f("Fintek F71869", 0x04, 3, 0, false, 3, false)),
+        0x0901 => Some(f("Fintek F71808E", 0x04, 3, 0, false, 2, false)),
+        0x0909 => Some(f("Fintek F71889ED", 0x04, 3, 3, true, 3, false)),
+        0x1005 => Some(f("Fintek F71889AD", 0x04, 3, 3, true, 3, false)),
+        0x1007 => Some(f("Fintek F71869A", 0x04, 3, 0, false, 3, false)),
+        0x1106 => Some(f("Fintek F71878AD", 0x04, 3, 3, true, 3, false)),
+        0x1118 => Some(f("Fintek F71811", 0x04, 3, 0, false, 3, false)),
+        _ => None,
+    }
+}
+
+pub(crate) fn fintek_rpm_from_regs(hi: u8, lo: u8) -> u32 {
+    let raw = ((hi as u32) << 8) | (lo as u32);
+    if (1..0x0FFF).contains(&raw) {
+        let rpm = 1_500_000u32 / raw;
+        if (100..15_000).contains(&rpm) { rpm } else { 0 }
+    } else {
+        0
+    }
+}
+
+/// Fintek `FAN_PWM_ENABLE_REG (0x96)` uses 2 bits per fan: bit 2n = duty mode, bit 2n+1 = manual.
+pub(crate) fn fintek_pwm_enable_mask(ch: usize) -> u8 {
+    0x03u8 << (2 * ch.min(3))
+}
+
+pub(crate) fn sanitize_superio_temp(t: f32) -> Option<f32> {
+    if t.is_finite() && (5.0..=115.0).contains(&t) {
+        Some((t * 10.0).round() / 10.0)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn decode_nuvoton_temp_half(
+    int_byte: u8,
+    half_byte: Option<u8>,
+    half_bit: u8,
+) -> Option<f32> {
+    if matches!(int_byte, 0x00 | 0x7F | 0x80) {
+        return None;
+    }
+    let whole = (int_byte as i8) as f32;
+    let frac = half_byte
+        .map(|b| {
+            if ((b >> half_bit) & 0x01) != 0 {
+                0.5
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(0.0);
+    sanitize_superio_temp(whole + frac)
+}
+
+pub(crate) fn decode_signed_byte_temp(raw: u8) -> Option<f32> {
+    if matches!(raw, 0x00 | 0x7F | 0x80) {
+        return None;
+    }
+    sanitize_superio_temp((raw as i8) as f32)
+}
+
 #[cfg(windows)]
 mod win_sio {
     use super::*;
@@ -779,6 +888,7 @@ mod win_sio {
             } => allow_no_vendor_id || verify_nuvoton_vendor(s, chip.hwm_base),
             ChipFamily::NuvotonEc { .. } => ec_verify_alive(s, chip.hwm_base),
             ChipFamily::Ite(_) => verify_ite_vendor(s, chip.hwm_base),
+            ChipFamily::Fintek(_) => ite_ec_read(s, chip.hwm_base, 0x00).unwrap_or(0xFF) != 0xFF,
         }
     }
 
@@ -854,6 +964,32 @@ mod win_sio {
                                 },
                             ));
                         }
+                    }
+                } else if let Some(spec) = identify_fintek(chip_id)
+                    && sio_inw(&sess, FINTEK_VENDOR_ID_REG).unwrap_or(0) == FINTEK_VENDOR_ID
+                {
+                    let _ = sess.execute("ioctl_find_bars", &[], 0);
+                    let _ = sio_outb(&sess, 0x07, spec.ldn);
+                    let mut hwm_base = sio_inw(&sess, 0x60).unwrap_or(0);
+                    exit_nuvoton(&sess, reg_port);
+                    if (hwm_base & 0x07) == 0x05 {
+                        hwm_base &= 0xFFF8;
+                    }
+                    if hwm_base >= 0x100
+                        && hwm_base != 0xFFFF
+                        && ite_ec_read(&sess, hwm_base, 0x00).unwrap_or(0xFF) != 0xFF
+                    {
+                        return Ok((
+                            sess,
+                            DetectedChip {
+                                slot,
+                                hwm_base,
+                                chip_id,
+                                chip_name: spec.name,
+                                fan_count: spec.tach_count,
+                                family: ChipFamily::Fintek(spec),
+                            },
+                        ));
                     }
                 } else {
                     exit_nuvoton(&sess, reg_port);
@@ -948,12 +1084,91 @@ mod win_sio {
         }
 
         let mut fans = Vec::new();
+        let mut temps = Vec::new();
+        let mut motherboard_temp_c: Option<f32> = None;
         match chip.family {
             ChipFamily::NuvotonBank {
                 use_98_pwm_out,
                 rpm_mode,
                 ..
             } => {
+                // Read SYSTIN & auxiliary board / T_Sensor temperatures natively.
+                let systin = match rpm_mode {
+                    NuvotonRpmMode::Rpm656Direct => {
+                        hwm_read(sess, chip.hwm_base, 0x077).ok().and_then(|hi| {
+                            decode_nuvoton_temp_half(
+                                hi,
+                                hwm_read(sess, chip.hwm_base, 0x078).ok(),
+                                7,
+                            )
+                        })
+                    }
+                    NuvotonRpmMode::Rpm4C0Direct | NuvotonRpmMode::Rpm4B0Count13 => {
+                        let direct = hwm_read(sess, chip.hwm_base, 0x490)
+                            .ok()
+                            .and_then(decode_signed_byte_temp);
+                        direct.or_else(|| {
+                            let src = hwm_read(sess, chip.hwm_base, 0x300).unwrap_or(0) & 0x1F;
+                            if src == 1 {
+                                hwm_read(sess, chip.hwm_base, 0x077).ok().and_then(|hi| {
+                                    decode_nuvoton_temp_half(
+                                        hi,
+                                        hwm_read(sess, chip.hwm_base, 0x078).ok(),
+                                        7,
+                                    )
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                    }
+                };
+                if let Some(t) = systin {
+                    motherboard_temp_c = Some(t);
+                    temps.push(SuperIoTempSensor {
+                        label: "Carte mère (SYSTIN)".into(),
+                        temp_c: t,
+                    });
+                }
+                if use_98_pwm_out && let Ok(ts_hi) = hwm_read(sess, chip.hwm_base, 0x4A2) {
+                    let ts_t = decode_nuvoton_temp_half(
+                        ts_hi,
+                        hwm_read(sess, chip.hwm_base, 0x4A1).ok(),
+                        7,
+                    )
+                    .or_else(|| {
+                        hwm_read(sess, chip.hwm_base, 0x496)
+                            .ok()
+                            .and_then(decode_signed_byte_temp)
+                    });
+                    if let Some(t) = ts_t {
+                        temps.push(SuperIoTempSensor {
+                            label: "Sonde T_Sensor".into(),
+                            temp_c: t,
+                        });
+                    }
+                }
+                for aux_idx in 0..2usize {
+                    let reg = match rpm_mode {
+                        NuvotonRpmMode::Rpm656Direct => 0x075,
+                        _ => 0x492 + aux_idx as u16,
+                    };
+                    if let Some(t) = hwm_read(sess, chip.hwm_base, reg)
+                        .ok()
+                        .and_then(decode_signed_byte_temp)
+                    {
+                        temps.push(SuperIoTempSensor {
+                            label: format!("AUXTIN{aux_idx}"),
+                            temp_c: t,
+                        });
+                        if motherboard_temp_c.is_none() {
+                            motherboard_temp_c = Some(t);
+                        }
+                    }
+                    if rpm_mode == NuvotonRpmMode::Rpm656Direct {
+                        break;
+                    }
+                }
                 let rpm_regs: &[u16] = match rpm_mode {
                     NuvotonRpmMode::Rpm656Direct => &FAN_RPM_REGS_6771,
                     NuvotonRpmMode::Rpm4C0Direct => &FAN_RPM_REGS_95,
@@ -999,6 +1214,25 @@ mod win_sio {
                 }
             }
             ChipFamily::NuvotonEc { dr_handshake } => {
+                for &(reg, label, is_sys) in &[
+                    (0x0102u16, "Carte mère (Système)", true),
+                    (0x0104u16, "MOS / VRM", false),
+                    (0x0106u16, "Chipset (PCH)", false),
+                ] {
+                    if let (Ok(hi), Ok(lo)) = (
+                        ec_read(sess, chip.hwm_base, reg),
+                        ec_read(sess, chip.hwm_base, reg + 1),
+                    ) && let Some(t) = decode_nuvoton_temp_half(hi, Some(lo), 7)
+                    {
+                        if is_sys || motherboard_temp_c.is_none() {
+                            motherboard_temp_c = Some(t);
+                        }
+                        temps.push(SuperIoTempSensor {
+                            label: label.into(),
+                            temp_c: t,
+                        });
+                    }
+                }
                 for (disp_idx, ch) in ec_channels(dr_handshake).into_iter().enumerate() {
                     let Ok(hi) = ec_read(sess, chip.hwm_base, ch.rpm_reg) else {
                         *guard = None;
@@ -1031,6 +1265,19 @@ mod win_sio {
                 }
             }
             ChipFamily::Ite(spec) => {
+                for (idx, reg) in [0x29u8, 0x2Au8, 0x2Bu8].into_iter().enumerate() {
+                    if let Ok(raw) = ite_ec_read(sess, chip.hwm_base, reg)
+                        && let Some(t) = decode_signed_byte_temp(raw)
+                    {
+                        if idx == 0 || motherboard_temp_c.is_none() {
+                            motherboard_temp_c = Some(t);
+                        }
+                        temps.push(SuperIoTempSensor {
+                            label: format!("Sonde CM #{}", idx + 1),
+                            temp_c: t,
+                        });
+                    }
+                }
                 let reg_16bit = ite_ec_read(sess, chip.hwm_base, 0x0C).unwrap_or(0);
                 let (tach_lsb, tach_msb, pwm_ctrl) = if spec.alt_regs {
                     (
@@ -1086,6 +1333,74 @@ mod win_sio {
                     });
                 }
             }
+            ChipFamily::Fintek(spec) => {
+                for i in 0..spec.temp_count {
+                    let temp_c = if spec.is_f71858 {
+                        let hi =
+                            ite_ec_read(sess, chip.hwm_base, FINTEK_TEMP_BASE_REG + 2 * i as u8)
+                                .unwrap_or(0);
+                        let lo = ite_ec_read(
+                            sess,
+                            chip.hwm_base,
+                            FINTEK_TEMP_BASE_REG + 2 * i as u8 + 1,
+                        )
+                        .unwrap_or(0);
+                        let raw = (((hi as i16) << 8) | lo as i16) & 0x07FF;
+                        sanitize_superio_temp(raw as f32 / 128.0)
+                    } else {
+                        ite_ec_read(
+                            sess,
+                            chip.hwm_base,
+                            FINTEK_TEMP_BASE_REG + 2 * (i as u8 + 1),
+                        )
+                        .ok()
+                        .and_then(decode_signed_byte_temp)
+                    };
+                    if let Some(t) = temp_c {
+                        if i == 0 || motherboard_temp_c.is_none() {
+                            motherboard_temp_c = Some(t);
+                        }
+                        temps.push(SuperIoTempSensor {
+                            label: format!("Sonde CM #{}", i + 1),
+                            temp_c: t,
+                        });
+                    }
+                }
+                let enable_reg = if spec.has_pwm_enable {
+                    ite_ec_read(sess, chip.hwm_base, FINTEK_PWM_ENABLE_REG).unwrap_or(0)
+                } else {
+                    0
+                };
+                for i in 0..spec.pwm_count.min(FINTEK_PWM_REGS.len()) {
+                    let Ok(hi) = ite_ec_read(sess, chip.hwm_base, FINTEK_TACH_REGS[i]) else {
+                        *guard = None;
+                        return SuperIoSnapshot {
+                            diagnostic: "Erreur lecture RPM Fintek SuperIO.".into(),
+                            ..Default::default()
+                        };
+                    };
+                    let Ok(lo) = ite_ec_read(sess, chip.hwm_base, FINTEK_TACH_REGS[i] + 1) else {
+                        *guard = None;
+                        return SuperIoSnapshot {
+                            diagnostic: "Erreur lecture RPM Fintek SuperIO.".into(),
+                            ..Default::default()
+                        };
+                    };
+                    let rpm = fintek_rpm_from_regs(hi, lo);
+                    let pwm_raw = ite_ec_read(sess, chip.hwm_base, FINTEK_PWM_REGS[i]).unwrap_or(0);
+                    let pwm_pct = ((pwm_raw as u32 * 100 + 127) / 255).min(100) as u8;
+                    let mask = fintek_pwm_enable_mask(i);
+                    let is_manual = !spec.has_pwm_enable || (enable_reg & mask) == mask;
+                    fans.push(SuperIoFanChannel {
+                        index: i,
+                        label: format!("Fan Header #{}", i + 1),
+                        rpm,
+                        pwm_pct,
+                        mode_raw: enable_reg,
+                        is_manual,
+                    });
+                }
+            }
         }
 
         let vendor_note = match chip.family {
@@ -1095,12 +1410,15 @@ mod win_sio {
                 dr_handshake: false,
             } => "Nuvoton eSIO EC vérifié",
             ChipFamily::Ite(_) => "Vendor ITE vérifié",
+            ChipFamily::Fintek(_) => "Vendor Fintek vérifié",
         };
         SuperIoSnapshot {
             detected: true,
             chip_name: chip.chip_name.to_string(),
             chip_id_hex: format!("0x{:04X}", chip.chip_id),
             hwm_base_hex: format!("0x{:04X} (slot {})", chip.hwm_base, chip.slot),
+            motherboard_temp_c,
+            temps,
             diagnostic: format!(
                 "{} (0x{:04X}) @ 0x{:04X} — {} canaux PWM/RPM actifs ({vendor_note})",
                 chip.chip_name,
@@ -1342,6 +1660,97 @@ mod win_sio {
                     rb_duty
                 ))
             }
+            ChipFamily::Fintek(spec) => {
+                if spec.pwm_count == 0 {
+                    anyhow::bail!(
+                        "SuperIO {} : contrôle PWM non pris en charge sur ce modèle",
+                        chip.chip_name
+                    );
+                }
+                let ch_cap = spec.pwm_count.min(FINTEK_PWM_REGS.len());
+                if channel_idx >= ch_cap {
+                    anyhow::bail!(
+                        "Canal SuperIO #{} hors plage pour {} ({ch_cap} canaux PWM)",
+                        channel_idx + 1,
+                        chip.chip_name
+                    );
+                }
+                let pwm_reg = FINTEK_PWM_REGS[channel_idx];
+                let target_reg = FINTEK_TARGET_REGS[channel_idx];
+                let mask = fintek_pwm_enable_mask(channel_idx);
+                let cur_pwm = ite_ec_read(&sess, chip.hwm_base, pwm_reg)?;
+                let cur_target = if spec.has_pwm_enable {
+                    ite_ec_read(&sess, chip.hwm_base, target_reg)?
+                } else {
+                    0
+                };
+                let cur_enable = if spec.has_pwm_enable {
+                    ite_ec_read(&sess, chip.hwm_base, FINTEK_PWM_ENABLE_REG)?
+                } else {
+                    mask
+                };
+                if let Ok(mut guard) = saved_states().lock()
+                    && guard[channel_idx].is_none()
+                {
+                    guard[channel_idx] = Some(SavedFanState {
+                        mode: cur_enable & mask,
+                        cmd: cur_pwm,
+                        extra: cur_target,
+                    });
+                }
+                let target_duty = ((duty_pct as u32 * 255 + 50) / 100).min(255) as u8;
+                if spec.has_pwm_enable
+                    && let Err(e) = ite_ec_write(
+                        &sess,
+                        chip.hwm_base,
+                        FINTEK_PWM_ENABLE_REG,
+                        (cur_enable & !mask) | mask,
+                    )
+                {
+                    let _ = ite_ec_write(&sess, chip.hwm_base, FINTEK_PWM_ENABLE_REG, cur_enable);
+                    return Err(e);
+                }
+                if let Err(e) = ite_ec_write(&sess, chip.hwm_base, pwm_reg, target_duty) {
+                    let _ = ite_ec_write(&sess, chip.hwm_base, pwm_reg, cur_pwm);
+                    if spec.has_pwm_enable {
+                        let _ = ite_ec_write(&sess, chip.hwm_base, target_reg, cur_target);
+                        let _ =
+                            ite_ec_write(&sess, chip.hwm_base, FINTEK_PWM_ENABLE_REG, cur_enable);
+                    }
+                    return Err(e);
+                }
+                drop(_lock);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                let _lock = NamedMutexGuard::acquire(ISA_MUTEX, 1500)
+                    .context("Bus SuperIO ISA occupé lors de la vérification")?;
+                let rb_duty = ite_ec_read(&sess, chip.hwm_base, pwm_reg)?;
+                let rb_enable = if spec.has_pwm_enable {
+                    ite_ec_read(&sess, chip.hwm_base, FINTEK_PWM_ENABLE_REG)?
+                } else {
+                    mask
+                };
+                if (spec.has_pwm_enable && (rb_enable & mask) != mask)
+                    || rb_duty.abs_diff(target_duty) > 2
+                {
+                    let _ = ite_ec_write(&sess, chip.hwm_base, pwm_reg, cur_pwm);
+                    if spec.has_pwm_enable {
+                        let _ = ite_ec_write(&sess, chip.hwm_base, target_reg, cur_target);
+                        let _ =
+                            ite_ec_write(&sess, chip.hwm_base, FINTEK_PWM_ENABLE_REG, cur_enable);
+                    }
+                    anyhow::bail!(
+                        "Échec vérification SuperIO Fintek ch#{} (rollback appliqué): enable=0x{rb_enable:02X}, duty={rb_duty}",
+                        channel_idx + 1
+                    );
+                }
+                Ok(format!(
+                    "SuperIO {} ch#{} -> {}% vérifié (duty={}, mode=Manuel)",
+                    chip.chip_name,
+                    channel_idx + 1,
+                    duty_pct,
+                    rb_duty
+                ))
+            }
         }
     }
 
@@ -1410,6 +1819,33 @@ mod win_sio {
                         ITE_FAN_MAIN_CTRL_REG,
                         cur_main & !(1 << channel_idx),
                     );
+                }
+            }
+            ChipFamily::Fintek(spec) => {
+                if channel_idx < FINTEK_PWM_REGS.len() {
+                    if spec.has_pwm_enable {
+                        let mask = fintek_pwm_enable_mask(channel_idx);
+                        let cur_enable =
+                            ite_ec_read(&sess, chip.hwm_base, FINTEK_PWM_ENABLE_REG).unwrap_or(0);
+                        ite_ec_write(
+                            &sess,
+                            chip.hwm_base,
+                            FINTEK_PWM_ENABLE_REG,
+                            (cur_enable & !mask) | (saved.mode & mask),
+                        )?;
+                        ite_ec_write(
+                            &sess,
+                            chip.hwm_base,
+                            FINTEK_TARGET_REGS[channel_idx],
+                            saved.extra,
+                        )?;
+                    }
+                    ite_ec_write(
+                        &sess,
+                        chip.hwm_base,
+                        FINTEK_PWM_REGS[channel_idx],
+                        saved.cmd,
+                    )?;
                 }
             }
         }
@@ -1507,6 +1943,37 @@ mod win_sio {
                                 } else {
                                     Ok(())
                                 }
+                            })
+                        }
+                    }
+                    ChipFamily::Fintek(spec) => {
+                        if s.index >= FINTEK_PWM_REGS.len() {
+                            Ok(())
+                        } else {
+                            let res = if spec.has_pwm_enable {
+                                let mask = fintek_pwm_enable_mask(s.index);
+                                let cur_enable =
+                                    ite_ec_read(&sess, chip.hwm_base, FINTEK_PWM_ENABLE_REG)
+                                        .unwrap_or(0);
+                                ite_ec_write(
+                                    &sess,
+                                    chip.hwm_base,
+                                    FINTEK_PWM_ENABLE_REG,
+                                    (cur_enable & !mask) | (s.mode & mask),
+                                )
+                                .and_then(|_| {
+                                    ite_ec_write(
+                                        &sess,
+                                        chip.hwm_base,
+                                        FINTEK_TARGET_REGS[s.index],
+                                        s.extra,
+                                    )
+                                })
+                            } else {
+                                Ok(())
+                            };
+                            res.and_then(|_| {
+                                ite_ec_write(&sess, chip.hwm_base, FINTEK_PWM_REGS[s.index], s.cmd)
                             })
                         }
                     }
@@ -1827,5 +2294,51 @@ mod tests {
         assert_eq!(nuvoton_rpm_from_regs(0xFF, 0x1F, true), 0);
         // Legacy direct RPM mode (NCT6791D..NCT6795D, NCT6771F/6776F, NCT668x).
         assert_eq!(nuvoton_rpm_from_regs(0x04, 0xB0, false), 1200);
+    }
+
+    #[test]
+    fn fintek_f718xx_identification_and_decoding() {
+        let f89 = identify_fintek(0x1005).unwrap();
+        assert_eq!(f89.name, "Fintek F71889AD");
+        assert!(f89.has_pwm_enable);
+        assert_eq!(f89.pwm_count, 3);
+        let f82 = identify_fintek(0x0541).unwrap();
+        assert!(!f82.has_pwm_enable);
+        assert_eq!(f82.pwm_count, 4);
+        assert_eq!(fintek_rpm_from_regs(0x04, 0xB0), 1250);
+        assert_eq!(fintek_rpm_from_regs(0x0F, 0xFF), 0);
+        assert_eq!(fintek_pwm_enable_mask(0), 0x03);
+        assert_eq!(fintek_pwm_enable_mask(2), 0x30);
+    }
+
+    #[test]
+    fn native_superio_temperature_decoders_filter_sentinels() {
+        assert_eq!(decode_nuvoton_temp_half(35, Some(0x80), 7), Some(35.5));
+        assert_eq!(decode_nuvoton_temp_half(35, Some(0x00), 7), Some(35.0));
+        assert_eq!(decode_nuvoton_temp_half(0x80, Some(0x80), 7), None);
+        assert_eq!(decode_nuvoton_temp_half(0x7F, None, 0), None);
+        assert_eq!(decode_signed_byte_temp(42), Some(42.0));
+        assert_eq!(decode_signed_byte_temp(0x00), None);
+        assert_eq!(sanitize_superio_temp(128.0), None);
+    }
+
+    #[test]
+    #[ignore = "requires local PawnIO driver and physical SuperIO chip"]
+    fn live_probe_superio_temps() {
+        let snap = read_superio_snapshot();
+        eprintln!(
+            "SuperIO detected={} chip={} mb_temp={:?} temps={:?} fans={}",
+            snap.detected,
+            snap.chip_name,
+            snap.motherboard_temp_c,
+            snap.temps,
+            snap.fans.len()
+        );
+        assert!(snap.detected, "{}", snap.diagnostic);
+        assert!(
+            snap.motherboard_temp_c.is_some(),
+            "expected native motherboard temp sensor on {}",
+            snap.chip_name
+        );
     }
 }

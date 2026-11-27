@@ -1,6 +1,6 @@
 import { ICONS, POLICIES, arr, clamp, clone, cssVar, domId, esc, fmtHz, num } from "../utils.js";
 import { S, curveDevice, deviceById, isExpert, local } from "../state.js";
-import { advancedHint, coolingDeviceIds, deviceSettings, emptyState, expertTag, pageHeader, seg, sensorChips, sliderRow, subtabs } from "../components.js";
+import { advancedHint, coolingDeviceIds, deviceSettings, emptyState, expertTag, pageHeader, seg, sensorChips, sliderRow, subtabs, telemetryChartsHtml } from "../components.js";
 
 export function viewPerformance() {
   const items = [
@@ -483,6 +483,7 @@ function viewCooling() {
       <div class="card-head"><div><h2 class="card-title">Capteurs en direct</h2>${ex ? `<div class="card-desc">${esc((S.telemetry.sensors && S.telemetry.sensors.source) || "")}</div>` : ""}</div></div>
       <div class="sensor-chip-row" id="cool-live">${sensorChips(S.telemetry)}</div>
     </div>
+    ${telemetryChartsHtml()}
     ${unifiedCoolingCard(fans, sp)}
     ${biosHtml}
     ${ex ? missingPawnIoCard(sp) : advancedHint("Courbes 8 points, Mix CPU + GPU, calibration et contrôle direct des ventilateurs sont en mode Expert.")}`;

@@ -46,6 +46,9 @@ pub fn read_hardware_sensors() -> HardwareSensorsSnapshot {
     let sio = crate::superio::read_superio_snapshot();
     if sio.detected {
         snap.available = true;
+        if let Some(mb_t) = sio.motherboard_temp_c {
+            snap.motherboard_temp_c = Some((mb_t * 10.0).round() / 10.0);
+        }
         if snap.source.is_empty() {
             snap.source = format!("PawnIO {}", sio.chip_name);
         } else {

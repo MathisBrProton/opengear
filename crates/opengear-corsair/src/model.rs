@@ -114,10 +114,14 @@ impl Driver for CorsairDriver {
     }
 
     fn discover(&self) -> Vec<Box<dyn Device>> {
-        CorsairDevice::connect_all()
+        let mut out: Vec<Box<dyn Device>> = CorsairDevice::connect_all()
             .into_iter()
             .map(|d| Box::new(d) as Box<dyn Device>)
-            .collect()
+            .collect();
+        for cpro in crate::commander::CorsairCommanderProDevice::discover_all() {
+            out.push(Box::new(cpro));
+        }
+        out
     }
 }
 

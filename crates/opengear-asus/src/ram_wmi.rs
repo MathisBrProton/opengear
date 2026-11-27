@@ -213,4 +213,24 @@ impl RamRgbBackend for AsusWmiRamBackend {
             anyhow::bail!("Non supporté hors Windows")
         }
     }
+
+    fn apply_direct(
+        &self,
+        frames: &[(&EneRamModule, &[opengear_core::Rgb], bool)],
+    ) -> Result<Option<usize>> {
+        #[cfg(windows)]
+        {
+            let n = imp::for_each(
+                frames,
+                |t| t.0,
+                |bus, (m, cols, enter)| opengear_mainboard::ene::apply_direct(bus, m, cols, *enter),
+            )?;
+            Ok(Some(n))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = frames;
+            anyhow::bail!("Non supporté hors Windows")
+        }
+    }
 }

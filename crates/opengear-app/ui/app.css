@@ -580,3 +580,12 @@ input[type="range"].eq-vslider:focus-visible { outline: 2px solid var(--focus); 
 .bp-fan { fill: rgba(255,255,255,0.03); stroke: var(--emerald); }
 .bp-fan.manual { stroke: var(--amber); }
 .bp-hub { fill: rgba(255,255,255,0.16); }
+
+/* Live telemetry history charts */
+.tel-charts { gap: 16px; }
+.tel-chart-card { padding-bottom: 12px; }
+.tel-legend { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; font-size: 11px; color: var(--text-2); }
+.tel-legend-item { display: inline-flex; align-items: center; gap: 5px; }
+.tel-legend-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.bg-emerald { background: var(--emerald); }
+.tel-chart-svg { width: 100%; height: auto; display: block; border-radius: var(--radius-sm); background: rgba(14, 18, 29, 0.45); border: 1px solid var(--border); }

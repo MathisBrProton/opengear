@@ -235,7 +235,7 @@ function sysAbout() {
         <div class="card-head"><h2 class="card-title">OpenGear</h2></div>
         <p class="muted">Contrôleur matériel unifié, léger et local : remplace iCUE, G HUB et Armoury Crate pour l'éclairage, les souris, claviers, casques et la ventilation.</p>
         <div class="divider"></div>
-        ${infoTable([["Version", S.app_version || "0.4.0"], ["Données personnelles", "Aucune télémétrie, rien n'est envoyé sur Internet"], ["Images officielles locales", [la.lghub_depot_found ? "G HUB" : "", la.icue_devices_found ? "iCUE" : ""].filter(Boolean).join(" + ") || "Non (images vectorielles intégrées)"]])}
+        ${infoTable([["Version", S.app_version || "0.5.0"], ["Données personnelles", "Aucune télémétrie, rien n'est envoyé sur Internet"], ["Images officielles locales", [la.lghub_depot_found ? "G HUB" : "", la.icue_devices_found ? "iCUE" : ""].filter(Boolean).join(" + ") || "Non (images vectorielles intégrées)"]])}
       </div>
       <div class="card">
         <div class="card-head"><h2 class="card-title">Ce PC</h2></div>

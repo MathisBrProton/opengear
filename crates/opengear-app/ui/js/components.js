@@ -1,5 +1,5 @@
-import { ICONS, SWATCHES, arr, clamp, dataAttrs, esc, fmtHz, num, setBar, setTxt } from "./utils.js";
-import { S, deviceById, isExpert, k70Image, local, settingOf } from "./state.js";
+import { ICONS, SWATCHES, arr, clamp, cssVar, dataAttrs, esc, fmtHz, num, setBar, setTxt } from "./utils.js";
+import { S, deviceById, isExpert, k70Image, local, settingOf, telemetryHistory } from "./state.js";
 import { curLang, t, translateDom } from "./i18n.js";
 
 export function pageHeader(title, subHtml, actionsHtml = "", accent = "") {
@@ -252,8 +252,146 @@ export function updateTelemetryDom(tel) {
     live.innerHTML = sensorChips(tel);
     translateDom(live);
   }
+  updateTelemetryChartsDom();
   const audioOut = document.getElementById("wa-out-state");
   if (audioOut && tel.audio) audioOut.textContent = tel.audio.output_muted ? t("Muet") : `${num(tel.audio.output_volume_pct)} %`;
+}
+
+export function telemetryChartsHtml() {
+  return `
+    <div class="tel-charts grid-2 mb-16">
+      <div class="card tel-chart-card">
+        <div class="card-head">
+          <div><h2 class="card-title">Historique températures (90 s)</h2></div>
+          <div class="tel-legend">
+            <span class="tel-legend-item"><span class="tel-legend-dot bg-cyan"></span>CPU</span>
+            <span class="tel-legend-item"><span class="tel-legend-dot bg-rog"></span>GPU</span>
+            <span class="tel-legend-item"><span class="tel-legend-dot bg-amber"></span>Carte mère</span>
+            <span class="tel-legend-item"><span class="tel-legend-dot bg-purple"></span>NVMe</span>
+          </div>
+        </div>
+        <svg id="tel-history-svg" class="tel-chart-svg" viewBox="0 0 560 165" role="img" aria-label="Historique températures"></svg>
+      </div>
+      <div class="card tel-chart-card">
+        <div class="card-head">
+          <div><h2 class="card-title">Charge &amp; ventilation (90 s)</h2></div>
+          <div class="tel-legend">
+            <span class="tel-legend-item"><span class="tel-legend-dot bg-cyan"></span>CPU %</span>
+            <span class="tel-legend-item"><span class="tel-legend-dot bg-rog"></span>GPU %</span>
+            <span class="tel-legend-item"><span class="tel-legend-dot bg-emerald"></span>Max RPM</span>
+          </div>
+        </div>
+        <svg id="tel-load-svg" class="tel-chart-svg" viewBox="0 0 560 165" role="img" aria-label="Charge et ventilation"></svg>
+      </div>
+    </div>`;
+}
+
+function buildPolylinePath(pts) {
+  let d = "";
+  let open = false;
+  for (const pt of pts) {
+    if (!pt) {
+      open = false;
+      continue;
+    }
+    d += `${open ? "L" : "M"}${pt[0].toFixed(1)},${pt[1].toFixed(1)} `;
+    open = true;
+  }
+  return d.trim();
+}
+
+function renderSeriesSvg(svg, seriesList, { minY, maxY, ticks, unit, emptyLabel, rightBadge }) {
+  if (!svg) return;
+  const W = 560, H = 165, padL = 40, padR = 14, padT = 14, padB = 20;
+  const pw = W - padL - padR, ph = H - padT - padB;
+  const muted = cssVar("--text-3", "#64748b");
+  const yOf = (v) => padT + ph * (1 - clamp((v - minY) / Math.max(1, maxY - minY), 0, 1));
+  let out = "";
+  for (const tick of ticks) {
+    const y = yOf(tick);
+    out += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="rgba(255,255,255,0.06)"/>`;
+    out += `<text x="${padL - 6}" y="${y + 3.5}" fill="${muted}" font-size="10" text-anchor="end" font-family="Consolas,monospace">${tick}${unit}</text>`;
+  }
+  const n = telemetryHistory.length;
+  if (n < 2) {
+    out += `<text x="${padL + pw / 2}" y="${padT + ph / 2}" fill="${muted}" font-size="12" text-anchor="middle">${esc(emptyLabel)}</text>`;
+    svg.innerHTML = out;
+    return;
+  }
+  const denom = Math.max(1, n - 1);
+  for (const s of seriesList) {
+    const pts = telemetryHistory.map((sample, idx) => {
+      const val = s.get(sample);
+      if (val == null || !Number.isFinite(val)) return null;
+      const x = padL + (idx / denom) * pw;
+      const y = yOf(val);
+      return [x, y, val];
+    });
+    const d = buildPolylinePath(pts);
+    if (!d) continue;
+    out += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0.92"/>`;
+    const last = [...pts].reverse().find(Boolean);
+    if (last) {
+      out += `<circle cx="${last[0].toFixed(1)}" cy="${last[1].toFixed(1)}" r="3.4" fill="${s.color}"/>`;
+    }
+  }
+  if (rightBadge) {
+    out += `<text x="${W - padR}" y="${padT + 10}" fill="${cssVar("--text-2", "#cbd5e1")}" font-size="10.5" text-anchor="end" font-family="Consolas,monospace">${esc(rightBadge)}</text>`;
+  }
+  svg.innerHTML = out;
+}
+
+function updateTelemetryChartsDom() {
+  const tempSvg = document.getElementById("tel-history-svg");
+  const loadSvg = document.getElementById("tel-load-svg");
+  if (!tempSvg && !loadSvg) return;
+  const isEn = curLang() === "en";
+  const latest = telemetryHistory.length ? telemetryHistory[telemetryHistory.length - 1] : null;
+  if (tempSvg) {
+    const parts = [];
+    if (latest && latest.cpuT != null) parts.push(`CPU ${Math.round(latest.cpuT)}°C`);
+    if (latest && latest.gpuT != null) parts.push(`GPU ${Math.round(latest.gpuT)}°C`);
+    if (latest && latest.mbT != null) parts.push(`${isEn ? "MB" : "CM"} ${Math.round(latest.mbT)}°C`);
+    renderSeriesSvg(
+      tempSvg,
+      [
+        { color: cssVar("--cyan", "#00D4FF"), get: (s) => s.cpuT },
+        { color: cssVar("--rog", "#FF3D63"), get: (s) => s.gpuT },
+        { color: cssVar("--amber", "#FFA53D"), get: (s) => s.mbT },
+        { color: cssVar("--purple", "#AD80FF"), get: (s) => s.nvmeT },
+      ],
+      {
+        minY: 20,
+        maxY: 100,
+        ticks: [20, 40, 60, 80, 100],
+        unit: "°",
+        emptyLabel: isEn ? "Collecting live samples…" : "Collecte des mesures en direct…",
+        rightBadge: parts.join(" · "),
+      },
+    );
+  }
+  if (loadSvg) {
+    const maxObservedRpm = telemetryHistory.reduce((m, s) => Math.max(m, num(s.maxRpm)), 2500);
+    const rpmCeil = Math.max(2500, Math.ceil(maxObservedRpm / 500) * 500);
+    const rpmUnit = isEn ? "RPM" : "tr/min";
+    const badge = latest && latest.maxRpm != null ? `${Math.round(latest.maxRpm)} ${rpmUnit}` : "";
+    renderSeriesSvg(
+      loadSvg,
+      [
+        { color: cssVar("--cyan", "#00D4FF"), get: (s) => s.cpuPct },
+        { color: cssVar("--rog", "#FF3D63"), get: (s) => s.gpuPct },
+        { color: cssVar("--emerald", "#2EE59D"), get: (s) => s.maxRpm != null ? (s.maxRpm / rpmCeil) * 100 : null },
+      ],
+      {
+        minY: 0,
+        maxY: 100,
+        ticks: [0, 25, 50, 75, 100],
+        unit: "%",
+        emptyLabel: isEn ? "Collecting live samples…" : "Collecte des mesures en direct…",
+        rightBadge: badge,
+      },
+    );
+  }
 }
 
 export function renderKeyboard(mode, kb) {
