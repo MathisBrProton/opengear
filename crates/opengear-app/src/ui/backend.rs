@@ -96,6 +96,9 @@ pub(crate) struct BackendEngine {
     pub watchdog_spawned: bool,
     pub suspended: bool,
     pub resume_reconnect_at: Option<Instant>,
+    /// Post-boot / post-resume settle window during which sleeping wireless peripherals
+    /// (whose USB dongle is already present) are checked periodically without waiting for USB hotplug.
+    pub wireless_wake_window_until: Option<Instant>,
     pub blackout_lock: bool,
     pub blackout_idle: bool,
     pub blackout_applied: bool,
@@ -321,6 +324,7 @@ impl BackendEngine {
             watchdog_spawned: false,
             suspended: false,
             resume_reconnect_at: None,
+            wireless_wake_window_until: Some(Instant::now() + Duration::from_secs(55)),
             blackout_lock: false,
             blackout_idle: false,
             blackout_applied: false,
@@ -399,6 +403,7 @@ impl BackendEngine {
             watchdog_spawned: false,
             suspended: false,
             resume_reconnect_at: None,
+            wireless_wake_window_until: None,
             blackout_lock: false,
             blackout_idle: false,
             blackout_applied: false,
@@ -919,6 +924,7 @@ impl BackendEngine {
         let mut last_laptop_poll = Instant::now();
         let mut last_cooling_poll = Instant::now();
         let mut last_cooling_refresh = Instant::now();
+        let mut last_dormant_check = Instant::now();
 
         loop {
             if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
@@ -1151,6 +1157,33 @@ impl BackendEngine {
                 last_hotplug_check = Instant::now();
             }
 
+            // 2b. Re-probe dormant wireless dongles (e.g. a mouse that was still asleep at boot
+            // or system resume) without touching already-connected devices or polling idle trays
+            // once the post-boot/wake window expires.
+            let in_wake_window = self
+                .wireless_wake_window_until
+                .is_some_and(|until| Instant::now() < until);
+            if !in_wake_window {
+                self.wireless_wake_window_until = None;
+            }
+            let dormant_interval = if ui_open || in_wake_window {
+                Duration::from_secs(5)
+            } else {
+                Duration::ZERO
+            };
+            if !self.suspended
+                && !dormant_interval.is_zero()
+                && last_dormant_check.elapsed() >= dormant_interval
+            {
+                if self.check_dormant_wireless() && ui_open {
+                    let st = self.full_state_json();
+                    let _ = proxy.send_event(UserEvent::EvalJs(format!(
+                        "window.__ogHotplug && window.__ogHotplug({st});"
+                    )));
+                }
+                last_dormant_check = Instant::now();
+            }
+
             // 3. Battery refresh + laptop polls
             let status_interval = if ui_open {
                 Duration::from_secs(30)
@@ -1353,7 +1386,8 @@ impl BackendEngine {
                         tr.reset();
                     }
                 }
-                self.resume_reconnect_at = Some(Instant::now() + Duration::from_millis(1200));
+                self.resume_reconnect_at = Some(Instant::now() + Duration::from_millis(2000));
+                self.wireless_wake_window_until = Some(Instant::now() + Duration::from_secs(55));
             }
             SysEvent::Lock => {
                 if self.config.lights_off_on_lock {
@@ -1679,6 +1713,29 @@ impl BackendEngine {
         self.last_hid_sig = sig;
         self.reconnect_vendors(&vendors);
         self.reapply_runtime_state();
+        true
+    }
+
+    pub(crate) fn check_dormant_wireless(&mut self) -> bool {
+        let added = super::devices::discover_dormant_wireless(
+            &mut self.driver_devices,
+            &self.drivers,
+            &self.config.experimental_drivers,
+        );
+        if added == 0 {
+            return false;
+        }
+        info!(
+            added,
+            "Périphérique sans fil réveillé détecté automatiquement"
+        );
+        seed_and_resize_device_lighting(&mut self.config, &mut self.driver_devices);
+        self.invalidate_keyboard_view();
+        self.refresh_curve_states();
+        if !self.headless {
+            self.sync_openrgb_server();
+            self.sync_tray_state();
+        }
         true
     }
 

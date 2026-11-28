@@ -783,7 +783,12 @@ impl BackendEngine {
         proxy: Option<&EventLoopProxy<UserEvent>>,
     ) -> std::result::Result<Value, String> {
         match cmd {
-            "get_state" => Ok(self.full_state_json()),
+            "get_state" => {
+                if !self.suspended {
+                    self.check_dormant_wireless();
+                }
+                Ok(self.full_state_json())
+            }
             "get_catalog" => Ok(Self::catalog_json()),
             "get_telemetry" => Ok(self.telemetry_json()),
             "get_diagnostics" => Ok(self.diagnostics_json()),

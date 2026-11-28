@@ -457,6 +457,13 @@ pub trait Driver: Send + Sync {
     }
     /// Open every device currently connected. Called at start-up and on hot-plug.
     fn discover(&self) -> Vec<Box<dyn Device>>;
+
+    /// Probe only wireless receivers/dongles that currently have no open device in `open_ids`,
+    /// recovering wireless peripherals (e.g. a sleeping mouse) that woke up after startup without
+    /// changing USB `(vid, pid)` topology. Existing active devices are never reopened.
+    fn discover_dormant_wireless(&self, _open_ids: &[&str]) -> Vec<Box<dyn Device>> {
+        Vec::new()
+    }
 }
 
 /// Find `id` among `device`'s settings and validate `value` for it.

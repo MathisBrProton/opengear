@@ -38,6 +38,21 @@ impl Driver for LogitechDriver {
             (0xFF00, Some(0x0002)),
             (0xFF43, Some(0x0202)),
         ]);
+        Self::init_devices(transports)
+    }
+
+    fn discover_dormant_wireless(&self, open_ids: &[&str]) -> Vec<Box<dyn Device>> {
+        let open_pids = crate::hidpp::extract_open_logitech_pids(open_ids);
+        let transports = crate::hidpp::HidppTransport::open_dormant_receivers(&open_pids);
+        if transports.is_empty() {
+            return Vec::new();
+        }
+        Self::init_devices(transports)
+    }
+}
+
+impl LogitechDriver {
+    fn init_devices(transports: Vec<(u16, crate::hidpp::HidppTransport)>) -> Vec<Box<dyn Device>> {
         let mut seen = std::collections::BTreeSet::new();
         let unique: Vec<(u16, crate::hidpp::HidppTransport)> = transports
             .into_iter()

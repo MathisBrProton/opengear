@@ -120,6 +120,50 @@ pub(crate) fn discover_all(
     })
 }
 
+/// Probe dormant wireless receivers/dongles across all active drivers without interrupting
+/// already-open devices. Returns how many newly woken devices were appended.
+pub(crate) fn discover_dormant_wireless(
+    driver_devices: &mut Vec<Box<dyn Device>>,
+    drivers: &[Box<dyn Driver>],
+    enabled_experimental: &std::collections::BTreeSet<String>,
+) -> usize {
+    let open_ids: Vec<String> = driver_devices.iter().map(|d| d.info().id).collect();
+    let open_refs: Vec<&str> = open_ids.iter().map(String::as_str).collect();
+    let active: Vec<&Box<dyn Driver>> = drivers
+        .iter()
+        .filter(|d| !d.experimental() || enabled_experimental.contains(d.name()))
+        .collect();
+    let discovered: Vec<Box<dyn Device>> = if active.len() <= 1 {
+        active
+            .into_iter()
+            .flat_map(|d| d.discover_dormant_wireless(&open_refs))
+            .collect()
+    } else {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = active
+                .into_iter()
+                .map(|drv| s.spawn(|| drv.discover_dormant_wireless(&open_refs)))
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        })
+    };
+    let mut added = 0usize;
+    for dev in discovered {
+        let id = dev.info().id;
+        if !driver_devices
+            .iter()
+            .any(|existing| existing.info().id == id)
+        {
+            driver_devices.push(dev);
+            added += 1;
+        }
+    }
+    added
+}
+
 impl BackendEngine {
     pub(crate) fn device_mut(&mut self, id: &str) -> Option<&mut (dyn Device + 'static)> {
         self.driver_devices
@@ -495,5 +539,63 @@ mod tests {
         assert_eq!(touched, vec!["fake:".to_string()]);
         assert_eq!(other_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(devs.len(), 3);
+    }
+
+    #[test]
+    fn dormant_wireless_discovery_appends_only_missing_devices() {
+        struct LateWakeDriver;
+        impl Driver for LateWakeDriver {
+            fn name(&self) -> &'static str {
+                "late"
+            }
+            fn discover(&self) -> Vec<Box<dyn Device>> {
+                Vec::new()
+            }
+            fn discover_dormant_wireless(&self, open_ids: &[&str]) -> Vec<Box<dyn Device>> {
+                if open_ids.contains(&"other:1") {
+                    vec![Box::new(OtherDevice)]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+        struct FreshDriver;
+        impl Driver for FreshDriver {
+            fn name(&self) -> &'static str {
+                "fresh"
+            }
+            fn discover(&self) -> Vec<Box<dyn Device>> {
+                Vec::new()
+            }
+            fn discover_dormant_wireless(&self, open_ids: &[&str]) -> Vec<Box<dyn Device>> {
+                if open_ids.contains(&"fresh:new") {
+                    Vec::new()
+                } else {
+                    struct NewDev;
+                    impl Device for NewDev {
+                        fn info(&self) -> DeviceInfo {
+                            DeviceInfo {
+                                id: "fresh:new".into(),
+                                vendor: "Fresh".into(),
+                                model: "Mouse".into(),
+                                kind: DeviceKind::Mouse,
+                                connection: Connection::Wireless,
+                                firmware: None,
+                            }
+                        }
+                    }
+                    vec![Box::new(NewDev)]
+                }
+            }
+        }
+
+        let drivers: Vec<Box<dyn Driver>> = vec![Box::new(LateWakeDriver), Box::new(FreshDriver)];
+        let enabled = std::collections::BTreeSet::new();
+        let mut devs: Vec<Box<dyn Device>> = vec![Box::new(OtherDevice)];
+        assert_eq!(discover_dormant_wireless(&mut devs, &drivers, &enabled), 1);
+        assert_eq!(devs.len(), 2);
+        // Second call sees fresh:new already in open_ids and appends nothing.
+        assert_eq!(discover_dormant_wireless(&mut devs, &drivers, &enabled), 0);
+        assert_eq!(devs.len(), 2);
     }
 }

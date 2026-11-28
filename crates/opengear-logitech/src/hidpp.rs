@@ -270,6 +270,13 @@ impl HidppTransport {
         Self::open_all_multi(None, specs)
     }
 
+    /// Fast re-probe of wireless HID++ receivers (`0xFF00`) whose PID does not yet have any active
+    /// device in `open_pids` (so sleeping wireless mice/keyboards are discovered on wake without
+    /// disturbing already-connected hardware).
+    pub(crate) fn open_dormant_receivers(open_pids: &[u16]) -> Vec<(u16, Self)> {
+        Self::open_all_multi_inner(None, &[(0xFF00, Some(0x0002))], Some(open_pids), true)
+    }
+
     fn open_all_matching_filtered(
         pid_filter: Option<u16>,
         usage_page: u16,
@@ -282,6 +289,15 @@ impl HidppTransport {
     }
 
     fn open_all_multi(pid_filter: Option<u16>, specs: &[(u16, Option<u16>)]) -> Vec<(u16, Self)> {
+        Self::open_all_multi_inner(pid_filter, specs, None, false)
+    }
+
+    fn open_all_multi_inner(
+        pid_filter: Option<u16>,
+        specs: &[(u16, Option<u16>)],
+        skip_open_pids: Option<&[u16]>,
+        dormant_mode: bool,
+    ) -> Vec<(u16, Self)> {
         let Ok(api) = HidApi::new() else {
             return Vec::new();
         };
@@ -304,15 +320,20 @@ impl HidppTransport {
             if d.vendor_id() != LOGITECH_VID {
                 continue;
             }
+            let pid = d.product_id();
+            if let Some(open) = skip_open_pids
+                && open.contains(&pid)
+            {
+                continue;
+            }
             let usage_page = d.usage_page();
             let Some(&(_, preferred_usage)) = specs.iter().find(|&&(p, _)| p == usage_page) else {
                 continue;
             };
-            if pid_filter.is_some_and(|p| d.product_id() != p) {
+            if pid_filter.is_some_and(|p| pid != p) {
                 continue;
             }
             let vid = d.vendor_id();
-            let pid = d.product_id();
             let iface = d.interface_number();
             let path_cstr = d.path().to_owned();
             let serial_raw = d.serial_number().unwrap_or("").trim();
@@ -395,14 +416,21 @@ impl HidppTransport {
                 };
                 probe.drain();
 
-                // Probe wired/direct 0xFF FIRST (fast 90 ms) so wired mice never stall on receiver slots.
+                // Probe wired/direct 0xFF FIRST (fast 50-90 ms) so wired mice never stall on receiver slots.
+                let wired_timeout = if dormant_mode { 50 } else { 90 };
+                let slot1_timeout = if dormant_mode { 120 } else { 450 };
+                let other_slot_timeout = if dormant_mode { 50 } else { 90 };
                 probe.device_index = 0xFF;
-                if let Ok((maj, min)) = probe.ping_protocol_version_timeout(90) {
+                if let Ok((maj, min)) = probe.ping_protocol_version_timeout(wired_timeout) {
                     matched_slots.push((0xFF, maj, min));
                 } else if usage_page != 0xFF43 {
                     for idx in 0x01..=0x06u8 {
                         probe.device_index = idx;
-                        let timeout = if idx == 0x01 { 450 } else { 90 };
+                        let timeout = if idx == 0x01 {
+                            slot1_timeout
+                        } else {
+                            other_slot_timeout
+                        };
                         if let Ok((maj, min)) = probe.ping_protocol_version_timeout(timeout) {
                             matched_slots.push((idx, maj, min));
                         }
@@ -765,6 +793,23 @@ pub(crate) fn read_battery_info(t: &HidppTransport) -> Option<BatteryInfo> {
     None
 }
 
+/// Extract already-connected Logitech product IDs from shared device IDs (`logitech:046D:<PID>:<idx>`).
+pub(crate) fn extract_open_logitech_pids(open_ids: &[&str]) -> Vec<u16> {
+    let mut pids = Vec::new();
+    for id in open_ids {
+        let mut parts = id.split(':');
+        if parts.next() == Some("logitech")
+            && parts.next() == Some("046D")
+            && let Some(pid_hex) = parts.next()
+            && let Ok(pid) = u16::from_str_radix(pid_hex, 16)
+            && !pids.contains(&pid)
+        {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,5 +883,16 @@ mod tests {
         let t = HidppTransport::from_io(Box::new(io), 0xFF, false);
         let err = t.request(0x02, 0x10, &[]).unwrap_err();
         assert!(matches!(err, HidppError::Protocol10(0x04)));
+    }
+
+    #[test]
+    fn extract_open_logitech_pids_parses_standard_ids_only() {
+        let ids = [
+            "corsair:corsair_1B1C_1B73_sub0_TEST",
+            "logitech:046D:0AAA:255",
+            "logitech:046D:C547:1",
+            "logitech:046D:0AAA:254",
+        ];
+        assert_eq!(extract_open_logitech_pids(&ids), vec![0x0AAA, 0xC547]);
     }
 }
